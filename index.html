@@ -111,11 +111,17 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 .chips{display:flex;flex-direction:column;gap:2px;min-width:0}
 .chip{display:block;font-size:12px;line-height:1.3;padding:2px 5px;border-radius:4px;background:color-mix(in oklab, var(--c) 22%, var(--surface));border-left:3px solid var(--c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
 .chip.done{text-decoration:line-through;opacity:.6}
+.chip.ms{border-radius:4px 0 0 4px;margin-right:-6px}
+.chip.mm{border-radius:0;border-left-color:transparent;margin-left:-6px;margin-right:-6px;padding-left:8px}
+.chip.me{border-radius:0 4px 4px 0;border-left-color:transparent;margin-left:-6px;padding-left:8px}
+.range-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.range-row .to{color:var(--muted);font-size:13px}
 .more{font-size:11px;color:var(--muted);padding-left:4px}
 @media (max-width:640px){
   .day{min-height:58px}
   .chips{flex-direction:row;flex-wrap:wrap;gap:3px}
   .chip{width:8px;height:8px;padding:0;border:none;border-radius:50%;background:var(--c);font-size:0}
+  .chip.ms,.chip.mm,.chip.me{margin:0;padding:0;border-radius:50%}
   .more{font-size:10px;padding:0}
 }
 .legend{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
@@ -280,7 +286,7 @@ dialog::backdrop{background:rgba(10,12,20,.45)}
       </div>
       <form id="addForm" class="add editor" autocomplete="off">
         <input id="addTitle" class="field grow" placeholder="Add a task" aria-label="Task title">
-        <input id="addDate" class="field" type="date" aria-label="Due date">
+        <span class="range-row"><input id="addDate" class="field" type="date" aria-label="Start date"><span class="to">to</span><input id="addEnd" class="field" type="date" aria-label="End date (optional, for tasks that last several days)" title="End date (optional)"></span>
         <input id="addTime" class="field" type="time" aria-label="Time">
         <div class="colors" id="addColors" aria-label="Task color"></div>
         <button class="btn primary" type="submit">Add</button>
@@ -298,7 +304,8 @@ dialog::backdrop{background:rgba(10,12,20,.45)}
     <label>Title<input id="tTitle" class="field" required></label>
     <label>Tab<select id="tTab" class="field"></select></label>
     <div class="two">
-      <label>Date<input id="tDate" class="field" type="date"></label>
+      <label>Start date<input id="tDate" class="field" type="date"></label>
+      <label>End date <span style="font-weight:400">(optional, for multi-day tasks)</span><input id="tEnd" class="field" type="date"></label>
       <label>Time<input id="tTime" class="field" type="time"></label>
     </div>
     <label>Calendar color<div class="colors" id="tColors"></div></label>
@@ -408,7 +415,17 @@ function fmtDue(s,t){const d=diff(s),dt=parse(s);let x;
   if(d===0)x="Today";else if(d===1)x="Tomorrow";else if(d===-1)x="Yesterday";
   else if(d>1&&d<7)x=DOW[dt.getDay()];else x=`${MON[dt.getMonth()]} ${dt.getDate()}${dt.getFullYear()!==now.getFullYear()?", "+dt.getFullYear():""}`;
   return t?`${x} · ${fmtTime(t)}`:x}
-const dueCls=t=>!t.due||t.done?"":diff(t.due)<0?"over":diff(t.due)===0?"today":"";
+/* Multi-day tasks: `due` is the start date, optional `end` is the last day. Tasks without `end` are one day. */
+const tEnd=t=>t.due&&t.end&&t.end>t.due?t.end:t.due;
+const isMulti=t=>!!t.due&&tEnd(t)!==t.due;
+const isOver=t=>!!t.due&&diff(tEnd(t))<0;
+const isNow=t=>!!t.due&&diff(t.due)<=0&&diff(tEnd(t))>=0;
+const isLater=t=>!!t.due&&diff(t.due)>0;
+const onDay=(t,k)=>!!t.due&&t.due<=k&&tEnd(t)>=k;
+function fmtShort(s){const dt=parse(s);return `${MON[dt.getMonth()]} ${dt.getDate()}${dt.getFullYear()!==now.getFullYear()?", "+dt.getFullYear():""}`}
+function fmtWhen(t){if(!t.due)return t.time?fmtTime(t.time):"";if(!isMulti(t))return fmtDue(t.due,t.time);
+  return `${fmtShort(t.due)} – ${fmtShort(tEnd(t))}${t.time?" · "+fmtTime(t.time):""}`}
+const dueCls=t=>!t.due||t.done?"":isOver(t)?"over":isNow(t)?"today":"";
 
 const S={tabs:[],tasks:[],active:"dash",cal:new Date(now.getFullYear(),now.getMonth(),1),sel:TODAY,hidden:new Set(),showDone:{},canWrite:true,db:null,loaded:false,local:false};
 try{const a=localStorage.getItem("juggle.active");if(a)S.active=a;const h=JSON.parse(localStorage.getItem("juggle.hidden")||"[]");S.hidden=new Set(h)}catch(e){}
@@ -504,17 +521,17 @@ function renderTabs(){
   const on=$("#tabs .tab.on");if(on)on.scrollIntoView({block:"nearest",inline:"nearest"});
 }
 function miniItem(t,showWhen=true){
-  const tab=tabById(t.tab);const d=t.due?diff(t.due):null;
-  const when=showWhen&&t.due?fmtDue(t.due,t.time):(t.time?fmtTime(t.time):"");
-  return `<li><button type="button" data-action="openTask" data-id="${t.id}" style="--c:${taskColor(t)}"><span class="bar"></span><span style="min-width:0"><span class="t" style="display:block;${t.done?"text-decoration:line-through;opacity:.6":""}">${esc(t.title)}</span><span class="m">${esc(tab?tab.name:"")}</span></span><span class="w ${!t.done&&d<0?"over":d===0?"today":""}">${esc(when)}</span></button></li>`}
+  const tab=tabById(t.tab);
+  const when=showWhen||isMulti(t)?fmtWhen(t):(t.time?fmtTime(t.time):"");
+  return `<li><button type="button" data-action="openTask" data-id="${t.id}" style="--c:${taskColor(t)}"><span class="bar"></span><span style="min-width:0"><span class="t" style="display:block;${t.done?"text-decoration:line-through;opacity:.6":""}">${esc(t.title)}</span><span class="m">${esc(tab?tab.name:"")}</span></span><span class="w ${dueCls(t)}">${esc(when)}</span></button></li>`}
 
 function renderDash(){
   $("#todayLabel").textContent=`${DOW[now.getDay()]}, ${MON[now.getMonth()]} ${now.getDate()}`;
   $("#dashDate").textContent=now.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"});
   const open=S.tasks.filter(t=>!t.done);
-  const over=open.filter(t=>t.due&&diff(t.due)<0).length;
-  const tod=open.filter(t=>t.due&&diff(t.due)===0).length;
-  const wk=open.filter(t=>t.due&&diff(t.due)>=0&&diff(t.due)<7).length;
+  const over=open.filter(isOver).length;
+  const tod=open.filter(isNow).length;
+  const wk=open.filter(t=>t.due&&diff(tEnd(t))>=0&&diff(t.due)<7).length;
   $("#stats").innerHTML=[[over,"Overdue",over?"alert":""],[tod,"Due today",""],[wk,"Next 7 days",""],[open.length,"Open tasks",""]]
     .map(([n,l,c])=>`<div class="stat ${c}"><b>${n}</b><span>${l}</span></div>`).join("");
 
@@ -524,33 +541,34 @@ function renderDash(){
   const first=new Date(y,mo,1),dim=new Date(y,mo+1,0).getDate();
   const cells=Math.ceil((first.getDay()+dim)/7)*7;
   const start=new Date(y,mo,1-first.getDay());
-  const map={};for(const t of S.tasks){if(!t.due||S.hidden.has(t.tab))continue;(map[t.due]=map[t.due]||[]).push(t)}
+  const map={};for(const t of S.tasks){if(!t.due||S.hidden.has(t.tab))continue;
+    const last=tEnd(t),d=parse(t.due);for(let k=t.due,n=0;k<=last&&n<400;n++){(map[k]=map[k]||[]).push(t);d.setDate(d.getDate()+1);k=ymd(d)}}
   let h="";
   for(let i=0;i<cells;i++){const d=new Date(start);d.setDate(start.getDate()+i);const k=ymd(d);
-    const list=(map[k]||[]).sort((a,b)=>(a.done-b.done)||(a.time||"99").localeCompare(b.time||"99"));
+    const list=(map[k]||[]).sort((a,b)=>(a.done-b.done)||(isMulti(b)-isMulti(a))||(a.due||"").localeCompare(b.due||"")||(a.time||"99").localeCompare(b.time||"99")||(a.id<b.id?-1:1));
     const shown=list.slice(0,3);
     h+=`<button type="button" class="day ${d.getMonth()!==mo?"out":""} ${k===TODAY?"today":""} ${k===S.sel?"sel":""}" data-action="selDay" data-day="${k}" aria-label="${d.toDateString()}, ${list.length} item${list.length===1?"":"s"}">
-      <span class="num">${d.getDate()}</span><span class="chips">${shown.map(t=>`<span class="chip ${t.done?"done":""}" style="--c:${taskColor(t)}" data-action="openTask" data-id="${t.id}" title="${esc(t.title)}">${t.time?esc(fmtTime(t.time).replace(":00","").replace(" ",""))+" ":""}${esc(t.title)}</span>`).join("")}${list.length>3?`<span class="more">+${list.length-3} more</span>`:""}</span></button>`}
+      <span class="num">${d.getDate()}</span><span class="chips">${shown.map(t=>`<span class="chip ${t.done?"done":""} ${!isMulti(t)?"":k===t.due?(d.getDay()===6?"":"ms"):k===tEnd(t)?(d.getDay()===0?"":"me"):(d.getDay()===0?"ms":d.getDay()===6?"me":"mm")}" style="--c:${taskColor(t)}" data-action="openTask" data-id="${t.id}" title="${esc(t.title)}">${t.time?esc(fmtTime(t.time).replace(":00","").replace(" ",""))+" ":""}${esc(t.title)}</span>`).join("")}${list.length>3?`<span class="more">+${list.length-3} more</span>`:""}</span></button>`}
   $("#calGrid").innerHTML=h;
   $("#legend").innerHTML=S.tabs.length?`<span class="legend-note">Show:</span>`+S.tabs.map(t=>`<button type="button" class="lg ${S.hidden.has(t.id)?"off":""}" style="--c:${t.color}" data-action="toggleLegend" data-id="${t.id}" aria-pressed="${!S.hidden.has(t.id)}"><i></i>${esc(t.name)}</button>`).join(""):"";
 
   // selected day
   const sd=parse(S.sel);
   $("#dayTitle").textContent=S.sel===TODAY?"Today":sd.toLocaleDateString(undefined,{weekday:"long",month:"short",day:"numeric"});
-  const dayItems=S.tasks.filter(t=>t.due===S.sel).sort(byDue);
+  const dayItems=S.tasks.filter(t=>onDay(t,S.sel)).sort(byDue);
   $("#dayList").innerHTML=dayItems.length?dayItems.map(t=>miniItem(t,false)).join(""):`<li class="empty">Nothing scheduled.${S.canWrite?" Use Add to put something on this day.":""}</li>`;
 
   // coming up
-  const od=open.filter(t=>t.due&&diff(t.due)<0).sort(byDue);
-  const up=open.filter(t=>t.due&&diff(t.due)>=0&&diff(t.due)<=14).sort(byDue);
+  const od=open.filter(isOver).sort(byDue);
+  const up=open.filter(t=>t.due&&!isOver(t)&&diff(t.due)<=14).sort(byDue);
   let u="";
   if(od.length)u+=`<li class="mini-group over">Overdue</li>`+od.map(t=>miniItem(t)).join("");
   if(up.length)u+=(od.length?`<li class="mini-group">Upcoming</li>`:"")+up.map(t=>miniItem(t)).join("");
   $("#upList").innerHTML=u||`<li class="empty">No dated tasks in the next two weeks. Give a task a date and it shows up here and on the calendar.</li>`;
 
   // list cards
-  $("#listsGrid").innerHTML=S.tabs.length?S.tabs.map(t=>{const n=openCount(t.id);const nx=S.tasks.filter(x=>x.tab===t.id&&!x.done&&x.due).sort(byDue)[0];
-    return `<button type="button" class="lcard" style="--c:${t.color}" data-action="go" data-id="${t.id}"><h4>${esc(t.name)}</h4><span class="n">${n?`${n} open task${n===1?"":"s"}`:"All clear"}</span><span class="nx">${nx?`<span>${esc(fmtDue(nx.due))}</span>${esc(nx.title)}`:"&nbsp;"}</span></button>`}).join("")
+  $("#listsGrid").innerHTML=S.tabs.length?S.tabs.map(t=>{const n=openCount(t.id);const nx=S.tasks.filter(x=>x.tab===t.id&&!x.done&&x.due&&!isOver(x)).sort(byDue)[0]||S.tasks.filter(x=>x.tab===t.id&&!x.done&&x.due).sort(byDue)[0];
+    return `<button type="button" class="lcard" style="--c:${t.color}" data-action="go" data-id="${t.id}"><h4>${esc(t.name)}</h4><span class="n">${n?`${n} open task${n===1?"":"s"}`:"All clear"}</span><span class="nx">${nx?`<span>${esc(isMulti(nx)?fmtWhen({...nx,time:""}):fmtDue(nx.due))}</span>${esc(nx.title)}`:"&nbsp;"}</span></button>`}).join("")
     :`<div class="list-empty">${S.loaded?"No tabs yet. Use + New tab to create your first list.":"Loading your lists…"}</div>`;
 }
 
@@ -562,9 +580,9 @@ function renderList(){
   const all=S.tasks.filter(t=>t.tab===tab.id);
   const open=all.filter(t=>!t.done);
   const groups=[
-    ["Overdue","over",open.filter(t=>t.due&&diff(t.due)<0).sort(byDue)],
-    ["Today","",open.filter(t=>t.due&&diff(t.due)===0).sort(byDue)],
-    ["Upcoming","",open.filter(t=>t.due&&diff(t.due)>0).sort(byDue)],
+    ["Overdue","over",open.filter(isOver).sort(byDue)],
+    ["Today","",open.filter(isNow).sort(byDue)],
+    ["Upcoming","",open.filter(isLater).sort(byDue)],
     ["No date","",open.filter(t=>!t.due).sort((a,b)=>(a.created||0)-(b.created||0))]];
   const done=all.filter(t=>t.done).sort((a,b)=>(b.doneAt||0)-(a.doneAt||0));
   let h="";
@@ -578,7 +596,7 @@ function rowHTML(t){
   return `<div class="row ${t.done?"done":""}" style="--c:${taskColor(t)}">
     <input type="checkbox" class="chk" data-id="${t.id}" ${t.done?"checked":""} ${S.canWrite?"":"disabled"} aria-label="Mark ${esc(t.title)} done">
     <button type="button" class="row-main" data-action="openTask" data-id="${t.id}"><span class="r-title">${esc(t.title)}</span>${t.notes?`<span class="r-notes">${esc(t.notes)}</span>`:""}</button>
-    ${t.due?`<span class="due ${dueCls(t)}">${esc(fmtDue(t.due,t.time))}</span>`:t.time?`<span class="due">${fmtTime(t.time)}</span>`:""}
+    ${t.due?`<span class="due ${dueCls(t)}">${esc(fmtWhen(t))}</span>`:t.time?`<span class="due">${fmtTime(t.time)}</span>`:""}
   </div>`}
 
 /* ---------- navigation ---------- */
@@ -593,7 +611,7 @@ function openTask(task){
   $("#tTitle").value=t.title||"";
   $("#tTab").innerHTML=S.tabs.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join("");
   $("#tTab").value=t.tab||(S.active!=="dash"?S.active:(S.tabs[0]||{}).id||"");
-  $("#tDate").value=t.due||"";$("#tTime").value=t.time||"";$("#tNotes").value=t.notes||"";$("#tDone").checked=!!t.done;
+  $("#tDate").value=t.due||"";$("#tEnd").value=isMulti(t)?t.end:"";$("#tTime").value=t.time||"";$("#tNotes").value=t.notes||"";$("#tDone").checked=!!t.done;
   picker($("#tColors"),t.color||"",true);
   $("#tDelete").hidden=!editing;
   $("#taskForm").querySelectorAll("input,select,textarea,.sw").forEach(el=>el.disabled=!S.canWrite);
@@ -603,7 +621,10 @@ $("#taskForm").addEventListener("submit",e=>{e.preventDefault();if(!S.canWrite)r
   const title=$("#tTitle").value.trim();if(!title){$("#tTitle").focus();return}
   if(!S.tabs.length){toast("Create a tab first.");return}
   const done=$("#tDone").checked;
-  const data={title,tab:$("#tTab").value,due:$("#tDate").value||"",time:$("#tTime").value||"",color:$("#tColors").dataset.value||"",notes:$("#tNotes").value.trim(),done};
+  const due=$("#tDate").value||"",endV=$("#tEnd").value||"";
+  if(endV&&!due){toast("Pick a start date for a multi-day task.");$("#tDate").focus();return}
+  if(endV&&endV<due){toast("The end date is before the start date.");$("#tEnd").focus();return}
+  const data={title,tab:$("#tTab").value,due,end:endV>due?endV:"",time:$("#tTime").value||"",color:$("#tColors").dataset.value||"",notes:$("#tNotes").value.trim(),done};
   if(editing){if(done&&!editing.done)data.doneAt=Date.now();safe(()=>upd("tasks",editing.id,data),"Saved")}
   else{data.created=Date.now();if(done)data.doneAt=Date.now();safe(()=>add("tasks",data),"Added");if(data.due)S.sel=data.due}
   $("#taskDlg").close()});
@@ -665,8 +686,11 @@ document.addEventListener("dblclick",e=>{const t=e.target.closest(".tab[data-id]
 document.addEventListener("keydown",e=>{if(e.target.closest("input,textarea,select,dialog")||e.metaKey||e.ctrlKey||e.altKey)return;
   if(e.key==="]"){cycle(1);e.preventDefault()}else if(e.key==="["){cycle(-1);e.preventDefault()}});
 $("#addForm").addEventListener("submit",e=>{e.preventDefault();const title=$("#addTitle").value.trim();if(!title){$("#addTitle").focus();return}
-  const data={title,tab:S.active,due:$("#addDate").value||"",time:$("#addTime").value||"",color:$("#addColors").dataset.value||"",notes:"",done:false,created:Date.now()};
-  $("#addTitle").value="";$("#addTime").value="";$("#addTitle").focus();
+  const due=$("#addDate").value||"",endV=$("#addEnd").value||"";
+  if(endV&&!due){toast("Pick a start date for a multi-day task.");$("#addDate").focus();return}
+  if(endV&&endV<due){toast("The end date is before the start date.");$("#addEnd").focus();return}
+  const data={title,tab:S.active,due,end:endV>due?endV:"",time:$("#addTime").value||"",color:$("#addColors").dataset.value||"",notes:"",done:false,created:Date.now()};
+  $("#addTitle").value="";$("#addTime").value="";$("#addEnd").value="";$("#addTitle").focus();
   safe(()=>add("tasks",data))});
 
 $("#unlockForm").addEventListener("submit",async e=>{e.preventDefault();const k=$("#unlockKey").value.trim();if(!k)return;

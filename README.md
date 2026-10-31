@@ -18,7 +18,8 @@ A standalone planner for juggling school, work, music, the label, the website, t
 
 ### Tabbed to-do lists
 - Each tab is its own list, grouped into **Overdue**, **Today**, **Upcoming**, **No date** and **Done** (Done is collapsed by default).
-- Quick-add bar: title, optional date and time, optional color.
+- Quick-add bar: title, optional start date, optional end date, time and color.
+- **Multi-day tasks:** give a task an end date and it stretches across every day from start to end on the calendar. It counts as "Today" while it's in progress and only becomes overdue after its last day.
 - Click any task to edit its title, tab, date, time, color, notes or done status, or to delete it.
 - Tick the checkbox to mark a task done.
 
@@ -81,7 +82,8 @@ In the Claude artifact, data lives in the artifact's shared database and syncs a
 |---|---|---|
 | `title` | string | Task text |
 | `tab` | string | ID of the tab it belongs to |
-| `due` | string | `YYYY-MM-DD`, empty if undated |
+| `due` | string | Start date, `YYYY-MM-DD`, empty if undated |
+| `end` | string | Last day for a multi-day task, `YYYY-MM-DD`; empty or missing means a one-day task |
 | `time` | string | `HH:MM` (24h), optional |
 | `color` | string | Hex color; empty means "use the tab color" |
 | `notes` | string | Optional |
