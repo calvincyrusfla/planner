@@ -220,6 +220,15 @@ dialog::backdrop{background:rgba(10,12,20,.45)}
   </nav>
 
   <div id="status" class="status" hidden></div>
+  <div id="localBanner" class="status" style="border-style:solid;border-color:var(--warn);color:var(--fg)" hidden>
+    <b id="lbText"></b>
+    <span style="display:block;color:var(--muted);font-size:13px;margin:2px 0 8px">They're safe in this browser. Nothing has been deleted.</span>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn small primary" type="button" data-action="lbAdd" id="lbAdd"></button>
+      <button class="btn small" type="button" data-action="lbDownload">Download them as a file</button>
+      <button class="btn small quiet" type="button" data-action="lbHide">Hide</button>
+    </div>
+  </div>
 
   <section id="dashView">
     <div style="display:flex;flex-direction:column;gap:16px">
@@ -447,6 +456,15 @@ async function mergeIn(data,msg){const d=await send([{op:"merge",data}]);const r
   toast(r.addedTasks||r.addedTabs?`${msg}: added ${r.addedTasks||0} task${r.addedTasks===1?"":"s"}${r.addedTabs?` and ${r.addedTabs} tab${r.addedTabs===1?"":"s"}`:""}.`:`${msg}: nothing new to add.`);return r}
 async function autoMergeLocal(){const l=localCopy();if(!l||!S.canWrite)return;let done="";try{done=localStorage.getItem("juggle.merged")||""}catch(e){}
   if(done)return;try{await mergeIn(l,"Brought in tasks saved in this browser");localStorage.setItem("juggle.merged",String(Date.now()))}catch(e){toast(errMsg(e))}}
+function unmerged(){const l=localCopy();if(!l)return[];
+  const have=new Set(S.tasks.map(t=>`${(t.title||"").toLowerCase().replace(/\s+/g,"")}|${t.due||""}`));
+  return l.tasks.filter(t=>t&&t.title&&!have.has(`${t.title.toLowerCase().replace(/\s+/g,"")}|${t.due||""}`))}
+function localBanner(){const n=unmerged().length;let hid="";try{hid=localStorage.getItem("juggle.bannerHidden")||""}catch(e){}
+  const el=$("#localBanner");el.hidden=!n||hid===String(n);if(!n)return;
+  $("#lbText").textContent=`This browser has ${n} task${n===1?"":"s"} you entered earlier that ${n===1?"isn't":"aren't"} on the shared calendar yet.`;
+  $("#lbAdd").textContent=S.canWrite?`Add ${n===1?"it":"them"} to the shared calendar`:`Unlock editing to add ${n===1?"it":"them"}`}
+function downloadJSON(obj,name){const blob=new Blob([JSON.stringify(obj,null,2)],{type:"application/json"});
+  const u=URL.createObjectURL(blob),l=document.createElement("a");l.href=u;l.download=name;document.body.appendChild(l);l.click();l.remove();setTimeout(()=>URL.revokeObjectURL(u),1000)}
 function sortT(){S.tabs.sort((a,b)=>(a.order||0)-(b.order||0))}
 
 async function add(col,data){if(S.remote){const doc={...data,id:uid()+uid().slice(0,4)};S[col].push(doc);if(col==="tabs")sortT();render();await send([{op:"add",col,id:doc.id,data}]);return doc}
@@ -469,6 +487,7 @@ document.addEventListener("click",e=>{const b=e.target.closest("[data-pick]");if
 function render(){
   document.body.classList.toggle("ro",!S.canWrite);
   $("#modePill").hidden=S.canWrite;
+  if(S.remote)localBanner();
   if(S.remote){$("#unlockBtn").hidden=false;$("#unlockBtn").textContent=S.canWrite?"Editing on":"Unlock editing";$("#backupBtn").hidden=false}
   if(S.active!=="dash"&&!tabById(S.active)&&S.loaded)S.active="dash";
   renderTabs();
@@ -634,6 +653,9 @@ document.addEventListener("click",e=>{const el=e.target.closest("[data-action]")
     $("#localNote").textContent=n?`This browser also has ${n} task${n===1?"":"s"} saved from the earlier version of the site. They're kept here untouched.`:"";$("#backupDlg").showModal()}
   else if(a==="exportFile"){const blob=new Blob([JSON.stringify({app:"juggle",exported:new Date().toISOString(),tabs:S.tabs,tasks:S.tasks},null,2)],{type:"application/json"});
     const u=URL.createObjectURL(blob),l=document.createElement("a");l.href=u;l.download=`juggle-backup-${TODAY}.json`;document.body.appendChild(l);l.click();l.remove();setTimeout(()=>URL.revokeObjectURL(u),1000)}
+  else if(a==="lbAdd"){if(!S.canWrite){$("[data-action=unlock]").click();return}const l=localCopy();if(l)mergeIn(l,"Added").catch(e=>toast(errMsg(e)))}
+  else if(a==="lbDownload"){const l=localCopy();if(l)downloadJSON({app:"juggle",source:"this browser",exported:new Date().toISOString(),...l},`juggle-saved-in-this-browser-${TODAY}.json`)}
+  else if(a==="lbHide"){try{localStorage.setItem("juggle.bannerHidden",String(unmerged().length))}catch(e){}$("#localBanner").hidden=true}
   else if(a==="importFile")$("#importInput").click();
   else if(a==="importLocal"){const l=localCopy();if(l)mergeIn(l,"Imported").then(()=>{try{localStorage.setItem("juggle.merged",String(Date.now()))}catch(e){}}).catch(e=>toast(errMsg(e)))}
 });
