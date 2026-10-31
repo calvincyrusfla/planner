@@ -1,0 +1,77 @@
+{
+  "tabs": [
+    {
+      "id": "nlp",
+      "color": "#2D8AD6",
+      "name": "NLP",
+      "order": 1
+    },
+    {
+      "id": "cv",
+      "color": "#4B5BE0",
+      "name": "Computer Vision",
+      "order": 2
+    },
+    {
+      "id": "precal",
+      "color": "#17998A",
+      "name": "Pre-Cal & Trig",
+      "order": 3
+    },
+    {
+      "id": "esc",
+      "color": "#5FA03A",
+      "name": "ESC",
+      "order": 4
+    },
+    {
+      "id": "sales",
+      "color": "#D69419",
+      "name": "Sales",
+      "order": 5
+    },
+    {
+      "id": "dj",
+      "color": "#9550C8",
+      "name": "DJ Gigs",
+      "order": 6
+    },
+    {
+      "id": "label",
+      "color": "#CF4A8C",
+      "name": "Record Label",
+      "order": 7
+    },
+    {
+      "id": "site",
+      "color": "#6B7A8C",
+      "name": "Website Moderation",
+      "order": 8
+    },
+    {
+      "id": "travel",
+      "color": "#E5674F",
+      "name": "Travel",
+      "order": 9
+    },
+    {
+      "id": "social",
+      "color": "#A86A47",
+      "name": "Social",
+      "order": 10
+    }
+  ],
+  "tasks": [
+    {
+      "id": "8l1qw1l1uh0cne4trnzs",
+      "color": "#E5674F",
+      "created": 1793456290470,
+      "done": false,
+      "due": "2026-11-14",
+      "notes": "",
+      "tab": "dj",
+      "time": "",
+      "title": "Sacred Meadows"
+    }
+  ]
+}

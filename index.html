@@ -48,6 +48,8 @@ h1,h2,h3{font-family:var(--f-display);margin:0;text-wrap:balance;letter-spacing:
 .brand h1{font-size:24px;font-weight:800}
 .brand p{margin:0;color:var(--muted);font-size:13px}
 .top-actions{display:flex;gap:8px;align-items:center}
+.top-actions .btn,.pill{white-space:nowrap}
+@media (max-width:520px){.top-actions{width:100%;flex-wrap:wrap}.top-actions .btn{padding:6px 10px;font-size:13px}}
 .pill{font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);color:var(--muted)}
 
 /* buttons */
@@ -205,6 +207,8 @@ dialog::backdrop{background:rgba(10,12,20,.45)}
     </div>
     <div class="top-actions">
       <span id="modePill" class="pill" hidden>View only</span>
+      <button class="btn" data-action="unlock" type="button" id="unlockBtn" hidden>Unlock editing</button>
+      <button class="btn" data-action="backup" type="button" id="backupBtn" hidden>Backup</button>
       <button class="btn" data-action="share" type="button" id="shareBtn">Share</button>
     </div>
   </header>
@@ -336,6 +340,47 @@ dialog::backdrop{background:rgba(10,12,20,.45)}
   </div>
 </dialog>
 
+<dialog id="webShareDlg">
+  <div class="dlg">
+    <h3>Share this planner</h3>
+    <p>Send this link. Anyone who opens it sees your calendar and lists, kept up to date. They can look but not change anything.</p>
+    <input id="shareUrl" class="field" readonly aria-label="Planner link">
+    <p id="shareEditNote">To let someone else edit, give them the editing passcode too. They tap <b>Unlock editing</b> and enter it.</p>
+    <div class="dlg-foot">
+      <button class="btn" type="button" data-action="closeDlg">Close</button>
+      <button class="btn primary" type="button" data-action="copyLink">Copy link</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="unlockDlg">
+  <form class="dlg" id="unlockForm" method="dialog" autocomplete="off">
+    <h3>Unlock editing</h3>
+    <p id="unlockText">Enter the editing passcode set in Netlify. This browser remembers it.</p>
+    <label>Passcode<input id="unlockKey" class="field" type="password" required autocomplete="current-password"></label>
+    <div class="dlg-foot">
+      <button class="btn left" type="button" data-action="lock" id="lockBtn" hidden>Lock this browser</button>
+      <button class="btn" type="button" data-action="closeDlg">Cancel</button>
+      <button class="btn primary" type="submit">Unlock</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="backupDlg">
+  <div class="dlg">
+    <h3>Backup</h3>
+    <p>Download a copy of every tab and task, or bring tasks in from a backup file. Importing only adds what's missing. It never removes anything.</p>
+    <p id="localNote" hidden></p>
+    <div class="dlg-foot">
+      <button class="btn left" type="button" data-action="closeDlg">Close</button>
+      <button class="btn editor" type="button" data-action="importFile">Import file…</button>
+      <button class="btn editor" type="button" data-action="importLocal" id="importLocalBtn" hidden>Add this browser's saved tasks</button>
+      <button class="btn primary" type="button" data-action="exportFile">Download backup</button>
+    </div>
+    <input type="file" id="importInput" accept="application/json,.json" hidden>
+  </div>
+</dialog>
+
 <div class="toast" id="toast" hidden></div>
 
 <script>
@@ -369,6 +414,8 @@ const uid=()=>Math.random().toString(36).slice(2,10);
 function toast(msg){const el=$("#toast");el.textContent=msg;el.hidden=false;clearTimeout(toast.t);toast.t=setTimeout(()=>el.hidden=true,2600)}
 function errMsg(e){const c=e&&e.code;
   if(c==="not_granted"||c==="revoked")return"You have view access, so changes can't be saved.";
+  if(c==="bad_key")return"That passcode didn't work.";
+  if(c==="busy")return"Someone else was saving at the same moment. Try again.";
   if(c==="unavailable")return"Couldn't reach the server. Check your connection and try again.";
   return"That change didn't save. Try again."}
 /* Standalone mode (e.g. Netlify): data is kept in this browser's localStorage. */
@@ -378,9 +425,36 @@ function loadLocal(){let d=null;try{d=JSON.parse(localStorage.getItem(LKEY)||"nu
   if(d&&Array.isArray(d.tabs)&&Array.isArray(d.tasks)){S.tabs=d.tabs.sort((a,b)=>(a.order||0)-(b.order||0));S.tasks=d.tasks;return true}
   S.tabs=SEED.map(([name,color],i)=>({id:uid(),name,color,order:i+1}));S.tasks=[];return persist()}
 function persist(){try{localStorage.setItem(LKEY,JSON.stringify({tabs:S.tabs,tasks:S.tasks}));return true}catch(e){return false}}
-async function add(col,data){if(S.db)return S.db.collection(col).add(data);const doc={...data,id:uid()};S[col].push(doc);if(col==="tabs")S.tabs.sort((a,b)=>(a.order||0)-(b.order||0));persist();render();return doc}
-async function upd(col,id,data){if(S.db)return S.db.doc(`${col}/${id}`).update(data);Object.assign(S[col].find(x=>x.id===id)||{},data);if(col==="tabs")S.tabs.sort((a,b)=>(a.order||0)-(b.order||0));persist();render()}
-async function del(col,id){if(S.db)return S.db.doc(`${col}/${id}`).delete();S[col]=S[col].filter(x=>x.id!==id);persist();render()}
+/* Netlify mode: shared data through /api/planner. Viewers read; the passcode unlocks editing.
+   This never writes to LKEY, so anything saved in this browser before stays put as a backup. */
+const API="/api/planner";
+let editKey="";try{editKey=localStorage.getItem("juggle.editKey")||""}catch(e){}
+function remoteErr(code){const e=new Error(code);e.code=code;return e}
+async function api(method,body){
+  let r;try{r=await fetch(API,{method,headers:{"content-type":"application/json",...(editKey?{"x-edit-key":editKey}:{})},body:body?JSON.stringify(body):undefined,cache:"no-store"})}catch(e){throw remoteErr("unavailable")}
+  let d=null;try{d=await r.json()}catch(e){}
+  if(!r.ok||!d)throw remoteErr(r.status===401?"bad_key":r.status===403?"not_granted":d&&d.error||"unavailable");
+  return d}
+function applyRemote(d){if(!Array.isArray(d.tabs)||!Array.isArray(d.tasks))return;
+  if((d.rev||0)<(S.rev||0))return;S.rev=d.rev||0;
+  S.tabs=d.tabs.sort((a,b)=>(a.order||0)-(b.order||0));S.tasks=d.tasks;S.canWrite=!!d.canEdit;S.editingEnabled=!!d.editingEnabled;render()}
+let pending=Promise.resolve();
+function send(ops){const p=pending.then(()=>api("POST",{ops})).then(d=>{applyRemote(d);return d});
+  pending=p.catch(()=>{});p.catch(()=>refresh());return p}
+async function refresh(){try{applyRemote(await api("GET"))}catch(e){}}
+function localCopy(){try{const d=JSON.parse(localStorage.getItem(LKEY)||"null");return d&&Array.isArray(d.tasks)?d:null}catch(e){return null}}
+async function mergeIn(data,msg){const d=await send([{op:"merge",data}]);const r=d.result||{};
+  toast(r.addedTasks||r.addedTabs?`${msg}: added ${r.addedTasks||0} task${r.addedTasks===1?"":"s"}${r.addedTabs?` and ${r.addedTabs} tab${r.addedTabs===1?"":"s"}`:""}.`:`${msg}: nothing new to add.`);return r}
+async function autoMergeLocal(){const l=localCopy();if(!l||!S.canWrite)return;let done="";try{done=localStorage.getItem("juggle.merged")||""}catch(e){}
+  if(done)return;try{await mergeIn(l,"Brought in tasks saved in this browser");localStorage.setItem("juggle.merged",String(Date.now()))}catch(e){toast(errMsg(e))}}
+function sortT(){S.tabs.sort((a,b)=>(a.order||0)-(b.order||0))}
+
+async function add(col,data){if(S.remote){const doc={...data,id:uid()+uid().slice(0,4)};S[col].push(doc);if(col==="tabs")sortT();render();await send([{op:"add",col,id:doc.id,data}]);return doc}
+  if(S.db)return S.db.collection(col).add(data);const doc={...data,id:uid()};S[col].push(doc);if(col==="tabs")S.tabs.sort((a,b)=>(a.order||0)-(b.order||0));persist();render();return doc}
+async function upd(col,id,data){if(S.remote){Object.assign(S[col].find(x=>x.id===id)||{},data);if(col==="tabs")sortT();render();return send([{op:"upd",col,id,data}])}
+  if(S.db)return S.db.doc(`${col}/${id}`).update(data);Object.assign(S[col].find(x=>x.id===id)||{},data);if(col==="tabs")S.tabs.sort((a,b)=>(a.order||0)-(b.order||0));persist();render()}
+async function del(col,id){if(S.remote){S[col]=S[col].filter(x=>x.id!==id);render();return send([{op:"del",col,id}])}
+  if(S.db)return S.db.doc(`${col}/${id}`).delete();S[col]=S[col].filter(x=>x.id!==id);persist();render()}
 async function safe(fn,ok){try{await fn();if(ok)toast(ok)}catch(e){toast(errMsg(e))}}
 
 /* ---------- color pickers ---------- */
@@ -395,6 +469,7 @@ document.addEventListener("click",e=>{const b=e.target.closest("[data-pick]");if
 function render(){
   document.body.classList.toggle("ro",!S.canWrite);
   $("#modePill").hidden=S.canWrite;
+  if(S.remote){$("#unlockBtn").hidden=false;$("#unlockBtn").textContent=S.canWrite?"Editing on":"Unlock editing";$("#backupBtn").hidden=false}
   if(S.active!=="dash"&&!tabById(S.active)&&S.loaded)S.active="dash";
   renderTabs();
   const dash=S.active==="dash";
@@ -549,7 +624,18 @@ document.addEventListener("click",e=>{const el=e.target.closest("[data-action]")
   else if(a==="toggleDone"){S.showDone[S.active]=!S.showDone[S.active];renderList()}
   else if(a==="deleteTask"&&editing){const t=editing;$("#taskDlg").close();confirmBox("Delete this task?",`“${t.title}” will be removed.`,()=>safe(()=>del("tasks",t.id),"Task deleted"))}
   else if(a==="closeDlg")el.closest("dialog").close();
-  else if(a==="share")$("#shareDlg").showModal();
+  else if(a==="share"){if(S.remote){$("#shareUrl").value=location.origin+location.pathname;$("#webShareDlg").showModal();$("#shareUrl").select()}else $("#shareDlg").showModal()}
+  else if(a==="copyLink"){const u=$("#shareUrl").value;(navigator.clipboard?navigator.clipboard.writeText(u):Promise.reject()).then(()=>toast("Link copied"),()=>{$("#shareUrl").select();toast("Press Ctrl+C (or ⌘C) to copy")})}
+  else if(a==="unlock"){$("#unlockKey").value="";$("#lockBtn").hidden=!S.canWrite;
+    $("#unlockText").textContent=S.editingEnabled===false?"Editing isn't set up yet. In Netlify, add an environment variable named EDIT_KEY with your passcode, then redeploy.":S.canWrite?"This browser can edit. Enter a different passcode, or lock this browser.":"Enter the editing passcode set in Netlify. This browser remembers it.";
+    $("#unlockDlg").showModal();$("#unlockKey").focus()}
+  else if(a==="lock"){editKey="";try{localStorage.removeItem("juggle.editKey")}catch(e){}$("#unlockDlg").close();refresh().then(()=>toast("Editing locked in this browser"))}
+  else if(a==="backup"){const l=localCopy();const n=l?l.tasks.length:0;$("#importLocalBtn").hidden=!n;$("#localNote").hidden=!n;
+    $("#localNote").textContent=n?`This browser also has ${n} task${n===1?"":"s"} saved from the earlier version of the site. They're kept here untouched.`:"";$("#backupDlg").showModal()}
+  else if(a==="exportFile"){const blob=new Blob([JSON.stringify({app:"juggle",exported:new Date().toISOString(),tabs:S.tabs,tasks:S.tasks},null,2)],{type:"application/json"});
+    const u=URL.createObjectURL(blob),l=document.createElement("a");l.href=u;l.download=`juggle-backup-${TODAY}.json`;document.body.appendChild(l);l.click();l.remove();setTimeout(()=>URL.revokeObjectURL(u),1000)}
+  else if(a==="importFile")$("#importInput").click();
+  else if(a==="importLocal"){const l=localCopy();if(l)mergeIn(l,"Imported").then(()=>{try{localStorage.setItem("juggle.merged",String(Date.now()))}catch(e){}}).catch(e=>toast(errMsg(e)))}
 });
 document.addEventListener("change",e=>{if(!e.target.matches(".chk"))return;const done=e.target.checked;
   safe(()=>upd("tasks",e.target.dataset.id,done?{done,doneAt:Date.now()}:{done}))});
@@ -561,6 +647,14 @@ $("#addForm").addEventListener("submit",e=>{e.preventDefault();const title=$("#a
   $("#addTitle").value="";$("#addTime").value="";$("#addTitle").focus();
   safe(()=>add("tasks",data))});
 
+$("#unlockForm").addEventListener("submit",async e=>{e.preventDefault();const k=$("#unlockKey").value.trim();if(!k)return;
+  const prev=editKey;editKey=k;
+  try{const d=await api("GET");if(!d.canEdit)throw remoteErr(d.editingEnabled?"bad_key":"not_set");
+    try{localStorage.setItem("juggle.editKey",k)}catch(e){}$("#unlockDlg").close();applyRemote(d);toast("Editing unlocked");autoMergeLocal()}
+  catch(err){editKey=prev;toast(err.code==="not_set"?"Editing isn't set up yet. Add EDIT_KEY in Netlify first.":errMsg(err))}});
+$("#importInput").addEventListener("change",async e=>{const f=e.target.files[0];e.target.value="";if(!f)return;
+  try{const d=JSON.parse(await f.text());if(!Array.isArray(d.tasks))throw 0;await mergeIn(d,"Imported")}catch(err){toast(err&&err.code?errMsg(err):"That file isn't a Juggle backup.")}});
+
 /* ---------- boot ---------- */
 render();
 (async()=>{
@@ -568,6 +662,12 @@ render();
   const timer=setTimeout(()=>{if(!S.loaded){status.textContent="Your lists are taking a while to load. Check your connection, then reopen this page.";status.hidden=false}},10000);
   const c=window.claude;
   const db=c?await c.use("db"):null;
+  if(!db&&location.protocol.startsWith("http")){
+    try{const d=await api("GET");S.remote=true;S.loaded=true;clearTimeout(timer);status.hidden=true;applyRemote(d);
+      autoMergeLocal();
+      setInterval(()=>{if(document.visibilityState==="visible"&&!document.querySelector("dialog[open]"))refresh()},20000);
+      document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")refresh()});
+      return}catch(e){}}
   if(!db){clearTimeout(timer);S.local=true;S.loaded=true;$("#shareBtn").hidden=true;
     if(!loadLocal()){status.textContent="This browser is blocking storage, so anything you add disappears when you close this page.";status.hidden=false}
     render();return}

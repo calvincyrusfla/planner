@@ -1,7 +1,11 @@
-# Netlify deploy settings: a static site served straight from the repo root.
+# Netlify deploy settings: static page at the repo root plus one function
+# (netlify/functions/planner.mjs) that stores the shared planner data.
 [build]
   publish = "."
   command = ""
+
+[functions]
+  directory = "netlify/functions"
 
 [[headers]]
   for = "/*"

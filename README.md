@@ -93,25 +93,39 @@ Small per-device preferences (last open tab, hidden calendar filters) are kept i
 
 ---
 
-## Standalone site (Netlify)
+## Netlify site: shared calendar
 
-`index.html` is the whole app: one self-contained page with no build step.
+On Netlify the planner saves to a shared store, so the link shows the same tabs and tasks on every device and to everyone you send it to.
 
-- **Inside Claude** it saves through the artifact's shared database (`window.claude.use("db")`).
-- **Anywhere else** (Netlify, a local file) it saves to the browser's `localStorage`. The starting tabs are created on first visit. Data stays on that one device and browser, so clearing site data erases it, and it does not sync between devices or people. The Share button is hidden in this mode.
+- **Viewing:** anyone with the link sees the calendar and lists (read-only), refreshed every 20 seconds.
+- **Editing:** tap **Unlock editing** and enter the passcode. The browser remembers it. Give the passcode only to people who should be able to change things.
+- **Share:** the Share button gives you the link to copy.
+- **Backup:** downloads every tab and task as a JSON file, and can import one. Importing only adds what's missing; it never deletes.
 
-Syncing across devices on the hosted site would mean swapping the storage functions (`add`, `upd`, `del`, `loadLocal`) for a backend such as Firebase or Supabase.
+### One-time setup in Netlify
 
-### Deploying to Netlify
+1. **Site configuration → Environment variables → Add a variable**: key `EDIT_KEY`, value = the passcode you want. (Without it, the site is view-only for everyone.)
+2. **Deploys → Trigger deploy → Deploy site**, so the function picks up the passcode.
 
-1. In Netlify, choose **Add new site → Import an existing project → GitHub**, and pick this repository.
-2. Choose the branch to deploy. `netlify.toml` already sets the publish directory to the repo root with no build command.
-3. Deploy. Every push to that branch redeploys the site.
+### How earlier data is kept
+
+- The shared store starts with the tabs and tasks from the Claude artifact (`netlify/functions/seed.json`).
+- Tasks you typed into the earlier Netlify version are still in that browser. The first time you unlock editing in that browser, they're added to the shared store automatically (skipping duplicates). The browser's own copy is never deleted, and **Backup → Add this browser's saved tasks** can add it again at any time.
+- Do this on every device where you entered tasks before.
+
+### How it works
+
+- `index.html`: the whole app. Inside Claude it uses the artifact's database; on Netlify it uses `/api/planner`; opened as a local file it falls back to browser storage.
+- `netlify/functions/planner.mjs`: reads and writes one JSON document in Netlify Blobs. Edits are sent as individual add, update, delete or merge operations with conditional writes, so two people saving at once don't overwrite each other.
 
 ### Running locally
 
-Open `index.html` in a browser, or serve the folder:
+Opening `index.html` directly works with browser storage only. To run the shared mode locally, use the Netlify CLI:
 
 ```bash
-python3 -m http.server 8000
+npm install
+```
+
+```bash
+EDIT_KEY=yourpasscode npx netlify dev
 ```
