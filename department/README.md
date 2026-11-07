@@ -91,6 +91,7 @@ npm run icons
 - **Tasks:** each open task, with its progress bar and the teams on it. Click **×** on a team to remove it, or use **+ Add team…** to add one (a busy team is moved off its old task). You can also pause, queue, mark done, cancel or delete a task.
 - **Activity:** a live feed of assignments, moves and progress notes from the agents.
 - Updates stream in live while agents report progress.
+- The dashboard always uses a dark theme.
 
 ## CLI
 
