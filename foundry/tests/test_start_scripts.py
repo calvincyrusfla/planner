@@ -58,7 +58,20 @@ def test_bat_structure() -> None:
     assert text.index("title Foundry") < launch < text.index("\r\npause\r\n")
     # No parenthesised blocks around paths: "C:\Program Files (x86)" would close them early.
     assert not re.search(r"\(\r\n[^)]*%(?:PY|TARGET|REPO_ROOT)%", text)
-    assert (REPO_ROOT / ".gitattributes").read_text().split() == ["*.bat", "text", "eol=crlf", "*.sh", "text", "eol=lf"]
+    # Trailing backslash is normalised away before launch (drive roots become "C:\\.").
+    norm = text.index('for %%I in ("%TARGET%\\.") do set "TARGET=%%~fI"')
+    assert norm < text.index('if "%TARGET:~-1%"=="\\" set "TARGET=%TARGET%."') < launch
+    assert text.index('\r\n:args_done\r\n') < norm < text.index('if not exist "%TARGET%\\" goto :no_repo')
+    # Echoed paths are quoted so "&" in a folder name cannot split the line.
+    for line in re.findall(r"^echo .*$", text, flags=re.M):
+        for var in ("%PY%", "%TARGET%", "%REPO_ROOT%"):
+            assert var not in line or f'"{var}"' in line, line
+    # -h/--help exits 0 without pausing; a bad --repo exits 2.
+    help_block = text[text.index("\r\n:help\r\n"):].split("\r\n\r\n")[0]
+    assert 'set "RC=0"\r\ngoto :end' in help_block
+    assert 'if /i "%~1"=="--help" goto :help' in text and 'if /i "%~1"=="-h" goto :help' in text
+    rules = {tuple(line.split()) for line in (REPO_ROOT / ".gitattributes").read_text().splitlines() if line.strip()}
+    assert ("*.bat", "text", "eol=crlf") in rules and ("*.sh", "text", "eol=lf") in rules
 
 
 # --------------------------------------------------------------------------- start_foundry.sh (dry run)
