@@ -817,3 +817,56 @@ def test_busy_slot_cannot_be_promoted(tmp_path: Path) -> None:
             return pool.promote_peer_reviewer(3, minutes=1)
 
     assert asyncio.run(scenario()) is None
+
+
+def test_is_infrastructure_error_shapes() -> None:
+    from foundry.builder_worker import is_infrastructure_error
+    from foundry.schemas import ClaudeResult
+
+    def err(error: str, text: str = "", out: int = 0) -> ClaudeResult:
+        return ClaudeResult(text=text, output_tokens=out, is_error=True, error=error)
+
+    assert is_infrastructure_error(err("timeout after 600s"))
+    assert is_infrastructure_error(err("claude exited 1 without JSON output: boom"))
+    assert is_infrastructure_error(err("simulated failure"))  # no reply at all
+    assert not is_infrastructure_error(err("error_max_turns", text="partial answer", out=40))
+    assert not is_infrastructure_error(ClaudeResult(text="ok"))
+
+
+def _fake_claude(tmp_path: Path, body: str) -> str:
+    import os
+    import stat
+
+    script = tmp_path / "bin" / "claude"
+    script.parent.mkdir(exist_ok=True)
+    script.write_text("#!/bin/sh\ncat > /dev/null\n" + body + "\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    assert os.access(script, os.X_OK)
+    return str(script)
+
+
+@pytest.mark.skipif(__import__("sys").platform.startswith("win"), reason="POSIX shell fake")
+@pytest.mark.parametrize("body", ["sleep 5", "echo 'segfault' >&2; exit 3"])
+def test_real_client_timeout_or_no_json_never_uses_an_attempt(tmp_path: Path, body: str) -> None:
+    """Real ClaudeCodeClient shapes: 'timeout after Ns' and 'exited N without JSON output'."""
+    from foundry.claude_client import ClaudeCodeClient
+
+    rig = Rig(tmp_path, lambda p, agent: APPROVE)
+    rig.client = ClaudeCodeClient(_fake_claude(tmp_path, body))  # type: ignore[assignment]
+    rig.submit("T-RC", "S")
+
+    async def scenario() -> TeamPool:
+        pool = rig.pool(claude_timeout=0.3, infra_backoff_s=0.05)
+        async with pool:
+            await asyncio.sleep(1.5)
+        return pool
+
+    pool = asyncio.run(scenario())
+    outcomes = pool.builder(1).outcomes
+    assert outcomes and set(outcomes) == {"released"}
+    assert rig.state("T-RC") == TaskState.BUILDING
+    t = rig.queue.tickets_for_task("T-RC")[0]
+    assert t.attempt == 0 and t.fix_hint is None
+    assert rig.telemetry.retries("T-RC") == 0
+    errors = pool.builder(1).infra_errors
+    assert errors and ("timeout after" in errors[0] or "without JSON output" in errors[0])

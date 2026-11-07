@@ -24,17 +24,33 @@ Every phase-1 test and the demo run with simulated Claude and Gemma. `--real` ex
 
 ## Install
 
+Run every command in this README **from the repository root** (the folder that holds `foundry\` and `department\`).
+
+Windows (PowerShell or cmd):
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\python -m pip install -r foundry\requirements.txt
+.venv\Scripts\python -m pip install -r foundry\requirements-dev.txt   # only needed to run the tests
+```
+
+macOS / Linux:
+
 ```bash
-python -m venv .venv
-.venv/bin/pip install -r foundry/requirements-dev.txt     # Windows: .venv\Scripts\pip ...
+python3 -m venv .venv
+.venv/bin/python -m pip install -r foundry/requirements-dev.txt
 ```
 
 You need Python 3.11+. The only runtime dependency is `pydantic>=2.7`; everything else uses the standard library.
 
 ## Run the simulated demo
 
+```powershell
+.venv\Scripts\python -m foundry.main --simulate
+```
+
 ```bash
-python -m foundry.main --simulate
+.venv/bin/python -m foundry.main --simulate
 ```
 
 The demo takes well under a second and needs no network, Claude or Ollama. It prints:
@@ -44,7 +60,7 @@ The demo takes well under a second and needs no network, Claude or Ollama. It pr
 3. **gates**: `bravo-1`'s first diff has a syntax error. You see the one-line hint (`[syntax] shop/strings.py:16: ... '(' was never closed`) and the retry prompt that carries it;
 4. **review**: the diff-only reviewer verdicts;
 5. **escalation**: the Foreman's line check (here a `TOKEN_VELOCITY_SPIKE`) and the Floor Manager's action (`THROTTLE_DISPATCH` on the rate limiter);
-6. **PR summaries**: commit messages and a PR body drafted by the Foreman;
+6. **PR summaries**: commit messages and a PR body drafted by the Foreman, plus the `.patch` file written for each task;
 7. **telemetry and board**: call counts by role, tokens saved and the board ops it would have sent.
 
 Options:
@@ -56,6 +72,10 @@ Options:
 Time in the demo is simulated. The queue, telemetry and limiter share a virtual clock, so rate-limit waits advance it instead of sleeping.
 
 ## Tests
+
+```powershell
+.venv\Scripts\python -m pytest foundry\tests -q
+```
 
 ```bash
 .venv/bin/python -m pytest foundry/tests -q
@@ -108,19 +128,75 @@ Environment variables:
 
 To check the Foreman on its own:
 
-```bash
-python -m foundry.foreman_probe [--json]
+```powershell
+.venv\Scripts\python -m foundry.foreman_probe [--json]
 ```
 
-`python -m foundry.main --real ...` runs the probe first. If Gemma isn't reachable or the model is missing, it prints how to fix it and exits with code **2**.
+Two variables point at Ollama, one per tool:
+
+- `FOREMAN_OLLAMA_URL` is the server root (`http://localhost:11434`) used by the **setup scripts**.
+- `FOUNDRY_GEMMA_BASE_URL` is the OpenAI-compatible API (`http://localhost:11434/v1`, note the `/v1`) used by **Foundry itself** (`main.py`, `OllamaGemmaClient`, the probe).
+
+If you move Ollama, set both.
+
+Tip: Ollama's default context window is small. For long sizing and PR prompts, start the server with a larger window, for example `set OLLAMA_CONTEXT_LENGTH=8192` (cmd), `$env:OLLAMA_CONTEXT_LENGTH=8192` (PowerShell) or `OLLAMA_CONTEXT_LENGTH=8192 ollama serve`. If you use the Ollama tray app, quit and restart it after setting the variable.
 
 ### Real mode (phase 2, untested against live services)
 
-```bash
-python -m foundry.main --real --repo C:\path\to\repo --title "Add clamp helper" --files shop/mathx.py
+```powershell
+.venv\Scripts\python -m foundry.main --real --repo C:\path\to\repo --title "Add clamp helper" --files shop/mathx.py
 ```
 
-Real mode sizes the order, runs the teams with `ClaudeCodeClient` and `OllamaGemmaClient`, and prints the final state and the PR draft. Claude Code must be installed and logged in (`claude` or `claude.cmd` on PATH, or set `FOUNDRY_CLAUDE_BIN`).
+Before doing anything, real mode runs two preflight checks. If either fails it prints how to fix it and exits with code **2**:
+
+1. It looks up the Claude Code executable (`claude.exe` or `claude.cmd` on Windows, or `FOUNDRY_CLAUDE_BIN`).
+2. It probes the Gemma Shop Foreman: is Gemma reachable, and is the model installed?
+
+It then sizes the order and runs the teams with `ClaudeCodeClient` and `OllamaGemmaClient`. Claude Code must be logged in under your subscription.
+
+**Your working tree is never modified:**
+
+- Claude runs with `cwd` = the target repo, but only as a diff-only builder or reviewer.
+- Gates apply each diff to a scratch copy of the repo (`.git`, `node_modules`, `.venv` and caches are left out).
+- Each approved task ends up as two files in `FOUNDRY_PATCHES_DIR` (default `foundry\data\patches\`):
+  - `<task>.patch`: the combined approved diff;
+  - `<task>.md`: the commit message and PR body.
+
+Review the patch, then apply it yourself from the target repo's root:
+
+```powershell
+git apply --check C:\path\to\planner\foundry\data\patches\F-001.patch
+git apply --index C:\path\to\planner\foundry\data\patches\F-001.patch
+git commit -F C:\path\to\planner\foundry\data\patches\F-001.md
+```
+
+**Claude flags.** Every Claude Code call gets the safe defaults from `FoundryConfig.claude_extra_args`:
+
+- `--max-turns 3`;
+- `--disallowedTools "Bash Edit Write NotebookEdit Task WebFetch WebSearch"`;
+- `--append-system-prompt` with `claude_append_prompt`. That prompt says the agent is a Foundry builder or reviewer whose only output is the diff or JSON, and that it must ignore repository instructions (such as this repo's `CLAUDE.md`) to register tasks or spawn agents.
+
+To change them, set `FOUNDRY_CLAUDE_ARGS` (split like a shell command line) and `FOUNDRY_CLAUDE_APPEND_PROMPT`. Either can be set to `none`.
+
+### What happens at the Claude usage limit
+
+A subscription usage limit is not the builder's fault, so **it never uses up a ticket attempt**. Messages such as "You've hit your limit · resets 3pm (Europe/Berlin)" or "usage limit reached|<epoch>" are recognised.
+
+1. The worker releases its ticket; the attempt count stays the same.
+2. The rate limiter pauses all dispatch until the reset time. Foundry reads it from the message and honours the time zone in parentheses.
+3. If the reset time can't be read, the pause lasts `FOUNDRY_LIMIT_COOLDOWN_S` (default 1200 s).
+4. After the pause, work resumes where it stopped, with no burst of catch-up calls.
+
+Timeouts, a missing `claude` executable and "please run /login" are handled the same way. Only real outcomes count as attempts: a failed gate, a REVISE verdict or an unusable reply.
+
+### Restarts
+
+Foundry is restart-safe on the same database:
+
+- On start, `build_factory` calls `queue.resume()`, which reopens tickets a crashed worker left claimed.
+- The Floor Manager reloads its state from the queue's key-value table: directives, orders, allocations, board task ids, PR drafts, reported quarantines and applied alert ids.
+- New work orders continue numbering after the highest `F-###` in the database.
+- Escalations are idempotent per `alert_id`: an alert that was already applied is not applied or posted again.
 
 ## How it feeds the Agent Department dashboard
 
@@ -128,7 +204,7 @@ Real mode sizes the order, runs the teams with `ClaudeCodeClient` and `OllamaGem
 
 | Foundry event | Board op |
 |---|---|
-| work order sized | `addTask {title, description, size, builders}` (S/M → `small`, L/XL → `large`), then `assignTeam` |
+| work order sized | `addTask {title, description, size: "small", builders: <allocation>}`, then `unassignTeam` for every team the board auto-assigned except the Foundry team, and `assignTeam` for the Foundry team if the board didn't pick it |
 | builder approved, retries, notes | `reportProgress {taskId, teamId, agentId, message, status}` |
 | Foreman escalation | `reportProgress` with message `[Foreman] <severity> <category>: <diagnosis> -> <action>` |
 | reviewer verdict | `updateTask {status: "review"}` + `reviewTask {verdict: approved/changes, by: <team>-6}` |
@@ -140,6 +216,8 @@ The bridge never blocks or crashes the factory:
 - In `auto` mode ops go onto an in-memory queue, and one daemon thread sends them with short timeouts.
 - Every error is caught.
 - Board task ids (`T-0xx`) are resolved in that thread.
+
+Every board task is registered as `small` with `builders` = the Foundry allocation; a `large` task would take every free team. After that only the Foundry team stays on it, so the board's review sign-off waits for exactly one verdict: the one Foundry posts.
 
 Run `npm run dashboard` to watch Foundry tasks appear live. If a shared board (hub) is configured, the dashboard forwards to it like any other client. In tests use `mode="dry"`: it records ops in `bridge.ops` and makes no I/O.
 
@@ -163,15 +241,20 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_TEAMS` | `alpha,bravo,charlie` |
 | `FOUNDRY_BUILDERS_PER_TEAM` | `5` |
 | `FOUNDRY_BOARD_BRIDGE_MODE` | `auto` (`auto`, `dry`, `off`) |
+| `FOUNDRY_TRUST_CACHE` | `false`: a cache hit skips only the builder's Claude call; the gates and the reviewer still run. `true` also skips the reviewer |
+| `FOUNDRY_LIMIT_COOLDOWN_S` | `1200` (pause after a usage limit whose reset time can't be parsed) |
+| `FOUNDRY_CLAUDE_ARGS` | safe defaults above; split like a shell command line; `none` = no extra flags |
+| `FOUNDRY_CLAUDE_APPEND_PROMPT` | the Foundry role prompt; `none` = no `--append-system-prompt` |
+| `FOUNDRY_PATCHES_DIR` | `foundry/data/patches` |
 
 ## Escalation actions (Floor Manager)
 
 | Action | What the manager does |
 |---|---|
-| `PROMOTE_PEER_REVIEWER` | runs an idle builder slot as a temporary extra reviewer for `minutes` |
-| `QUARANTINE_TASK` | `queue.quarantine(task, reason)` and pauses the task on the board |
-| `RESET_BUILDER_CONTEXT` | clears the builder's scratch and reopens its claimed ticket with a fresh prompt (no fix hint) |
-| `RESIZE_ALLOCATION` | `queue.resize(task, builders)` |
+| `PROMOTE_PEER_REVIEWER` | runs an idle builder slot (above the task's current allocation, with no claimed ticket) as a temporary extra reviewer for `minutes`; it never reviews its own slot's work. If no slot is idle or the pool doesn't start the reviewer, the action reports `applied=False` |
+| `QUARANTINE_TASK` | `queue.quarantine(task, reason)` and pauses the task on the board (reported once per task) |
+| `RESET_BUILDER_CONTEXT` | clears the builder's scratch and releases its claimed ticket (`queue.release_ticket`: attempt unchanged); the next claim starts with a fresh prompt. Every reset is logged as a `builder_reset` event |
+| `RESIZE_ALLOCATION` | `queue.resize(task, builders)`; the manager's allocation view is updated as well |
 | `THROTTLE_DISPATCH` | `limiter.throttle(factor, seconds)` |
 | `NONE` | nothing (still recorded and posted) |
 
@@ -180,10 +263,10 @@ Every escalation is validated as a `ForemanEscalation`, stored in the queue and 
 ## Honest limits
 
 - **Nothing has run against real Claude Code or a real Gemma yet.** The real clients are unit-tested only against fakes (a fake `claude` script and a local fake HTTP server).
-- **Resetting a stalled builder costs it a retry.** `RESET_BUILDER_CONTEXT` reopens the ticket with `reopen_ticket`, which counts as an attempt, because the queue has no way to release one ticket without counting it.
 - **The solution cache matches exactly.** It hits only on identical criteria, files and context; fuzzy matching is phase 2.
 - **The context engine uses AST and regex, not semantics.** Python is pruned with `ast` (signatures, fields, docstring first lines) and TS/JS with signature regexes. Snippet relevance comes from keyword overlap, which Gemma can re-rank.
 - **The default lint is light.** Without `ruff` installed, the linter gate is a small AST check (unused imports, bare `except`, and so on).
+- **Patches are not applied for you.** Foundry writes `.patch` files; you apply them with `git apply`. A patch can conflict if the repo changed since the run.
 - **Everything runs in one process.** The queue is safe across processes (WAL, `BEGIN IMMEDIATE`), but teams run as asyncio tasks in one process. A crash is recovered with `queue.resume()`.
 - **The bridge is fire-and-forget.** If the board refuses an op (for example the team is busy on another task), the bridge only logs it; Foundry state stays authoritative in SQLite. Through the CLI fallback, the ops go wherever `dept.mjs` is configured to send them, which may be the shared hub.
 - **Demo timing is simulated.** The demo's TPM spike comes from realistic per-call session overhead on the simulated client, and its waits use virtual time.

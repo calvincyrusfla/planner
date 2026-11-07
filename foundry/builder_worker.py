@@ -72,6 +72,7 @@ __all__ = [
     "parse_reviewer_reply",
     "extract_diff_paths",
     "directives_to_hint",
+    "is_infrastructure_error",
     "GateSummary",
     "ReviewItem",
     "BuilderWorker",
@@ -498,6 +499,28 @@ def parse_reviewer_reply(
         first = exc.errors()[0]
         where = ".".join(str(p) for p in first.get("loc", ()))
         return invalid(f"{where}: {first.get('msg', 'invalid')}")
+
+
+_INFRA_ERROR_RE = re.compile(
+    r"^timeout after\b|without JSON output|^empty output\b|no JSON object", re.I
+)
+
+
+def is_infrastructure_error(result: ClaudeResult) -> bool:
+    """True when an ``is_error`` result means Claude never produced a reply (D1).
+
+    Matches the real ``ClaudeCodeClient`` shapes: ``"timeout after Ns"``,
+    ``"claude exited N without JSON output: ..."`` (non-zero exit / non-JSON
+    output), plus any error result with no reply text and no output tokens.
+    Such failures release the ticket without using an attempt.  An error
+    result that carries a model reply (e.g. ``error_max_turns`` with text or
+    output tokens) is a real build outcome and does use an attempt.
+    """
+    if not result.is_error:
+        return False
+    if _INFRA_ERROR_RE.search(result.error or ""):
+        return True
+    return not (result.text or "").strip() and result.output_tokens == 0
 
 
 def directives_to_hint(directives: Iterable[LineDirective], limit: int = MAX_FIX_HINT_CHARS) -> str:
@@ -1146,6 +1169,13 @@ class BuilderWorker(_WorkerBase):
             return "released"
         self._tm("record_duration", task_id, "build", time.monotonic() - started)
         self.scratch["last_reply"] = result.text
+        if is_infrastructure_error(result):
+            # D1: timeout / non-zero exit without JSON / no reply at all -> not the builder's fault.
+            self._backoff_s = await self._handle_infra_error(
+                _claude_client.ClaudeError(result.error or "claude produced no reply")
+            )
+            self._release(ticket, _one_line(f"Claude produced no reply: {result.error or 'error'}", 200))
+            return "released"
         if result.is_error:
             return self._send_back(
                 ticket, _one_line(f"Claude call failed: {result.error or 'error'}"), reason="claude_error"
