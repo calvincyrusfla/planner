@@ -178,7 +178,7 @@ if not "%RC%"=="0" goto :finish
 echo [foreman] Shop Foreman ready.
 :next_step
 if "%PY_IS_VENV%"=="1" goto :next_step_venv
-rem The probe ran on %PY% (no usable .venv); the orchestrator needs pydantic, so set up the venv first.
+rem The probe ran without a usable .venv; the orchestrator needs pydantic, so set up the venv first.
 echo [foreman] No .venv yet - the probe ran with %PY%. Create the venv first, from %REPO_ROOT%
 echo [foreman] - see "Install" in foundry\README.md:
 echo   py -3.11 -m venv .venv

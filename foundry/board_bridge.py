@@ -74,6 +74,8 @@ class BoardOp:
     #: addTask only: the Foundry team that must end up as the board task's only team.
     team_id: str | None = None
     focus: str = ""
+    #: reviewTask only: send one verdict per team on the board task (see BoardBridge.board_teams).
+    fanout: bool = False
 
     def resolved(self, board_id: str | None) -> dict[str, Any]:
         """Return ``{type, args}`` with the board task id filled in."""
@@ -105,6 +107,8 @@ class BoardBridge:
         dry_autoassign: dry mode only: the teams the simulated board
             auto-assigns to each new task (so tests can see the bridge
             unassign them); the real board's answer is used otherwise.
+        dry_busy: dry mode only: teams the simulated board has on other
+            open tasks (the bridge must never move them).
     """
 
     def __init__(
@@ -116,6 +120,7 @@ class BoardBridge:
         node_bin: str = "node",
         cli_path: str | Path = DEPT_CLI,
         dry_autoassign: tuple[str, ...] | list[str] = (),
+        dry_busy: tuple[str, ...] | list[str] = (),
     ) -> None:
         if mode not in ("auto", "off", "dry"):
             raise ValueError(f"unknown board bridge mode {mode!r}")
@@ -137,6 +142,9 @@ class BoardBridge:
         self._dashboard_down = False
         self._registered: list[str] = []
         self.dry_autoassign = tuple(dry_autoassign)
+        self.dry_busy = frozenset(dry_busy)
+        #: Foundry task id -> the board teams left on its board task (who must sign off).
+        self.board_teams: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------ events
 
@@ -172,32 +180,73 @@ class BoardBridge:
             )
         )
 
-    def restore(self, board_ids: dict[str, str]) -> None:
-        """Reload Foundry task id -> board task id after a restart."""
+    def restore(self, board_ids: dict[str, str], board_teams: dict[str, list[str]] | None = None) -> None:
+        """Reload Foundry task id -> board task id (and its board teams) after a restart."""
         with self._lock:
             self.board_ids.update({str(k): str(v) for k, v in board_ids.items()})
             for k in board_ids:
                 if k not in self._registered:
                     self._registered.append(str(k))
+            for k, teams in (board_teams or {}).items():
+                self.board_teams[str(k)] = [str(t) for t in teams]
+            # keep dry ids unique after a restart
+            for v in self.board_ids.values():
+                m = re.match(r"^DRY-(\d+)$", v)
+                if m:
+                    self._dry_seq = max(self._dry_seq, int(m.group(1)))
 
-    def _team_fixups(self, op: BoardOp, assigned: list[str]) -> list[BoardOp]:
-        """Ops that leave exactly the Foundry team on a freshly added board task."""
-        if not op.team_id:
+    def _team_fixups(self, op: BoardOp, assigned: list[str], foundry_team_state: str) -> list[BoardOp]:
+        """Ops that make the board task's team list safe, and record who must sign off.
+
+        ``foundry_team_state`` is where the board has the Foundry team:
+        ``"ours"`` (the board put it on this task), ``"free"``, ``"busy"`` (on
+        another task) or ``"unknown"`` (board state unreadable; treated as busy).
+
+        * ours/free: assign it if needed and unassign the other teams the board
+          just auto-assigned (they were free a moment ago), so only the Foundry
+          team signs off;
+        * busy/unknown: never move a team; leave the board's assignment as it
+          is and have every team on the board task sign off at review time.
+        """
+        ftask = op.foundry_task or ""
+        team = op.team_id
+        if not team:
+            self.board_teams[ftask] = list(assigned)
             return []
-        out = [
-            BoardOp("unassignTeam", {"taskId": None, "teamId": t, "by": "foundry"}, foundry_task=op.foundry_task, task_key="taskId")
-            for t in assigned
-            if t != op.team_id
-        ]
-        if op.team_id not in assigned:
-            out.append(
-                BoardOp(
-                    "assignTeam",
-                    {"taskId": None, "teamId": op.team_id, "focus": op.focus, "by": "foundry"},
-                    foundry_task=op.foundry_task,
-                    task_key="taskId",
+        if foundry_team_state in ("ours", "free") or team in assigned:
+            out = []
+            if team not in assigned:
+                out.append(
+                    BoardOp(
+                        "assignTeam",
+                        {"taskId": None, "teamId": team, "focus": op.focus, "by": "foundry"},
+                        foundry_task=ftask,
+                        task_key="taskId",
+                    )
                 )
-            )
+            out += [
+                BoardOp("unassignTeam", {"taskId": None, "teamId": t, "by": "foundry"}, foundry_task=ftask, task_key="taskId")
+                for t in assigned
+                if t != team
+            ]
+            self.board_teams[ftask] = [team]
+            return out
+        self.board_teams[ftask] = list(assigned)
+        log.info(
+            "board bridge: team %s is busy on another board task; %s keeps the board's teams %s",
+            team, ftask, ", ".join(assigned) or "(none, queued)",
+        )
+        return []
+
+    def _expand(self, op: BoardOp) -> list[BoardOp]:
+        """A fan-out reviewTask becomes one verdict per team on the board task."""
+        if not op.fanout:
+            return [op]
+        teams = self.board_teams.get(op.foundry_task or "") or [op.args.get("teamId")]
+        out = []
+        for t in teams:
+            args = dict(op.args, teamId=t, by=f"{t}-6" if op.args.get("by") == f"{op.team_id}-6" else op.args.get("by"))
+            out.append(BoardOp(op.type, args, foundry_task=op.foundry_task, task_key=op.task_key))
         return out
 
     def progress(
@@ -257,6 +306,8 @@ class BoardBridge:
                 },
                 foundry_task=task_id,
                 task_key="taskId",
+                team_id=team_id,
+                fanout=True,
             )
         )
 
@@ -302,7 +353,8 @@ class BoardBridge:
             if self.mode == "off":
                 return
             if self.mode == "dry":
-                self._send_dry(op)
+                for one in self._expand(op):
+                    self._send_dry(one)
                 return
             self._ensure_thread()
             self._q.put_nowait(op)
@@ -321,7 +373,14 @@ class BoardBridge:
         self.stats.sent += 1
         self.stats.transport = "dry"
         if op.type == "addTask":
-            for fix in self._team_fixups(op, list(self.dry_autoassign)):
+            assigned = list(self.dry_autoassign)
+            if op.team_id in assigned:
+                where = "ours"
+            elif op.team_id in self.dry_busy:
+                where = "busy"
+            else:
+                where = "free"
+            for fix in self._team_fixups(op, assigned, where):
                 self._send_dry(fix)
 
     def _board_id_for(self, op: BoardOp) -> str | None:
@@ -342,7 +401,8 @@ class BoardBridge:
             try:
                 if op is None:
                     return
-                self._deliver(op)
+                for one in self._expand(op):
+                    self._deliver(one)
             except Exception as exc:  # never let the thread die
                 self.stats.failed += 1
                 log.warning("board bridge: %s failed: %s", getattr(op, "type", "?"), exc)
@@ -379,12 +439,51 @@ class BoardBridge:
                 with self._lock:
                     self.board_ids[op.foundry_task] = str(board_id)
                 assigned = [str(t) for t in (result.get("assigned") or []) if t]
-                for fix in self._team_fixups(op, assigned):
+                where = "ours" if op.team_id in assigned else self._team_state(op.team_id, str(board_id))
+                for fix in self._team_fixups(op, assigned, where):
                     try:
                         self._deliver(fix)
                     except Exception as exc:  # never let a fix-up stop the sender
                         self.stats.failed += 1
                         log.warning("board bridge: %s failed: %s", fix.type, exc)
+
+    def _team_state(self, team_id: str | None, board_id: str) -> str:
+        """Where the board has ``team_id``: ours / free / busy / unknown (read from the board state)."""
+        if not team_id:
+            return "unknown"
+        state = self._fetch_state()
+        teams = state.get("teams") if isinstance(state, dict) else None
+        if not isinstance(teams, list):
+            return "unknown"
+        for t in teams:
+            if isinstance(t, dict) and t.get("id") == team_id:
+                task = t.get("taskId")
+                if task == board_id:
+                    return "ours"
+                return "free" if not task else "busy"
+        return "unknown"
+
+    def _fetch_state(self) -> dict[str, Any] | None:
+        """The board state: ``GET /api/state`` on the dashboard, else ``dept.mjs json``."""
+        if not self._dashboard_down:
+            try:
+                with urllib.request.urlopen(f"{self.dashboard_url}/api/state", timeout=self.timeout) as resp:
+                    body = json.loads(resp.read() or b"{}")
+                if isinstance(body, dict):
+                    return body.get("result") if isinstance(body.get("result"), dict) else body
+            except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+                pass
+        node = shutil.which(self.node_bin)
+        if node is None or not self.cli_path.exists():
+            return None
+        try:
+            proc = subprocess.run(
+                [node, str(self.cli_path), "json"], capture_output=True, text=True,
+                timeout=max(self.timeout, 10.0), cwd=str(self.cli_path.parent.parent),
+            )
+            return json.loads(proc.stdout) if proc.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
 
     def _post(self, payload: dict[str, Any]) -> Any:
         """POST /api/op. Returns the op result, or _UNAVAILABLE when the dashboard is down."""

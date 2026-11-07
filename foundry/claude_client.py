@@ -53,6 +53,7 @@ __all__ = [
     "parse_claude_json",
     "parse_retry_after",
     "resolve_claude_bin",
+    "windows_cmd_launch_line",
     "windows_shim_command_line",
 ]
 
@@ -144,13 +145,25 @@ _TRY_AGAIN_RE = re.compile(
 )
 #: Claude Code's usage-limit message has the form "Claude AI usage limit reached|1700000000".
 _EPOCH_RE = re.compile(r"\|\s*(\d{10})(?:\d{3})?\b")
-#: "resets 3pm (Europe/Berlin)", "resets 10:30pm", "resets at 15:00". A bare number
-#: without am/pm or minutes is not accepted (too ambiguous).
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_MONTH_ALT = "|".join(_MONTHS)
+#: "resets 3pm (Europe/Berlin)", "resets 10:30pm", "resets at 15:00", and the weekly
+#: forms "resets Nov 8, 3pm (Europe/Berlin)", "resets 8 Nov 3pm", "resets Sat 6pm".
+#: A bare hour without am/pm or minutes is not accepted (too ambiguous).
 _RESET_CLOCK_RE = re.compile(
-    r"\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?(?=[\s(.,;·∙|]|$)"
-    r"(?:\s*\(([^)]+)\))?",
+    r"\bresets?\s+(?:on\s+)?"
+    r"(?:(?P<wd>" + "|".join(_WEEKDAYS) + r")[a-z]*\.?,?\s+"
+    r"|(?P<mon>" + _MONTH_ALT + r")[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"|(?P<day2>\d{1,2})(?:st|nd|rd|th)?\s+(?P<mon2>" + _MONTH_ALT + r")[a-z]*\.?,?\s+)?"
+    r"(?:at\s+)?(?P<h>\d{1,2})(?::(?P<mi>\d{2}))?\s*(?P<ap>[ap]\.?m\.?)?(?=[\s(.,;·∙|]|$)"
+    r"(?:\s*\((?P<tz>[^)]+)\))?",
     re.IGNORECASE,
 )
+#: A reset time this far in the past is treated as "already reset" (clock skew).
+_RESET_GRACE_S = 300.0
+#: A month-day reset up to this far in the past already happened (not next year).
+_RESET_PAST_DATE_S = 180 * 86400.0
 _AUTH_RE = re.compile(
     r"/login\b|not logged in|invalid api key|authentication[_\s-]?error|oauth token (?:has )?expired"
     r"|credentials? (?:are |is )?(?:missing|invalid|expired)|\b401\b|unauthori[sz]ed",
@@ -188,8 +201,26 @@ def _zone(name: str | None, local_tz: tzinfo | None) -> tzinfo:
 
 
 def _seconds_until_clock(
-    hour: int, minute: int, meridiem: str | None, tz: tzinfo, now: float
+    hour: int,
+    minute: int,
+    meridiem: str | None,
+    tz: tzinfo,
+    now: float,
+    *,
+    weekday: int | None = None,
+    month: int | None = None,
+    day: int | None = None,
 ) -> float | None:
+    """Seconds from ``now`` until the described reset, or ``None`` if it is invalid.
+
+    * clock only → the next occurrence of that wall-clock time (today or tomorrow);
+    * weekday → the next such weekday at that time (up to 7 days ahead);
+    * month + day → that date this year; if it is already past (within ~6 months)
+      the limit has reset (0), otherwise the date is next year (Dec → Jan wrap).
+
+    Times up to five minutes in the past count as "already reset" (0) so clock
+    skew never turns into a day/week-long wait.
+    """
     if meridiem:
         if not 1 <= hour <= 12:
             return None
@@ -198,11 +229,35 @@ def _seconds_until_clock(
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
     now_dt = datetime.fromtimestamp(now, tz)
-    target = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now_dt:
-        # next occurrence; wall-clock arithmetic in the zone (DST-safe with zoneinfo)
-        target = (target.replace(tzinfo=None) + timedelta(days=1)).replace(tzinfo=tz)
-    return max(0.0, target.timestamp() - now)
+    naive_now = now_dt.replace(tzinfo=None)
+
+    def at(d: datetime) -> float:
+        # wall-clock arithmetic on naive values, then attach the zone (DST-safe)
+        return d.replace(tzinfo=tz).timestamp() - now
+
+    if month is not None and day is not None:
+        for year in (naive_now.year, naive_now.year + 1):
+            try:
+                target = datetime(year, month, day, hour, minute)
+            except ValueError:
+                return None
+            delta = at(target)
+            if delta > -_RESET_GRACE_S:
+                return max(0.0, delta)
+            if -delta <= _RESET_PAST_DATE_S:
+                return 0.0  # that date already passed: the limit has reset
+        return None  # pragma: no cover - the next-year candidate is always ahead
+
+    target = naive_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if weekday is not None:
+        target += timedelta(days=(weekday - naive_now.weekday()) % 7)
+        step = timedelta(days=7)
+    else:
+        step = timedelta(days=1)
+    delta = at(target)
+    if delta > -_RESET_GRACE_S:
+        return max(0.0, delta)
+    return max(0.0, at(target + step))
 
 
 def parse_retry_after(
@@ -215,9 +270,11 @@ def parse_retry_after(
     * ``retry after 30`` / ``retry-after: 2.5s`` / ``try again in 5 minutes``;
     * Claude Code's ``usage limit reached|<unix epoch>`` form;
     * a reset clock time: ``resets 3pm (Europe/Berlin)``, ``resets 10:30pm``,
-      ``resets at 15:00``. The IANA zone in parentheses is honoured via zoneinfo;
-      without one (or when it can't be resolved) local time is used. The next
-      occurrence of that time is taken.
+      ``resets at 15:00``, optionally with a date (weekly limits):
+      ``resets Nov 8, 3pm (Europe/Berlin)``, ``resets 8 Nov 3pm``,
+      ``resets Sat 6pm``. The IANA zone in parentheses is honoured via zoneinfo;
+      without one (or when it can't be resolved) local time is used. See
+      :func:`_seconds_until_clock` for how past times are handled.
 
     ``now`` is a Unix timestamp (defaults to ``time.time()``); ``local_tz`` overrides
     the machine's zone (tests). Results are never negative. ``None`` means "no
@@ -234,11 +291,21 @@ def parse_retry_after(
     if m:
         return max(0.0, float(m.group(1)) - current)
     for m in _RESET_CLOCK_RE.finditer(text):
-        hour_s, minute_s, meridiem, zone_name = m.groups()
-        if minute_s is None and meridiem is None:
+        g = m.groupdict()
+        if g["mi"] is None and g["ap"] is None:
             continue
-        tz = _zone(zone_name, local_tz)
-        secs = _seconds_until_clock(int(hour_s), int(minute_s or 0), meridiem, tz, current)
+        mon = g["mon"] or g["mon2"]
+        day = g["day"] or g["day2"]
+        secs = _seconds_until_clock(
+            int(g["h"]),
+            int(g["mi"] or 0),
+            g["ap"],
+            _zone(g["tz"], local_tz),
+            current,
+            weekday=_WEEKDAYS.index(g["wd"][:3].lower()) if g["wd"] else None,
+            month=_MONTHS.index(mon[:3].lower()) + 1 if mon else None,
+            day=int(day) if day else None,
+        )
         if secs is not None:
             return secs
     return None
@@ -346,14 +413,15 @@ def _auth_message(blob: str) -> str:
 
 
 def windows_shim_command_line(exe: str, args: Sequence[str]) -> str:
-    """The command string handed to ``cmd.exe /c`` for a ``.cmd``/``.bat`` shim.
+    """The inner command string for a ``.cmd``/``.bat`` shim (what cmd.exe runs).
 
     Every token (the shim path too) is wrapped in double quotes, so spaces
     (``C:\\Users\\John Smith\\...``) and cmd metacharacters (``& | < > ^``) are
-    inert. ``subprocess`` (``shell=True``) runs it as ``cmd.exe /c "<this string>"``;
-    since the string contains more than two quotes, cmd strips exactly the outer
-    pair and runs this string unchanged. A trailing backslash is doubled so it
-    does not escape the closing quote for the CRT argument parser in node.
+    inert. It is launched as ``"%COMSPEC%" /d /c "<this string>"`` (see
+    :func:`windows_cmd_launch_line`); since the string contains more than two
+    quotes, cmd strips exactly the outer pair and runs this string unchanged. A
+    trailing backslash is doubled so it does not escape the closing quote for the
+    CRT argument parser in node.
 
     Raises:
         ClaudeError: when a token contains ``"``, ``%`` or a newline, which cannot
@@ -371,6 +439,32 @@ def windows_shim_command_line(exe: str, args: Sequence[str]) -> str:
             tok += "\\" * (len(tok) - len(tok.rstrip("\\")))
         parts.append(f'"{tok}"')
     return " ".join(parts)
+
+
+def _default_comspec(environ: Mapping[str, str]) -> str:
+    root = environ.get("SystemRoot") or environ.get("SYSTEMROOT") or r"C:\Windows"
+    return root.rstrip("\\") + r"\System32\cmd.exe"
+
+
+def windows_cmd_launch_line(
+    exe: str, args: Sequence[str], *, environ: Mapping[str, str] | None = None
+) -> str:
+    """The full, verbatim Windows command line for running a ``.cmd``/``.bat`` shim::
+
+        "%COMSPEC%" /d /c ""C:\\Users\\John Smith\\...\\claude.cmd" "-p" ..."
+
+    ``/d`` turns off cmd's AutoRun registry hook (which could change the working
+    directory or print noise into the JSON on stdout). The string is passed to
+    ``CreateProcess`` unchanged (no list2cmdline re-quoting).
+
+    Raises:
+        ClaudeError: on unsafe characters in any token or in ``COMSPEC``.
+    """
+    env = os.environ if environ is None else environ
+    comspec = (env.get("COMSPEC") or env.get("ComSpec") or "").strip().strip('"') or _default_comspec(env)
+    if _CMD_UNSAFE.intersection(comspec):
+        raise ClaudeError(f"COMSPEC {comspec!r} contains characters that cannot be quoted")
+    return f'"{comspec}" /d /c "{windows_shim_command_line(exe, args)}"'
 
 
 def _result_from_payload(payload: dict, wall_seconds: float) -> ClaudeResult:
@@ -442,6 +536,7 @@ class ClaudeCodeClient:
         self.extra_args = tuple(extra_args)
         self.env = dict(env) if env else None
         self._resolved: str | None = None
+        self._spec: tuple[Literal["exec", "verbatim"], list[str] | str] | None = None
 
     def command(self) -> list[str]:
         """The logical argv used for each call (the prompt goes to stdin, not here)."""
@@ -449,47 +544,143 @@ class ClaudeCodeClient:
             self._resolved = resolve_claude_bin(self.claude_bin)
         return [self._resolved, "-p", "--output-format", "json", *self.extra_args]
 
-    def launch_spec(self, *, platform: str | None = None) -> tuple[Literal["exec", "shell"], list[str] | str]:
-        """How the child is started: ``("exec", argv)`` or ``("shell", command_line)``.
+    def launch_spec(
+        self, *, platform: str | None = None
+    ) -> tuple[Literal["exec", "verbatim"], list[str] | str]:
+        """How the child is started: ``("exec", argv)`` or ``("verbatim", command_line)``.
 
         On Windows a ``.cmd``/``.bat`` shim (the npm install) cannot be exec'd
-        directly, and ``cmd.exe /s /c`` with list2cmdline quoting breaks on paths with
-        spaces. Such shims are run through the shell (``cmd.exe /c "<line>"``) with the
-        line built by :func:`windows_shim_command_line`. Everything else is exec'd.
+        directly. It is run as ``"%COMSPEC%" /d /c "<line>"`` (built by
+        :func:`windows_cmd_launch_line`), handed to ``CreateProcess`` verbatim.
+        Everything else (``claude.exe``, POSIX ``claude``) is exec'd with an argv.
+
+        Raises:
+            ClaudeNotFound: when the executable cannot be resolved.
+            ClaudeError: when an argument cannot be passed safely.
         """
         plat = sys.platform if platform is None else platform
         argv = self.command()
+        for tok in argv:
+            if not isinstance(tok, str):
+                raise ClaudeError(f"claude argument {tok!r} is not a string")
+            if "\x00" in tok:
+                raise ClaudeError(f"claude argument {tok[:40]!r} contains a NUL character")
         if plat.startswith("win") and Path(argv[0]).suffix.lower() in (".cmd", ".bat"):
-            return "shell", windows_shim_command_line(argv[0], argv[1:])
+            environ = {**os.environ, **(self.env or {})}
+            return "verbatim", windows_cmd_launch_line(argv[0], argv[1:], environ=environ)
         return "exec", argv
 
-    async def _spawn(self, cwd: str | None, env: dict[str, str] | None) -> asyncio.subprocess.Process:
-        mode, spec = self.launch_spec()
-        kwargs: dict = {
-            "stdin": asyncio.subprocess.PIPE,
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-            "cwd": cwd,
-            "env": env,
-        }
-        if sys.platform.startswith("win"):
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        else:
-            kwargs["start_new_session"] = True
-        try:
-            if mode == "shell":
-                assert isinstance(spec, str)
-                return await asyncio.create_subprocess_shell(spec, **kwargs)
-            assert isinstance(spec, list)
-            return await asyncio.create_subprocess_exec(*spec, **kwargs)
-        except (FileNotFoundError, PermissionError) as exc:
+    def validate_launch(
+        self, *, platform: str | None = None
+    ) -> tuple[Literal["exec", "verbatim"], list[str] | str]:
+        """Resolve the executable and build the launch spec once (for the ``--real`` preflight).
+
+        The spec is cached and reused by :meth:`run`, so a bad configuration fails
+        before any ticket is claimed instead of on every call.
+
+        Raises:
+            ClaudeNotFound: Claude Code is not installed / not on PATH.
+            ClaudeError: an extra argument cannot be passed (e.g. ``"`` or ``%``
+                through ``claude.cmd``).
+        """
+        spec = self.launch_spec(platform=platform)
+        if platform is None:
+            self._spec = spec
+        return spec
+
+    def _spawn_error(self, exc: OSError, cwd: str | None) -> ClaudeError:
+        if isinstance(exc, (FileNotFoundError, PermissionError)):
             if cwd is not None and not Path(cwd).is_dir():
-                raise ClaudeError(f"working directory {cwd!r} does not exist") from exc
-            raise ClaudeNotFound(
-                f"could not start Claude Code ({self._resolved or self.claude_bin!r}): {exc}"
-            ) from exc
+                return ClaudeError(f"working directory {cwd!r} does not exist")
+            return ClaudeNotFound(f"could not start Claude Code ({self._resolved or self.claude_bin!r}): {exc}")
+        return ClaudeError(f"could not start Claude Code: {exc}")
+
+    @staticmethod
+    def _popen_flags() -> dict:
+        if sys.platform.startswith("win"):
+            return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        return {"start_new_session": True}
+
+    async def _execute(
+        self, data: bytes, cwd: str | None, env: dict[str, str] | None, timeout: float
+    ) -> tuple[int | None, bytes, bytes, bool]:
+        """Run the child; returns ``(returncode, stdout, stderr, timed_out)``."""
+        mode, spec = self._spec if self._spec is not None else self.validate_launch()
+        if mode == "verbatim":
+            return await self._execute_verbatim(spec, data, cwd, env, timeout)
+        assert isinstance(spec, list)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *spec,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                **self._popen_flags(),
+            )
         except OSError as exc:
-            raise ClaudeError(f"could not start Claude Code: {exc}") from exc
+            raise self._spawn_error(exc, cwd) from exc
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(data), timeout=timeout)
+        except asyncio.TimeoutError:
+            await self._kill(proc)
+            return proc.returncode, b"", b"", True
+        except BaseException:
+            await self._kill(proc)
+            raise
+        return proc.returncode, out_b, err_b, False
+
+    async def _execute_verbatim(
+        self,
+        spec: list[str] | str,
+        data: bytes,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout: float,
+    ) -> tuple[int | None, bytes, bytes, bool]:
+        """Run with :class:`subprocess.Popen` in a worker thread.
+
+        asyncio's subprocess API always re-quotes argv (or wraps strings as
+        ``cmd /c "..."`` without ``/d``), so the Windows shim line, which must
+        reach ``CreateProcess`` verbatim, goes through plain Popen instead. A
+        string is passed unchanged on Windows; a list (used by tests on POSIX) is
+        exec'd normally.
+        """
+        holder: dict[str, subprocess.Popen[bytes]] = {}
+
+        def work() -> tuple[int | None, bytes, bytes, bool]:
+            proc = subprocess.Popen(  # noqa: S603 - fixed argv, prompt on stdin
+                spec,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                **self._popen_flags(),
+            )
+            holder["proc"] = proc
+            try:
+                out_b, err_b = proc.communicate(data, timeout=timeout)
+                return proc.returncode, out_b, err_b, False
+            except subprocess.TimeoutExpired:
+                _kill_tree_sync(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:  # pragma: no cover - pipes held open
+                    pass
+                return proc.returncode, b"", b"", True
+
+        try:
+            return await asyncio.to_thread(work)
+        except OSError as exc:
+            if "proc" not in holder:
+                raise self._spawn_error(exc, cwd) from exc
+            raise
+        except BaseException:
+            if "proc" in holder:
+                _kill_tree_sync(holder["proc"])
+            raise
 
     async def run(
         self,
@@ -505,13 +696,10 @@ class ClaudeCodeClient:
         log.debug("claude prompt length=%d chars", len(prompt))
         env = {**os.environ, **self.env} if self.env else None
         started = time.monotonic()
-        proc = await self._spawn(cwd, env)
-        try:
-            out_b, err_b = await asyncio.wait_for(
-                proc.communicate(prompt.encode("utf-8")), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            await self._kill(proc)
+        returncode, out_b, err_b, timed_out = await self._execute(
+            prompt.encode("utf-8"), cwd, env, timeout
+        )
+        if timed_out:
             log.warning("claude call agent=%s timed out after %.0fs; killed", agent_id, timeout)
             return _make_result(
                 text="",
@@ -522,9 +710,6 @@ class ClaudeCodeClient:
                 is_error=True,
                 error=f"timeout after {timeout:g}s",
             )
-        except BaseException:
-            await self._kill(proc)
-            raise
         wall = time.monotonic() - started
         stdout = out_b.decode("utf-8", errors="replace")
         stderr = err_b.decode("utf-8", errors="replace")
@@ -542,9 +727,9 @@ class ClaudeCodeClient:
                     raise ClaudeAuthError(_auth_message(blob))
                 if detect_rate_limit(blob):
                     raise ClaudeRateLimited(parse_retry_after(blob), (result.error or "rate limited")[:_ERROR_EXCERPT])
-            elif proc.returncode not in (0, None):
+            elif returncode not in (0, None):
                 result = result.model_copy(
-                    update={"is_error": True, "error": f"claude exited {proc.returncode}: {stderr.strip()[:_ERROR_EXCERPT]}"}
+                    update={"is_error": True, "error": f"claude exited {returncode}: {stderr.strip()[:_ERROR_EXCERPT]}"}
                 )
             log.info(
                 "claude done agent=%s in=%d out=%d err=%s",
@@ -565,7 +750,7 @@ class ClaudeCodeClient:
             duration_seconds=wall,
             cost_usd=None,
             is_error=True,
-            error=f"claude exited {proc.returncode} without JSON output: {excerpt}",
+            error=f"claude exited {returncode} without JSON output: {excerpt}",
         )
 
     @staticmethod
@@ -592,6 +777,26 @@ class ClaudeCodeClient:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:  # pragma: no cover - extremely unlikely
             pass
+
+
+def _kill_tree_sync(proc: subprocess.Popen[bytes]) -> None:
+    """Blocking variant of :meth:`ClaudeCodeClient._kill` for Popen children."""
+    if proc.poll() is not None:
+        return
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- simulator

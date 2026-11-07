@@ -14,6 +14,7 @@ from foundry.config import (
     DEFAULT_PATCHES_DIR,
     AnomalyThresholds,
     FoundryConfig,
+    split_claude_args,
 )
 
 
@@ -158,7 +159,8 @@ def test_round1_defaults() -> None:
         "--max-turns",
         "3",
         "--disallowedTools",
-        "Bash Edit Write NotebookEdit Task WebFetch WebSearch",
+        "Agent Bash Edit Write NotebookEdit Task WebFetch WebSearch",
+        "--strict-mcp-config",
     ]
     assert tuple(cfg.claude_extra_args) == DEFAULT_CLAUDE_EXTRA_ARGS
     assert cfg.claude_append_prompt == DEFAULT_CLAUDE_APPEND_PROMPT
@@ -173,8 +175,9 @@ def test_round1_defaults() -> None:
 def test_claude_cli_args() -> None:
     cfg = FoundryConfig()
     args = cfg.claude_cli_args()
-    assert args[:4] == list(DEFAULT_CLAUDE_EXTRA_ARGS)
-    assert args[4:] == ["--append-system-prompt", DEFAULT_CLAUDE_APPEND_PROMPT]
+    n = len(DEFAULT_CLAUDE_EXTRA_ARGS)
+    assert args[:n] == list(DEFAULT_CLAUDE_EXTRA_ARGS)
+    assert args[n:] == ["--append-system-prompt", DEFAULT_CLAUDE_APPEND_PROMPT]
     bare = FoundryConfig(claude_extra_args=[], claude_append_prompt="  ")
     assert bare.claude_append_prompt is None
     assert bare.claude_cli_args() == []
@@ -195,19 +198,26 @@ def test_round1_env_vars(tmp_path: Path) -> None:
     }
     cfg = FoundryConfig.from_env(env)
     assert cfg.limit_cooldown_s == 90
-    assert cfg.claude_extra_args == ["--max-turns", "5", "--disallowedTools", "Bash Edit"]
+    assert cfg.claude_extra_args == [
+        *DEFAULT_CLAUDE_EXTRA_ARGS, "--max-turns", "5", "--disallowedTools", "Bash Edit"
+    ]
     assert cfg.claude_append_prompt == "Only output a diff."
     assert cfg.patches_dir == tmp_path / "p"
     assert cfg.ensure_patches_dir().is_dir()
 
 
-def test_none_word_clears_claude_flags() -> None:
+def test_none_word() -> None:
+    # without REPLACE, "none" appends nothing: the safe defaults stay
     cfg = FoundryConfig.from_env(
         {"FOUNDRY_CLAUDE_ARGS": "none", "FOUNDRY_CLAUDE_APPEND_PROMPT": "NONE"}
     )
-    assert cfg.claude_extra_args == []
+    assert cfg.claude_extra_args == list(DEFAULT_CLAUDE_EXTRA_ARGS)
     assert cfg.claude_append_prompt is None
-    assert cfg.claude_cli_args() == []
+    assert cfg.claude_cli_args() == list(DEFAULT_CLAUDE_EXTRA_ARGS)
+    # with REPLACE, "none" (or unset) clears every extra flag
+    for env in ({"FOUNDRY_CLAUDE_ARGS": "none"}, {}):
+        env = {**env, "FOUNDRY_CLAUDE_ARGS_REPLACE": "1", "FOUNDRY_CLAUDE_APPEND_PROMPT": "none"}
+        assert FoundryConfig.from_env(env).claude_cli_args() == []
 
 
 @pytest.mark.parametrize(
@@ -217,8 +227,65 @@ def test_none_word_clears_claude_flags() -> None:
         ("FOUNDRY_LIMIT_COOLDOWN_S", "0"),
         ("FOUNDRY_LIMIT_COOLDOWN_S", "soon"),
         ("FOUNDRY_CLAUDE_ARGS", '--x "unbalanced'),
+        ("FOUNDRY_CLAUDE_ARGS_REPLACE", "sometimes"),
+        ("FOUNDRY_INFRA_FAILURE_CAP", "0"),
+        ("FOUNDRY_INFRA_FAILURE_CAP", "three"),
     ],
 )
 def test_round1_bad_values(var: str, value: str) -> None:
     with pytest.raises(ValueError):
         FoundryConfig.from_env({var: value})
+
+
+def test_claude_args_append_windows_path() -> None:
+    # bravo-6's repro: a Windows path must survive (no backslash eating)
+    cfg = FoundryConfig.from_env({"FOUNDRY_CLAUDE_ARGS": r"--mcp-config C:\Users\me\mcp.json"})
+    assert cfg.claude_extra_args == [
+        *DEFAULT_CLAUDE_EXTRA_ARGS, "--mcp-config", r"C:\Users\me\mcp.json"
+    ]
+    assert "--strict-mcp-config" in cfg.claude_cli_args()
+
+
+def test_claude_args_replace() -> None:
+    env = {
+        "FOUNDRY_CLAUDE_ARGS": '--max-turns 8 --disallowedTools "Bash Agent"',
+        "FOUNDRY_CLAUDE_ARGS_REPLACE": "true",
+    }
+    assert FoundryConfig.from_env(env).claude_extra_args == [
+        "--max-turns", "8", "--disallowedTools", "Bash Agent"
+    ]
+    env["FOUNDRY_CLAUDE_ARGS_REPLACE"] = "0"  # explicit off = append
+    assert FoundryConfig.from_env(env).claude_extra_args[: len(DEFAULT_CLAUDE_EXTRA_ARGS)] == list(
+        DEFAULT_CLAUDE_EXTRA_ARGS
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (r"--mcp-config C:\Users\me\mcp.json", ["--mcp-config", r"C:\Users\me\mcp.json"]),
+        (
+            r'--mcp-config "C:\Users\John Smith\AppData\mcp.json" --verbose',
+            ["--mcp-config", r"C:\Users\John Smith\AppData\mcp.json", "--verbose"],
+        ),
+        (r'--add-dir="D:\work dir\"', [r"--add-dir=D:\work dir" + "\\"]),
+        ("--model 'claude opus'", ["--model", "claude opus"]),
+        ("  --a   --b  ", ["--a", "--b"]),
+        ("--tag #1", ["--tag", "#1"]),
+        ("", []),
+    ],
+)
+def test_split_claude_args(text: str, expected: list[str]) -> None:
+    assert split_claude_args(text) == expected
+
+
+def test_split_claude_args_unbalanced() -> None:
+    with pytest.raises(ValueError):
+        split_claude_args('--x "oops')
+
+
+def test_infra_failure_cap() -> None:
+    assert FoundryConfig().infra_failure_cap == 3
+    assert FoundryConfig.from_env({"FOUNDRY_INFRA_FAILURE_CAP": "5"}).infra_failure_cap == 5
+    with pytest.raises(ValidationError):
+        FoundryConfig(infra_failure_cap=0)

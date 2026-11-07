@@ -26,6 +26,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -44,7 +45,26 @@ from foundry.schemas import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["WorkOrder", "ActionOutcome", "PeerReviewerGrant", "FloorManager", "WorkspaceGates", "Factory", "build_factory"]
+__all__ = [
+    "InfrastructureError",
+    "WorkOrder",
+    "ActionOutcome",
+    "PeerReviewerGrant",
+    "FloorManager",
+    "WorkspaceGates",
+    "Factory",
+    "build_factory",
+]
+
+
+class InfrastructureError(Exception):
+    """A failure of Foundry's own plumbing, not of the builder's work.
+
+    Raised e.g. by :class:`WorkspaceGates` when the scratch copy of the
+    workspace cannot be made. Workers treat it as a *counted* infrastructure
+    failure (D1/E1: release the ticket, no attempt spent; quarantine after the
+    configured number of consecutive failures), never as a gate failure.
+    """
 
 
 class WorkOrder(BaseModel):
@@ -135,6 +155,7 @@ class FloorManager:
         limiter: Any = None,
         builders_per_team: int = 5,
         patches_dir: str | Path | None = None,
+        repo_root: str | Path | None = None,
     ) -> None:
         self.queue = queue
         self.foreman = foreman
@@ -149,8 +170,10 @@ class FloorManager:
         self.pr_summaries: dict[str, dict[str, str]] = {}
         self.peer_reviewers: dict[str, PeerReviewerGrant] = {}
         self.actions: list[ActionOutcome] = []
-        #: Approved diffs per task (collected through :meth:`on_approved`).
-        self.diffs: dict[str, list[str]] = {}
+        #: Approved diffs per task and subtask (collected through :meth:`on_approved`).
+        self.diffs: dict[str, dict[str, str]] = {}
+        #: Combined patches that failed ``git apply --check`` (task -> .patch.rejected path).
+        self.rejected_patches: dict[str, Path] = {}
         self._seq = 0
         self._completed: set[str] = set()
         self._finishing: set[str] = set()
@@ -161,6 +184,7 @@ class FloorManager:
         #: alert_id -> outcome of every escalation already applied (idempotency).
         self.applied_alerts: dict[str, ActionOutcome] = {}
         self.patches_dir = Path(patches_dir) if patches_dir else None
+        self.repo_root = Path(repo_root) if repo_root else None
         self.patch_paths: dict[str, Path] = {}
         self._load()
 
@@ -193,6 +217,7 @@ class FloorManager:
             "directives": {t: d.model_dump(mode="json") for t, d in self.directives.items()},
             "allocations": dict(self.allocations),
             "board_ids": dict(getattr(self.bridge, "board_ids", {}) or {}),
+            "board_teams": dict(getattr(self.bridge, "board_teams", {}) or {}),
             "completed": sorted(self._completed),
             "reported_quarantine": sorted(self._reported_quarantine),
             "pr_summaries": dict(self.pr_summaries),
@@ -216,13 +241,16 @@ class FloorManager:
             self._reported_quarantine = set(state.get("reported_quarantine") or [])
             self.pr_summaries = {t: dict(v) for t, v in (state.get("pr_summaries") or {}).items()}
             self.applied_alerts = {k: ActionOutcome(**v) for k, v in (state.get("applied_alerts") or {}).items()}
-            self.diffs = {t: list(v) for t, v in (state.get("diffs") or {}).items()}
+            self.diffs = {}
+            for t, v in (state.get("diffs") or {}).items():
+                # older saves stored a list; key it by position so nothing is lost
+                self.diffs[t] = {str(k): str(d) for k, d in (v.items() if isinstance(v, dict) else enumerate(v))}
         except Exception as exc:  # a corrupt blob must not stop a restart
             log.warning("floor manager: ignoring unreadable saved state: %s", exc)
         board_ids = state.get("board_ids") or {}
         restore = getattr(self.bridge, "restore", None)
         if board_ids and callable(restore):
-            restore(board_ids)
+            restore(board_ids, state.get("board_teams") or {})
         # Continue numbering after anything already in the queue (or the saved counter).
         highest = int(state.get("seq") or 0)
         try:
@@ -528,7 +556,8 @@ class FloorManager:
         ticket done, so completion does not depend on the pool's own callback).
         """
         task_id = item.assignment.task_id
-        self.diffs.setdefault(task_id, []).append(item.submission.diff)
+        # keyed by subtask: a re-approval after a resume replaces, never duplicates
+        self.diffs.setdefault(task_id, {})[str(item.assignment.subtask_id)] = item.submission.diff
         self.save()
         d = self.directives.get(task_id)
         team_id = d.team_id if d else item.assignment.team_id
@@ -593,7 +622,8 @@ class FloorManager:
 
     async def _finish(self, task_id: str, diff: str | None) -> dict[str, str]:
         if diff is None:
-            diff = "\n".join(self.diffs.get(task_id, [])) or self._task_diff(task_id)
+            parts = self.diffs.get(task_id, {})
+            diff = "".join(_with_newline(parts[k]) for k in sorted(parts, key=_subtask_order)) or self._task_diff(task_id)
         order = self.orders.get(task_id)
         summary = await _maybe_await(
             self.foreman.draft_pr_summary(diff, task_id=task_id, title=order.title if order else None)
@@ -605,7 +635,7 @@ class FloorManager:
             self.queue.store_pr_summary(task_id, summary)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
             log.debug("store_pr_summary failed: %s", exc)
-        self._write_patch(task_id, diff, summary)
+        await self._write_patch(task_id, diff, summary)
         d = self.directives.get(task_id)
         if d is not None:
             self.bridge.review(task_id, d.team_id, "APPROVED", note="Foundry reviewer approved")
@@ -613,20 +643,32 @@ class FloorManager:
         self.save()
         return summary
 
-    def _write_patch(self, task_id: str, diff: str, summary: Mapping[str, str]) -> None:
+    async def _write_patch(self, task_id: str, diff: str, summary: Mapping[str, str]) -> None:
         """Write ``<task_id>.patch`` (apply with ``git apply``) and ``<task_id>.md`` into patches_dir.
 
-        Foundry never edits the target repository itself; these files are the output.
+        Foundry never edits the target repository itself; these files are the
+        output. When git is installed the combined patch is first checked with
+        ``git apply --check`` against a scratch copy of the repo; a patch that
+        does not apply is written as ``<task_id>.patch.rejected`` (with git's
+        complaint in the log) instead.
         """
         if self.patches_dir is None:
             return
+        text = _with_newline(diff) if diff else ""
+        problem = await asyncio.to_thread(_git_check, text, self.repo_root) if text else None
         try:
             self.patches_dir.mkdir(parents=True, exist_ok=True)
-            text = diff if diff.endswith("\n") or not diff else diff + "\n"
-            (self.patches_dir / f"{task_id}.patch").write_text(text, encoding="utf-8", newline="\n")
             md = f"{summary.get('commit_message', '').strip()}\n\n{summary.get('pr_body', '').strip()}\n"
             (self.patches_dir / f"{task_id}.md").write_text(md, encoding="utf-8")
-            self.patch_paths[task_id] = self.patches_dir / f"{task_id}.patch"
+            if problem:
+                path = self.patches_dir / f"{task_id}.patch.rejected"
+                path.write_text(text, encoding="utf-8", newline="\n")
+                self.rejected_patches[task_id] = path
+                log.warning("floor manager: combined patch for %s does not apply (%s); wrote %s", task_id, problem[:160], path.name)
+                return
+            path = self.patches_dir / f"{task_id}.patch"
+            path.write_text(text, encoding="utf-8", newline="\n")
+            self.patch_paths[task_id] = path
         except OSError as exc:
             log.warning("floor manager: could not write the patch for %s: %s", task_id, exc)
 
@@ -639,6 +681,55 @@ class FloorManager:
             if isinstance(got, (list, tuple)):
                 return "\n".join(str(x) for x in got)
         return ""
+
+
+def _with_newline(text: str) -> str:
+    return text if text.endswith("\n") else text + "\n"
+
+
+def _subtask_order(key: str) -> tuple[int, ...] | tuple[str]:
+    """Sort ``F-001.2`` before ``F-001.10``."""
+    nums = re.findall(r"\d+", key)
+    return tuple(int(n) for n in nums) if nums else (key,)
+
+
+def _copy_workspace(src: Path, dst: Path) -> None:
+    """Copy ``src`` to ``dst`` without VCS data, environments and caches (InfrastructureError on failure)."""
+    try:
+        if src.is_dir():
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*SCRATCH_IGNORE))
+        else:
+            dst.mkdir(parents=True)
+    except (OSError, shutil.Error) as exc:
+        raise InfrastructureError(f"could not copy the workspace for the gates: {exc}") from exc
+
+
+def _git_check(patch: str, repo_root: Path | None) -> str | None:
+    """``git apply --check`` the patch in a scratch copy of the repo; the error text, or None.
+
+    Returns None (no check) when git is not installed or there is no repo to check against.
+    """
+    git = shutil.which("git")
+    if git is None or repo_root is None or not repo_root.is_dir():
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="foundry-patch-"))
+    try:
+        ws = tmp / "ws"
+        _copy_workspace(repo_root, ws)
+        (tmp / "combined.patch").write_text(patch, encoding="utf-8", newline="\n")
+        proc = subprocess.run(
+            [git, "apply", "--check", str(tmp / "combined.patch")],
+            cwd=str(ws), capture_output=True, text=True, timeout=60,
+        )
+        return None if proc.returncode == 0 else (proc.stderr or proc.stdout or "git apply --check failed").strip()
+    except InfrastructureError as exc:
+        log.warning("floor manager: patch check skipped: %s", exc)
+        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("floor manager: patch check skipped: %s", exc)
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _get(obj: Any, name: str) -> Any:
@@ -677,18 +768,19 @@ class WorkspaceGates:
     async def run(self, submission: Any, assignment: Any) -> Any:
         """Validate ``submission`` in a scratch copy of the workspace."""
         self.calls += 1
-        tmp = Path(tempfile.mkdtemp(prefix="foundry-gates-"))
+        try:
+            tmp = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="foundry-gates-"))
+        except OSError as exc:
+            raise InfrastructureError(f"could not create a scratch workspace: {exc}") from exc
         try:
             ws = tmp / "ws"
-            if self.base_workspace.is_dir():
-                shutil.copytree(self.base_workspace, ws, ignore=shutil.ignore_patterns(*SCRATCH_IGNORE))
-            else:
-                ws.mkdir()
+            # copying a real repo is slow: keep it off the event loop
+            await asyncio.to_thread(_copy_workspace, self.base_workspace, ws)
             return await self.gates.validate_async(
                 submission, ws, allowed_files=list(assignment.allowed_files) or None
             )
         finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, tmp, True)
 
 
 @dataclass
@@ -826,6 +918,7 @@ def build_factory(
         limiter=limiter,
         builders_per_team=config.builders_per_team,
         patches_dir=patches_dir,
+        repo_root=repo_root,
     )
     pools = {
         team: TeamPool(

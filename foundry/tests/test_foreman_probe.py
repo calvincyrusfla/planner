@@ -375,7 +375,7 @@ def test_setup_bat_structure() -> None:
         assert needle in text, needle
     # The venv branch is only taken when .venv\Scripts\python.exe passed the version check.
     venv_set = text.index('set PY="%REPO_ROOT%\\.venv\\Scripts\\python.exe"')
-    assert venv_set < text.index('if defined PY set "PY_IS_VENV=1"') < text.index(":try_py_launcher")
+    assert venv_set < text.index('if defined PY set "PY_IS_VENV=1"') < text.index("\r\n:try_py_launcher\r\n")
     assert 'if "%PY_IS_VENV%"=="1" goto :next_step_venv' in text
     assert (REPO_ROOT / ".gitattributes").read_text().split() == ["*.bat", "text", "eol=crlf", "*.sh", "text", "eol=lf"]
     assert "wmic" not in text.lower().replace("wmic is deprecated", "")

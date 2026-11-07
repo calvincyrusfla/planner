@@ -53,10 +53,39 @@ def test_board_autoassigned_teams_are_unassigned_except_the_foundry_team() -> No
     bridge = BoardBridge(mode="dry", dry_autoassign=("alpha", "bravo"))
     bridge.register_task("F-1", "t", complexity="S", builders=1, team_id="charlie")
     ops = [(op["type"], op["args"].get("teamId")) for op in bridge.ops]
-    assert ops == [("addTask", None), ("unassignTeam", "alpha"), ("unassignTeam", "bravo"), ("assignTeam", "charlie")]
+    assert ops == [("addTask", None), ("assignTeam", "charlie"), ("unassignTeam", "alpha"), ("unassignTeam", "bravo")]
+    assert bridge.board_teams["F-1"] == ["charlie"]
     bridge2 = BoardBridge(mode="dry", dry_autoassign=("alpha", "charlie"))
     bridge2.register_task("F-1", "t", complexity="M", builders=2, team_id="charlie")
     assert [(op["type"], op["args"].get("teamId")) for op in bridge2.ops] == [("addTask", None), ("unassignTeam", "alpha")]
+
+
+def test_busy_foundry_team_is_never_moved_and_every_board_team_signs_off() -> None:
+    # charlie is on another open board task; the board auto-assigned alpha and bravo to the new one.
+    bridge = BoardBridge(mode="dry", dry_autoassign=("alpha", "bravo"), dry_busy=("charlie",))
+    bridge.register_task("F-1", "t", complexity="S", builders=1, team_id="charlie")
+    assert [op["type"] for op in bridge.ops] == ["addTask"]  # no assignTeam(charlie), no unassign
+    assert bridge.board_teams["F-1"] == ["alpha", "bravo"]
+    bridge.review("F-1", "charlie", "APPROVED", note="ok")
+    bridge.done("F-1")
+    verdicts = [op["args"] for op in bridge.ops if op["type"] == "reviewTask"]
+    assert [(v["teamId"], v["verdict"], v["by"]) for v in verdicts] == [("alpha", "approved", "alpha-6"), ("bravo", "approved", "bravo-6")]
+    assert bridge.ops[-1]["args"]["patch"] == {"status": "done"}
+
+
+def test_busy_team_and_queued_board_task_sends_no_team_ops() -> None:
+    bridge = BoardBridge(mode="dry", dry_busy=("alpha",))
+    bridge.register_task("F-1", "t", team_id="alpha")
+    assert [op["type"] for op in bridge.ops] == ["addTask"]
+    assert bridge.board_teams["F-1"] == []
+
+
+def test_restore_seeds_the_dry_counter() -> None:
+    bridge = BoardBridge(mode="dry")
+    bridge.restore({"F-1": "DRY-001", "F-2": "DRY-007"}, {"F-1": ["alpha"]})
+    bridge.register_task("F-3", "t", team_id="alpha")
+    assert bridge.board_ids["F-3"] == "DRY-008"
+    assert bridge.board_teams["F-1"] == ["alpha"]
 
 
 def test_register_is_idempotent_and_restore_skips_known_tasks() -> None:
@@ -133,12 +162,22 @@ def test_auto_mode_unreachable_never_blocks_or_raises(tmp_path: Path) -> None:
 
 class _FakeDashboard(BaseHTTPRequestHandler):
     received: list[dict[str, Any]] = []
+    assigned: list[str] = ["alpha", "bravo"]
+    teams: list[dict[str, Any]] = []
+
+    def do_GET(self) -> None:  # noqa: N802
+        data = json.dumps({"ok": True, "result": {"teams": type(self).teams}}).encode()
+        self.send_response(200 if self.path == "/api/state" else 404)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self) -> None:  # noqa: N802
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         type(self).received.append(body)
         if body["type"] == "addTask":
-            result: Any = {"task": {"id": "T-077"}, "assigned": ["alpha", "bravo"]}
+            result: Any = {"task": {"id": "T-077"}, "assigned": list(type(self).assigned)}
         elif body["type"] == "reviewTask":
             self.send_response(400)
             self.end_headers()
@@ -159,6 +198,7 @@ class _FakeDashboard(BaseHTTPRequestHandler):
 
 def test_auto_mode_posts_to_dashboard_and_resolves_board_id(tmp_path: Path) -> None:
     _FakeDashboard.received = []
+    _FakeDashboard.assigned = ["alpha", "bravo"]
     server = HTTPServer(("127.0.0.1", 0), _FakeDashboard)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -202,3 +242,62 @@ def test_parse_cli_add_output() -> None:
         "task": {"id": "T-013"}, "assigned": [],
     }
     assert parse_cli_add("Error: nope") is None
+
+
+def _serve() -> HTTPServer:
+    server = HTTPServer(("127.0.0.1", 0), _FakeDashboard)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_auto_mode_busy_team_is_left_alone(tmp_path: Path) -> None:
+    """The user's own board task T-001 keeps alpha; the Foundry task keeps the board's bravo."""
+    _FakeDashboard.received = []
+    _FakeDashboard.assigned = ["bravo"]
+    _FakeDashboard.teams = [{"id": "alpha", "taskId": "T-001"}, {"id": "bravo", "taskId": "T-077"}, {"id": "charlie", "taskId": None}]
+    server = _serve()
+    try:
+        bridge = BoardBridge(mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs")
+        bridge.register_task("F-1", "t", complexity="S", builders=1, team_id="alpha")
+        bridge.review("F-1", "alpha", "APPROVED")
+        bridge.done("F-1")
+        assert bridge.flush(5.0)
+        bridge.close()
+    finally:
+        server.shutdown()
+    types = [r["type"] for r in _FakeDashboard.received]
+    assert "assignTeam" not in types and "unassignTeam" not in types
+    verdicts = [r["args"] for r in _FakeDashboard.received if r["type"] == "reviewTask"]
+    assert [v["teamId"] for v in verdicts] == ["bravo"]
+    assert bridge.board_teams["F-1"] == ["bravo"]
+
+
+def test_auto_mode_free_team_is_assigned_and_others_released(tmp_path: Path) -> None:
+    _FakeDashboard.received = []
+    _FakeDashboard.assigned = ["bravo"]
+    _FakeDashboard.teams = [{"id": "alpha", "taskId": None}, {"id": "bravo", "taskId": "T-077"}]
+    server = _serve()
+    try:
+        bridge = BoardBridge(mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs")
+        bridge.register_task("F-1", "t", team_id="alpha")
+        assert bridge.flush(5.0)
+        bridge.close()
+    finally:
+        server.shutdown()
+    team_ops = [(r["type"], r["args"]["teamId"]) for r in _FakeDashboard.received if r["type"] in ("assignTeam", "unassignTeam")]
+    assert team_ops == [("assignTeam", "alpha"), ("unassignTeam", "bravo")]
+
+
+def test_auto_mode_unreadable_board_state_counts_as_busy(tmp_path: Path) -> None:
+    _FakeDashboard.received = []
+    _FakeDashboard.assigned = []
+    _FakeDashboard.teams = "not a list"  # type: ignore[assignment]
+    server = _serve()
+    try:
+        bridge = BoardBridge(mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs")
+        bridge.register_task("F-1", "t", team_id="alpha")
+        assert bridge.flush(5.0)
+        bridge.close()
+    finally:
+        server.shutdown()
+    assert [r["type"] for r in _FakeDashboard.received] == ["addTask"]

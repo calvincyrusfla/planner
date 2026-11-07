@@ -1020,6 +1020,8 @@ class BuilderWorker(_WorkerBase):
         #: Outcomes of processed tickets, in order ("review", "retry", "quarantined", "cached", ...).
         self.outcomes: list[str] = []
         self._backoff_s = 0.0
+        #: True while this slot serves as a promoted peer reviewer (M1: claims no build tickets).
+        self.promoted = False
 
     # -- lifecycle ------------------------------------------------------------
     def _set_busy(self, busy: bool) -> None:
@@ -1041,13 +1043,16 @@ class BuilderWorker(_WorkerBase):
             await self._wait(0.0, stop)
             if stop.is_set():
                 break
+            if self.promoted:
+                await self._wait(self.poll, stop)
+                continue
             ticket = await self.queue.wait_for_ticket(self.team_id, self.slot, poll=self.poll, stop=stop)
             if ticket is None:
                 if stop.is_set():
                     break
                 continue
-            if self._pause_remaining() > 0:
-                self._release(ticket, "dispatch paused")
+            if self._pause_remaining() > 0 or self.promoted:
+                self._release(ticket, "dispatch paused" if not self.promoted else "slot promoted to reviewer")
                 continue
             self.current_ticket = ticket
             self._set_busy(True)
@@ -1240,21 +1245,17 @@ class BuilderWorker(_WorkerBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # D1: usage limits / timeouts / missing or logged-out CLI are not the
-            # builder's fault: release the ticket (attempt unchanged) and pause.
+            # D1/E1: not the builder's fault -> no attempt spent; account-wide errors
+            # pause dispatch, the rest count toward the per-ticket infrastructure cap.
             self._tm("record_duration", task_id, "build", time.monotonic() - started)
-            self._backoff_s = await self._handle_infra_error(exc)
-            self._release(ticket, _one_line(f"Claude unavailable: {type(exc).__name__}: {exc}", 200))
-            return "released"
+            return await self._infra_release(ticket, exc)
         self._tm("record_duration", task_id, "build", time.monotonic() - started)
         self.scratch["last_reply"] = result.text
         if is_infrastructure_error(result):
-            # D1: timeout / non-zero exit without JSON / no reply at all -> not the builder's fault.
-            self._backoff_s = await self._handle_infra_error(
-                _claude_client.ClaudeError(result.error or "claude produced no reply")
+            # timeout / non-zero exit without JSON / no reply at all
+            return await self._infra_release(
+                ticket, _claude_client.ClaudeError(result.error or "claude produced no reply")
             )
-            self._release(ticket, _one_line(f"Claude produced no reply: {result.error or 'error'}", 200))
-            return "released"
         if result.is_error:
             return self._send_back(
                 ticket, _one_line(f"Claude call failed: {result.error or 'error'}"), reason="claude_error"
@@ -1262,6 +1263,7 @@ class BuilderWorker(_WorkerBase):
 
         # 3. parse the reply (diff-only contract); a bad reply never reaches gates or reviewer
         submission = parse_builder_reply(result.text, assignment)
+        self._reset_infra(ticket)  # Claude produced a parsed reply (E1)
         self._event(
             "submission",
             task_id,
@@ -1276,7 +1278,13 @@ class BuilderWorker(_WorkerBase):
         # 4. deterministic gates, short-circuit before any reviewer
         self._set_state(task_id, TaskState.VALIDATING)
         snapshot = self._snapshot(submission.diff)
-        gates = await self._run_gates(submission, assignment)
+        try:
+            gates = await self._run_gates(submission, assignment)
+        except Exception as exc:
+            _restore_files(self.workspace, snapshot)
+            if not _is_counted_infra(exc):
+                raise
+            return await self._infra_release(ticket, exc)  # e.g. scratch copy failed
         self._record_gate_results(gates.results)
         if not gates.passed:
             _restore_files(self.workspace, snapshot)
@@ -1306,7 +1314,13 @@ class BuilderWorker(_WorkerBase):
         )
         self._set_state(task_id, TaskState.VALIDATING)
         snapshot = self._snapshot(cached)
-        gates = await self._run_gates(submission, assignment)
+        try:
+            gates = await self._run_gates(submission, assignment)
+        except Exception as exc:
+            _restore_files(self.workspace, snapshot)
+            if not _is_counted_infra(exc):
+                raise
+            return await self._infra_release(ticket, exc)
         self._record_gate_results(gates.results)
         if not gates.passed:
             _restore_files(self.workspace, snapshot)
@@ -1321,6 +1335,15 @@ class BuilderWorker(_WorkerBase):
             return "cached"
         await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta)
         return "review"
+
+    async def _infra_release(self, ticket: Any, exc: BaseException) -> str:
+        """E1 for builders: pause/back off, then release the ticket or quarantine at the cap."""
+        kind, backoff = await self._infra_failure(ticket, exc)
+        if kind == "quarantined":
+            return "quarantined"
+        self._backoff_s = backoff
+        self._release(ticket, _one_line(f"infrastructure: {type(exc).__name__}: {exc}", 200))
+        return "released"
 
     def _work_order(self, task_id: str) -> dict[str, str]:
         """The task's title and description (part of the solution-cache key, D5)."""
@@ -1352,6 +1375,13 @@ class BuilderWorker(_WorkerBase):
 
 
 _SHORT_CONTRACT = "Reply with exactly one ```diff block holding a unified diff of the allowed files."
+
+
+def _is_counted_infra(exc: BaseException) -> bool:
+    """Infrastructure errors raised by gate runners (``floor_manager.InfrastructureError``)."""
+    return any(c.__name__ == "InfrastructureError" for c in type(exc).__mro__) or isinstance(
+        exc, _claude_client.ClaudeError
+    )
 
 
 def _cache_call(cache: Any, method: str, assignment: TaskAssignment, meta: dict[str, str], *args: Any) -> Any:
@@ -1470,6 +1500,7 @@ class ReviewerWorker(_WorkerBase):
         self._backoff_s = 0.0
         self.cache = cache
         self.inbox = inbox
+
         self.on_task_complete = on_task_complete
         self.on_approved = on_approved
         self.busy = False
@@ -1544,8 +1575,12 @@ class ReviewerWorker(_WorkerBase):
         if error is None and result is not None and result.is_error:
             error = _claude_client.ClaudeError(result.error or "reviewer call returned an error")
         if error is not None:
-            # D1: reviewer infrastructure failure -> back into the inbox, no builder retry.
-            self._backoff_s = await self._handle_infra_error(error)
+            # D1/E1: reviewer infrastructure failure (any is_error, with or without text)
+            # -> back into the inbox, no builder retry; counted toward the ticket's cap.
+            kind, self._backoff_s = await self._infra_failure(item.ticket, error)
+            if kind == "quarantined":
+                _restore_files(item.workspace, item.snapshot)
+                return None
             self._tm("mark_review_wait", task_id, item=item_key)
             self.inbox.put_nowait(item)
             self._event("review_requeued", task_id, {"ticket_id": item.ticket_id, "reviewer_id": self.agent_id,
@@ -1561,6 +1596,7 @@ class ReviewerWorker(_WorkerBase):
             result.text, task_id=task_id, reviewer_id=self.agent_id, retry_count=retry,
             default_path=(item.submission.modified_files or ["(review)"])[0],
         )
+        self._reset_infra(item.ticket)  # a reply was parsed (E1)
         self._set_in_review(item.ticket, False)
         self.verdicts.append(verdict)
         self._record_verdict(verdict, item)
@@ -1632,9 +1668,13 @@ class TeamPool:
         config: Any = None,
         limit_cooldown_s: float | None = None,
         infra_backoff_s: float = 5.0,
+        infra_failure_cap: int | None = None,
     ) -> None:
         if not 1 <= builders <= 5:
             raise ValueError("a team has 1..5 builder slots")
+        if infra_failure_cap is None:
+            infra_failure_cap = int(getattr(config, "infra_failure_cap", 3))
+        self._infra_failure_cap = infra_failure_cap
         if trust_cache is None:
             trust_cache = bool(getattr(config, "trust_cache", False))
         if limit_cooldown_s is None:
@@ -1677,6 +1717,7 @@ class TeamPool:
                 cwd=cwd,
                 limit_cooldown_s=limit_cooldown_s,
                 infra_backoff_s=infra_backoff_s,
+                infra_failure_cap=infra_failure_cap,
             )
             for slot in range(1, builders + 1)
         ]
@@ -1705,6 +1746,7 @@ class TeamPool:
             cwd=self._cwd,
             limit_cooldown_s=self._limit_cooldown_s,
             infra_backoff_s=self._infra_backoff_s,
+            infra_failure_cap=self._infra_failure_cap,
         )
 
     # -- callbacks --------------------------------------------------------------
@@ -1718,7 +1760,7 @@ class TeamPool:
 
     def idle_count(self) -> int:
         """Builder slots not working on a ticket right now."""
-        return sum(1 for b in self.builders if not b.busy)
+        return sum(1 for b in self.builders if not b.busy and not b.promoted)
 
     def _report_idle(self) -> None:
         fn = getattr(self.telemetry, "set_idle", None) if self.telemetry is not None else None
@@ -1826,6 +1868,8 @@ class TeamPool:
             return agent_id
         peer = self._make_reviewer(agent_id, exclude_builder=agent_id)
         self.peer_reviewers[agent_id] = peer
+        builder = self.builder(slot)
+        builder.promoted = True  # M1: no build tickets while reviewing
         peer_stop = asyncio.Event()
         pool_stop = self._stop
 
@@ -1843,6 +1887,7 @@ class TeamPool:
             finally:
                 timer.cancel()
                 self.peer_reviewers.pop(agent_id, None)
+                builder.promoted = False
 
         self._tasks.append(asyncio.create_task(run_peer(), name=f"{agent_id}-peer-reviewer"))
         return agent_id
