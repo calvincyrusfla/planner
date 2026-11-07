@@ -358,8 +358,9 @@ function taskTimer(task, finished) {
     const team = byId[id];
     const open = team && team.taskId === task.id ? team.assignedAt : null;
     const base = teamMs[id] || 0;
-    if (!base && !open) return null;
-    return { order: team ? state.teams.indexOf(team) : 99, html: `<span class="tt-team" style="--team:${team ? team.color : 'var(--muted)'}">${esc(team ? team.name : id)} ${liveSpan(base, open)}</span>` };
+    if (base < 1000 && !open) return null;
+    const label = team ? team.name.replace(/^Team\s+/i, '') : id;
+    return { order: team ? state.teams.indexOf(team) : 99, html: `<span class="tt-team" style="--team:${team ? team.color : 'var(--muted)'}">${esc(label)} ${liveSpan(base, open)}</span>` };
   }).filter(Boolean).sort((a, b) => a.order - b.order).map((p) => p.html);
   let line;
   if (finished) {
