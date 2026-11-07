@@ -32,7 +32,6 @@ from foundry.schemas import (
     ForemanEscalation,
     PrescribedAction,
     TaskSizingDirective,
-    TaskState,
 )
 
 log = logging.getLogger(__name__)
@@ -157,7 +156,6 @@ class FloorManager:
         order = order.model_copy(update={"task_id": task_id, "team_id": self._pick_team(order)})
         self.orders[task_id] = order
         self.queue.add_task(task_id, order.title, order.description, order.team_id)
-        self.queue.set_state(task_id, TaskState.SIZING, "floor manager: sizing")
         directive = await self._size(order)
         self.directives[task_id] = directive
         self.queue.apply_sizing(directive)
@@ -217,15 +215,10 @@ class FloorManager:
             applied, detail, params = False, f"failed: {exc}", {}
         outcome = ActionOutcome(alert.alert_id, action.value, applied, detail, params)
         self.actions.append(outcome)
-        task_id = alert.target_entity.task_id
         try:
-            self.queue.record_event(
-                "escalation",
-                task_id or "",
-                {"alert_id": alert.alert_id, "category": _val(alert.category), "action": action.value, "applied": applied, "detail": detail},
-            )
-        except Exception as exc:  # pragma: no cover - telemetry is best effort
-            log.debug("record_event failed: %s", exc)
+            self.queue.record_escalation(alert, applied=applied)
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.debug("record_escalation failed: %s", exc)
         self.bridge.escalation(alert)
         return outcome
 
@@ -294,18 +287,19 @@ class FloorManager:
         return True, "; ".join(detail), {"agent_id": agent_id, "ticket": reopened}
 
     async def _reopen_claimed(self, team_id: str, slot: int, task_id: str | None) -> str | None:
-        fn = getattr(self.queue, "release_ticket", None) or getattr(self.queue, "reset_ticket", None)
-        tickets_fn = getattr(self.queue, "tickets_for", None) or getattr(self.queue, "get_tickets", None)
-        if not callable(tickets_fn):
-            return None
-        tickets = tickets_fn(task_id) if task_id else []
-        for t in tickets or []:
-            status = _val(_get(t, "status"))
-            if _get(t, "team_id") == team_id and int(_get(t, "slot") or 0) == slot and status == "claimed":
-                ticket_id = _get(t, "ticket_id")
-                if callable(fn):
-                    fn(ticket_id)
-                return str(ticket_id)
+        """Reopen the ticket the stalled builder holds, with no fix hint (a fresh prompt).
+
+        The queue has no attempt-neutral single-ticket release, so the reopen
+        counts as an attempt (a stall that needs a reset is treated like a failed
+        try); after the retry limit the queue quarantines the task instead.
+        """
+        agent_id = f"{team_id}-{slot}"
+        for t in self.queue.tickets(team_id=team_id, status="claimed"):
+            if task_id and t.task_id != task_id:
+                continue
+            if t.claimed_by == agent_id or (t.claimed_by is None and t.slot == slot):
+                self.queue.reopen_ticket(t.ticket_id, None)
+                return t.ticket_id
         return None
 
     async def _resize_allocation(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
@@ -352,9 +346,9 @@ class FloorManager:
         self.pr_summaries[task_id] = summary
         self._completed.add(task_id)
         try:
-            self.queue.record_event("pr_summary", task_id, summary)
-        except Exception as exc:  # pragma: no cover
-            log.debug("record_event failed: %s", exc)
+            self.queue.store_pr_summary(task_id, summary)
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.debug("store_pr_summary failed: %s", exc)
         d = self.directives.get(task_id)
         if d is not None:
             self.bridge.review(task_id, d.team_id, "APPROVED", note="Foundry reviewer approved")

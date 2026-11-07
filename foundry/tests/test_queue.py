@@ -687,3 +687,54 @@ def test_data_survives_reopen(db: Path) -> None:
         assert len(tickets_of(db, "T-1")) == 2
     finally:
         close(q2)
+
+
+def test_reopen_after_resize_down_moves_into_allocation(q: FoundryQueue) -> None:
+    sized(q, complexity="L")
+    t5 = q.claim_ticket("alpha", 5)
+    assert t5 is not None
+    q.resize("T-1", 2)  # claimed ticket keeps slot 5 while its worker runs
+    assert q.reopen_ticket(f(t5, "ticket_id"), "retry") is True
+    again = q.get_ticket(f(t5, "ticket_id"))
+    assert again is not None and f(again, "slot") <= 2
+    assert q.claim_ticket("alpha", 5) is None
+
+
+def test_last_ticket_done_completes_task(q: FoundryQueue) -> None:
+    sized(q, complexity="M")
+    a = q.claim_ticket("alpha", 1)
+    b = q.claim_ticket("alpha", 2)
+    assert q.complete_ticket(f(a, "ticket_id")) is False
+    assert state_of(q, "T-1") == "building"
+    assert q.complete_ticket(f(b, "ticket_id")) is True
+    assert state_of(q, "T-1") == "complete"
+
+
+def test_resume_returns_count_and_keeps_attempt(db: Path) -> None:
+    q1 = FoundryQueue(db)
+    sized(q1, complexity="S")
+    t = q1.claim_ticket("alpha", 1)
+    q1.reopen_ticket(f(t, "ticket_id"), "hint")
+    q1.claim_ticket("alpha", 1)  # attempt 1, then crash
+    close(q1)
+    q2 = FoundryQueue(db)
+    try:
+        assert q2.resume() == 1
+        t2 = q2.claim_ticket("alpha", 1)
+        assert t2 is not None and f(t2, "attempt") == 1  # crash is not a retry
+    finally:
+        close(q2)
+
+
+def test_resume_moves_validating_task_back_to_building(db: Path) -> None:
+    q1 = FoundryQueue(db)
+    sized(q1, complexity="S")
+    q1.claim_ticket("alpha", 1)
+    q1.set_state("T-1", "validating")
+    close(q1)
+    q2 = FoundryQueue(db)
+    try:
+        q2.resume()
+        assert state_of(q2, "T-1") == "building"
+    finally:
+        close(q2)

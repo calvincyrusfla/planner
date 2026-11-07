@@ -66,8 +66,9 @@ echo [foreman] Video adapters:
 powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Select Name,AdapterRAM | Format-Table -AutoSize | Out-String -Width 200" 2>nul
 rem AdapterRAM is a 32-bit field (caps at 4 GB); the display-class registry key has the real size
 rem (readable without admin). Take the largest value either source reports, in MB.
-powershell -NoProfile -Command "$r = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' -ErrorAction SilentlyContinue).'HardwareInformation.qwMemorySize') + @((Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue).AdapterRAM); $a = [long[]]@($r -ne $null); if ($a.Count) { [long]([Linq.Enumerable]::Max($a) / 1MB) } else { 0 }" > "%TMPF%.vram" 2>nul
+powershell -NoProfile -Command "$r = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' -ErrorAction SilentlyContinue).'HardwareInformation.qwMemorySize') + @((Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue).AdapterRAM); $a = @(foreach ($v in $r) { if ($null -ne $v) { try { [long]$v } catch {} } }); if ($a.Count) { [long](($a | Measure-Object -Maximum).Maximum / 1MB) } else { 0 }" > "%TMPF%.vram" 2>nul
 set "VRAM_RAW="
+set "VRAM_NUM=0"
 if exist "%TMPF%.vram" set /p VRAM_RAW=<"%TMPF%.vram"
 del "%TMPF%.vram" >nul 2>&1
 if not defined VRAM_RAW goto :gpu_done
@@ -123,10 +124,10 @@ echo [foreman] Ollama API already answering at %OLLAMA_URL%
 
 rem ---- 5. ollama pull -------------------------------------------------------
 :pull
-if "%DRY%"=="1" (
-  echo [dry-run] ollama pull %MODEL%
-  goto :probe
-)
+if not "%DRY%"=="1" goto :pull_real
+echo [dry-run] ollama pull %MODEL%
+goto :probe
+:pull_real
 ollama list 2>nul | findstr /b /i /c:"%MODEL% " /c:"%MODEL%:latest " >nul
 if errorlevel 1 goto :do_pull
 echo [foreman] Model %MODEL% already installed; skipping pull.
@@ -158,10 +159,10 @@ goto :finish
 
 :run_probe
 cd /d "%REPO_ROOT%"
-if "%DRY%"=="1" (
-  echo [dry-run] %PY% -m foundry.foreman_probe --base-url "%OLLAMA_URL%/v1" --model "%MODEL%"
-  goto :finish
-)
+if not "%DRY%"=="1" goto :run_probe_real
+echo [dry-run] %PY% -m foundry.foreman_probe --base-url "%OLLAMA_URL%/v1" --model "%MODEL%"
+goto :finish
+:run_probe_real
 %PY% -m foundry.foreman_probe --base-url "%OLLAMA_URL%/v1" --model "%MODEL%"
 set "RC=%ERRORLEVEL%"
 if "%RC%"=="0" echo [foreman] Shop Foreman ready. Launch the orchestrator: %PY% -m foundry.main
@@ -179,6 +180,7 @@ rem :gpu_line "name" "memory MB" - print one nvidia-smi row and keep the largest
 :gpu_line
 set "GNAME=%~1"
 set "GMEM_RAW=%~2"
+set "GMEM=0"
 set /a "GMEM=GMEM_RAW+0" >nul 2>&1
 echo [foreman] GPU: %GNAME% - %GMEM% MB VRAM
 if "%GMEM%"=="0" exit /b 0

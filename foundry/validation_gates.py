@@ -360,7 +360,7 @@ def apply_diff(
         else:
             planned.append((target, AppliedFile(rel, "modified"), content))
 
-    for target, applied, content in planned:
+    for target, _applied, content in planned:
         if content is None:
             target.unlink()
         else:
