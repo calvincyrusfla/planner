@@ -27,6 +27,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -405,6 +406,25 @@ def _make_result(**fields: object) -> ClaudeResult:
 _CMD_UNSAFE = frozenset('"%\r\n\x00')
 
 
+def _join_unique(*parts: str | None) -> str:
+    """Join non-empty parts, skipping any already contained in an earlier part.
+
+    ``ClaudeResult.error`` is usually a truncated copy of ``text``; joining both
+    would repeat the excerpt in exception messages.
+    """
+    kept: list[str] = []
+    for part in parts:
+        part = (part or "").strip()
+        if part and not any(part in k or k in part for k in kept):
+            kept.append(part)
+        elif part:
+            # keep the longer of two overlapping parts
+            for i, k in enumerate(kept):
+                if k in part and len(part) > len(k):
+                    kept[i] = part
+    return " ".join(kept)
+
+
 def _auth_message(blob: str) -> str:
     excerpt = " ".join(blob.split())[:200]
     return (
@@ -646,10 +666,18 @@ class ClaudeCodeClient:
         reach ``CreateProcess`` verbatim, goes through plain Popen instead. A
         string is passed unchanged on Windows; a list (used by tests on POSIX) is
         exec'd normally.
+
+        Cancellation is race-free: the coroutine sets ``cancelled`` *before* looking
+        for the process, and the thread stores the process *before* re-checking
+        ``cancelled``, so whichever side runs second kills the child. A thread that
+        starts after cancellation never spawns at all.
         """
         holder: dict[str, subprocess.Popen[bytes]] = {}
+        cancelled = threading.Event()
 
         def work() -> tuple[int | None, bytes, bytes, bool]:
+            if cancelled.is_set():
+                return None, b"", b"", False  # caller is gone; never spawn
             proc = subprocess.Popen(
                 spec,
                 stdin=subprocess.PIPE,
@@ -660,6 +688,9 @@ class ClaudeCodeClient:
                 **self._popen_flags(),
             )
             holder["proc"] = proc
+            if cancelled.is_set():
+                # cancelled while Popen was running: the coroutine saw no process
+                _kill_tree_sync(proc)
             try:
                 out_b, err_b = proc.communicate(data, timeout=timeout)
                 return proc.returncode, out_b, err_b, False
@@ -678,8 +709,10 @@ class ClaudeCodeClient:
                 raise self._spawn_error(exc, cwd) from exc
             raise
         except BaseException:
-            if "proc" in holder:
-                _kill_tree_sync(holder["proc"])
+            cancelled.set()
+            proc = holder.get("proc")
+            if proc is not None:
+                _kill_tree_sync(proc)
             raise
 
     async def run(
@@ -722,7 +755,7 @@ class ClaudeCodeClient:
         if payload is not None:
             result = _result_from_payload(payload, wall)
             if result.is_error:
-                blob = " ".join(filter(None, [result.error, result.text, stderr]))
+                blob = _join_unique(result.error, result.text, stderr)
                 if detect_auth_error(blob):
                     raise ClaudeAuthError(_auth_message(blob))
                 if detect_rate_limit(blob):

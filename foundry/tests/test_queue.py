@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import threading
 from collections import Counter
@@ -1086,3 +1087,129 @@ def test_infra_counter_persists_and_migrates(db: Path) -> None:
         assert t.infra_failures == 1 and t.infra_last_error == "launch failed"
     finally:
         close(q2)
+
+
+# --------------------------------------------------------------------------
+# Round 3: tasks belong to a repo (G1)
+# --------------------------------------------------------------------------
+
+
+def _sized_in(q: FoundryQueue, task_id: str, repo: Path | str | None,
+              complexity: str = "S", via_sizing: bool = False) -> None:
+    if via_sizing:
+        q.add_task(task_id, f"title {task_id}", "desc", "alpha")
+        q.apply_sizing(directive(task_id, "alpha", complexity), repo_root=repo)
+    else:
+        q.add_task(task_id, f"title {task_id}", "desc", "alpha", repo_root=repo)
+        q.apply_sizing(directive(task_id, "alpha", complexity))
+
+
+def test_repo_root_stored_normalized(q: FoundryQueue, tmp_path: Path) -> None:
+    from foundry.orchestrator_queue import normalize_repo_root
+
+    repo = tmp_path / "repo_a"
+    q.add_task("T-1", "t", "d", "alpha", repo_root=str(repo / "sub" / ".."))
+    assert q.get_task("T-1")["repo_root"] == normalize_repo_root(repo)
+    q.add_task("T-2", "t", "d", "alpha")
+    assert q.get_task("T-2")["repo_root"] is None
+    assert normalize_repo_root(None) is None and normalize_repo_root("  ") is None
+
+
+def test_apply_sizing_sets_repo_root(q: FoundryQueue, tmp_path: Path) -> None:
+    repo = tmp_path / "repo_a"
+    _sized_in(q, "T-1", repo, via_sizing=True)
+    assert q.get_task("T-1")["repo_root"] == str(repo)
+    # Auto-registered task (no add_task) also gets it.
+    q.apply_sizing(directive("T-9", "alpha", "S"), repo_root=repo)
+    assert q.get_task("T-9")["repo_root"] == str(repo)
+    # None keeps the repo the task already has.
+    q.add_task("T-3", "t", "d", "alpha", repo_root=repo)
+    q.apply_sizing(directive("T-3", "alpha", "S"))
+    assert q.get_task("T-3")["repo_root"] == str(repo)
+
+
+def test_claim_ticket_filters_by_repo(q: FoundryQueue, tmp_path: Path) -> None:
+    a, b = tmp_path / "A", tmp_path / "B"
+    _sized_in(q, "T-A", a)
+    _sized_in(q, "T-B", b)
+    _sized_in(q, "T-N", None)  # old/simulated row: unknown repo
+    t = q.claim_ticket("alpha", 1, repo_root=b)
+    assert t is not None and t.task_id == "T-B"
+    assert q.claim_ticket("alpha", 1, repo_root=b) is None
+    t = q.claim_ticket("alpha", 1, repo_root=str(a) + os.sep)  # trailing sep normalized
+    assert t is not None and t.task_id == "T-A"
+    assert q.claim_ticket("alpha", 1, repo_root=a) is None  # T-N never handed to a repo
+    t = q.claim_ticket("alpha", 1)  # no filter (simulate/tests): anything left
+    assert t is not None and t.task_id == "T-N"
+
+
+def test_no_repo_filter_claims_every_repo(q: FoundryQueue, tmp_path: Path) -> None:
+    _sized_in(q, "T-A", tmp_path / "A")
+    _sized_in(q, "T-N", None)
+    got = {q.claim_ticket("alpha", 1).task_id, q.claim_ticket("alpha", 1).task_id}
+    assert got == {"T-A", "T-N"}
+
+
+def test_wait_for_ticket_respects_repo(q: FoundryQueue, tmp_path: Path) -> None:
+    a, b = tmp_path / "A", tmp_path / "B"
+    _sized_in(q, "T-A", a)
+
+    async def scenario() -> tuple[Any, Any]:
+        stop = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.1, stop.set)
+        other = await q.wait_for_ticket("alpha", 1, poll=0.01, stop=stop, repo_root=b)
+        mine = await q.wait_for_ticket("alpha", 1, poll=0.01, stop=asyncio.Event(), repo_root=a)
+        return other, mine
+
+    other, mine = asyncio.run(scenario())
+    assert other is None
+    assert mine is not None and mine.task_id == "T-A"
+
+
+def test_unfinished_tasks_lists_other_repos(q: FoundryQueue, tmp_path: Path) -> None:
+    a, b = tmp_path / "A", tmp_path / "B"
+    _sized_in(q, "T-A", a)
+    _sized_in(q, "T-B", b)
+    _sized_in(q, "T-N", None)
+    q.add_task("T-done", "t", "d", "alpha", repo_root=b)
+    q.set_state("T-done", "failed")
+    every = q.unfinished_tasks()
+    assert [t["task_id"] for t in every] == ["T-A", "T-B", "T-N"]
+    assert {t["task_id"]: t["repo_root"] for t in every}["T-N"] is None
+    others = q.unfinished_tasks(exclude_repo_root=a)
+    assert [(t["task_id"], t["repo_root"]) for t in others] == [("T-B", str(b)), ("T-N", None)]
+    assert all("state" in t and "title" in t for t in others)
+
+
+def test_set_repo_root(q: FoundryQueue, tmp_path: Path) -> None:
+    q.add_task("T-1", "t", "d", "alpha")
+    q.set_repo_root("T-1", tmp_path)
+    assert q.get_task("T-1")["repo_root"] == str(tmp_path)
+    q.set_repo_root("T-1", None)
+    assert q.get_task("T-1")["repo_root"] is None
+    with pytest.raises(KeyError):
+        q.set_repo_root("NOPE", tmp_path)
+
+
+def test_repo_root_migration_old_tasks_table(db: Path, tmp_path: Path) -> None:
+    with raw(db) as c:  # tasks table from before round 3 (no repo_root)
+        c.executescript(
+            """
+            CREATE TABLE tasks (task_id TEXT PRIMARY KEY, title TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '', team_id TEXT NOT NULL, state TEXT NOT NULL,
+              complexity TEXT, allocated_builders INTEGER NOT NULL DEFAULT 0, sizing_json TEXT,
+              quarantine_reason TEXT, pr_summary_json TEXT, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL, state_changed_at TEXT NOT NULL);
+            INSERT INTO tasks VALUES ('F-001', 'old', '', 'alpha', 'backlog', NULL, 0, NULL,
+              NULL, NULL, 't', 't', 't');
+            """
+        )
+    q = FoundryQueue(db)
+    try:
+        assert q.get_task("F-001")["repo_root"] is None
+        assert [t["task_id"] for t in q.unfinished_tasks(exclude_repo_root=tmp_path)] == ["F-001"]
+        q.apply_sizing(directive("F-001", "alpha", "S"))
+        assert q.claim_ticket("alpha", 1, repo_root=tmp_path) is None  # unknown repo
+        assert q.claim_ticket("alpha", 1) is not None
+    finally:
+        close(q)

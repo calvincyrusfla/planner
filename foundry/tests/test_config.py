@@ -165,8 +165,9 @@ def test_round1_defaults() -> None:
     assert tuple(cfg.claude_extra_args) == DEFAULT_CLAUDE_EXTRA_ARGS
     assert cfg.claude_append_prompt == DEFAULT_CLAUDE_APPEND_PROMPT
     assert "spawn agents" in DEFAULT_CLAUDE_APPEND_PROMPT
-    assert cfg.patches_dir == DEFAULT_PATCHES_DIR
-    assert cfg.patches_dir.parts[-3:] == ("foundry", "data", "patches")
+    assert cfg.patches_dir is None
+    assert cfg.resolved_patches_dir() == DEFAULT_PATCHES_DIR
+    assert cfg.resolved_patches_dir().parts[-3:] == ("foundry", "data", "patches")
     # default list is not shared between instances
     cfg.claude_extra_args.append("--x")
     assert FoundryConfig().claude_extra_args == list(DEFAULT_CLAUDE_EXTRA_ARGS)
@@ -203,7 +204,9 @@ def test_round1_env_vars(tmp_path: Path) -> None:
     ]
     assert cfg.claude_append_prompt == "Only output a diff."
     assert cfg.patches_dir == tmp_path / "p"
-    assert cfg.ensure_patches_dir().is_dir()
+    assert cfg.resolved_patches_dir() == tmp_path / "p"
+    assert cfg.ensure_patches_dir() == tmp_path / "p"
+    assert (tmp_path / "p").is_dir()
 
 
 def test_none_word() -> None:
@@ -289,3 +292,19 @@ def test_infra_failure_cap() -> None:
     assert FoundryConfig.from_env({"FOUNDRY_INFRA_FAILURE_CAP": "5"}).infra_failure_cap == 5
     with pytest.raises(ValidationError):
         FoundryConfig(infra_failure_cap=0)
+
+
+def test_patches_dir_follows_db(tmp_path: Path) -> None:
+    cfg = FoundryConfig(db_path=tmp_path / "run1" / "foundry.db")
+    assert cfg.patches_dir is None
+    assert cfg.resolved_patches_dir() == tmp_path / "run1" / "patches"
+    # from_env: FOUNDRY_DB_PATH alone moves the patches with the db
+    env = {"FOUNDRY_DB_PATH": str(tmp_path / "run2" / "q.db")}
+    assert FoundryConfig.from_env(env).resolved_patches_dir() == tmp_path / "run2" / "patches"
+    # FOUNDRY_PATCHES_DIR still wins
+    env["FOUNDRY_PATCHES_DIR"] = str(tmp_path / "elsewhere")
+    assert FoundryConfig.from_env(env).resolved_patches_dir() == tmp_path / "elsewhere"
+    # assigning db_path later moves the derived folder too
+    cfg.db_path = tmp_path / "run3" / "f.db"
+    assert cfg.ensure_patches_dir() == tmp_path / "run3" / "patches"
+    assert (tmp_path / "run3" / "patches").is_dir()

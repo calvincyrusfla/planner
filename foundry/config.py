@@ -43,7 +43,9 @@ Environment variable               Field (default)
 ``FOUNDRY_CLAUDE_APPEND_PROMPT``   ``claude_append_prompt`` (see
                                    ``DEFAULT_CLAUDE_APPEND_PROMPT``); ``none``
                                    disables ``--append-system-prompt``
-``FOUNDRY_PATCHES_DIR``            ``patches_dir`` (``foundry/data/patches``)
+``FOUNDRY_PATCHES_DIR``            ``patches_dir`` (unset: ``<db dir>/patches``,
+                                   i.e. next to the queue database; see
+                                   ``resolved_patches_dir()``)
 ``FOUNDRY_INFRA_FAILURE_CAP``      ``infra_failure_cap`` (``3``): consecutive
                                    infrastructure failures on one ticket
                                    (timeouts, crashes; not usage limits)
@@ -86,8 +88,9 @@ ENV_PREFIX = "FOUNDRY_"
 DEFAULT_DATA_DIR: Path = Path(__file__).resolve().parent / "data"
 DEFAULT_DB_PATH: Path = DEFAULT_DATA_DIR / "foundry.db"
 
-#: Where approved tasks' combined diffs (``<task_id>.patch``) and PR
-#: summaries (``<task_id>.md``) are written; apply them with ``git apply``.
+#: Patches folder for the default database.  ``FoundryConfig.patches_dir``
+#: defaults to None, which resolves to ``<db_path dir>/patches``; this
+#: constant is that value when ``db_path`` is the default.
 DEFAULT_PATCHES_DIR: Path = DEFAULT_DATA_DIR / "patches"
 
 #: Safe default flags for diff-only headless Claude Code roles (builder,
@@ -203,7 +206,13 @@ class FoundryConfig(BaseModel):
         default=DEFAULT_CLAUDE_APPEND_PROMPT,
         description="Text for --append-system-prompt (None/empty: flag omitted).",
     )
-    patches_dir: Path = Field(default=DEFAULT_PATCHES_DIR)
+    patches_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Where approved tasks' <task_id>.patch / <task_id>.md go. None = "
+            "<db_path dir>/patches; use resolved_patches_dir() to read it."
+        ),
+    )
     infra_failure_cap: int = Field(
         default=3,
         ge=1,
@@ -256,10 +265,21 @@ class FoundryConfig(BaseModel):
             args += ["--append-system-prompt", self.claude_append_prompt]
         return args
 
+    def resolved_patches_dir(self) -> Path:
+        """Return the effective patches folder.
+
+        ``patches_dir`` when set, otherwise ``db_path.parent / "patches"``, so
+        the patches always sit next to the database that produced them.
+        """
+        if self.patches_dir is not None:
+            return self.patches_dir
+        return self.db_path.parent / "patches"
+
     def ensure_patches_dir(self) -> Path:
-        """Create ``patches_dir`` if needed and return it."""
-        self.patches_dir.mkdir(parents=True, exist_ok=True)
-        return self.patches_dir
+        """Create the resolved patches folder if needed and return it."""
+        path = self.resolved_patches_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def ensure_data_dir(self) -> Path:
         """Create the directory holding ``db_path`` if needed and return it."""

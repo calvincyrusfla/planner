@@ -707,3 +707,98 @@ def test_verbatim_runner_spawn_error_mapped(tmp_path: Path) -> None:
     client._spec = ("verbatim", [client._resolved, "-p"])
     with pytest.raises(ClaudeNotFound):
         run(client.run("p", agent_id="a-1", role="builder", timeout=5))
+
+
+# --------------------------------------------------------------------------- round 3 (G6)
+
+
+def test_auth_error_message_does_not_repeat_excerpt(tmp_path: Path) -> None:
+    body = """
+sys.stderr.write("Invalid API key · Please run /login\\n")
+print(json.dumps({"type": "result", "is_error": True, "result": "Invalid API key · Please run /login",
+                  "usage": {"input_tokens": 0, "output_tokens": 0}}))
+"""
+    exe = make_fake_claude(tmp_path, body)
+    with pytest.raises(ClaudeAuthError) as ei:
+        run(ClaudeCodeClient(claude_bin=str(exe)).run("p", agent_id="a-1", role="builder", timeout=30))
+    assert str(ei.value).count("Invalid API key") == 1
+
+
+def test_join_unique() -> None:
+    from foundry.claude_client import _join_unique
+
+    assert _join_unique("abc", "abc", None, "") == "abc"
+    assert _join_unique("abc"[:2], "abc") == "abc"  # truncated copy replaced by the full text
+    assert _join_unique("abc", "ab") == "abc"
+    assert _join_unique("err", "text", "stderr line") == "err text stderr line"
+
+
+def test_verbatim_cancel_while_popen_runs_kills_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation lands while the thread is inside Popen: the thread must kill the child."""
+    import subprocess as sp
+    import threading
+
+    marker = tmp_path / "alive.txt"
+    exe = make_fake_claude(tmp_path / "bin", f"time.sleep(2)\nopen({str(marker)!r}, 'w').write('x')\n")
+    client = ClaudeCodeClient(claude_bin=str(exe))
+    _force_verbatim(client)
+    real_popen = sp.Popen
+    entered, go = threading.Event(), threading.Event()
+    procs: list = []
+
+    def slow_popen(*a, **k):
+        entered.set()
+        go.wait(5)
+        p = real_popen(*a, **k)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(sp, "Popen", slow_popen)
+
+    async def main() -> None:
+        task = asyncio.create_task(client.run("p", agent_id="a-1", role="builder", timeout=30))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task  # coroutine saw no process yet
+        go.set()
+
+    run(main())  # loop shutdown waits for the worker thread
+    assert len(procs) == 1
+    assert procs[0].wait(timeout=5) != 0  # killed, not exited normally
+    time.sleep(2.5)
+    assert not marker.exists()
+
+
+def test_verbatim_cancel_before_thread_starts_never_spawns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess as sp
+    import threading
+
+    exe = make_fake_claude(tmp_path, OK_BODY)
+    client = ClaudeCodeClient(claude_bin=str(exe))
+    _force_verbatim(client)
+    spawned: list = []
+    real_popen = sp.Popen
+    monkeypatch.setattr(sp, "Popen", lambda *a, **k: spawned.append(a) or real_popen(*a, **k))
+    gate = threading.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def delayed_to_thread(fn, /, *args, **kwargs):
+        def delayed():
+            gate.wait(5)
+            return fn(*args, **kwargs)
+        return await real_to_thread(delayed)
+
+    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
+
+    async def main() -> None:
+        task = asyncio.create_task(client.run("p", agent_id="a-1", role="builder", timeout=30))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        gate.set()
+
+    run(main())
+    assert spawned == []

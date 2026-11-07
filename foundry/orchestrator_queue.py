@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -51,6 +52,7 @@ __all__ = [
     "TERMINAL_STATES",
     "Ticket",
     "TicketStatus",
+    "normalize_repo_root",
     "utc_now_iso",
 ]
 
@@ -87,6 +89,25 @@ for _state, _targets in list(ALLOWED_TRANSITIONS.items()):
     if _state not in TERMINAL_STATES:
         ALLOWED_TRANSITIONS[_state] = _targets | {TaskState.QUARANTINED, TaskState.FAILED}
 del _state, _targets
+
+
+def normalize_repo_root(repo_root: str | Path | None) -> str | None:
+    """Canonical string form of a repo root as stored in ``tasks.repo_root``.
+
+    ``os.path.normpath`` of the absolute path (no symlink resolution: the
+    caller passes an already resolved path). Matching is case-insensitive on
+    Windows (see :data:`_REPO_COLLATE`). None stays None.
+    """
+    if repo_root is None:
+        return None
+    text = str(repo_root).strip()
+    if not text:
+        return None
+    return os.path.normpath(os.path.abspath(text))
+
+
+#: SQL comparison for repo roots: case-insensitive on Windows only.
+_REPO_COLLATE: str = " COLLATE NOCASE" if os.name == "nt" else ""
 
 
 def utc_now_iso() -> str:
@@ -131,6 +152,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     sizing_json        TEXT,
     quarantine_reason  TEXT,
     pr_summary_json    TEXT,
+    repo_root          TEXT,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL,
     state_changed_at   TEXT NOT NULL
@@ -229,6 +251,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "infra_last_error": "TEXT",
     },
     "escalations": {"result": "TEXT"},
+    "tasks": {"repo_root": "TEXT"},
 }
 
 
@@ -373,20 +396,34 @@ class FoundryQueue:
 
     # ------------------------------------------------------------------ tasks
 
-    def add_task(self, task_id: str, title: str, description: str, team_id: str) -> None:
-        """Register a new task in ``backlog``. ValueError if the id exists."""
+    def add_task(
+        self,
+        task_id: str,
+        title: str,
+        description: str,
+        team_id: str,
+        repo_root: str | Path | None = None,
+    ) -> None:
+        """Register a new task in ``backlog``. ValueError if the id exists.
+
+        ``repo_root`` is the target repository the task belongs to (stored
+        normalized, see :func:`normalize_repo_root`); None for simulated runs.
+        """
+        root = normalize_repo_root(repo_root)
         now = self.now()
         with self.transaction() as conn:
             if conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
                 raise ValueError(f"task {task_id!r} already exists")
             conn.execute(
                 "INSERT INTO tasks (task_id, title, description, team_id, state,"
-                " created_at, updated_at, state_changed_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (task_id, title, description, team_id, TaskState.BACKLOG.value, now, now, now),
+                " created_at, updated_at, state_changed_at, repo_root)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (task_id, title, description, team_id, TaskState.BACKLOG.value, now, now, now,
+                 root),
             )
             self._event(conn, "task_added", task_id,
-                        {"title": title, "team_id": team_id, "state": TaskState.BACKLOG.value})
+                        {"title": title, "team_id": team_id, "state": TaskState.BACKLOG.value,
+                         "repo_root": root})
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         """Return the task as a dict (``state`` is a :class:`TaskState`), or None."""
@@ -408,6 +445,36 @@ class FoundryQueue:
         with self.lock:
             rows = self.conn.execute("SELECT * FROM tasks ORDER BY created_at, rowid").fetchall()
         return [self._task_dict(r) for r in rows]
+
+    def unfinished_tasks(
+        self, *, exclude_repo_root: str | Path | None = None
+    ) -> list[dict[str, Any]]:
+        """Every task not yet complete/quarantined/failed, oldest first.
+
+        Each dict is the usual task dict, including ``repo_root`` (None means
+        "unknown repo": a pre-repo_root row or a simulated task). With
+        ``exclude_repo_root`` given, tasks of that repository are left out, so
+        real mode can list the *other* repos' unfinished work; tasks with an
+        unknown repo are always included.
+        """
+        root = normalize_repo_root(exclude_repo_root)
+        sql = "SELECT * FROM tasks WHERE state NOT IN ('complete','quarantined','failed')"
+        args: list[Any] = []
+        if root is not None:
+            sql += f" AND (repo_root IS NULL OR repo_root != ?{_REPO_COLLATE})"
+            args.append(root)
+        with self.lock:
+            rows = self.conn.execute(sql + " ORDER BY created_at, rowid", args).fetchall()
+        return [self._task_dict(r) for r in rows]
+
+    def set_repo_root(self, task_id: str, repo_root: str | Path | None) -> None:
+        """Set (or clear, with None) the repository a task belongs to. KeyError if unknown."""
+        root = normalize_repo_root(repo_root)
+        with self.transaction() as conn:
+            self._require_task(conn, task_id)
+            conn.execute("UPDATE tasks SET repo_root=?, updated_at=? WHERE task_id=?",
+                         (root, self.now(), task_id))
+            self._event(conn, "repo_root", task_id, {"repo_root": root})
 
     def set_state(self, task_id: str, state: TaskState | str, note: str = "") -> None:
         """Move a task to ``state`` following :data:`ALLOWED_TRANSITIONS`.
@@ -451,7 +518,9 @@ class FoundryQueue:
 
     # ---------------------------------------------------------------- sizing
 
-    def apply_sizing(self, directive: TaskSizingDirective) -> list[Ticket]:
+    def apply_sizing(
+        self, directive: TaskSizingDirective, repo_root: str | Path | None = None
+    ) -> list[Ticket]:
         """Store the Foreman's allocation and create one ticket per subtask.
 
         Ticket ``i`` (0-based) gets slot ``i % allocated + 1``, so with the
@@ -459,7 +528,9 @@ class FoundryQueue:
         The task moves backlog -> sizing -> building. An unknown task id is
         registered on the fly (title = task id). Applying sizing to a task
         that already has tickets raises ValueError; use :meth:`resize`.
+        A given ``repo_root`` is stored on the task (None keeps the existing one).
         """
+        root = normalize_repo_root(repo_root)
         n = int(directive.allocated_builders)
         if not 1 <= n <= 5:
             raise ValueError(f"allocated_builders must be 1..5, got {n}")
@@ -469,19 +540,23 @@ class FoundryQueue:
             if row is None:
                 conn.execute(
                     "INSERT INTO tasks (task_id, title, description, team_id, state,"
-                    " created_at, updated_at, state_changed_at) VALUES (?,?,?,?,?,?,?,?)",
+                    " created_at, updated_at, state_changed_at, repo_root)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
                     (directive.task_id, directive.task_id, "", directive.team_id,
-                     TaskState.BACKLOG.value, now, now, now),
+                     TaskState.BACKLOG.value, now, now, now, root),
                 )
                 self._event(conn, "task_added", directive.task_id,
                             {"title": directive.task_id, "team_id": directive.team_id,
-                             "state": TaskState.BACKLOG.value})
+                             "state": TaskState.BACKLOG.value, "repo_root": root})
                 current = TaskState.BACKLOG
             else:
                 current = TaskState(row["state"])
             if conn.execute("SELECT 1 FROM tickets WHERE task_id=? LIMIT 1",
                             (directive.task_id,)).fetchone():
                 raise ValueError(f"task {directive.task_id!r} is already sized; use resize()")
+            if root is not None:
+                conn.execute("UPDATE tasks SET repo_root=? WHERE task_id=?",
+                             (root, directive.task_id))
             if current not in (TaskState.BACKLOG, TaskState.SIZING):
                 raise ValueError(
                     f"cannot size task {directive.task_id!r} in state {current.value}")
@@ -571,24 +646,33 @@ class FoundryQueue:
         """Deterministic ticket id for a task's subtask."""
         return f"{task_id}:{subtask_id}"
 
-    def claim_ticket(self, team_id: str, builder_slot: int) -> Ticket | None:
+    def claim_ticket(
+        self, team_id: str, builder_slot: int, repo_root: str | Path | None = None
+    ) -> Ticket | None:
         """Atomically claim the oldest open ticket for ``team_id`` on ``builder_slot``.
 
         Only tickets whose slot equals ``builder_slot`` *and* is within the
         task's current allocation are eligible, and only for tasks that are
-        not terminal. Returns None when there is nothing for this slot; the
-        caller must then not call Claude.
+        not terminal. With ``repo_root`` given, only tasks of that repository
+        are eligible (tasks with no repo_root are then never handed out);
+        with None every repo's tasks are (simulate/tests). Returns None when
+        there is nothing for this slot; the caller must then not call Claude.
         """
+        root = normalize_repo_root(repo_root)
+        sql = (
+            "SELECT t.ticket_id, t.task_id FROM tickets t JOIN tasks k ON k.task_id=t.task_id"
+            " WHERE t.team_id=? AND t.slot=? AND t.status='open'"
+            " AND t.slot <= k.allocated_builders"
+            " AND k.state NOT IN ('complete','quarantined','failed')"
+        )
+        args: list[Any] = [team_id, int(builder_slot)]
+        if root is not None:
+            sql += f" AND k.repo_root = ?{_REPO_COLLATE}"
+            args.append(root)
+        sql += " ORDER BY k.created_at, k.rowid, t.rowid LIMIT 1"
         now = self.now()
         with self.transaction() as conn:
-            row = conn.execute(
-                "SELECT t.ticket_id, t.task_id FROM tickets t JOIN tasks k ON k.task_id=t.task_id"
-                " WHERE t.team_id=? AND t.slot=? AND t.status='open'"
-                " AND t.slot <= k.allocated_builders"
-                " AND k.state NOT IN ('complete','quarantined','failed')"
-                " ORDER BY k.created_at, k.rowid, t.rowid LIMIT 1",
-                (team_id, int(builder_slot)),
-            ).fetchone()
+            row = conn.execute(sql, args).fetchone()
             if row is None:
                 return None
             agent = f"{team_id}-{int(builder_slot)}"
@@ -607,16 +691,18 @@ class FoundryQueue:
         slot: int,
         poll: float = 0.05,
         stop: asyncio.Event | None = None,
+        repo_root: str | Path | None = None,
     ) -> Ticket | None:
         """Poll until a ticket for ``(team_id, slot)`` can be claimed.
 
         Never calls Claude or anything else external: it only queries SQLite
-        and sleeps. Returns None as soon as ``stop`` is set.
+        and sleeps. Returns None as soon as ``stop`` is set. ``repo_root`` is
+        passed to :meth:`claim_ticket`.
         """
         while True:
             if stop is not None and stop.is_set():
                 return None
-            ticket = self.claim_ticket(team_id, slot)
+            ticket = self.claim_ticket(team_id, slot, repo_root=repo_root)
             if ticket is not None:
                 return ticket
             if stop is None:
@@ -1237,4 +1323,5 @@ class FoundryQueue:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "state_changed_at": row["state_changed_at"],
+            "repo_root": row["repo_root"],
         }

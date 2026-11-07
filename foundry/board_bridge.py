@@ -239,7 +239,19 @@ class BoardBridge:
         return []
 
     def _expand(self, op: BoardOp) -> list[BoardOp]:
-        """A fan-out reviewTask becomes one verdict per team on the board task."""
+        """Resolve board-team dependent ops at send time.
+
+        * a fan-out reviewTask becomes one verdict per team on the board task;
+        * a reportProgress for a Foundry team that is *not* on that board task
+          (it was busy elsewhere, G3) keeps only the message: no agentId,
+          teamId or status, so it never touches another task's team.
+        """
+        if op.type == "reportProgress" and op.team_id:
+            teams = self.board_teams.get(op.foundry_task or "")
+            if teams is not None and op.team_id not in teams:
+                args = {k: v for k, v in op.args.items() if k not in ("agentId", "teamId", "status")}
+                return [BoardOp(op.type, args, foundry_task=op.foundry_task, task_key=op.task_key)]
+            return [op]
         if not op.fanout:
             return [op]
         teams = self.board_teams.get(op.foundry_task or "") or [op.args.get("teamId")]
@@ -269,7 +281,8 @@ class BoardBridge:
             args["progress"] = max(0, min(100, int(pct)))
         if status:
             args["status"] = status
-        self._emit(BoardOp("reportProgress", args, foundry_task=task_id, task_key="taskId"))
+        team = team_id or (agent_id.rsplit("-", 1)[0] if agent_id and "-" in agent_id else None)
+        self._emit(BoardOp("reportProgress", args, foundry_task=task_id, task_key="taskId", team_id=team))
 
     def escalation(self, alert: Any) -> None:
         """Post a Foreman escalation as ``[Foreman] <severity> <category>: <diagnosis>``."""

@@ -78,6 +78,9 @@ class WorkOrder(BaseModel):
     team_id: str | None = Field(default=None, description="Optional team; least-loaded team when absent.")
     files: list[str] = Field(default_factory=list, description="Repo-relative files the work may touch.")
     acceptance_criteria: list[str] = Field(default_factory=list)
+    repo_root: str | None = Field(
+        default=None, description="Repository the task belongs to (resolved); the manager's repo when absent."
+    )
 
 
 @dataclass
@@ -186,6 +189,8 @@ class FloorManager:
         self.patches_dir = Path(patches_dir) if patches_dir else None
         self.repo_root = Path(repo_root) if repo_root else None
         self.patch_paths: dict[str, Path] = {}
+        #: task id -> file stem this manager uses in patches_dir (``F-001`` or ``F-001-2``).
+        self.patch_names: dict[str, str] = {}
         self._load()
 
     # ------------------------------------------------------------ persistence
@@ -223,6 +228,7 @@ class FloorManager:
             "pr_summaries": dict(self.pr_summaries),
             "applied_alerts": {k: v.__dict__ for k, v in self.applied_alerts.items()},
             "diffs": {t: v for t, v in self.diffs.items() if t not in self._completed},
+            "patch_names": dict(self.patch_names),
         }
         try:
             fn(_KV_KEY, state)
@@ -241,6 +247,7 @@ class FloorManager:
             self._reported_quarantine = set(state.get("reported_quarantine") or [])
             self.pr_summaries = {t: dict(v) for t, v in (state.get("pr_summaries") or {}).items()}
             self.applied_alerts = {k: ActionOutcome(**v) for k, v in (state.get("applied_alerts") or {}).items()}
+            self.patch_names = {str(k): str(v) for k, v in (state.get("patch_names") or {}).items()}
             self.diffs = {}
             for t, v in (state.get("diffs") or {}).items():
                 # older saves stored a list; key it by position so nothing is lost
@@ -289,9 +296,12 @@ class FloorManager:
         """
         order = work_order if isinstance(work_order, WorkOrder) else WorkOrder.model_validate(dict(work_order))
         task_id = order.task_id or self._next_task_id()
-        order = order.model_copy(update={"task_id": task_id, "team_id": self._pick_team(order)})
+        repo = order.repo_root or (str(self.repo_root.resolve()) if self.repo_root else None)
+        if repo:
+            repo = str(Path(repo).resolve())
+        order = order.model_copy(update={"task_id": task_id, "team_id": self._pick_team(order), "repo_root": repo})
         self.orders[task_id] = order
-        self.queue.add_task(task_id, order.title, order.description, order.team_id)
+        self._add_task(order)
         directive = await self._size(order)
         self.directives[task_id] = directive
         self.allocations[task_id] = directive.allocated_builders
@@ -316,6 +326,22 @@ class FloorManager:
         )
         self.save()
         return task_id
+
+    def _add_task(self, order: WorkOrder) -> None:
+        """``queue.add_task`` with the task's repo (G1), on queues that store it."""
+        args = (order.task_id, order.title, order.description, order.team_id)
+        if order.repo_root and "repo_root" in _params(self.queue.add_task):
+            self.queue.add_task(*args, repo_root=order.repo_root)
+        else:
+            self.queue.add_task(*args)
+
+    def task_repo(self, task_id: str) -> str | None:
+        """The repository a task belongs to (queue column first, then the saved order)."""
+        task = self.queue.get_task(task_id) or {}
+        repo = task.get("repo_root")
+        if not repo and task_id in self.orders:
+            repo = self.orders[task_id].repo_root
+        return str(repo) if repo else None
 
     async def _size(self, order: WorkOrder) -> TaskSizingDirective:
         task = {
@@ -644,33 +670,71 @@ class FloorManager:
         return summary
 
     async def _write_patch(self, task_id: str, diff: str, summary: Mapping[str, str]) -> None:
-        """Write ``<task_id>.patch`` (apply with ``git apply``) and ``<task_id>.md`` into patches_dir.
+        """Write ``<name>.patch`` (apply with ``git apply``) and ``<name>.md`` into patches_dir.
 
         Foundry never edits the target repository itself; these files are the
         output. When git is installed the combined patch is first checked with
-        ``git apply --check`` against a scratch copy of the repo; a patch that
-        does not apply is written as ``<task_id>.patch.rejected`` (with git's
-        complaint in the log) instead.
+        ``git apply --check`` against a scratch copy of the task's repo; a patch
+        that does not apply is written as ``<name>.patch.rejected`` instead.
+
+        The output is never misleading (G2):
+
+        * ``<name>`` is the task id, unless files of that name already exist
+          with different content (another database, a reset): then the next
+          free ``<task>-2``, ``<task>-3`` ... is used. Files this manager wrote
+          earlier for the same task are reused and updated;
+        * writing one variant removes the other (a stale ``.patch.rejected``
+          next to a good ``.patch``, or the reverse).
         """
         if self.patches_dir is None:
             return
         text = _with_newline(diff) if diff else ""
-        problem = await asyncio.to_thread(_git_check, text, self.repo_root) if text else None
+        repo = self.task_repo(task_id)
+        problem = await asyncio.to_thread(_git_check, text, Path(repo) if repo else self.repo_root) if text else None
+        md = f"{summary.get('commit_message', '').strip()}\n\n{summary.get('pr_body', '').strip()}\n"
         try:
             self.patches_dir.mkdir(parents=True, exist_ok=True)
-            md = f"{summary.get('commit_message', '').strip()}\n\n{summary.get('pr_body', '').strip()}\n"
-            (self.patches_dir / f"{task_id}.md").write_text(md, encoding="utf-8")
+            name = self._patch_name(task_id, text, md, rejected=bool(problem))
+            good = self.patches_dir / f"{name}.patch"
+            bad = self.patches_dir / f"{name}.patch.rejected"
+            (self.patches_dir / f"{name}.md").write_text(md, encoding="utf-8")
+            target, stale = (bad, good) if problem else (good, bad)
+            target.write_text(text, encoding="utf-8", newline="\n")
+            stale.unlink(missing_ok=True)
+            self.patch_names[task_id] = name
             if problem:
-                path = self.patches_dir / f"{task_id}.patch.rejected"
-                path.write_text(text, encoding="utf-8", newline="\n")
-                self.rejected_patches[task_id] = path
-                log.warning("floor manager: combined patch for %s does not apply (%s); wrote %s", task_id, problem[:160], path.name)
-                return
-            path = self.patches_dir / f"{task_id}.patch"
-            path.write_text(text, encoding="utf-8", newline="\n")
-            self.patch_paths[task_id] = path
+                self.rejected_patches[task_id] = target
+                self.patch_paths.pop(task_id, None)
+                log.warning("floor manager: combined patch for %s does not apply (%s); wrote %s", task_id, problem[:160], target.name)
+            else:
+                self.patch_paths[task_id] = target
+                self.rejected_patches.pop(task_id, None)
         except OSError as exc:
             log.warning("floor manager: could not write the patch for %s: %s", task_id, exc)
+
+    def _patch_name(self, task_id: str, text: str, md: str, *, rejected: bool) -> str:
+        """The file stem for a task's patch: its own earlier name, else the first name that is free or identical."""
+        own = self.patch_names.get(task_id)
+        if own:
+            return own
+        n = 1
+        while True:
+            name = task_id if n == 1 else f"{task_id}-{n}"
+            files = {
+                "patch": self.patches_dir / f"{name}.patch",  # type: ignore[operator]
+                "rejected": self.patches_dir / f"{name}.patch.rejected",  # type: ignore[operator]
+                "md": self.patches_dir / f"{name}.md",  # type: ignore[operator]
+            }
+            mine = files["rejected" if rejected else "patch"]
+            other = files["patch" if rejected else "rejected"]
+            same = (
+                not other.exists()
+                and (not mine.exists() or mine.read_text(encoding="utf-8") == text)
+                and (not files["md"].exists() or files["md"].read_text(encoding="utf-8") == md)
+            )
+            if same:
+                return name
+            n += 1
 
     def _task_diff(self, task_id: str) -> str:
         fn = getattr(self.queue, "task_diff", None) or getattr(self.queue, "approved_diffs", None)
@@ -681,6 +745,13 @@ class FloorManager:
             if isinstance(got, (list, tuple)):
                 return "\n".join(str(x) for x in got)
         return ""
+
+
+def _params(fn: Any) -> set[str]:
+    try:
+        return set(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        return set()
 
 
 def _with_newline(text: str) -> str:
@@ -697,7 +768,8 @@ def _copy_workspace(src: Path, dst: Path) -> None:
     """Copy ``src`` to ``dst`` without VCS data, environments and caches (InfrastructureError on failure)."""
     try:
         if src.is_dir():
-            shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*SCRATCH_IGNORE))
+            # symlinks are copied as links: never follow them out of the repo (or loop on them)
+            shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(*SCRATCH_IGNORE))
         else:
             dst.mkdir(parents=True)
     except (OSError, shutil.Error) as exc:
@@ -858,6 +930,7 @@ def build_factory(
     poll: float = 0.01,
     trust_cache: bool | None = None,
     patches_dir: str | Path | None = None,
+    dispatch_repo: str | Path | None = None,
 ) -> Factory:
     """Build queue, telemetry, limiter, context engine, Foreman, cache, gates, pools and manager.
 
@@ -873,7 +946,11 @@ def build_factory(
         queue_clock / telemetry_clock: fake clocks for tests (datetime / epoch).
         trust_cache: overrides ``config.trust_cache`` (default False: a cache
             hit still goes through the gates and the reviewer).
-        patches_dir: overrides ``config.patches_dir`` for the approved patches.
+        patches_dir: overrides ``config.patches_dir`` for the approved patches
+            (default: ``config.resolved_patches_dir()``, i.e. ``patches/`` next
+            to the database unless FOUNDRY_PATCHES_DIR says otherwise).
+        dispatch_repo: when given, the pools only claim tickets of tasks that
+            belong to this repository (real mode); None dispatches everything.
 
     The target repository is never modified: gates patch scratch copies only,
     Claude runs with ``cwd=repo_root`` (it reads, it does not write: diff-only
@@ -907,7 +984,9 @@ def build_factory(
     if trust_cache is None:
         trust_cache = bool(getattr(config, "trust_cache", False))
     if patches_dir is None:
-        patches_dir = getattr(config, "patches_dir", None) or Path(config.db_path).parent / "patches"
+        resolve = getattr(config, "resolved_patches_dir", None)
+        patches_dir = resolve() if callable(resolve) else None
+        patches_dir = patches_dir or getattr(config, "patches_dir", None) or Path(config.db_path).parent / "patches"
     manager = FloorManager(
         queue,
         foreman,
@@ -920,6 +999,11 @@ def build_factory(
         patches_dir=patches_dir,
         repo_root=repo_root,
     )
+    pool_extra: dict[str, Any] = {}
+    if dispatch_repo is not None:
+        if "repo_root" not in _params(TeamPool):
+            raise TypeError("this TeamPool cannot scope dispatch to one repository (no repo_root)")
+        pool_extra["repo_root"] = str(Path(dispatch_repo).resolve())
     pools = {
         team: TeamPool(
             team,
@@ -940,6 +1024,7 @@ def build_factory(
             config=config,
             limit_cooldown_s=getattr(config, "limit_cooldown_s", None),
             infra_failure_cap=int(getattr(config, "infra_failure_cap", 3)),
+            **pool_extra,
         )
         for team in config.teams
     }

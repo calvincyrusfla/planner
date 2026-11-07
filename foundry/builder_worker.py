@@ -60,6 +60,7 @@ from foundry.schemas import (
     ReviewerVerdict,
     TaskAssignment,
     TaskState,
+    utc_now_iso,
 )
 
 __all__ = [
@@ -796,6 +797,7 @@ class _WorkerBase:
         self.infra_errors.append(f"{type(exc).__name__}: {excerpt}")
         log.warning("%s infrastructure error %s: %s", self.agent_id, type(exc).__name__, excerpt)
         if self._is_account_wide(exc):
+            self._remember_account_error(exc, excerpt)
             retry_after = getattr(exc, "retry_after", None)
             seconds = float(retry_after) if retry_after else self.limit_cooldown_s
             pause = getattr(self.limiter, "pause_until", None)
@@ -804,6 +806,16 @@ class _WorkerBase:
                 return 0.0
             return seconds
         return min(self.limit_cooldown_s, self.infra_backoff_s * 2 ** (self.infra_failures - 1))
+
+    def _remember_account_error(self, exc: BaseException, excerpt: str) -> None:
+        """G5: persist the last account-wide error (type + <= 160-char message, never the prompt)."""
+        fn = getattr(self.queue, "kv_set", None)
+        if fn is None:
+            return
+        try:
+            fn("last_account_error", {"type": type(exc).__name__, "message": excerpt[:160], "at": utc_now_iso()})
+        except Exception:  # pragma: no cover - defensive
+            log.exception("kv_set(last_account_error) failed")
 
     def _count_infra(self, ticket: Any, exc: BaseException) -> bool:
         """Count a non-account-wide failure on ``ticket``; quarantine at the cap.
@@ -977,6 +989,7 @@ class BuilderWorker(_WorkerBase):
         on_state: Callable[[BuilderWorker], None] | None = None,
         on_task_complete: Callable[[str], Any] | None = None,
         workspace: str | Path | None = None,
+        repo_root: str | Path | None = None,
         claude_timeout: float = 600,
         cwd: str | None = None,
         backoff_attempts: int = 5,
@@ -999,6 +1012,8 @@ class BuilderWorker(_WorkerBase):
             infra_failure_cap=infra_failure_cap,
         )
         self.workspace: Path | None = Path(workspace) if workspace is not None else None
+        #: Only tickets of tasks for this repo are claimed (G1); None = any repo.
+        self.repo_root: str | None = str(repo_root) if repo_root is not None else None  # queue normalizes
         if self.workspace is None and (hasattr(gates, "validate_async") or hasattr(gates, "validate")):
             raise ValueError("ValidationGates applies diffs into a workspace: pass workspace=")
         if slot < 1:
@@ -1046,7 +1061,7 @@ class BuilderWorker(_WorkerBase):
             if self.promoted:
                 await self._wait(self.poll, stop)
                 continue
-            ticket = await self.queue.wait_for_ticket(self.team_id, self.slot, poll=self.poll, stop=stop)
+            ticket = await self._next_ticket(stop)
             if ticket is None:
                 if stop.is_set():
                     break
@@ -1069,6 +1084,23 @@ class BuilderWorker(_WorkerBase):
             if self._backoff_s > 0:
                 wait, self._backoff_s = self._backoff_s, 0.0
                 await self._wait(wait, stop)
+
+    async def _next_ticket(self, stop: asyncio.Event) -> Any:
+        """Wait for this slot's next ticket (no Claude call), scoped to ``repo_root`` when set (G1)."""
+        if self.repo_root is None:
+            return await self.queue.wait_for_ticket(self.team_id, self.slot, poll=self.poll, stop=stop)
+        waiter = self.queue.wait_for_ticket
+        if _accepts_kw(waiter, "repo_root"):
+            return await waiter(self.team_id, self.slot, poll=self.poll, stop=stop, repo_root=self.repo_root)
+        claim = self.queue.claim_ticket
+        if not _accepts_kw(claim, "repo_root"):
+            raise TypeError("this queue cannot scope tickets to a repo (claim_ticket has no repo_root)")
+        while not stop.is_set():
+            ticket = claim(self.team_id, self.slot, repo_root=self.repo_root)
+            if ticket is not None:
+                return ticket
+            await self._wait(self.poll, stop)
+        return None
 
     # -- assignment -------------------------------------------------------------
     def _subtask_info(self, ticket: Any) -> dict[str, Any]:
@@ -1669,6 +1701,7 @@ class TeamPool:
         claude_timeout: float = 600,
         cwd: str | None = None,
         config: Any = None,
+        repo_root: str | Path | None = None,
         limit_cooldown_s: float | None = None,
         infra_backoff_s: float = 5.0,
         infra_failure_cap: int | None = None,
@@ -1683,6 +1716,7 @@ class TeamPool:
         if limit_cooldown_s is None:
             limit_cooldown_s = float(getattr(config, "limit_cooldown_s", 1200.0))
         self.trust_cache = trust_cache
+        self.repo_root = repo_root
         self._poll = poll
         self._limit_cooldown_s = limit_cooldown_s
         self._infra_backoff_s = infra_backoff_s
@@ -1716,6 +1750,7 @@ class TeamPool:
                 on_state=self._on_builder_state,
                 on_task_complete=self._task_completed,
                 workspace=workspace,
+                repo_root=repo_root,
                 claude_timeout=claude_timeout,
                 cwd=cwd,
                 limit_cooldown_s=limit_cooldown_s,

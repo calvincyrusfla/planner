@@ -1052,3 +1052,58 @@ def test_usage_limit_is_not_counted_toward_infra_cap(tmp_path: Path) -> None:
     assert rig.state("T-UL") == TaskState.BUILDING  # never quarantined
     t = rig.queue.tickets_for_task("T-UL")[0]
     assert t.attempt == 0 and getattr(t, "infra_failures", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# round 3: repo-scoped dispatch (G1), last account-wide error (G5)
+# ---------------------------------------------------------------------------
+
+
+def test_pool_only_claims_tickets_of_its_repo(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF))
+    repo_a, repo_b = tmp_path / "repo-a", tmp_path / "repo-b"
+    rig.submit("T-RA", "S")
+    rig.submit("T-RB", "S")
+    rig.queue.set_repo_root("T-RA", repo_a)
+    rig.queue.set_repo_root("T-RB", repo_b)
+
+    async def scenario() -> None:
+        pool = rig.pool(repo_root=repo_a)
+        assert pool.builder(1).repo_root == str(repo_a)
+        async with pool:
+            await pool.wait_for_tasks(["T-RA"], timeout=10)
+            await asyncio.sleep(0.1)
+
+    asyncio.run(scenario())
+    assert rig.state("T-RA") == TaskState.COMPLETE
+    assert rig.state("T-RB") == TaskState.BUILDING  # other repo's task untouched
+    assert rig.queue.tickets_for_task("T-RB")[0].status == "open"
+    assert rig.client.calls[f"{TEAM}-1"] == 1
+
+
+def test_auth_error_is_remembered_for_the_end_of_run_message(tmp_path: Path) -> None:
+    from foundry import claude_client
+
+    exc_type = getattr(claude_client, "ClaudeAuthError", claude_client.ClaudeNotFound)
+    rig = Rig(tmp_path, lambda p, agent: fenced(GOOD_DIFF))
+    rig.client.inject_exception(exc_type("Invalid API key · Please run /login " + "x" * 300), times=10)
+    rig.submit("T-AE", "S")
+    asyncio.run(_run_for(rig, 0.2, limit_cooldown_s=900))
+    saved = rig.queue.kv_get("last_account_error")
+    assert saved["type"] == exc_type.__name__
+    assert "/login" in saved["message"] and len(saved["message"]) <= 160
+    assert "## Objective" not in saved["message"]
+    assert saved["at"].endswith("Z")
+
+
+def test_usage_limit_is_remembered_and_timeouts_are_not(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, _loop_script("builder_timeout"))
+    rig.submit("T-TO", "S")
+    _run_to_end(rig, "T-TO")
+    assert rig.queue.kv_get("last_account_error") is None  # timeouts are not account-wide
+
+    rig2 = Rig(tmp_path / "second", lambda p, agent: fenced(GOOD_DIFF))
+    rig2.client.inject_rate_limit(times=10, retry_after=3600.0)
+    rig2.submit("T-UL2", "S")
+    asyncio.run(_run_for(rig2, 0.2))
+    assert rig2.queue.kv_get("last_account_error")["type"] == "ClaudeRateLimited"
