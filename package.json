@@ -4,5 +4,10 @@
   "type": "module",
   "dependencies": {
     "@netlify/blobs": "^11.1.7"
+  },
+  "scripts": {
+    "dashboard": "node department/server.mjs --open",
+    "dept": "node department/dept.mjs",
+    "test:dept": "node --test department/test/*.test.mjs"
   }
 }

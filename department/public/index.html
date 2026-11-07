@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Department</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%231c7ed6'/><circle cx='10' cy='16' r='4' fill='white'/><circle cx='22' cy='10' r='4' fill='white'/><circle cx='22' cy='22' r='4' fill='white'/></svg>">
+<style>
+  :root {
+    --bg: #f5f6f8; --surface: #ffffff; --surface-2: #f0f2f5; --border: #dfe3e8;
+    --text: #1b1f24; --muted: #5f6b7a; --faint: #8a95a3;
+    --accent: #1c7ed6; --accent-text: #ffffff;
+    --ok: #2f9e44; --warn: #e67700; --bad: #e03131; --idle: #adb5bd;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --surface: #171b21; --surface-2: #1f242c; --border: #2b323c;
+      --text: #e7ebf0; --muted: #9aa5b3; --faint: #6c7785;
+      --accent: #4dabf7; --accent-text: #0b1520;
+      --ok: #51cf66; --warn: #fcc419; --bad: #ff6b6b; --idle: #5c6670;
+      --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216; --surface: #171b21; --surface-2: #1f242c; --border: #2b323c;
+    --text: #e7ebf0; --muted: #9aa5b3; --faint: #6c7785;
+    --accent: #4dabf7; --accent-text: #0b1520;
+    --ok: #51cf66; --warn: #fcc419; --bad: #ff6b6b; --idle: #5c6670;
+    --shadow: none;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 18px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 28px 0 10px; font-weight: 600; }
+  .live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .live i { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  .live.on i { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+  .spacer { flex: 1; }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; min-width: 92px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 11px; color: var(--muted); }
+  .switch { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; cursor: pointer; user-select: none; }
+  .switch input { accent-color: var(--accent); width: 16px; height: 16px; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+  button, select, input, textarea { font: inherit; color: inherit; }
+  button {
+    border: 1px solid var(--border); background: var(--surface-2); border-radius: 7px;
+    padding: 6px 11px; cursor: pointer; white-space: nowrap;
+  }
+  button:hover { border-color: var(--faint); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button.danger { color: var(--bad); }
+  button.small { padding: 3px 8px; font-size: 12px; }
+  button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  select, input[type=text], textarea {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 9px; min-width: 0;
+  }
+
+  /* new task */
+  .new-task { padding: 14px; display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: start; }
+  .new-task .fields { display: grid; gap: 8px; }
+  .new-task textarea { resize: vertical; min-height: 38px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .seg label { padding: 6px 12px; cursor: pointer; background: var(--surface-2); color: var(--muted); }
+  .seg input { display: none; }
+  .seg input:checked + span { color: var(--text); font-weight: 600; }
+  .seg label:has(input:checked) { background: var(--surface); box-shadow: inset 0 -2px 0 var(--accent); }
+  .hint { grid-column: 1 / -1; color: var(--faint); font-size: 12px; margin: -2px 0 0; }
+  @media (max-width: 720px) { .new-task { grid-template-columns: 1fr; } }
+
+  /* teams */
+  .teams { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .team { overflow: hidden; display: flex; flex-direction: column; }
+  .team-head { padding: 12px 14px 10px; border-top: 4px solid var(--team); }
+  .team-name { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: 15px; }
+  .pill { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 99px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
+  .pill.active { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+  .pill.queued { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+  .pill.paused { color: var(--muted); }
+  .pill.done { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .pill.cancelled { color: var(--faint); text-decoration: line-through; }
+  .pill.large { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+  .team-task { margin-top: 6px; color: var(--muted); min-height: 20px; }
+  .team-task strong { color: var(--text); font-weight: 600; }
+  .focus { font-size: 12px; color: var(--faint); }
+  .progress { height: 8px; border-radius: 99px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--border); }
+  .progress > i { display: block; height: 100%; background: var(--team, var(--accent)); transition: width .4s ease; }
+  .prow { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .prow .progress { flex: 1; }
+  .prow b { font-size: 12px; font-variant-numeric: tabular-nums; width: 36px; text-align: right; }
+  .agents { list-style: none; margin: 0; padding: 4px 0; border-top: 1px solid var(--border); flex: 1; }
+  .agents li { display: grid; grid-template-columns: 10px 92px 1fr; gap: 8px; align-items: center; padding: 5px 14px; font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  .dot.assigned { background: var(--accent); }
+  .dot.working { background: var(--ok); animation: pulse 1.6s infinite; }
+  .dot.blocked { background: var(--bad); }
+  .dot.done { background: var(--team); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .dot.working { animation: none; } .progress > i { transition: none; } }
+  .agent-name { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .agent-work { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agent-work.empty { color: var(--faint); }
+  .team-actions { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface-2); flex-wrap: wrap; }
+  .team-actions select { flex: 1; min-width: 140px; }
+
+  /* tasks */
+  .task-groups { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; align-items: start; }
+  @media (max-width: 960px) { .task-groups { grid-template-columns: 1fr; } }
+  .tasks { display: grid; gap: 10px; }
+  .task { padding: 12px 14px; }
+  .task-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .task-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--faint); }
+  .task-title { font-weight: 600; flex: 1; min-width: 160px; }
+  .task-desc { color: var(--muted); margin: 4px 0 0; white-space: pre-wrap; font-size: 13px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 9px; border-radius: 99px; font-size: 12px; font-weight: 600;
+    background: color-mix(in srgb, var(--team) 14%, transparent); color: var(--text); border: 1px solid color-mix(in srgb, var(--team) 45%, transparent); }
+  .chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--team); }
+  .chip button { border: 0; background: transparent; padding: 0 5px; line-height: 1; font-size: 15px; color: var(--muted); border-radius: 50%; }
+  .chip button:hover { color: var(--bad); }
+  .chip small { font-weight: 500; color: var(--muted); }
+  .none { color: var(--faint); font-size: 12px; }
+  .task-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .task-actions select { font-size: 12px; padding: 3px 6px; }
+  .empty-state { padding: 22px; text-align: center; color: var(--faint); border: 1px dashed var(--border); border-radius: var(--radius); }
+  details.finished summary { cursor: pointer; color: var(--muted); font-size: 13px; margin: 14px 0 8px; }
+  .task.finished { opacity: .75; }
+
+  /* log */
+  .log { padding: 4px 0; max-height: 620px; overflow: auto; }
+  .log-item { padding: 7px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .log-item:last-child { border-bottom: 0; }
+  .log-item time { display: block; font-size: 11px; color: var(--faint); }
+  .log-item .who { font-weight: 600; }
+
+  .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text); color: var(--bg);
+    padding: 9px 14px; border-radius: 8px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100% - 32px); }
+  .toast.show { opacity: 1; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Agent Department</h1>
+    <span class="live" id="live"><i></i><span>Connecting…</span></span>
+    <div class="spacer"></div>
+    <div class="stats" id="stats"></div>
+    <label class="switch" title="Free teams automatically pick up waiting tasks">
+      <input type="checkbox" id="auto"> Auto-dispatch
+    </label>
+  </header>
+
+  <form class="card new-task" id="new-task">
+    <div class="fields">
+      <label class="visually-hidden" for="t-title">Task title</label>
+      <input type="text" id="t-title" placeholder="New task, e.g. Build the export feature" required autocomplete="off">
+      <label class="visually-hidden" for="t-desc">Details</label>
+      <textarea id="t-desc" rows="1" placeholder="Details (optional)"></textarea>
+    </div>
+    <div class="seg" role="radiogroup" aria-label="Task size">
+      <label><input type="radio" name="size" value="small" checked><span>Small</span></label>
+      <label><input type="radio" name="size" value="large"><span>Large</span></label>
+    </div>
+    <button class="primary" type="submit">Assign task</button>
+    <p class="hint">Each task gets one team. A large task gets all three teams when nothing else is running. Tasks wait in the queue when every team is busy.</p>
+  </form>
+
+  <h2>Teams</h2>
+  <div class="teams" id="teams"></div>
+
+  <div class="task-groups">
+    <section>
+      <h2>Tasks</h2>
+      <div class="tasks" id="tasks"></div>
+      <details class="finished" id="finished-wrap"><summary id="finished-sum">Finished</summary><div class="tasks" id="finished"></div></details>
+    </section>
+    <section>
+      <h2>Activity</h2>
+      <div class="card log" id="log"></div>
+    </section>
+  </div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const OPEN = ['active', 'queued', 'paused'];
+let state = null;
+
+async function api(method, path, body) {
+  try {
+    const res = await fetch(path, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error);
+    return json.result;
+  } catch (err) {
+    toast(err.message);
+    throw err;
+  }
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
+}
+
+const ago = (iso) => {
+  if (!iso) return '';
+  const s = Math.round((Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return new Date(iso).toLocaleDateString();
+};
+
+function teamOptions(task) {
+  return state.teams
+    .filter((t) => t.taskId !== task.id)
+    .map((t) => `<option value="${t.id}">${esc(t.name)}${t.taskId ? ` (on ${t.taskId})` : ' (free)'}</option>`)
+    .join('');
+}
+
+function renderStats() {
+  const active = state.tasks.filter((t) => t.status === 'active').length;
+  const waiting = state.tasks.filter((t) => t.status === 'queued' || t.status === 'paused').length;
+  const busy = state.teams.filter((t) => t.taskId).length;
+  const agents = state.teams.flatMap((t) => t.agents);
+  const working = agents.filter((a) => a.status === 'working').length;
+  const done = state.tasks.filter((t) => t.status === 'done').length;
+  $('#stats').innerHTML = [
+    [active, 'Active tasks'], [waiting, 'Waiting'], [`${busy}/${state.teams.length}`, 'Teams busy'],
+    [`${working}/${agents.length}`, 'Agents working'], [done, 'Done'],
+  ].map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join('');
+  $('#auto').checked = state.settings.autoDispatch;
+}
+
+function renderTeams() {
+  const open = state.tasks.filter((t) => OPEN.includes(t.status));
+  $('#teams').innerHTML = state.teams.map((team) => {
+    const task = state.tasks.find((t) => t.id === team.taskId);
+    const moveOpts = open.filter((t) => t.id !== team.taskId)
+      .map((t) => `<option value="${t.id}">${esc(t.id)} · ${esc(t.title)}</option>`).join('');
+    return `<article class="card team" style="--team:${team.color}">
+      <div class="team-head">
+        <div class="team-name">${esc(team.name)} <span class="pill ${task ? 'active' : ''}">${task ? 'On task' : 'Free'}</span></div>
+        <div class="team-task">${task ? `<strong>${esc(task.id)}</strong> ${esc(task.title)}` : 'Waiting for a task'}</div>
+        ${team.focus ? `<div class="focus">Focus: ${esc(team.focus)}</div>` : ''}
+        ${task ? `<div class="prow"><div class="progress" role="progressbar" aria-valuenow="${team.progress}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(team.name)} progress"><i style="width:${team.progress}%"></i></div><b>${team.progress}%</b></div>` : ''}
+      </div>
+      <ul class="agents">
+        ${team.agents.map((a) => `<li title="${esc(a.status)}${a.updatedAt ? ' · ' + ago(a.updatedAt) : ''}">
+          <span class="dot ${a.status}"></span><span class="agent-name">${esc(a.id)}</span>
+          <span class="agent-work ${a.work ? '' : 'empty'}">${esc(a.work || a.status)}</span></li>`).join('')}
+      </ul>
+      <div class="team-actions">
+        <select data-move="${team.id}" aria-label="Move ${esc(team.name)} to a task" ${moveOpts ? '' : 'disabled'}>
+          <option value="">${moveOpts ? (task ? 'Reassign to…' : 'Assign to…') : 'No other open tasks'}</option>${moveOpts}
+        </select>
+        ${task ? `<button class="danger" data-unassign="${task.id}" data-team="${team.id}">Remove from task</button>` : ''}
+      </div>
+    </article>`;
+  }).join('');
+}
+
+function taskCard(task) {
+  const teams = state.teams.filter((t) => t.taskId === task.id);
+  const finished = !OPEN.includes(task.status);
+  const opts = finished ? '' : teamOptions(task);
+  return `<article class="card task ${finished ? 'finished' : ''}">
+    <div class="task-top">
+      <span class="task-id">${esc(task.id)}</span>
+      <span class="task-title">${esc(task.title)}</span>
+      ${task.size === 'large' ? '<span class="pill large">Large</span>' : ''}
+      <span class="pill ${task.status}">${task.status === 'queued' ? 'Queued' : task.status[0].toUpperCase() + task.status.slice(1)}</span>
+    </div>
+    ${task.description ? `<p class="task-desc">${esc(task.description)}</p>` : ''}
+    <div class="prow"><div class="progress" role="progressbar" aria-valuenow="${task.progress}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(task.id)} progress"><i style="width:${task.progress}%"></i></div><b>${task.progress}%</b></div>
+    ${finished ? '' : `<div class="chips">
+      ${teams.length ? teams.map((t) => `<span class="chip" style="--team:${t.color}"><i></i>${esc(t.name)} <small>${t.progress}%</small>
+        <button title="Remove ${esc(t.name)} from ${esc(task.id)}" aria-label="Remove ${esc(t.name)} from ${esc(task.id)}" data-unassign="${task.id}" data-team="${t.id}">×</button></span>`).join('')
+        : `<span class="none">${task.status === 'paused' ? 'Paused, no team assigned' : 'Waiting for a free team'}</span>`}
+    </div>`}
+    <div class="task-actions">
+      ${opts ? `<select data-assign="${task.id}" aria-label="Add a team to ${esc(task.id)}"><option value="">+ Add team…</option>${opts}</select>` : ''}
+      ${task.status === 'paused' ? `<button class="small" data-status="queued" data-task="${task.id}">Queue</button>` : ''}
+      ${task.status === 'active' || task.status === 'queued' ? `<button class="small" data-status="paused" data-task="${task.id}">Pause</button>` : ''}
+      ${finished ? `<button class="small" data-status="queued" data-task="${task.id}">Reopen</button>`
+        : `<button class="small" data-status="done" data-task="${task.id}">Mark done</button>
+           <button class="small" data-status="cancelled" data-task="${task.id}">Cancel</button>`}
+      <button class="small danger" data-delete="${task.id}">Delete</button>
+      <span class="none" style="margin-left:auto">updated ${ago(task.updatedAt)}</span>
+    </div>
+  </article>`;
+}
+
+function renderTasks() {
+  const order = { active: 0, queued: 1, paused: 2 };
+  const open = state.tasks.filter((t) => OPEN.includes(t.status))
+    .sort((a, b) => order[a.status] - order[b.status] || a.createdAt.localeCompare(b.createdAt));
+  const finished = state.tasks.filter((t) => !OPEN.includes(t.status))
+    .sort((a, b) => (b.finishedAt || '').localeCompare(a.finishedAt || ''));
+  $('#tasks').innerHTML = open.length ? open.map(taskCard).join('')
+    : '<div class="empty-state">No open tasks. Add one above and a team picks it up.</div>';
+  $('#finished-wrap').hidden = !finished.length;
+  $('#finished-sum').textContent = `Finished (${finished.length})`;
+  $('#finished').innerHTML = finished.map(taskCard).join('');
+}
+
+function renderLog() {
+  const teamName = Object.fromEntries(state.teams.map((t) => [t.id, t]));
+  const items = state.log.slice(-80).reverse();
+  $('#log').innerHTML = items.length ? items.map((e) => {
+    const team = e.teamId && teamName[e.teamId];
+    const who = e.agentId || (e.kind === 'progress' && team ? team.name : '');
+    return `<div class="log-item"><time datetime="${e.at}" title="${new Date(e.at).toLocaleString()}">${ago(e.at)}${e.taskId ? ` · ${esc(e.taskId)}` : ''}</time>
+      ${who ? `<span class="who" style="color:${team ? team.color : 'inherit'}">${esc(who)}:</span> ` : ''}${esc(e.message)}</div>`;
+  }).join('') : '<div class="log-item none">Nothing yet.</div>';
+}
+
+let pending = false;
+function render() {
+  if (!state) return;
+  const active = document.activeElement;
+  // Don't yank an open dropdown out from under the user; render once they leave it.
+  if (active && active.tagName === 'SELECT' && active.closest('#teams, #tasks') && !active.value) {
+    pending = true;
+    return;
+  }
+  pending = false;
+  renderStats(); renderTeams(); renderTasks(); renderLog();
+}
+document.addEventListener('focusout', () => setTimeout(() => pending && render(), 0));
+
+// ---- events ----
+$('#new-task').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const title = $('#t-title').value.trim();
+  if (!title) return;
+  const size = document.querySelector('input[name=size]:checked').value;
+  const r = await api('POST', '/api/tasks', { title, description: $('#t-desc').value, size });
+  $('#t-title').value = ''; $('#t-desc').value = '';
+  toast(r.assigned.length ? `${r.task.id} assigned to ${r.assigned.map((id) => state.teams.find((t) => t.id === id)?.name || id).join(', ')}` : `${r.task.id} queued until a team is free`);
+});
+
+$('#auto').addEventListener('change', (e) => api('PATCH', '/api/settings', { autoDispatch: e.target.checked }));
+
+document.addEventListener('change', async (e) => {
+  const el = e.target;
+  if (el.dataset.move && el.value) {
+    const r = await api('POST', `/api/tasks/${el.value}/assign`, { teamId: el.dataset.move });
+    toast(`${r.team.name} → ${r.task.id}${r.previous ? ` (from ${r.previous})` : ''}`);
+  } else if (el.dataset.assign && el.value) {
+    const r = await api('POST', `/api/tasks/${el.dataset.assign}/assign`, { teamId: el.value });
+    toast(`${r.team.name} → ${r.task.id}${r.previous ? ` (from ${r.previous})` : ''}`);
+  }
+});
+
+document.addEventListener('click', async (e) => {
+  const el = e.target.closest('button');
+  if (!el) return;
+  if (el.dataset.unassign) {
+    const r = await api('POST', `/api/tasks/${el.dataset.unassign}/unassign`, { teamId: el.dataset.team });
+    toast(`${r.team.name} removed from ${r.task.id}`);
+  } else if (el.dataset.status) {
+    await api('PATCH', `/api/tasks/${el.dataset.task}`, { status: el.dataset.status });
+  } else if (el.dataset.delete) {
+    if (confirm(`Delete ${el.dataset.delete}? Its teams are freed.`)) await api('DELETE', `/api/tasks/${el.dataset.delete}`);
+  }
+});
+
+// ---- live updates ----
+function setLive(on) {
+  $('#live').classList.toggle('on', on);
+  $('#live span').textContent = on ? 'Live' : 'Reconnecting…';
+}
+function connect() {
+  const es = new EventSource('/api/events');
+  es.addEventListener('state', (e) => { state = JSON.parse(e.data); setLive(true); render(); });
+  es.onerror = () => setLive(false);
+}
+connect();
+setInterval(render, 30000); // refresh "x ago" labels
+</script>
+</body>
+</html>
