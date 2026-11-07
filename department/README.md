@@ -224,7 +224,7 @@ Each meter shows the percentage used, a bar and a live countdown to when that wi
 
 Claude Code can run a small program for its status bar, and it passes that program the current usage. The usage meter installs `department/usage/statusline.mjs` as that program. Each time Claude Code refreshes its status bar, the program shows the numbers there too, and sends them to the board in the background: about once a minute, or sooner when the numbers change, but never more often than every 15 seconds. It goes through the dashboard, the shared board or the local state file, the same way the CLI does.
 
-It only reads what Claude Code hands it. It doesn't read passwords, tokens or credential files, and it doesn't call any Claude account API.
+The status line only reads what Claude Code hands it. It doesn't read passwords, tokens or credential files, and it doesn't call any Claude account API. The **Update** button below is the one exception, and only when you press it.
 
 ### Set it up
 
@@ -259,6 +259,34 @@ npm run usage-meter:remove
 ```
 
 This removes only the usage meter's status line; any other status line is left alone. If you installed with `--force`, it puts back the status line that was replaced and deletes `statusline.replaced-by-agent-department.json`. Restart Claude Code afterwards.
+
+### Update button
+
+The band has an **Update** button. Press it to get the current numbers straight from Anthropic, without waiting for Claude Code to report. It also works when the band says the meter isn't connected, so you can see your usage without Claude Code running.
+
+What it reads and sends:
+
+- When you press it, the dashboard server on this PC reads the login Claude Code saved here: `%USERPROFILE%\.claude\.credentials.json` on Windows (`~/.claude/.credentials.json` on Linux, the `CLAUDE_CONFIG_DIR` folder if you set it, or the Keychain entry "Claude Code-credentials" on macOS).
+- It sends that login only to Anthropic (`api.anthropic.com`), to ask for your usage. It never saves it, logs it, shows it in the browser or puts it on the board. Only the two percentages and their reset times go on the board, with the source shown as your computer name followed by **Anthropic**.
+- It never renews the login and never changes the credentials file.
+- Only this PC can use it. The server refuses requests from other computers, and the page must be open at `http://127.0.0.1:4300` or `http://localhost:4300`.
+
+Things to know:
+
+- **The address it asks is unofficial.** Anthropic doesn't document it and can change or remove it at any time. If that happens, Update shows an error such as "Anthropic didn't return usage data" and the status line meter keeps working as before.
+- **If your login has expired,** Update says so. Open Claude Code once so it renews the login, then press Update again.
+- **Once every 30 seconds.** After it has asked Anthropic, the button counts down until you can press it again.
+- If Anthropic is limiting how often you can check, it asks you to try again in a minute. If it can't reach Anthropic, it says so.
+
+From the terminal, `node department/dept.mjs usage refresh` does the same thing.
+
+To turn the button off, set `DEPT_USAGE_DIRECT=off` before starting the dashboard. In PowerShell:
+
+```powershell
+$env:DEPT_USAGE_DIRECT = "off"; npm run dashboard
+```
+
+The button then disappears, and the server and `usage refresh` refuse to read the login.
 
 ### Why the numbers can be out of date
 

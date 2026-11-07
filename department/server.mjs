@@ -14,6 +14,7 @@ import * as core from './lib/core.mjs';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { hubConfig, hubGet, hubOp } from './lib/hub.mjs';
+import { refreshUsageFromAnthropic, isUsageDirectEnabled, defaultSource, CODE_STATUS, MESSAGES } from './lib/usage-direct.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(here, 'public');
@@ -40,7 +41,10 @@ function persist() {
 
 // Sync status goes on the payloads only, never into the saved state.
 const sync = hub ? { mode: 'hub', ok: false, lastSync: null, error: null, url: hub.url } : { mode: 'local' };
-const payload = () => ({ ...state, sync: { ...sync } });
+// Capabilities, like sync, are computed per payload and never saved.
+const usageDirectOff = !isUsageDirectEnabled(process.env); // DEPT_USAGE_DIRECT=off
+const capabilities = () => ({ usageRefresh: !usageDirectOff });
+const payload = () => ({ ...state, sync: { ...sync }, capabilities: capabilities() });
 
 const clients = new Set();
 function broadcast() {
@@ -167,6 +171,78 @@ async function readBody(req) {
   }
 }
 
+// ---------- live usage refresh (POST /api/usage/refresh) ----------
+// Reads Claude Code's saved login on this PC (lib/usage-direct.mjs), asks
+// Anthropic for the current usage and stores it as a normal reportUsage op.
+// The token never leaves usage-direct.mjs except towards Anthropic: nothing
+// here sees, logs or returns it. Only callers on this machine may trigger it,
+// and at most once per REFRESH_GAP_MS.
+const REFRESH_GAP_MS = 30 * 1000;
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+// Short messages for every code usage-direct.mjs can raise. An error without one of
+// these codes gets the generic bad_response text, so unexpected text never reaches the browser.
+const REFRESH_FALLBACK = {
+  disabled: MESSAGES.disabled,
+  no_login: MESSAGES.noLogin,
+  expired: MESSAGES.expired,
+  rate_limited: MESSAGES.rateLimited,
+  unreachable: MESSAGES.unreachable,
+  bad_response: MESSAGES.badResponse(),
+};
+let lastRefreshAt = 0;
+
+const hostOf = (value) => String(value || '').toLowerCase().replace(/:\d+$/, '');
+
+// Requests must come from this machine: loopback socket, a local Host header
+// (blocks DNS rebinding) and, if a browser sends an Origin, the same local host.
+function refreshAllowed(req) {
+  if (!LOOPBACK.has(req.socket.remoteAddress)) return false;
+  if (!LOCAL_HOSTS.has(hostOf(req.headers.host))) return false;
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  try {
+    const u = new URL(origin);
+    return LOCAL_HOSTS.has(u.hostname.toLowerCase().replace(/^::1$/, '[::1]')) && u.host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+async function refreshUsage(req, res) {
+  if (!refreshAllowed(req)) return send(res, 403, { ok: false, error: 'Usage refresh is only allowed from this computer', code: 'forbidden' });
+  if (usageDirectOff) return send(res, 403, { ok: false, error: MESSAGES.disabled, code: 'disabled' });
+  const wait = lastRefreshAt + REFRESH_GAP_MS - Date.now();
+  if (wait > 0) {
+    const retryAfter = Math.ceil(wait / 1000);
+    res.setHeader('retry-after', String(retryAfter));
+    return send(res, 429, { ok: false, error: `Wait ${retryAfter} s before refreshing again`, code: 'throttled', retryAfter });
+  }
+  lastRefreshAt = Date.now(); // taken before the await, so parallel clicks are throttled too
+  let report;
+  // Only attempts that actually sent a request to Anthropic use up the throttle, so
+  // fixing a missing/expired login can be followed by an immediate retry.
+  let sent = false;
+  const fetchImpl = (...a) => {
+    sent = true;
+    return globalThis.fetch(...a); // passed straight through; the request is never inspected or kept
+  };
+  try {
+    // Resolves to {type: 'reportUsage', args}; the token stays inside usage-direct.mjs.
+    report = (await refreshUsageFromAnthropic({ env: process.env, source: defaultSource(), fetchImpl })).args;
+  } catch (err) {
+    const code = err && Object.hasOwn(REFRESH_FALLBACK, err.code) ? err.code : 'bad_response';
+    if (!sent) lastRefreshAt = 0;
+    // usage-direct's messages are short fixed texts by contract; anything else gets ours.
+    const message = err && err.code === code && typeof err.message === 'string' && err.message.length <= 200 ? err.message : REFRESH_FALLBACK[code];
+    const status = CODE_STATUS[code] || 502;
+    console.warn(`Usage refresh failed (${code})`);
+    return send(res, status, { ok: false, error: message, code });
+  }
+  const result = await mutate('reportUsage', report); // same path as every other mutation (hub or local)
+  return send(res, 200, { ok: true, result: { usage: result?.usage ?? null, stored: result?.stored !== false } });
+}
+
 const routes = [
   ['GET', /^\/api\/state$/, () => payload()],
   ['POST', /^\/api\/tasks$/, (b) => mutate('addTask', { title: b.title, description: b.description, size: b.size, builders: b.builders })],
@@ -195,6 +271,10 @@ const server = http.createServer(async (req, res) => {
         clients.delete(res);
       });
       return;
+    }
+    if (url.pathname === '/api/usage/refresh') {
+      if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use POST', code: 'method' });
+      return await refreshUsage(req, res);
     }
     if (url.pathname.startsWith('/api/')) {
       for (const [method, re, handler] of routes) {

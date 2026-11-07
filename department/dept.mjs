@@ -59,6 +59,10 @@ const HELP = `Agent Department CLI
                        [--week <pct>] [--week-reset <iso|epoch>] [--source X]
                                                        Store a usage report by hand (testing); the
                                                        status line (npm run usage-meter) does this
+  node department/dept.mjs usage refresh               Fetch live usage from Anthropic with Claude
+                                                       Code's saved login on this PC (unofficial
+                                                       endpoint; at most every 30 s via the dashboard;
+                                                       env DEPT_USAGE_DIRECT=off disables it)
   node department/dept.mjs json                        Dump the full state
   node department/dept.mjs reset                       Wipe all tasks and reset the teams
 
@@ -256,9 +260,47 @@ function printUsage(s) {
   }
 }
 
+// `usage refresh`: through the local dashboard server when it runs (it throttles
+// and stores the result), else read the login and ask Anthropic from here and
+// store the report like any other op. The token stays inside usage-direct.mjs.
+async function usageRefresh() {
+  let res;
+  try {
+    res = await fetch(`${BASE}/api/usage/refresh`, { method: 'POST', signal: AbortSignal.timeout(20000) });
+  } catch {
+    res = null; // dashboard not running
+  }
+  let usage;
+  if (res) {
+    let json;
+    try {
+      json = await res.json();
+    } catch {
+      throw new core.DeptError(`Unexpected answer from the dashboard server at ${BASE} (HTTP ${res.status})`);
+    }
+    if (!json.ok) throw new core.DeptError(json.error || `Usage refresh failed (HTTP ${res.status})`, res.status);
+    usage = json.result?.usage;
+  } else {
+    const direct = await import('./lib/usage-direct.mjs');
+    let args;
+    try {
+      // Resolves to {type: 'reportUsage', args}; it refuses itself when DEPT_USAGE_DIRECT=off.
+      args = (await direct.refreshUsageFromAnthropic({ env: process.env })).args;
+    } catch (err) {
+      // Only usage-direct's own short, token-free messages are shown.
+      throw new core.DeptError(err instanceof direct.UsageDirectError ? err.message : "Couldn't refresh usage from Anthropic.");
+    }
+    const r = await run('POST', '/api/op', { type: 'reportUsage', args }, { type: 'reportUsage', args });
+    usage = r?.usage;
+  }
+  console.log('Usage updated from Anthropic.');
+  if (usage) printUsage({ usage });
+}
+
 async function usageCommand(sub, opt) {
   if (sub === undefined || sub === 'show' || sub === 'status') return printUsage(await currentState());
-  if (sub !== 'report') throw new core.DeptError(`Unknown usage command ${sub}; use \`usage\` or \`usage report ...\``);
+  if (sub === 'refresh' || sub === 'update') return usageRefresh();
+  if (sub !== 'report') throw new core.DeptError(`Unknown usage command ${sub}; use \`usage\`, \`usage refresh\` or \`usage report ...\``);
   const fiveHour = usageWindowArg(opt, 'five', 'five-reset');
   const sevenDay = usageWindowArg(opt, 'week', 'week-reset');
   if (!fiveHour && !sevenDay) throw new core.DeptError(USAGE_HELP);

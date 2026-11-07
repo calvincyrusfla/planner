@@ -255,6 +255,16 @@
     border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; white-space: nowrap; }
   @media (max-width: 640px) { .usage-meters { grid-template-columns: 1fr; } .usage { padding: 12px 12px 9px; } .meter-pct { font-size: 30px; } }
   @media (prefers-reduced-motion: reduce) { .meter-bar > i { transition: none; } }
+  /* "Update" (live usage from Anthropic): one persistent button moved into the band on each redraw, so its busy and
+     countdown state survive. Text is --text on --surface-2 (>= 12:1); waiting/busy states keep the same colours. */
+  .usage-update { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; align-self: center; }
+  .usage-update[aria-disabled="true"] { cursor: not-allowed; }
+  .usage-update[aria-disabled="true"]:hover { border-color: var(--border); background: var(--surface-2); }
+  .usage-update .spin { display: none; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--muted); border-top-color: transparent; animation: usage-spin .8s linear infinite; }
+  .usage-update[aria-busy="true"] .spin { display: inline-block; }
+  .usage-update .wait { font-variant-numeric: tabular-nums; }
+  @keyframes usage-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .usage-update .spin { animation: none; border-top-color: var(--muted); border-right-color: transparent; } }
 </style>
 </head>
 <body>
@@ -469,20 +479,83 @@ function usageMeter(key, label, w, now) {
 }
 let usageKey = '';
 let usageShownPhase = '';
-// Rebuilds only the band, and only when the data or its phase changed; the 1 s ticker keeps its text live.
+let usageCapShown = false;
+// ---- "Update" button: asks this PC's dashboard server to read live usage from Anthropic (POST /api/usage/refresh).
+// One persistent element, re-attached after each band redraw, so busy/countdown state and focus survive.
+const USAGE_REFRESH_GAP_MS = 30 * 1000; // matches the server's throttle
+const usageRefresh = { busy: false, until: 0 };
+const usageBtn = document.createElement('button');
+usageBtn.type = 'button';
+usageBtn.className = 'usage-update';
+usageBtn.innerHTML = '<span class="spin" aria-hidden="true"></span><span class="lbl">Update</span>';
+const usageCanRefresh = () => !!(state && state.capabilities && state.capabilities.usageRefresh);
+const usageWaitS = (now = Date.now()) => Math.max(0, Math.ceil((usageRefresh.until - now) / 1000));
+function syncUsageBtn(now = Date.now()) {
+  const wait = usageRefresh.busy ? 0 : usageWaitS(now);
+  const lbl = usageRefresh.busy ? 'Updating…' : wait ? `Update in ${wait} s` : 'Update';
+  const aria = usageRefresh.busy ? 'Updating Claude usage from Anthropic'
+    : wait ? `Update Claude usage from Anthropic, available in ${wait} seconds` : 'Update Claude usage from Anthropic';
+  const l = usageBtn.querySelector('.lbl');
+  if (l.textContent !== lbl) l.textContent = lbl;
+  if (usageBtn.getAttribute('aria-label') !== aria) usageBtn.setAttribute('aria-label', aria);
+  usageBtn.title = 'Read the current usage from Anthropic with the Claude Code login saved on this PC';
+  usageBtn.setAttribute('aria-busy', String(usageRefresh.busy));
+  // aria-disabled, not disabled: it stays focusable, and a click while waiting says how long is left.
+  usageBtn.setAttribute('aria-disabled', String(usageRefresh.busy || wait > 0));
+}
+async function refreshUsage() {
+  if (usageRefresh.busy) return;
+  const wait = usageWaitS();
+  if (wait) { toast(`Wait ${wait} s before updating the usage again`); return; }
+  usageRefresh.busy = true;
+  syncUsageBtn();
+  try {
+    let json = null;
+    let status = 0;
+    try {
+      const res = await fetch('/api/usage/refresh', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      status = res.status;
+      json = await res.json().catch(() => null);
+    } catch {
+      toast("Couldn't reach the dashboard server");
+      return;
+    }
+    if (json && json.ok) {
+      usageRefresh.until = Date.now() + USAGE_REFRESH_GAP_MS;
+      const usage = json.result && json.result.usage;
+      if (usage && typeof usage === 'object' && state) { state.usage = usage; renderUsage(); } // the state push follows anyway
+      toast('Claude usage updated from Anthropic');
+      return;
+    }
+    const retry = Number(json && json.retryAfter);
+    if (status === 429 && Number.isFinite(retry) && retry > 0) usageRefresh.until = Date.now() + retry * 1000;
+    // Like the server: attempts that never reached Anthropic (expired or missing login, refused) don't start the wait.
+    else if (json && !['disabled', 'no_login', 'expired', 'forbidden', 'method'].includes(json.code)) usageRefresh.until = Date.now() + USAGE_REFRESH_GAP_MS;
+    toast((json && json.error) || (status === 404 ? 'This dashboard server is too old for Update; restart it' : `Update failed (HTTP ${status})`));
+  } finally {
+    usageRefresh.busy = false;
+    syncUsageBtn();
+  }
+}
+usageBtn.addEventListener('click', refreshUsage);
+// Rebuilds only the band, and only when the data, its phase or the Update capability changed; the 1 s ticker keeps its text live.
 function renderUsage(force = false) {
   const el = $('#usage');
   const u = state && state.usage && typeof state.usage === 'object' ? state.usage : null;
   const wins = u ? USAGE_WINDOWS.map(([k, label]) => [k, label, usageWin(u[k])]) : [];
   const connected = wins.some(([, , w]) => w);
   const now = Date.now();
+  const cap = usageCanRefresh();
   const key = connected ? JSON.stringify(u) + usagePhase(u, now) : 'off';
-  if (!force && key === usageKey) return;
+  if (!force && key === usageKey && cap === usageCapShown) return;
+  const hadFocus = document.activeElement === usageBtn;
   usageKey = key;
+  usageCapShown = cap;
   usageShownPhase = usagePhase(u, now);
   if (!connected) {
     el.className = 'card usage off';
-    el.innerHTML = '<b>Claude usage</b><span>Usage meter not connected — run <code>npm run usage-meter</code> on your PC</span>';
+    el.innerHTML = `<b>Claude usage</b><span>Usage meter not connected — ${cap ? 'press Update to read it from Anthropic, or ' : ''}run <code>npm run usage-meter</code> on your PC</span>`;
+    attachUsageBtn(el, cap, hadFocus);
     return;
   }
   const live = wins.filter(([, , w]) => w && !(Number.isFinite(w.reset) && w.reset <= now));
@@ -493,10 +566,18 @@ function renderUsage(force = false) {
   el.innerHTML = `<div class="usage-meters">${wins.map(([k, label, w]) => usageMeter(k, label, w, now)).join('')}</div>
     <div class="usage-foot"><b>Claude usage</b>${at ? `<span data-usage-ago="${esc(at)}">Updated ${esc(fmtAgoLong(at))}${u.source ? ` from ${esc(u.source)}` : ''}</span>` : ''}${
       stale ? '<span class="usage-stale">No Claude Code session is reporting — numbers may be out of date</span>' : ''}</div>`;
+  attachUsageBtn(el.querySelector('.usage-foot'), cap, hadFocus);
+}
+function attachUsageBtn(parent, cap, hadFocus) {
+  if (!cap) return;
+  syncUsageBtn();
+  parent.appendChild(usageBtn);
+  if (hadFocus) usageBtn.focus();
 }
 function tickUsage() {
   if (!state) return;
   const now = Date.now();
+  if (usageBtn.isConnected) syncUsageBtn(now);
   if (usageKey !== 'off' && usageShownPhase !== usagePhase(state.usage, now)) return renderUsage(true);
   for (const el of document.querySelectorAll('#usage [data-reset-at]')) {
     const txt = fmtCountdown(Number(el.dataset.resetAt) - now);
