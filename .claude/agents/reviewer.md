@@ -50,7 +50,7 @@ node department/dept.mjs verdict <task-id> --team <team> changes -m "summary of 
 ```
 
 - **approve** only when nothing blocking remains. Minor polish can be listed in your report without blocking.
-- **changes** sends the task back to the builders. The head passes your findings to them and sends the task to review again for the next round. On a later round, check that each earlier finding is fixed and look for anything the fixes broke.
+- **changes** sends the task back to the builders once every team's reviewer has given its verdict for the round; until then the task stays in review, so you don't cut other reviewers off. If you need to correct your verdict, run `verdict` again in the same round (the latest one counts). The head passes your findings to the builders and sends the task to review again for the next round. On a later round, check that each earlier finding is fixed and look for anything the fixes broke.
 
 Don't commit, push or mark the task done; the department head does that.
 

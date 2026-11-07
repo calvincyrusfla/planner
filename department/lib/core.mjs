@@ -288,6 +288,7 @@ export function addTask(state, { title, description = '', size = 'small' } = {})
     activeSince: null,
     teamMs: {},
     reviewRound: 0,
+    approvedRound: 0, // last round every reviewer approved (0 = none)
     reviews: {},
     issuesFound: 0,
   };
@@ -342,14 +343,10 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
     }
     if (status === 'review' && !onTask.length) throw new DeptError('Assign a team before review');
     let forced = false;
-    if (status === 'done' && onTask.length) {
-      const { pending, changes } = reviewStatus(state, task);
-      const missing = [...changes, ...pending];
-      if (missing.length) {
-        if (patch.force !== true) {
-          const names = missing.map((id) => getTeam(state, id).name).join(', ');
-          throw new DeptError(`${task.id} needs reviewer sign-off from ${names}. Send it to review, or mark it done with force.`);
-        }
+    if (status === 'done') {
+      const gate = reviewGate(state, task);
+      if (!gate.ok) {
+        if (patch.force !== true) throw new DeptError(gate.message);
         forced = true;
       }
     }
@@ -383,6 +380,32 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
 // a new round; every attached team's reviewer must approve that round before
 // the task can be marked done (unless forced).
 
+// Can `task` be marked done without force? Mirrors updateTask's done gate.
+// - Teams on the task: each must have approved the current round.
+// - No teams, but worked on before: its latest round must have been approved
+//   by all reviewers (task.approvedRound === task.reviewRound).
+// - Never worked by a team: always ok.
+export function reviewGate(state, task) {
+  if (typeof task === 'string') task = getTask(state, task);
+  const onTask = teamsOn(state, task.id);
+  if (onTask.length) {
+    const { changes, pending } = reviewStatus(state, task);
+    const missing = onTask.map((t) => t.id).filter((id) => changes.includes(id) || pending.includes(id));
+    if (!missing.length) return { ok: true, missing: [], message: '' };
+    const names = missing.map((id) => getTeam(state, id).name).join(', ');
+    return {
+      ok: false,
+      missing,
+      message: `${task.id} needs reviewer sign-off from ${names}. Send it to review, or mark it done with force.`,
+    };
+  }
+  const worked = Array.isArray(task.teamHistory) && task.teamHistory.length > 0;
+  const signedOff = task.reviewRound > 0 && task.approvedRound === task.reviewRound;
+  if (!worked || signedOff) return { ok: true, missing: [], message: '' };
+  return { ok: false, missing: [], message: `${task.id} was worked on but has no reviewer sign-off. Mark it done with force.` };
+}
+
+// approved / changes / pending (no verdict yet) for the teams on the task, current round only.
 export function reviewStatus(state, task) {
   if (typeof task === 'string') task = getTask(state, task);
   const round = task.reviewRound || 0;
@@ -409,28 +432,45 @@ export function reviewTask(state, { taskId, teamId, verdict, note = '', issues =
   note = String(note ?? '');
   const round = task.reviewRound || 0;
   task.reviews ||= {};
+  // A second verdict from the same team in the same round replaces the first,
+  // issue count included (so issues aren't counted twice).
+  const prev = task.reviews[team.id];
+  const prevIssues = prev && prev.round === round && Number.isFinite(prev.issues) ? prev.issues : 0;
   task.reviews[team.id] = { verdict, note, issues: count, at: now(), round };
-  task.issuesFound = (task.issuesFound || 0) + count;
-  team.issuesFound = (team.issuesFound || 0) + count;
+  task.issuesFound = Math.max(0, (task.issuesFound || 0) - prevIssues + count);
+  team.issuesFound = Math.max(0, (team.issuesFound || 0) - prevIssues + count);
   const reviewer = reviewerOf(team);
+  const byNote = by && by !== 'reviewer' ? ` (by ${by})` : '';
   if (verdict === 'approved') {
     setAgent(reviewer, 'done', `Approved round ${round}`);
-    log(state, { kind: 'review', taskId: task.id, teamId: team.id, agentId: reviewer?.id, message: `${team.name} reviewer approved ${task.id}` });
+    log(state, { kind: 'review', taskId: task.id, teamId: team.id, agentId: reviewer?.id, message: `${team.name} reviewer approved ${task.id}${byNote}` });
   } else {
     setAgent(reviewer, 'working', note);
-    task.status = 'active'; // back to the builders
-    syncActive(task);
     log(state, {
       kind: 'review',
       taskId: task.id,
       teamId: team.id,
       agentId: reviewer?.id,
-      message: `${team.name} reviewer requested changes on ${task.id}: ${note}`,
+      message: `${team.name} reviewer requested changes on ${task.id}: ${note}${byNote}`,
     });
   }
-  touch(task);
+  // The task stays in review until every team on it has a verdict this round.
   const status = reviewStatus(state, task);
-  return { task, team, approved: verdict === 'approved' && status.pending.length === 0 && status.changes.length === 0, pending: [...status.changes, ...status.pending] };
+  const complete = status.pending.length === 0;
+  const approved = complete && status.changes.length === 0;
+  if (complete) {
+    if (approved) {
+      task.approvedRound = round;
+      log(state, { kind: 'review', taskId: task.id, message: `${task.id} approved by all reviewers (round ${round})` });
+    } else {
+      task.status = 'active'; // back to the builders
+      syncActive(task);
+      const names = status.changes.map((id) => getTeam(state, id).name).join(', ');
+      log(state, { kind: 'review', taskId: task.id, message: `${task.id} back to the builders: changes requested by ${names}` });
+    }
+  }
+  touch(task);
+  return { task, team, approved, pending: status.pending, changes: status.changes, complete };
 }
 
 export function deleteTask(state, taskId, { by = 'user' } = {}) {
@@ -504,6 +544,7 @@ export function normalize(state) {
     if (typeof task.activeMs !== 'number' || !Number.isFinite(task.activeMs)) task.activeMs = 0;
     if (!task.teamMs || typeof task.teamMs !== 'object') task.teamMs = {};
     if (!Number.isInteger(task.reviewRound) || task.reviewRound < 0) task.reviewRound = 0;
+    if (!Number.isInteger(task.approvedRound) || task.approvedRound < 0) task.approvedRound = 0;
     if (!task.reviews || typeof task.reviews !== 'object' || Array.isArray(task.reviews)) task.reviews = {};
     if (typeof task.issuesFound !== 'number' || !Number.isFinite(task.issuesFound)) task.issuesFound = 0;
     if (isRunning(task)) task.activeSince ||= task.startedAt || task.updatedAt || now();
@@ -531,6 +572,8 @@ export function normalize(state) {
     if (team.taskId && !tasks.has(team.taskId)) team.taskId = null;
     if (typeof team.totalMs !== 'number' || !Number.isFinite(team.totalMs)) team.totalMs = 0;
     if (typeof team.issuesFound !== 'number' || !Number.isFinite(team.issuesFound)) team.issuesFound = 0;
+    const reviewer = reviewerOf(team);
+    if (team.taskId && reviewer && reviewer.status === 'idle') reviewer.status = 'assigned';
     if (team.taskId) team.assignedAt ||= tasks.get(team.taskId).startedAt || now();
     else team.assignedAt = null;
   }

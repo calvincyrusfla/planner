@@ -131,8 +131,11 @@ test('review bumps reviewRound, keeps teams and sets the reviewers working', () 
   }
   assert.ok(s.log.some((e) => e.message.includes(`${task.id} sent to review (round 1)`)));
 
-  // Back to active, then review again: round 2.
+  // Every team gives a verdict, one asks for changes: back to active, then round 2.
   verdict(s, task.id, 'alpha', 'changes', { note: 'tests missing' });
+  verdict(s, task.id, 'bravo', 'approved');
+  verdict(s, task.id, 'charlie', 'approved');
+  assert.equal(task.status, 'active');
   toReview(s, task.id);
   assert.equal(task.reviewRound, 2);
   assert.equal(agent(s, 'alpha-6').work, 'Reviewing round 2');
@@ -170,7 +173,9 @@ test("'changes' sends the task back to active and records issues", () => {
   assert.equal(task.status, 'active');
   assert.deepEqual(teamsOn(s, task.id), ['alpha']);
   assert.equal(r.approved, false);
-  assert.deepEqual(r.pending, ['alpha']);
+  assert.deepEqual(r.pending, [], 'pending means no verdict yet');
+  assert.deepEqual(r.changes, ['alpha']);
+  assert.equal(r.complete, true);
   assert.equal(r.task, task);
   assert.equal(r.team, team(s, 'alpha'));
 
@@ -195,6 +200,9 @@ test('approval keeps the task in review and marks the reviewer done', () => {
   assert.equal(task.status, 'review');
   assert.equal(r.approved, true);
   assert.deepEqual(r.pending, []);
+  assert.deepEqual(r.changes, []);
+  assert.equal(r.complete, true);
+  assert.equal(task.approvedRound, task.reviewRound);
   assert.equal(task.reviews.alpha.verdict, 'approved');
   assert.equal(task.reviews.alpha.round, 1);
   assert.equal(task.issuesFound, 1);

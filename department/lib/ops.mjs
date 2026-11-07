@@ -58,7 +58,8 @@ export function applyOp(state, op) {
 //   in-review) task that keeps no team goes back to the queue. Done/cancelled
 //   tasks have no team. A kept team keeps this board's roster (so an older
 //   5-agent board can't drop the reviewer); saved agent status/work is taken.
-//   Team issuesFound is this board's own count and is not overwritten.
+//   Team issuesFound is not overwritten; like totalMs, it is credited from the
+//   added tasks only (reviews[team].issues), so a re-push can't double count.
 // - Logs are merged (duplicates dropped), sorted by `at` and capped at 500.
 // - Finally dispatch runs so queued work picks up free teams.
 
@@ -121,6 +122,12 @@ export function importState(state, other) {
     for (const [teamId, ms] of Object.entries(task.teamMs || {})) {
       const team = state.teams.find((t) => t.id === teamId);
       if (team && Number.isFinite(ms)) team.totalMs = (team.totalMs || 0) + ms;
+    }
+    // Same for issues caught: credit each team's recorded verdict issues.
+    for (const [teamId, review] of Object.entries(task.reviews && typeof task.reviews === 'object' ? task.reviews : {})) {
+      const team = state.teams.find((t) => t.id === teamId);
+      const n = Number(review?.issues);
+      if (team && Number.isInteger(n) && n > 0) team.issuesFound = (team.issuesFound || 0) + n;
     }
   }
 

@@ -146,6 +146,18 @@ function reviewLine(s, task) {
   return `in review (round ${rs.round}): ${ids.map(mark).join(', ') || '—'}`;
 }
 
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+// Would marking this task done skip missing reviewer sign-off? Uses
+// core.reviewGate when present; otherwise: every team on it approved this round.
+function signOffMissing(s, task) {
+  if (typeof core.reviewGate === 'function') return !core.reviewGate(s, task).ok;
+  const on = s.teams.filter((x) => x.taskId === task.id);
+  if (!on.length) return false;
+  const rs = reviewState(s, task);
+  return rs.approved.length < on.length;
+}
+
 const VERDICTS = { approve: 'approved', approved: 'approved', ok: 'approved', changes: 'changes', change: 'changes', reject: 'changes' };
 
 async function hubCommand(sub, pos, opt) {
@@ -245,7 +257,7 @@ function printStatus(s) {
       if (a.role === 'reviewer') console.log(`  ★ ${`${a.id} reviewer`.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
       else console.log(`  · ${a.id.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
     }
-    if (team.issuesFound) console.log(`  issues caught by review: ${team.issuesFound}`);
+    if (team.issuesFound) console.log(`  ${plural(team.issuesFound, 'issue')} caught by review`);
   }
   const open = s.tasks.filter((t) => OPEN.includes(t.status));
   console.log(`\nOpen tasks (${open.length})`);
@@ -257,7 +269,7 @@ function printStatus(s) {
       const back = Object.entries(t.reviews || {}).filter(([, r]) => r.round === t.reviewRound && r.verdict === 'changes').map(([id]) => id);
       console.log(`        review round ${t.reviewRound}${back.length ? `: changes requested by ${back.join(', ')}` : ''}`);
     }
-    if (t.issuesFound) console.log(`        issues caught: ${t.issuesFound}`);
+    if (t.issuesFound) console.log(`        ${plural(t.issuesFound, 'issue')} caught`);
   }
 }
 
@@ -283,9 +295,9 @@ function printTask(s, task, at) {
   console.log(`  created      ${task.createdAt || '—'}`);
   if (task.finishedAt) console.log(`  finished     ${task.finishedAt}`);
   if (task.reviewRound) {
-    console.log(`  review       round ${task.reviewRound}, ${task.issuesFound || 0} issues caught`);
+    console.log(`  review       round ${task.reviewRound}, ${plural(task.issuesFound || 0, 'issue')} caught`);
     for (const [id, r] of Object.entries(task.reviews || {})) {
-      console.log(`    ${id.padEnd(11)} ${r.verdict === 'approved' ? '✓ approved' : '✗ changes'} (round ${r.round}${r.issues ? `, ${r.issues} issues` : ''})${r.note ? ` — ${r.note}` : ''}`);
+      console.log(`    ${id.padEnd(11)} ${r.verdict === 'approved' ? '✓ approved' : '✗ changes'} (round ${r.round}${r.issues ? `, ${plural(r.issues, 'issue')}` : ''})${r.note ? ` — ${r.note}` : ''}`);
     }
   }
   const per = core.taskTeamMs(s, task, at);
@@ -405,6 +417,7 @@ async function main() {
       }
       let issues = 0;
       if (opt.issues !== undefined) {
+        if (typeof opt.issues !== 'string') throw new core.DeptError('Usage: verdict <task> --team <id> approve|changes [-m "note"] [--issues N]');
         issues = Number(opt.issues);
         if (!Number.isInteger(issues) || issues < 0) throw new core.DeptError('--issues must be a whole number, 0 or more');
       }
@@ -412,9 +425,13 @@ async function main() {
       const r = await run('POST', '/api/op', { type: 'reviewTask', args }, { type: 'reviewTask', args });
       const id = r.task?.id || taskId;
       const name = r.team?.name || opt.team;
-      if (verdict === 'changes') console.log(`${name} requested changes on ${id}${issues ? ` (${issues} issues)` : ''}; back to the builders (${r.task?.status || 'active'})`);
-      else if (r.approved) console.log(`${name} approved ${id}; all teams signed off, ready for done`);
-      else console.log(`${name} approved ${id}; still waiting on ${(r.pending || []).join(', ') || '—'}`);
+      console.log(`${name} ${verdict === 'changes' ? 'requested changes on' : 'approved'} ${id}${issues ? ` (${plural(issues, 'issue')})` : ''}`);
+      const pending = r.pending || [];
+      const changes = Array.isArray(r.changes) ? r.changes : [];
+      const complete = typeof r.complete === 'boolean' ? r.complete : !pending.length;
+      if (!complete) console.log(`  Waiting for: ${pending.join(', ') || '—'}`);
+      else if (changes.length) console.log(`  Back to the builders: changes requested by ${changes.join(', ')} (${id} now ${r.task?.status || 'active'})`);
+      else console.log(`  Signed off by all reviewers; ${id} is ready for done`);
       return;
     }
     case 'done': {
@@ -423,8 +440,18 @@ async function main() {
       const id = pos[0];
       if (!id) throw new core.DeptError('Usage: done <task> [--force]');
       const patch = opt.force ? { status: 'done', force: true } : { status: 'done' };
+      let skipped = false;
+      if (opt.force) {
+        try {
+          const s = await currentState();
+          const task = s.tasks.find((t) => t.id === id);
+          skipped = Boolean(task && signOffMissing(s, task));
+        } catch {
+          // Can't tell beforehand; the done itself reports any real problem.
+        }
+      }
       const r = await run('PATCH', `/api/tasks/${id}`, patch, { type: 'updateTask', args: { id, patch } });
-      console.log(`${r.id} done${opt.force ? ' (forced)' : ''}`);
+      console.log(`${r.id} done${skipped ? ' (forced, without reviewer sign-off)' : ''}`);
       return;
     }
     case 'delete': {

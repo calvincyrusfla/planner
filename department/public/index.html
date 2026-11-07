@@ -207,6 +207,8 @@
   button.ok { color: var(--ok); }
   button.ok:hover { border-color: color-mix(in srgb, var(--ok) 55%, transparent); background: color-mix(in srgb, var(--ok) 12%, var(--surface-2)); }
   button.review { color: var(--review); }
+  button.small.link { padding: 1px 6px; font-size: 11px; color: var(--muted); background: transparent; }
+  button.small.link:hover { color: var(--text); }
   button.review:hover { border-color: color-mix(in srgb, var(--review) 55%, transparent); background: color-mix(in srgb, var(--review) 12%, var(--surface-2)); }
   .time-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 </style>
@@ -272,10 +274,29 @@ function reviewStatus(task) {
   for (const team of state.teams.filter((t) => t.taskId === task.id)) {
     const r = (task.reviews || {})[team.id];
     if (round && r && r.round === round && r.verdict === 'approved') out.approved.push(team.id);
-    else if (round && r && r.round === round && r.verdict === 'changes') { out.changes.push(team.id); out.pending.push(team.id); }
+    else if (round && r && r.round === round && r.verdict === 'changes') out.changes.push(team.id);
     else out.pending.push(team.id);
   }
   return out;
+}
+// Mirrors core.reviewGate: can the task be marked done without force?
+// Teams on it: all must have approved the current round. No teams but worked by a team (teamHistory):
+// its latest round must have been fully approved (approvedRound === reviewRound > 0).
+function reviewGate(task) {
+  const name = (id) => state.teams.find((t) => t.id === id)?.name || id;
+  const onTask = state.teams.filter((t) => t.taskId === task.id);
+  if (onTask.length) {
+    const rs = reviewStatus(task);
+    const missing = onTask.map((t) => t.id).filter((id) => !rs.approved.includes(id));
+    return { ok: !missing.length, missing,
+      message: missing.length ? `${task.id} needs reviewer sign-off from ${missing.map(name).join(', ')}.` : '' };
+  }
+  const worked = (task.teamHistory || []).length > 0;
+  const round = task.reviewRound || 0;
+  if (worked && !(round > 0 && task.approvedRound === round)) {
+    return { ok: false, missing: [], message: `${task.id} has no reviewer sign-off${round ? ` for review round ${round}` : ' (it was never reviewed)'}.` };
+  }
+  return { ok: true, missing: [], message: '' };
 }
 let state = null;
 
@@ -445,9 +466,12 @@ function reviewRow(task, teams) {
       : `${name} reviewer has not signed off on round ${round} yet`;
     const chip = `<span class="verdict ${kind}" style="--team:${team ? team.color : 'var(--muted)'}" title="${esc(tip)}"><b>${esc(name)}</b> ${label}${
       r && r.verdict === 'changes' && r.note ? ` <span class="vnote">${esc(r.note)}</span>` : ''}</span>`;
-    const actions = inReview && kind !== 'approved' && team && team.taskId === task.id
+    const canAct = inReview && team && team.taskId === task.id;
+    // No verdict yet: Approve / Request changes. Verdict given this round: a small "Change" flips it.
+    const flip = kind === 'approved' ? 'changes' : 'approved';
+    const actions = !canAct ? '' : kind === 'waiting'
       ? `<span class="verdict-actions"><button class="small ok" data-verdict="approved" data-task="${task.id}" data-team="${id}" aria-label="Approve ${esc(task.id)} for ${esc(team.name)}">Approve</button><button class="small danger" data-verdict="changes" data-task="${task.id}" data-team="${id}" aria-label="Request changes on ${esc(task.id)} for ${esc(team.name)}">Request changes</button></span>`
-      : '';
+      : `<button class="small link" data-verdict="${flip}" data-task="${task.id}" data-team="${id}" title="Change ${esc(name)}'s verdict to ${flip === 'approved' ? 'approved' : 'changes requested'}" aria-label="Change ${esc(team.name)}'s verdict on ${esc(task.id)} to ${flip === 'approved' ? 'approved' : 'changes requested'}">Change</button>`;
     return chip + actions;
   });
   return `<div class="review-row">${round ? `<span class="round">Review round ${round}</span>` : ''}${chips.join('')}${
@@ -603,14 +627,15 @@ document.addEventListener('click', async (e) => {
       issues = Math.max(0, Math.floor(Number(count)) || 0);
     }
     const r = await api('POST', '/api/op', { type: 'reviewTask', args: { taskId, teamId, verdict, note, issues, by: 'user' } });
-    toast(verdict === 'changes' ? `Changes requested: ${taskId} is back with ${teamName}`
-      : r && r.approved ? `${taskId} approved by every reviewer, ready to mark done` : `${teamName} approved ${taskId}`);
+    const left = (r && r.pending || []).filter((id) => id !== teamId);
+    toast(r && r.task && r.task.status === 'active' ? `Every reviewer has answered: ${taskId} is back with the builders for changes`
+      : r && r.approved ? `${taskId} approved by every reviewer, ready to mark done`
+      : `${teamName} ${verdict === 'changes' ? 'requested changes on' : 'approved'} ${taskId}${left.length ? `; waiting on ${left.map((id) => state.teams.find((t) => t.id === id)?.name || id).join(', ')}` : ''}`);
   } else if (el.dataset.done) {
     const task = state.tasks.find((t) => t.id === el.dataset.done);
-    const rs = task ? reviewStatus(task) : { pending: [] };
-    if (rs.pending.length) {
-      const names = rs.pending.map((id) => state.teams.find((t) => t.id === id)?.name || id).join(', ');
-      if (!confirm(`Mark done without reviewer sign-off?\nStill waiting on: ${names}.`)) return;
+    const gate = task ? reviewGate(task) : { ok: true };
+    if (!gate.ok) {
+      if (!confirm(`Mark done without reviewer sign-off?\n${gate.message}`)) return;
       await api('PATCH', `/api/tasks/${el.dataset.done}`, { status: 'done', force: true });
       return;
     }
