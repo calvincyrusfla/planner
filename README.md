@@ -131,3 +131,9 @@ npm install
 ```bash
 EDIT_KEY=yourpasscode npx netlify dev
 ```
+
+---
+
+## Agent Department
+
+`department/` holds a local dashboard for monitoring the 3 agent teams (5 builders each), their task assignments and their progress. Run `npm run dashboard`, then see [department/README.md](department/README.md). To get a desktop shortcut with a network icon that starts the dashboard and opens it in your browser, run `npm run shortcut` once (Windows, macOS and Linux).

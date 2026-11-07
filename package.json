@@ -4,5 +4,14 @@
   "type": "module",
   "dependencies": {
     "@netlify/blobs": "^11.1.7"
+  },
+  "scripts": {
+    "dashboard": "node department/server.mjs --open",
+    "dept": "node department/dept.mjs",
+    "test:dept": "node --test department/test/*.test.mjs",
+    "start": "node department/launch.mjs",
+    "shortcut": "node department/scripts/install-shortcut.mjs",
+    "shortcut:remove": "node department/scripts/install-shortcut.mjs --uninstall",
+    "icons": "node department/scripts/build-icons.mjs"
   }
 }
