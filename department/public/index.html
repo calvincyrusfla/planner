@@ -80,6 +80,19 @@
   .crew-pick { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
   .crew-pick select { padding: 5px 8px; }
   .crew-pick small { color: var(--muted); font-size: 12px; }
+  /* Foundry: header status chip + "Send to Foundry" row on the new-task form */
+  .foundry-chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border: 1px solid var(--border); border-radius: 99px;
+    background: var(--surface); color: var(--muted); font-size: 12px; max-width: 100%; min-width: 0; }
+  .foundry-chip i { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  .foundry-chip b { color: var(--text); font-weight: 600; }
+  .foundry-chip .fc-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .foundry-chip.on i { background: var(--ok); }
+  .foundry-chip.warn i { background: var(--warn); }
+  .foundry-row { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+  .foundry-row .switch { color: var(--text); }
+  .foundry-row input[type=text] { flex: 1 1 260px; }
+  .foundry-row small { color: var(--muted); font-size: 12px; }
+  .foundry-row[data-on="false"] .fo-files { display: none; }
   .crew { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
   .crew b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
   .crew select { font-size: 12px; padding: 1px 4px; font-weight: 600; }
@@ -267,6 +280,23 @@
   @keyframes usage-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .usage-update .spin { animation: none; border-top-color: var(--muted); border-right-color: transparent; } }
 </style>
+<style>
+  /* "Ask the Foreman" panel. Text is --text/--muted on --surface/--surface-2 (>= 6:1); errors are --bad on --surface-2 (>= 5:1). */
+  .foreman { padding: 12px 16px 14px; margin-top: 16px; }
+  .foreman-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; margin-bottom: 8px; }
+  .foreman-top h2 { margin: 0; }
+  .foreman-hint { font-size: 12px; color: var(--muted); }
+  .foreman-hint.down::before { content: "\25CF"; color: var(--warn); margin-right: 5px; font-size: 9px; vertical-align: 1px; }
+  .foreman-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; overflow-wrap: anywhere; }
+  .foreman-form { display: flex; gap: 8px; }
+  .foreman-form input { flex: 1; min-width: 0; }
+  .foreman-answer { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border);
+    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow-y: auto; color: var(--text); }
+  .foreman-answer[aria-busy="true"]::after { content: "\2026"; color: var(--muted); }
+  .foreman-answer .foreman-note { display: block; margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .foreman-answer .foreman-err { color: var(--bad); }
+</style>
 </head>
 <body>
 <div class="wrap">
@@ -274,6 +304,7 @@
   <header>
     <h1>Agent Department</h1>
     <span class="live" id="live"><i></i><span>Connecting…</span></span>
+    <span class="foundry-chip" id="foundry-chip" role="status" title="Checking for Foundry…"><i></i><span class="fc-text"><b>Foundry</b> · checking…</span></span>
     <div class="spacer"></div>
     <div class="stats" id="stats"></div>
     <label class="switch" title="Free teams automatically pick up waiting tasks">
@@ -300,8 +331,27 @@
       <small>+ reviewer</small>
     </label>
     <button class="primary" type="submit">Assign task</button>
+    <div class="foundry-row" id="foundry-row" data-on="false">
+      <label class="switch" title="Hand this task to the Foundry service instead of the board; Foundry registers it on the board itself">
+        <input type="checkbox" id="t-foundry"> Send to Foundry
+      </label>
+      <label class="visually-hidden" for="t-files">Files (comma separated)</label>
+      <input type="text" class="fo-files" id="t-files" placeholder="Files (optional), comma separated, e.g. src/app.py, README.md" autocomplete="off">
+      <small id="foundry-hint"></small>
+    </div>
     <p class="hint">Each task gets one team. A large task gets all three teams when nothing else is running. Tasks wait in the queue when every team is busy. Builders sets how many of each team's five builders work on it (Small 2, Large 5 by default); the rest stand by and the reviewer always reviews.</p>
   </form>
+
+  <section class="card foreman" id="foreman" aria-labelledby="foreman-h">
+    <div class="foreman-top"><h2 id="foreman-h">Ask the Foreman</h2><span class="foreman-hint" id="foreman-hint">Checking Foundry…</span></div>
+    <form class="foreman-form" id="foreman-form">
+      <label class="visually-hidden" for="foreman-q">Question for the Foreman</label>
+      <input type="text" id="foreman-q" placeholder="Ask about the line, e.g. Why is the queue slow?" autocomplete="off" maxlength="2000" disabled>
+      <button class="primary" type="submit" id="foreman-ask" disabled>Ask</button>
+      <button type="button" id="foreman-stop" hidden>Stop</button>
+    </form>
+    <div class="foreman-answer" id="foreman-answer" role="region" aria-label="Foreman's answer" aria-live="polite" hidden></div>
+  </section>
 
   <h2>Teams</h2>
   <div class="teams" id="teams"></div>
@@ -871,12 +921,79 @@ $('#new-task').addEventListener('submit', async (e) => {
   if (!title) return;
   const size = document.querySelector('input[name=size]:checked').value;
   const builders = Number($('#t-builders').value) || DEFAULT_BUILDERS[size];
+  if ($('#t-foundry').checked) return sendToFoundry(title, size);
   // Via the generic op: args go straight to core.addTask, builders included.
   const r = await api('POST', '/api/op', { type: 'addTask', args: { title, description: $('#t-desc').value, size, builders } });
   $('#t-title').value = ''; $('#t-desc').value = '';
   buildersTouched = false; syncBuilders();
   toast(r.assigned.length ? `${r.task.id} assigned to ${r.assigned.map((id) => state.teams.find((t) => t.id === id)?.name || id).join(', ')}` : `${r.task.id} queued until a team is free`);
 });
+
+// ---- Foundry (local service on :4310, reached through the dashboard's /api/foundry/* proxy) ----
+let foundryUp = false;
+async function foundryJson(path, opts) {
+  const res = await fetch('/api/foundry' + path, opts);
+  let json = null;
+  try { json = await res.json(); } catch {}
+  return { status: res.status, json };
+}
+async function pollFoundry() {
+  const chip = $('#foundry-chip');
+  let health = null;
+  try { const r = await foundryJson('/health'); if (r.json && r.json.ok) health = r.json; else health = { down: true, error: r.json && r.json.error }; }
+  catch { health = { down: true, error: "Couldn't reach the dashboard server" }; }
+  foundryUp = !health.down;
+  let text, tip;
+  if (foundryUp) {
+    const repo = String(health.repo || '').split(/[\\/]/).filter(Boolean).pop() || health.repo || '';
+    text = `<b>Foundry</b> · running${repo ? ' · ' + esc(repo) : ''}${health.gemma_ok === false ? ' · Gemma off' : ''}`;
+    tip = `Foundry is running${health.repo ? ' on ' + health.repo : ''}`
+      + (health.model ? `\nModel: ${health.model}` : '')
+      + `\nGemma: ${health.gemma_ok ? 'ok' : 'not reachable'}`
+      + (health.claude_ok === false ? '\nClaude: not reachable' : '')
+      + (health.version ? `\nVersion ${health.version}` : '');
+  } else {
+    text = '<b>Foundry</b> · not running';
+    tip = health.error || 'Foundry is not running. Start it with foundry\\start_foundry.bat';
+  }
+  chip.classList.toggle('on', foundryUp && health.gemma_ok !== false);
+  chip.classList.toggle('warn', foundryUp && health.gemma_ok === false);
+  chip.title = tip;
+  chip.querySelector('.fc-text').innerHTML = text;
+  syncFoundryRow();
+}
+function syncFoundryRow() {
+  const on = $('#t-foundry').checked;
+  $('#foundry-row').dataset.on = String(on);
+  $('#new-task button[type=submit]').textContent = on ? 'Send to Foundry' : 'Assign task';
+  $('#foundry-hint').textContent = on && !foundryUp ? 'Foundry is not running. Start it first (foundry\\start_foundry.bat).'
+    : on ? 'Foundry picks the team and registers the task on the board.' : '';
+}
+$('#t-foundry').addEventListener('change', syncFoundryRow);
+async function sendToFoundry(title, size) {
+  const description = $('#t-desc').value;
+  const files = $('#t-files').value.split(',').map((f) => f.trim()).filter(Boolean);
+  const body = { title, size };
+  if (description.trim()) body.description = description;
+  if (files.length) body.files = files;
+  let r;
+  try {
+    r = await foundryJson('/orders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  } catch {
+    toast("Couldn't reach the dashboard server");
+    return;
+  }
+  if (!r.json || !r.json.ok) {
+    toast(`Foundry didn't take the order: ${(r.json && r.json.error) || `HTTP ${r.status}`}`);
+    if (r.status === 503) pollFoundry();
+    return;
+  }
+  $('#t-title').value = ''; $('#t-desc').value = ''; $('#t-files').value = '';
+  buildersTouched = false; syncBuilders();
+  toast(`Sent to Foundry${r.json.task_id ? ` as ${r.json.task_id}` : ''}; it appears on the board shortly`);
+}
+pollFoundry();
+setInterval(pollFoundry, 10000);
 
 // Small/Large set the Builders picker to 2/5 until the user picks a number themselves.
 let buildersTouched = false;
@@ -960,6 +1077,127 @@ document.addEventListener('click', async (e) => {
     if (confirm(`Delete ${el.dataset.delete}? Its teams are freed.`)) await api('DELETE', `/api/tasks/${el.dataset.delete}`);
   }
 });
+
+// ---- Ask the Foreman ----
+// Streams POST /api/foundry/ask (text/event-stream: `data: {"text": "..."}` chunks, then `event: done`).
+// Model output is only ever added as text nodes, never as HTML.
+const foreman = { up: false, ctrl: null };
+const FOREMAN_START = 'foundry\\start_foundry.bat';
+function foremanSync() {
+  const busy = !!foreman.ctrl;
+  $('#foreman-q').disabled = !foreman.up;
+  $('#foreman-ask').disabled = !foreman.up || busy;
+  $('#foreman-stop').hidden = !busy;
+}
+function foremanSetUp(up, health) {
+  foreman.up = up;
+  const hint = $('#foreman-hint');
+  hint.classList.toggle('down', !up);
+  if (up) {
+    const repo = health && health.repo ? String(health.repo).split(/[\\/]/).filter(Boolean).pop() : '';
+    hint.textContent = `Foundry running${repo ? ' on ' + repo : ''}`
+      + (health && health.gemma_ok === false ? ' · Gemma is not answering, replies may fail' : '');
+  } else {
+    hint.replaceChildren("Foundry isn't running. Start it with ", Object.assign(document.createElement('code'), { textContent: FOREMAN_START }),
+      ' to ask questions.');
+  }
+  foremanSync();
+}
+async function foremanHealth() {
+  try {
+    const res = await fetch('/api/foundry/health', { cache: 'no-store' });
+    const json = await res.json().catch(() => null);
+    foremanSetUp(res.ok && !!json && json.ok !== false, json);
+  } catch {
+    foremanSetUp(false);
+  }
+}
+function foremanNote(out, text, err) {
+  const el = document.createElement('span');
+  el.className = err ? 'foreman-note foreman-err' : 'foreman-note';
+  el.textContent = text;
+  out.append(el);
+}
+// Parse one SSE event block; returns {event, data} (data lines joined with \n).
+function foremanEvent(block) {
+  let event = 'message';
+  const data = [];
+  for (const line of block.split('\n')) {
+    if (!line || line.startsWith(':')) continue;
+    const i = line.indexOf(':');
+    const field = i < 0 ? line : line.slice(0, i);
+    const value = i < 0 ? '' : line.slice(i + 1).replace(/^ /, '');
+    if (field === 'event') event = value;
+    else if (field === 'data') data.push(value);
+  }
+  return { event, data: data.join('\n') };
+}
+async function foremanAsk(question) {
+  const out = $('#foreman-answer');
+  out.hidden = false;
+  out.replaceChildren();
+  out.setAttribute('aria-busy', 'true');
+  const ctrl = new AbortController();
+  foreman.ctrl = ctrl;
+  foremanSync();
+  let got = false;
+  let finished = false;
+  try {
+    const res = await fetch('/api/foundry/ask', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+      body: JSON.stringify({ question }),
+    });
+    if (!res.ok || !(res.headers.get('content-type') || '').includes('text/event-stream') || !res.body) {
+      const json = await res.json().catch(() => null);
+      if (res.status === 503) foremanSetUp(false);
+      throw new Error((json && json.error) || `Foundry answered ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    const handle = (block) => {
+      const { event, data } = foremanEvent(block);
+      if (event === 'done') { finished = true; return; }
+      let msg = null;
+      try { msg = data ? JSON.parse(data) : null; } catch { msg = { text: data }; }
+      if (event === 'error' || (msg && msg.error && msg.text == null)) throw new Error((msg && msg.error) || data || 'The Foreman could not answer');
+      if (msg && typeof msg.text === 'string' && msg.text) { out.append(document.createTextNode(msg.text)); got = true; }
+    };
+    while (!finished) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      // Normalise CRLF/CR line ends; keep a trailing \r until we know whether \n follows.
+      buf = (buf + dec.decode(value, { stream: true })).replace(/\r\n|\r(?!$)/g, '\n');
+      let i;
+      while (!finished && (i = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        handle(block);
+      }
+    }
+    if (!finished && buf.trim()) handle(buf.replace(/\r$/, ''));
+    if (finished) reader.cancel().catch(() => {});
+    if (!got) foremanNote(out, 'The Foreman had nothing to say.');
+    else if (!finished) foremanNote(out, 'The answer was cut off.', true);
+  } catch (err) {
+    if (err.name === 'AbortError') foremanNote(out, 'Stopped.');
+    else foremanNote(out, err.message || String(err), true);
+  } finally {
+    out.removeAttribute('aria-busy');
+    if (foreman.ctrl === ctrl) foreman.ctrl = null;
+    foremanSync();
+  }
+}
+$('#foreman-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const q = $('#foreman-q').value.trim();
+  if (!q || !foreman.up || foreman.ctrl) return;
+  foremanAsk(q);
+});
+$('#foreman-stop').addEventListener('click', () => { if (foreman.ctrl) foreman.ctrl.abort(); });
+foremanHealth();
+setInterval(foremanHealth, 10000);
 
 // ---- live updates ----
 // on = SSE connection is up; sync = the server's {mode, ok, lastSync, error, url}

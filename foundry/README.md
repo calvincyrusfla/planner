@@ -17,7 +17,7 @@ Foundry **feeds the existing Agent Department dashboard**; it does not replace i
 | Claude | `SimulatedClaudeClient` (scripted, counts calls per agent) | `ClaudeCodeClient` runs headless Claude Code on Windows |
 | Gemma | `SimulatedGemmaClient` (scripted) | `OllamaGemmaClient` talks to a real Gemma 4 in Ollama |
 | Real clients | exist, unit-tested against a fake `claude` executable and a fake HTTP server | used for real |
-| Dashboard | ops posted to `/api/op` (dry mode in tests and the demo) | plus a Q&A box wired to `ShopForeman.answer_question` |
+| Dashboard | ops posted to `/api/op` (dry mode in tests and the demo) | plus the [Foundry service](#run-foundry-in-the-background): status chip, Send to Foundry and Ask the Foreman |
 | Solution cache | exact match only | fuzzy/semantic matching |
 
 Every phase-1 test and the demo run with simulated Claude and Gemma. `--real` exists but **has not been run against real Claude Code or Ollama yet**.
@@ -274,6 +274,107 @@ Foundry is restart-safe on the same database:
 - New work orders continue numbering after the highest `F-###` in the database.
 - `--real` resumes an unfinished task with the same title, files and repo, and only dispatches tasks of its own `--repo`.
 - Escalations are idempotent per `alert_id`: an alert that was already applied is not applied or posted again.
+
+## Run Foundry in the background
+
+`--real` (above) runs one task and stops. The **Foundry service** keeps the factory running for one repository, so you can send it work from the dashboard at any time.
+
+### Start it (Windows)
+
+1. Do the [Install](#install) steps once, and set up the [Shop Foreman](#setting-up-the-shop-foreman-phase-2) if you want Gemma.
+2. Make sure Claude Code is logged in: open a terminal, run `claude`, then `/login` if it asks.
+3. Double-click `foundry\start_foundry.bat` in File Explorer, or run it from the repo root:
+
+   ```bat
+   foundry\start_foundry.bat
+   ```
+
+   A window titled **Foundry** opens and stays open. That window *is* the service. By default it works on this repository (the folder that holds `foundry\`). To work on another repository, pass its folder:
+
+   ```bat
+   foundry\start_foundry.bat --repo C:\path\to\repo
+   ```
+
+4. Leave the window open. You can minimise it.
+
+What the service does while it runs:
+
+- it listens on `http://127.0.0.1:4310` (only this PC can reach it);
+- it keeps the builder and reviewer pools started for that repository;
+- every 60 seconds the Shop Foreman checks the line and the Floor Manager carries out any escalation (the same actions as in [Escalation actions](#escalation-actions-floor-manager));
+- on start it picks up the unfinished tasks of that repository from the database, so nothing is lost after a restart;
+- finished tasks are written to the patches folder as `.patch` and `.md` files, exactly as in real mode. Your working tree is never changed; you apply the patch yourself.
+
+### Stop it
+
+Click in the **Foundry** window and press **Ctrl+C**, or simply close the window. On Ctrl+C the service sends its last board updates and shuts the factory down cleanly. Closing the window is safe too: unfinished work is resumed the next time you start it.
+
+### Without the .bat file
+
+The `.bat` file only runs this command, which also works on macOS and Linux (`foundry/start_foundry.sh` does the same there):
+
+```powershell
+.venv\Scripts\python -m foundry.serve --repo C:\path\to\repo
+```
+
+```bash
+./foundry/start_foundry.sh
+.venv/bin/python -m foundry.serve --repo /path/to/repo
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FOUNDRY_SERVE_PORT` | `4310` | port of the service. If you change it, the dashboard can't find Foundry (it always looks on 4310) |
+| `FOUNDRY_MONITOR_S` | `60` | seconds between the Foreman's line checks |
+
+All the variables in [Configuration](#configuration) apply as well.
+
+### The service's API
+
+The dashboard uses these endpoints; you don't need them yourself. They answer only on `127.0.0.1` and only to requests addressed to a local host name. There is no CORS, so web pages from other sites can't call them.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/health` | `{ok, repo, model, gemma_ok, claude_ok, version}` |
+| `GET /api/status` | the tasks (`id, title, state, team, builders, patch, md, rejected, reason`), a Foreman telemetry summary, `paused_until` and `last_account_error` |
+| `POST /api/orders` | `{title, description?, files?, size?}` submits a work order for the service's repository and returns `{ok, task_id}`. A bad order gets HTTP 400 |
+| `POST /api/ask` | `{question}`: the Foreman's answer, streamed as `text/event-stream` (`data: {"text": "..."}` chunks, then `event: done`) |
+
+## Dashboard integration
+
+Start the dashboard as usual (`npm run dashboard`, or the desktop shortcut) and start Foundry with `foundry\start_foundry.bat`. The order doesn't matter. The dashboard talks to Foundry through its own server (`/api/foundry/...` is passed on to `http://127.0.0.1:4310/api/...`), so the browser only ever talks to the dashboard.
+
+### The Foundry chip
+
+In the dashboard header a **Foundry** chip shows whether the service is running. It is checked every 10 seconds.
+
+- **running**: it also shows the repository Foundry works on and whether Gemma (the Shop Foreman) is reachable. If Gemma is not reachable, Foundry still works with its built-in fallbacks.
+- **not running**: start `foundry\start_foundry.bat`. The chip turns to running within 10 seconds; you don't need to reload the page.
+
+### Send to Foundry
+
+The new-task form has a **Send to Foundry** switch and an optional **Files** box.
+
+1. Type the title and description as usual.
+2. Turn **Send to Foundry** on.
+3. Optionally list the files the change is about, separated by commas, for example `shop/mathx.py, shop/strings.py`. This helps Foundry give the builders the right context.
+4. Submit.
+
+With the switch on, the task goes to Foundry instead of straight onto the board. Foundry sizes it, then registers it on the board itself, so it shows up as a normal task a moment later and you can follow its progress, reviews and completion there. With the switch off, the form works exactly as before. If Foundry isn't running, the dashboard shows the message and adds nothing.
+
+When the task is done, the patch and the commit message are in the patches folder (see [Real mode](#real-mode-phase-2-untested-against-live-services) for how to apply them).
+
+### Ask the Foreman
+
+The **Ask the Foreman** panel lets you ask the Shop Foreman a question in plain words, for example "Why is F-003 stuck?" or "Which tasks are waiting for review?". The answer appears piece by piece as Gemma writes it. The Foreman can only read: it looks at the queue, the telemetry and the repository, and it never changes anything.
+
+When Foundry isn't running, the panel is greyed out with a hint to start `foundry\start_foundry.bat`.
+
+### When something doesn't work
+
+- **The chip says not running but the Foundry window is open.** Look at the window for an error. Check that nothing else uses port 4310 and that `FOUNDRY_SERVE_PORT` is not set.
+- **"Foundry is not running"** when you submit or ask: the service was stopped or crashed. Start it again; unfinished tasks are resumed.
+- **A task stays paused.** Claude hit the usage limit; Foundry carries on by itself when the limit resets (see [What happens at the Claude usage limit](#what-happens-at-the-claude-usage-limit)).
 
 ## How it feeds the Agent Department dashboard
 

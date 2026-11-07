@@ -252,6 +252,119 @@ async function refreshUsage(req, res) {
   return send(res, 200, { ok: true, result: { usage: result?.usage ?? null, stored: result?.stored !== false } });
 }
 
+// ---------- Foundry proxy (/api/foundry/* -> http://127.0.0.1:4310/api/*) ----------
+// The Foundry service (python -m foundry.serve) listens on loopback only. Only callers on
+// this computer may reach it through the dashboard; a phone on the LAN gets 403. Known
+// endpoints only, short timeouts, and the SSE answer of POST /ask is streamed through.
+const FOUNDRY_PORT = Number(process.env.FOUNDRY_SERVE_PORT) || 4310;
+const FOUNDRY_DOWN = 'Foundry is not running — start it with foundry\\start_foundry.bat (or: python -m foundry.serve --repo <path>)';
+const FOUNDRY_ROUTES = { 'GET health': 3000, 'GET status': 5000, 'POST orders': 10000, 'POST ask': 15000 }; // ms until headers
+const FOUNDRY_IDLE_MS = 120000; // a streamed answer may pause this long between chunks
+
+async function readRaw(req) {
+  let raw = '';
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > 1e6) throw new core.DeptError('Body too large', 413);
+  }
+  return raw;
+}
+
+async function foundryProxy(req, res, rest) {
+  if (!refreshAllowed(req)) return send(res, 403, { ok: false, error: 'Foundry is only reachable from this computer', code: 'forbidden' });
+  const timeout = FOUNDRY_ROUTES[`${req.method} ${rest}`];
+  if (!timeout) {
+    const known = Object.keys(FOUNDRY_ROUTES).some((k) => k.endsWith(` ${rest}`));
+    return send(res, known ? 405 : 404, { ok: false, error: known ? 'Method not allowed' : 'Not found' });
+  }
+  const body = req.method === 'POST' ? await readRaw(req) : '';
+  if (body) {
+    try {
+      JSON.parse(body);
+    } catch {
+      return send(res, 400, { ok: false, error: 'Body must be JSON' });
+    }
+  }
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = (status, out) => {
+      if (done) return;
+      done = true;
+      if (!res.headersSent) send(res, status, out);
+      else res.end();
+      resolve();
+    };
+    const up = http.request({
+      host: '127.0.0.1',
+      port: FOUNDRY_PORT,
+      method: req.method,
+      path: `/api/${rest}`,
+      headers: {
+        host: `127.0.0.1:${FOUNDRY_PORT}`,
+        accept: req.method === 'POST' && rest === 'ask' ? 'text/event-stream' : 'application/json',
+        ...(body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {}),
+      },
+    });
+    const timer = setTimeout(() => {
+      up.destroy();
+      finish(504, { ok: false, error: 'Foundry did not answer in time', code: 'timeout' });
+    }, timeout);
+    up.on('error', (err) => {
+      clearTimeout(timer);
+      const down = ['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENOTFOUND'].includes(err.code);
+      finish(down ? 503 : 502, { ok: false, error: down ? FOUNDRY_DOWN : 'Foundry connection failed', code: down ? 'foundry_down' : 'bad_gateway' });
+    });
+    up.on('response', (ur) => {
+      clearTimeout(timer);
+      const type = String(ur.headers['content-type'] || '');
+      if (type.startsWith('text/event-stream')) {
+        res.writeHead(ur.statusCode, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' });
+        res.flushHeaders?.();
+        const idle = () => {
+          up.destroy();
+          finish();
+        };
+        ur.setTimeout(FOUNDRY_IDLE_MS, idle);
+        ur.on('data', (chunk) => res.write(chunk));
+        ur.on('end', () => finish());
+        ur.on('error', () => finish());
+        res.on('close', () => {
+          if (!done) {
+            up.destroy();
+            done = true;
+            resolve();
+          }
+        });
+        return;
+      }
+      let raw = '';
+      ur.setEncoding('utf8');
+      ur.setTimeout(timeout, () => {
+        up.destroy();
+        finish(504, { ok: false, error: 'Foundry did not answer in time', code: 'timeout' });
+      });
+      ur.on('data', (c) => {
+        raw += c;
+        if (raw.length > 5e6) {
+          up.destroy();
+          finish(502, { ok: false, error: 'Foundry answer too large', code: 'bad_gateway' });
+        }
+      });
+      ur.on('error', () => finish(502, { ok: false, error: 'Foundry connection failed', code: 'bad_gateway' }));
+      ur.on('end', () => {
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          return finish(502, { ok: false, error: 'Foundry sent an unreadable answer', code: 'bad_gateway' });
+        }
+        finish(ur.statusCode, parsed);
+      });
+    });
+    up.end(body || undefined);
+  });
+}
+
 const routes = [
   ['GET', /^\/api\/state$/, (b, m, req) => payload(isLocalRequest(req))],
   ['POST', /^\/api\/tasks$/, (b) => mutate('addTask', { title: b.title, description: b.description, size: b.size, builders: b.builders })],
@@ -286,6 +399,9 @@ const server = http.createServer(async (req, res) => {
       if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use POST', code: 'method' });
       return await refreshUsage(req, res);
     }
+    const fm = url.pathname.match(/^\/api\/foundry\/([a-z]+)$/);
+    if (fm) return await foundryProxy(req, res, fm[1]);
+    if (url.pathname.startsWith('/api/foundry')) return send(res, 404, { ok: false, error: 'Not found' });
     if (url.pathname.startsWith('/api/')) {
       for (const [method, re, handler] of routes) {
         const m = url.pathname.match(re);
