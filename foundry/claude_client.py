@@ -162,7 +162,7 @@ def _unit_factor(unit: str | None) -> float:
     if not unit:
         return 1.0
     u = unit.lower()
-    if u.startswith("ms") or u.startswith("milli"):
+    if u.startswith(("ms", "milli")):
         return 0.001
     if u.startswith("h"):
         return 3600.0
@@ -309,7 +309,7 @@ def parse_claude_json(stdout: str) -> dict:
     except json.JSONDecodeError:
         for line in text.splitlines():
             line = line.strip()
-            if line.startswith("{") or line.startswith("["):
+            if line.startswith(("{", "[")):
                 try:
                     candidates.append(json.loads(line))
                 except json.JSONDecodeError:
