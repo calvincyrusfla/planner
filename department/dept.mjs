@@ -8,6 +8,19 @@ import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
 
+// Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY is set
+// (Node 22.21+). Behind a proxy, as in Claude cloud sessions, re-run this
+// command with it so the shared board is reachable. Local addresses stay
+// direct through NO_PROXY. On a PC without a proxy nothing changes.
+if ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_USE_ENV_PROXY) {
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync(process.execPath, ['--disable-warning=UNDICI-EHPA', ...process.execArgv, ...process.argv.slice(1)], {
+    stdio: 'inherit',
+    env: { ...process.env, NODE_USE_ENV_PROXY: '1' },
+  });
+  process.exit(r.status ?? 1);
+}
+
 const BASE = process.env.DEPT_URL || `http://127.0.0.1:${process.env.PORT || 4300}`;
 
 const HELP = `Agent Department CLI
