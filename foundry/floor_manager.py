@@ -190,6 +190,9 @@ class FloorManager:
         self._completed: set[str] = set()
         #: task id -> the one task doing its completion work (shared by every caller).
         self._finish_tasks: dict[str, asyncio.Task[dict[str, str]]] = {}
+        #: Foreman drafts whose patch could not be written yet (task -> summary);
+        #: the next :meth:`on_task_complete` retries the write without a new draft.
+        self._drafts: dict[str, dict[str, str]] = {}
         self._reported_quarantine: set[str] = set()
         self._pending: set[asyncio.Task[Any]] = set()
         #: Current builder allocation per task (updated on RESIZE_ALLOCATION).
@@ -701,16 +704,23 @@ class FloorManager:
             await self._write_patch(task_id, diff, known)
             self.save()
             return known
-        order = self.orders.get(task_id)
-        summary = await _maybe_await(
-            self.foreman.draft_pr_summary(diff, task_id=task_id, title=order.title if order else None)
-        )
-        summary = {k: str(v) for k, v in dict(summary).items()}
-        await self._write_patch(task_id, diff, summary)
+        summary = self._drafts.get(task_id)
+        if summary is None:
+            order = self.orders.get(task_id)
+            summary = await _maybe_await(
+                self.foreman.draft_pr_summary(diff, task_id=task_id, title=order.title if order else None)
+            )
+            summary = {k: str(v) for k, v in dict(summary).items()}
+            self._drafts[task_id] = summary
+        if not await self._write_patch(task_id, diff, summary):
+            # Not written (disk error): nothing is recorded, the task stays
+            # unfinished and the next call retries the write with this draft.
+            return summary
         # Recorded only once the patch is written: a run cut short before this
         # point leaves the task unfinished, and the next call finishes it.
         # Nothing below awaits, so the summary, the board ops and the save
         # happen together or not at all.
+        self._drafts.pop(task_id, None)
         self.pr_summaries[task_id] = summary
         self._completed.add(task_id)
         try:
@@ -724,8 +734,11 @@ class FloorManager:
         self.save()
         return summary
 
-    async def _write_patch(self, task_id: str, diff: str, summary: Mapping[str, str]) -> None:
+    async def _write_patch(self, task_id: str, diff: str, summary: Mapping[str, str]) -> bool:
         """Write ``<name>.patch`` (apply with ``git apply``) and ``<name>.md`` into patches_dir.
+
+        Returns False when the files could not be written (True when written,
+        or when this manager writes no patches at all).
 
         Foundry never edits the target repository itself; these files are the
         output. When git is installed the combined patch is first checked with
@@ -742,7 +755,7 @@ class FloorManager:
           next to a good ``.patch``, or the reverse).
         """
         if self.patches_dir is None:
-            return
+            return True
         text = _with_newline(diff) if diff else ""
         repo = self.task_repo(task_id)
         problem = await asyncio.to_thread(_git_check, text, Path(repo) if repo else self.repo_root) if text else None
@@ -766,6 +779,8 @@ class FloorManager:
                 self.rejected_patches.pop(task_id, None)
         except OSError as exc:
             log.warning("floor manager: could not write the patch for %s: %s", task_id, exc)
+            return False
+        return True
 
     def _patch_name(self, task_id: str, text: str, md: str, *, rejected: bool) -> str:
         """The file stem for a task's patch: its own earlier name, else the first name that is free or identical."""
@@ -800,6 +815,17 @@ class FloorManager:
             if isinstance(got, (list, tuple)):
                 return "\n".join(str(x) for x in got)
         return ""
+
+
+def _finish_timeout(config: Any, explicit: float | None) -> float:
+    """The drain bound: the explicit value, else ``config.finish_timeout_s``, else the default."""
+    if explicit is not None:
+        return float(explicit)
+    value = getattr(config, "finish_timeout_s", None)
+    try:
+        return float(value) if value is not None and float(value) >= 0 else DEFAULT_FINISH_TIMEOUT_S
+    except (TypeError, ValueError):
+        return DEFAULT_FINISH_TIMEOUT_S
 
 
 def _params(fn: Any) -> set[str]:
@@ -929,8 +955,12 @@ class Factory:
     gemma: Any
 
     @asynccontextmanager
-    async def running(self) -> AsyncIterator[Factory]:
-        """Start every team pool; on exit wait for completion work, then stop the pools."""
+    async def running(self, finish_timeout: float | None = None) -> AsyncIterator[Factory]:
+        """Start every team pool; on exit wait for completion work, then stop the pools.
+
+        ``finish_timeout`` bounds each wait for in-flight completion work
+        (default: the manager's ``finish_timeout``); the work is never cancelled.
+        """
         for pool in self.pools.values():
             pool.start()
         try:
@@ -938,10 +968,11 @@ class Factory:
         finally:
             # Completion work first (the PR draft, the patch, the board's
             # review/done): a pool's stop grace would otherwise cancel it.
-            await self.manager.drain()
+            await self.manager.drain(finish_timeout)
             for pool in self.pools.values():
                 await pool.stop()
-            await self.manager.drain()
+            # completions a stopping worker scheduled on its way out
+            await self.manager.drain(finish_timeout)
 
     async def wait(self, task_ids: list[str], timeout: float = 30.0) -> dict[str, str]:
         """Wait until every task is terminal; returns ``{task_id: state}``."""
@@ -1017,6 +1048,7 @@ def build_factory(
             to the database unless FOUNDRY_PATCHES_DIR says otherwise).
         finish_timeout: how long shutdown (``Factory.running`` / ``wait``)
             waits for in-flight completion work (default
+            ``config.finish_timeout_s`` when the config has it, else
             :data:`DEFAULT_FINISH_TIMEOUT_S`).
         dispatch_repo: when given, the pools only claim tickets of tasks that
             belong to this repository (real mode); None dispatches everything.
@@ -1067,7 +1099,7 @@ def build_factory(
         builders_per_team=config.builders_per_team,
         patches_dir=patches_dir,
         repo_root=repo_root,
-        finish_timeout=DEFAULT_FINISH_TIMEOUT_S if finish_timeout is None else finish_timeout,
+        finish_timeout=_finish_timeout(config, finish_timeout),
     )
     pool_extra: dict[str, Any] = {}
     if dispatch_repo is not None:

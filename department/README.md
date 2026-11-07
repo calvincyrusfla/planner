@@ -312,6 +312,16 @@ It shows both limits, when they reset, and how old the last report is. To store 
 node department/dept.mjs usage report --five 42 --five-reset 2026-11-07T15:10:00Z --week 18 --week-reset 2026-11-12T09:00:00Z --source PC
 ```
 
+## Foundry
+
+[Foundry](../foundry/README.md) is the Python factory that can run coding work for the department. When its service is running (`foundry\start_foundry.bat` on Windows, `./foundry/start_foundry.sh` elsewhere), the dashboard shows three extra things:
+
+- a **Foundry** chip in the header: running or not running, the repository it works on and whether Gemma is reachable (checked every 10 seconds);
+- a **Send to Foundry** switch on the new-task form, with an optional **Files** box (comma separated) that appears when it is on. With the switch on, the task goes to Foundry, which picks the team and builders and registers it on the board itself;
+- an **Ask the Foreman** panel, where the Shop Foreman's answer appears as it is written. It is greyed out while Foundry isn't running.
+
+The dashboard server passes `/api/foundry/*` on to the service at `http://127.0.0.1:4310/api/*` (another port if `FOUNDRY_SERVE_PORT` is set when the dashboard starts; use the same value for Foundry). It only does so for requests from this PC; when Foundry is down it answers 503 with how to start it. Everything else on the dashboard works the same with or without Foundry. To stop Foundry, press Ctrl+C in its window or close it. See [Run Foundry in the background](../foundry/README.md#run-foundry-in-the-background) and [Dashboard integration](../foundry/README.md#dashboard-integration).
+
 ## How the agents use it
 
 `CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here with a crew size, staffed with that many of the assigned team's builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.
