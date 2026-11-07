@@ -10,6 +10,25 @@ export const TEAM_DEFS = [
 // the team's work before a task is called done.
 export const BUILDERS_PER_TEAM = 5;
 export const AGENTS_PER_TEAM = BUILDERS_PER_TEAM + 1;
+// Crew size: how many of a team's builders work a task (task.builders, 1-5).
+// The rest stand by; the reviewer always reviews. Defaults follow the size.
+export const DEFAULT_BUILDERS = Object.freeze({ small: 2, large: 5 });
+export const STANDBY_WORK = 'Standby';
+const isCrewSize = (n) => Number.isInteger(n) && n >= 1 && n <= BUILDERS_PER_TEAM;
+// Builders per team on `task`: its own setting, else the size default.
+export function crewFor(task) {
+  const n = Number(task?.builders);
+  if (isCrewSize(n)) return n;
+  return DEFAULT_BUILDERS[task?.size] || DEFAULT_BUILDERS.small;
+}
+// An explicit crew size from a request: integer (or integer string) 1-5.
+// undefined/null/'' means "not given" and returns undefined.
+function parseBuilders(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const n = typeof value === 'number' ? value : typeof value === 'string' && /^\s*\d+\s*$/.test(value) ? Number(value) : NaN;
+  if (!isCrewSize(n)) throw new DeptError(`builders must be 1–${BUILDERS_PER_TEAM}`, 400);
+  return n;
+}
 
 export const TASK_STATUSES = ['queued', 'active', 'review', 'paused', 'done', 'cancelled'];
 export const AGENT_STATUSES = ['idle', 'assigned', 'working', 'blocked', 'done'];
@@ -191,6 +210,26 @@ function setAgents(team, status, work = '') {
   for (const a of team.agents) setAgent(a, status, work);
 }
 
+// Builder number of an agent (<team>-N), or 0 for anything else.
+const builderIndex = (agent) => (agent?.role === 'builder' ? Number(String(agent.id).split('-').pop()) || 0 : 0);
+
+// Give the team's builders their parts on `task`: builders 1..crew are on it,
+// the rest stand by (idle, work "Standby"). On attach (fresh) every crew
+// builder starts 'assigned'; on a crew change, crew builders already working,
+// blocked or done keep their status. The reviewer is left alone.
+function applyCrew(task, team, { fresh = false } = {}) {
+  const crew = crewFor(task);
+  for (const agent of team.agents) {
+    const i = builderIndex(agent);
+    if (!i) continue;
+    if (i > crew) {
+      if (agent.status !== 'idle' || agent.work !== STANDBY_WORK) setAgent(agent, 'idle', STANDBY_WORK);
+    } else if (fresh || !['assigned', 'working', 'blocked', 'done'].includes(agent.status)) {
+      setAgent(agent, 'assigned');
+    }
+  }
+}
+
 function setAgent(agent, status, work = '') {
   if (!agent) return;
   agent.status = status;
@@ -208,6 +247,7 @@ function attach(state, task, team, { focus = '', by = 'dispatcher' } = {}) {
   team.focus = focus;
   team.progress = task.progress;
   setAgents(team, 'assigned');
+  applyCrew(task, team, { fresh: true });
   if (!task.teamHistory.includes(team.id)) task.teamHistory.push(team.id);
   // Sign-off only covers the work that was reviewed: a team joining a task
   // whose round was fully approved voids it. In review, that team is simply
@@ -277,16 +317,18 @@ export function dispatch(state) {
 
 // ---------- task operations ----------
 
-export function addTask(state, { title, description = '', size = 'small' } = {}) {
+export function addTask(state, { title, description = '', size = 'small', builders } = {}) {
   title = String(title || '').trim();
   if (!title) throw new DeptError('A task needs a title');
   if (!['small', 'large'].includes(size)) throw new DeptError('size must be small or large');
+  const crew = parseBuilders(builders) ?? DEFAULT_BUILDERS[size];
   const id = `T-${String(state.nextTaskNumber++).padStart(3, '0')}`;
   const task = {
     id,
     title,
     description: String(description || ''),
     size,
+    builders: crew, // builders per team on this task; the reviewer is extra
     status: 'queued',
     progress: 0,
     teamHistory: [],
@@ -334,6 +376,8 @@ export function unassignTeam(state, taskId, teamId, { by = 'user' } = {}) {
 
 export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
   const task = getTask(state, taskId);
+  // Validate before changing anything, so a bad crew size leaves the task as it was.
+  const builders = parseBuilders(patch.builders);
   if (patch.title !== undefined) {
     const title = String(patch.title).trim();
     if (!title) throw new DeptError('Title cannot be empty');
@@ -343,6 +387,12 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
   if (patch.size !== undefined) {
     if (!['small', 'large'].includes(patch.size)) throw new DeptError('size must be small or large');
     task.size = patch.size;
+  }
+  if (builders !== undefined && builders !== task.builders) {
+    const before = crewFor(task);
+    task.builders = builders;
+    for (const team of teamsOn(state, task.id)) applyCrew(task, team);
+    log(state, { kind: 'crew', taskId: task.id, message: `${task.id} crew set to ${builders} builder${builders === 1 ? '' : 's'} per team (was ${before}) by ${by}` });
   }
   if (patch.progress !== undefined) task.progress = clampPct(patch.progress);
   if (patch.status !== undefined && patch.status !== task.status) {
@@ -683,6 +733,8 @@ export function normalize(state) {
   state.usage = normalizeUsage(state.usage);
   state.nextTaskNumber ||= state.tasks.length + 1;
   for (const task of state.tasks) {
+    // Tasks from before crew sizing get their size's default.
+    if (!isCrewSize(task.builders)) task.builders = crewFor({ size: task.size });
     if (typeof task.activeMs !== 'number' || !Number.isFinite(task.activeMs)) task.activeMs = 0;
     if (!task.teamMs || typeof task.teamMs !== 'object') task.teamMs = {};
     if (!Number.isInteger(task.reviewRound) || task.reviewRound < 0) task.reviewRound = 0;

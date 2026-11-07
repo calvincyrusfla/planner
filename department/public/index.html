@@ -64,7 +64,7 @@
   ::placeholder { color: var(--faint); opacity: 1; }
 
   /* new task */
-  .new-task { padding: 14px; display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: start; }
+  .new-task { padding: 14px; display: grid; grid-template-columns: 1fr auto auto auto; gap: 10px; align-items: start; }
   .new-task .fields { display: grid; gap: 8px; }
   .new-task textarea { resize: vertical; min-height: 38px; }
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
@@ -76,6 +76,18 @@
   .seg label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
   .hint { grid-column: 1 / -1; color: var(--faint); font-size: 12px; margin: -2px 0 0; }
   @media (max-width: 720px) { .new-task { grid-template-columns: 1fr; } }
+  /* crew size: builders per team (the reviewer is extra and always reviews) */
+  .crew-pick { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .crew-pick select { padding: 5px 8px; }
+  .crew-pick small { color: var(--muted); font-size: 12px; }
+  .crew { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+  .crew b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .crew select { font-size: 12px; padding: 1px 4px; font-weight: 600; }
+  .team-crew { font-size: 12px; color: var(--muted); }
+  .agents li.standby .agent-name { color: var(--faint); }
+  .agents li.standby .agent-work { display: flex; align-items: center; gap: 6px; color: var(--faint); }
+  .agents li.standby .dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--idle); }
+  .tag.standby { color: var(--muted); background: var(--surface-2); border-color: var(--border); }
 
   /* teams */
   .teams { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
@@ -269,8 +281,15 @@
       <label><input type="radio" name="size" value="small" checked><span>Small</span></label>
       <label><input type="radio" name="size" value="large"><span>Large</span></label>
     </div>
+    <label class="crew-pick" title="Builders per team on this task; each team's reviewer always reviews as well">
+      <span>Builders</span>
+      <select id="t-builders" aria-label="Builders per team">
+        <option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option>
+      </select>
+      <small>+ reviewer</small>
+    </label>
     <button class="primary" type="submit">Assign task</button>
-    <p class="hint">Each task gets one team. A large task gets all three teams when nothing else is running. Tasks wait in the queue when every team is busy.</p>
+    <p class="hint">Each task gets one team. A large task gets all three teams when nothing else is running. Tasks wait in the queue when every team is busy. Builders sets how many of each team's five builders work on it (Small 2, Large 5 by default); the rest stand by and the reviewer always reviews.</p>
   </form>
 
   <h2>Teams</h2>
@@ -300,6 +319,17 @@ const OPEN = ['active', 'review', 'queued', 'paused'];
 const STATUS_LABEL = { active: 'Active', review: 'In review', queued: 'Queued', paused: 'Paused', done: 'Done', cancelled: 'Cancelled' };
 const isReviewer = (a) => a.role === 'reviewer';
 const shortName = (team) => team.name.replace(/^Team\s+/i, '');
+// Mirrors core.crewFor: builders per team on a task (1-5), else the size default.
+const DEFAULT_BUILDERS = { small: 2, large: 5 };
+function crewFor(task) {
+  const n = Number(task && task.builders);
+  if (Number.isInteger(n) && n >= 1 && n <= 5) return n;
+  return DEFAULT_BUILDERS[task && task.size] || DEFAULT_BUILDERS.small;
+}
+const crewText = (n) => `${n} builder${n === 1 ? '' : 's'} + reviewer`;
+const agentNum = (a) => Number((/-(\d+)$/.exec(a.id) || [])[1]) || 0;
+// A builder beyond the task's crew who isn't doing anything: shown dimmed as "Standby".
+const isStandby = (a, task) => !!task && !isReviewer(a) && agentNum(a) > crewFor(task) && a.status === 'idle';
 // Mirrors core.reviewStatus: verdicts of the teams currently on the task, current round only.
 function reviewStatus(task) {
   const round = task.reviewRound || 0;
@@ -543,6 +573,7 @@ function renderTeams() {
       <div class="team-head">
         <div class="team-name">${esc(team.name)} <span class="pill ${task ? (task.status === 'review' ? 'review' : 'active') : ''}">${task ? (task.status === 'review' ? 'In review' : 'On task') : 'Free'}</span></div>
         <div class="team-task">${task ? `<strong>${esc(task.id)}</strong> ${esc(task.title)}` : 'Waiting for a task'}</div>
+        ${task ? `<div class="team-crew">${crewText(crewFor(task))}</div>` : ''}
         <div class="team-time">${task ? `On this task ${liveSpan((task.teamMs || {})[team.id] || 0, team.assignedAt)} · ` : ''}Total ${liveSpan(team.totalMs || 0, task ? team.assignedAt : null)}</div>
         ${team.focus ? `<div class="focus">Focus: ${esc(team.focus)}</div>` : ''}
         ${task ? `<div class="prow"><div class="progress" role="progressbar" aria-valuenow="${team.progress}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(team.name)} progress"><i style="width:${team.progress}%"></i></div><b>${team.progress}%</b></div>` : ''}
@@ -552,6 +583,10 @@ function renderTeams() {
           ? `<li class="reviewer" title="${esc(a.name || 'Reviewer')} · ${esc(a.status)}${a.updatedAt ? ' · ' + ago(a.updatedAt) : ''}">
           <span class="dot ${a.status}"></span><span class="agent-name">${esc(a.id)}</span>
           <span class="agent-work ${a.work ? '' : 'empty'}"><span class="tag">Reviewer</span><span>${esc(a.work || a.status)}</span></span></li>`
+          : isStandby(a, task)
+          ? `<li class="standby" title="Standby: not part of this task's crew (${esc(crewText(crewFor(task)))})">
+          <span class="dot"></span><span class="agent-name">${esc(a.id)}</span>
+          <span class="agent-work"><span class="tag standby">Standby</span></span></li>`
           : `<li title="${esc(a.status)}${a.updatedAt ? ' · ' + ago(a.updatedAt) : ''}">
           <span class="dot ${a.status}"></span><span class="agent-name">${esc(a.id)}</span>
           <span class="agent-work ${a.work ? '' : 'empty'}">${esc(a.work || a.status)}</span></li>`).join('')}
@@ -631,6 +666,14 @@ function reviewRow(task, teams) {
     issues ? `<span class="issues">${issues} issue${issues === 1 ? '' : 's'} caught</span>` : ''}</div>`;
 }
 
+// "N builders + reviewer"; open tasks get a small picker (PATCH {builders}).
+function crewLine(task, finished) {
+  const n = crewFor(task);
+  if (finished) return `<div class="task-timer"><span class="crew"><b>${n}</b> builder${n === 1 ? '' : 's'} + reviewer</span></div>`;
+  const opts = [1, 2, 3, 4, 5].map((i) => `<option value="${i}"${i === n ? ' selected' : ''}>${i}</option>`).join('');
+  return `<div class="task-timer"><span class="crew"><select data-builders="${esc(task.id)}" aria-label="Builders per team on ${esc(task.id)}" title="Builders per team on this task">${opts}</select>builder${n === 1 ? '' : 's'} + reviewer</span></div>`;
+}
+
 function taskCard(task) {
   const teams = state.teams.filter((t) => t.taskId === task.id);
   const finished = !OPEN.includes(task.status);
@@ -645,6 +688,7 @@ function taskCard(task) {
     ${task.description ? `<p class="task-desc">${esc(task.description)}</p>` : ''}
     <div class="prow"><div class="progress" role="progressbar" aria-valuenow="${task.progress}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(task.id)} progress"><i style="width:${task.progress}%"></i></div><b>${task.progress}%</b></div>
     ${taskTimer(task, finished)}
+    ${crewLine(task, finished)}
     ${reviewRow(task, teams)}
     ${finished ? '' : `<div class="chips">
       ${teams.length ? teams.map((t) => `<span class="chip" style="--team:${t.color}"><i></i>${esc(t.name)} <small>${t.progress}%</small>
@@ -726,7 +770,7 @@ function render() {
   renderUsage();
   const active = document.activeElement;
   // Don't yank an open dropdown out from under the user; render once they leave it.
-  if (active && active.tagName === 'SELECT' && active.closest('#teams, #tasks') && !active.value) {
+  if (active && active.tagName === 'SELECT' && active.closest('#teams, #tasks') && (!active.value || active.dataset.builders)) {
     pending = true;
     return;
   }
@@ -741,10 +785,24 @@ $('#new-task').addEventListener('submit', async (e) => {
   const title = $('#t-title').value.trim();
   if (!title) return;
   const size = document.querySelector('input[name=size]:checked').value;
-  const r = await api('POST', '/api/tasks', { title, description: $('#t-desc').value, size });
+  const builders = Number($('#t-builders').value) || DEFAULT_BUILDERS[size];
+  // Via the generic op so `builders` reaches core.addTask (the POST /api/tasks route only forwards title/description/size).
+  const r = await api('POST', '/api/op', { type: 'addTask', args: { title, description: $('#t-desc').value, size, builders } });
   $('#t-title').value = ''; $('#t-desc').value = '';
+  buildersTouched = false; syncBuilders();
   toast(r.assigned.length ? `${r.task.id} assigned to ${r.assigned.map((id) => state.teams.find((t) => t.id === id)?.name || id).join(', ')}` : `${r.task.id} queued until a team is free`);
 });
+
+// Small/Large set the Builders picker to 2/5 until the user picks a number themselves.
+let buildersTouched = false;
+function syncBuilders() {
+  if (buildersTouched) return;
+  const size = document.querySelector('input[name=size]:checked').value;
+  $('#t-builders').value = String(DEFAULT_BUILDERS[size] || 2);
+}
+for (const r of document.querySelectorAll('input[name=size]')) r.addEventListener('change', syncBuilders);
+$('#t-builders').addEventListener('change', () => { buildersTouched = true; });
+syncBuilders();
 
 $('#auto').addEventListener('change', (e) => api('PATCH', '/api/settings', { autoDispatch: e.target.checked }));
 
@@ -753,6 +811,13 @@ document.addEventListener('change', async (e) => {
   if (el.dataset.move && el.value) {
     const r = await api('POST', `/api/tasks/${el.value}/assign`, { teamId: el.dataset.move });
     toast(`${r.team.name} → ${r.task.id}${r.previous ? ` (from ${r.previous})` : ''}`);
+  } else if (el.dataset.builders) {
+    const n = Number(el.value);
+    el.blur(); // let the deferred render run
+    try {
+      const t = await api('PATCH', `/api/tasks/${el.dataset.builders}`, { builders: n });
+      toast(`${t.id}: ${crewText(crewFor(t))} per team`);
+    } catch { render(); } // api() showed why; put the picker back to the saved number
   } else if (el.dataset.assign && el.value) {
     const r = await api('POST', `/api/tasks/${el.dataset.assign}/assign`, { teamId: el.value });
     toast(`${r.team.name} → ${r.task.id}${r.previous ? ` (from ${r.previous})` : ''}`);

@@ -27,9 +27,11 @@ const BASE = process.env.DEPT_URL || `http://127.0.0.1:${process.env.PORT || 430
 const HELP = `Agent Department CLI
 
   node department/dept.mjs status                      Teams, agents and open tasks
-  node department/dept.mjs add "Title" [--large] [--desc "..."]
+  node department/dept.mjs add "Title" [--large] [--builders 1-5] [--desc "..."]
                                                        New task; auto-assigns a team
-                                                       (all teams if large and nothing else runs)
+                                                       (all teams if large and nothing else runs).
+                                                       --builders: builders per team (default 2
+                                                       small, 5 large); the reviewer always reviews
   node department/dept.mjs assign <task> <team> [--focus "..."]
                                                        Put a team on a task (moves it off its old one)
   node department/dept.mjs unassign <task> <team>      Remove a team from a task
@@ -37,7 +39,9 @@ const HELP = `Agent Department CLI
                        [--pct 40] [--status working|blocked|done] [-m "note"]
                                                        Report progress
   node department/dept.mjs set <task> [--status queued|review|paused|done|cancelled] [--pct N]
-                       [--title "..."] [--size small|large]
+                       [--title "..."] [--size small|large] [--builders 1-5]
+                                                       --builders changes the crew per team; the
+                                                       rest of each team stands by
   node department/dept.mjs review <task>               Send a task to its teams' reviewers (In review)
   node department/dept.mjs verdict <task> --team <id> approve|changes [-m "note"] [--issues N]
                                                        Record a team reviewer's verdict; changes
@@ -151,6 +155,35 @@ function reviewLine(s, task) {
   const mark = (id) => (rs.approved.includes(id) ? `${id} ✓` : rs.changes.includes(id) ? `${id} ✗` : `${id} …`);
   const ids = s.teams.filter((x) => x.taskId === task.id).map((x) => x.id);
   return `in review (round ${rs.round}): ${ids.map(mark).join(', ') || '—'}`;
+}
+
+// Builders per team on a task: core.crewFor when the core has it, else the
+// task's own field, else the size default (small 2, large 5).
+const DEFAULT_CREW = core.DEFAULT_BUILDERS || { small: 2, large: 5 };
+function crewOf(task) {
+  if (!task) return null;
+  if (typeof core.crewFor === 'function') return core.crewFor(task);
+  return Number.isInteger(task.builders) ? task.builders : DEFAULT_CREW[task.size] || DEFAULT_CREW.small;
+}
+
+// --builders N → integer 1-5, or a clear error.
+function buildersArg(value) {
+  const max = core.BUILDERS_PER_TEAM || 5;
+  const msg = `--builders must be a whole number from 1 to ${max}`;
+  if (typeof value !== 'string' || !/^\s*\d+\s*$/.test(value)) throw new core.DeptError(msg);
+  const n = Number(value);
+  if (n < 1 || n > max) throw new core.DeptError(msg);
+  return n;
+}
+
+// A builder is on standby when its number is above its team's task crew (or
+// the core already marked it "Standby").
+function isStandby(agent, task) {
+  if (agent.role === 'reviewer') return false;
+  const crew = crewOf(task);
+  const n = Number(String(agent.id).split('-').pop());
+  if (crew && Number.isInteger(n)) return n > crew && !['working', 'blocked', 'done'].includes(agent.status);
+  return agent.status === 'idle' && agent.work === 'Standby';
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -333,12 +366,14 @@ function printStatus(s) {
   console.log(`Auto-dispatch: ${s.settings.autoDispatch ? 'on' : 'off'}\n`);
   for (const team of s.teams) {
     const task = team.taskId ? s.tasks.find((t) => t.id === team.taskId) : null;
-    console.log(`${team.name.padEnd(13)} ${task ? `${task.id} ${task.title}` : '(free)'}${team.focus ? ` — focus: ${team.focus}` : ''}`);
+    const crew = task ? ` (${plural(crewOf(task), 'builder')} + reviewer)` : '';
+    console.log(`${team.name.padEnd(13)} ${task ? `${task.id} ${task.title}${crew}` : '(free)'}${team.focus ? ` — focus: ${team.focus}` : ''}`);
     const total = `total ${dur(core.teamTotalMs(team, at))}`;
     if (task) console.log(`  ${bar(team.progress)}  on task ${dur(core.taskTeamMs(s, task, at)[team.id])} · ${total}`);
     else console.log(`  ${total}`);
     for (const a of team.agents) {
       if (a.role === 'reviewer') console.log(`  ★ ${`${a.id} reviewer`.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
+      else if (task && isStandby(a, task)) console.log(`  - ${a.id.padEnd(19)} ${'standby'.padEnd(8)} ${a.work && a.work !== 'Standby' ? a.work : ''}`.trimEnd());
       else console.log(`  · ${a.id.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
     }
     if (team.issuesFound) console.log(`  ${plural(team.issuesFound, 'issue')} caught by review`);
@@ -347,7 +382,7 @@ function printStatus(s) {
   console.log(`\nOpen tasks (${open.length})`);
   for (const t of open) {
     const teams = s.teams.filter((x) => x.taskId === t.id).map((x) => x.id).join(', ') || '—';
-    console.log(`  ${t.id} [${t.status}] ${t.size === 'large' ? '(large) ' : ''}${t.title}\n        ${bar(t.progress)}  teams: ${teams}  active: ${dur(core.taskActiveMs(t, at))}`);
+    console.log(`  ${t.id} [${t.status}] ${t.size === 'large' ? '(large) ' : ''}${t.title}\n        ${bar(t.progress)}  teams: ${teams}  ${plural(crewOf(t), 'builder')} + reviewer  active: ${dur(core.taskActiveMs(t, at))}`);
     if (t.status === 'review') console.log(`        ${reviewLine(s, t)}`);
     else if (t.reviewRound) {
       const back = Object.entries(t.reviews || {}).filter(([, r]) => r.round === t.reviewRound && r.verdict === 'changes').map(([id]) => id);
@@ -445,8 +480,15 @@ async function main() {
       return console.log(JSON.stringify(await currentState(), null, 2));
     case 'add': {
       const body = { title: pos.join(' '), description: opt.desc || '', size: opt.large ? 'large' : opt.size || 'small' };
+      if (opt.builders !== undefined) body.builders = buildersArg(opt.builders);
       const r = await run('POST', '/api/tasks', body, { type: 'addTask', args: body });
-      console.log(`${r.task.id} created → ${r.assigned.length ? r.assigned.join(', ') : 'queued (no free team)'}`);
+      const crew = crewOf(r.task);
+      console.log(`${r.task.id} created → ${r.assigned.length ? r.assigned.join(', ') : 'queued (no free team)'} · ${plural(crew, 'builder')} + reviewer per team`);
+      if (body.builders && r.task.builders !== undefined && r.task.builders !== body.builders) {
+        console.log(`  Note: the board kept ${plural(r.task.builders, 'builder')}; it may run older code without crew sizing.`);
+      } else if (body.builders && r.task.builders === undefined) {
+        console.log('  Note: the board did not store --builders; it may run older code without crew sizing.');
+      }
       return;
     }
     case 'assign': {
@@ -483,8 +525,13 @@ async function main() {
       if (opt.title) body.title = opt.title;
       if (opt.size) body.size = opt.size;
       if (opt.desc) body.description = opt.desc;
+      if (opt.builders !== undefined) body.builders = buildersArg(opt.builders);
+      if (!pos[0]) throw new core.DeptError('Usage: set <task> [--status ...] [--pct N] [--title "..."] [--size small|large] [--builders 1-5]');
       const r = await run('PATCH', `/api/tasks/${pos[0]}`, body, { type: 'updateTask', args: { id: pos[0], patch: body } });
-      console.log(`${r.id} [${r.status}] ${r.progress}%`);
+      console.log(`${r.id} [${r.status}] ${r.progress}%${body.builders !== undefined || r.builders !== undefined ? ` · ${plural(crewOf(r), 'builder')} + reviewer` : ''}`);
+      if (body.builders !== undefined && r.builders !== body.builders) {
+        console.log('  Note: the board did not store --builders; it may run older code without crew sizing.');
+      }
       return;
     }
     case 'review': {

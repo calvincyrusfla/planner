@@ -85,6 +85,24 @@ npm run icons
 - When you remove a task's last team, the task is **paused**. A paused task isn't handed out automatically. Click **Queue** to put it back in line, or add a team yourself.
 - Turn off **Auto-dispatch** to stop free teams from picking up queued tasks on their own.
 
+## Crew size
+
+Not every task needs all 5 builders. Each task has a crew: how many builders each team on it puts to work (1–5). The team's reviewer always reviews on top of that.
+
+- **Defaults:** a small task gets 2 builders, a large task 5.
+- **New task form:** the **Builders** picker (1–5) sits next to Small/Large. Choosing Small or Large sets it to 2 or 5 unless you've changed it yourself.
+- **Task cards:** show the crew as "N builders + reviewer". On an open task you can change it there.
+- **Standby builders:** builders beyond the crew (for example `alpha-3` to `alpha-5` on a 2-builder task) are shown dimmed as **Standby** on the team card and don't count as busy.
+
+From the CLI:
+
+```bash
+node department/dept.mjs add "Fix typo in footer" --builders 1
+node department/dept.mjs set T-002 --builders 3
+```
+
+`status` shows each open task's crew and marks standby builders.
+
 ## What the dashboard does
 
 - **Teams:** one card per team, showing its task, progress, focus area and what each of its 5 builders and its reviewer are doing (idle, assigned, working, blocked or done). The reviewer is shown below the builders with a **Reviewer** tag. Use **Reassign to…** to move the team to another task, or **Remove from task** to free it.
@@ -139,7 +157,8 @@ Agents report through the CLI, and you can use it too. It goes through the dashb
 
 ```bash
 node department/dept.mjs status
-node department/dept.mjs add "Build CSV export" --desc "Export tasks per tab" [--large]
+node department/dept.mjs add "Build CSV export" --desc "Export tasks per tab" [--large] [--builders N]
+node department/dept.mjs set T-002 --builders 3
 node department/dept.mjs assign T-002 bravo --focus "API"
 node department/dept.mjs unassign T-002 bravo
 node department/dept.mjs progress T-002 --agent bravo-3 -m "Endpoint done"
@@ -263,7 +282,9 @@ node department/dept.mjs usage report --five 42 --five-reset 2026-11-07T15:10:00
 
 ## How the agents use it
 
-`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here, staffed with the assigned team's 5 builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.
+`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here with a crew size, staffed with that many of the assigned team's builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.
+
+Pull requests are squash-merged, so each feature lands as one commit. Checkpoint commits on the branch are fine because they collapse on merge; write the PR description so it reads well as that single squash commit message.
 
 ## Tests
 

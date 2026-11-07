@@ -11,8 +11,8 @@ const clone = (v) => JSON.parse(JSON.stringify(v));
 const taskNumber = (n) => `T-${String(n).padStart(3, '0')}`;
 
 const OPS = {
-  addTask: (state, { title, description, size } = {}) => core.addTask(state, { title, description, size }),
-  // patch is passed whole, so patch.force (done without review sign-off) gets through.
+  addTask: (state, { title, description, size, builders } = {}) => core.addTask(state, { title, description, size, builders }),
+  // patch is passed whole, so patch.builders (crew size) and patch.force (done without review sign-off) gets through.
   updateTask: (state, { id, patch, by } = {}) => core.updateTask(state, id, patch || {}, by ? { by } : {}),
   deleteTask: (state, { id, by } = {}) => core.deleteTask(state, id, by ? { by } : {}),
   assignTeam: (state, { taskId, teamId, focus, by } = {}) =>
@@ -97,6 +97,8 @@ export function importState(state, other) {
 
   for (const { oldId, task } of addedTasks) {
     task.id = idMap[oldId];
+    // builders comes along with the task; boards from before crew sizing get the size default.
+    task.builders = core.crewFor(task);
     const open = OPEN.has(task.status);
     let kept = 0;
     if (open) {
