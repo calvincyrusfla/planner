@@ -280,23 +280,25 @@ function reviewStatus(task) {
   return out;
 }
 // Mirrors core.reviewGate: can the task be marked done without force?
-// Teams on it: all must have approved the current round. No teams but worked by a team (teamHistory):
-// its latest round must have been fully approved (approvedRound === reviewRound > 0).
+// Done needs the latest round fully signed off (reviewRound > 0 && approvedRound === reviewRound).
+// Teams on it: the ones without an approval this round are missing; if they all look approved but the
+// round's sign-off was voided (reopened, back to active, a team joined), every team on it is missing.
+// No teams: only a task some team worked on (teamHistory) needs the sign-off.
 function reviewGate(task) {
   const name = (id) => state.teams.find((t) => t.id === id)?.name || id;
   const onTask = state.teams.filter((t) => t.taskId === task.id);
+  const signedOff = task.reviewRound > 0 && task.approvedRound === task.reviewRound;
   if (onTask.length) {
     const rs = reviewStatus(task);
-    const missing = onTask.map((t) => t.id).filter((id) => !rs.approved.includes(id));
-    return { ok: !missing.length, missing,
-      message: missing.length ? `${task.id} needs reviewer sign-off from ${missing.map(name).join(', ')}. Send it to review, or mark it done with force.` : '' };
+    let missing = onTask.map((t) => t.id).filter((id) => rs.changes.includes(id) || rs.pending.includes(id));
+    if (!missing.length && !signedOff) missing = onTask.map((t) => t.id);
+    if (!missing.length) return { ok: true, missing: [], message: '' };
+    return { ok: false, missing,
+      message: `${task.id} needs reviewer sign-off from ${missing.map(name).join(', ')}. Send it to review, or mark it done with force.` };
   }
-  const worked = (task.teamHistory || []).length > 0;
-  const round = task.reviewRound || 0;
-  if (worked && !(round > 0 && task.approvedRound === round)) {
-    return { ok: false, missing: [], message: `${task.id} was worked on but has no reviewer sign-off. Mark it done with force.` };
-  }
-  return { ok: true, missing: [], message: '' };
+  const worked = Array.isArray(task.teamHistory) && task.teamHistory.length > 0;
+  if (!worked || signedOff) return { ok: true, missing: [], message: '' };
+  return { ok: false, missing: [], message: `${task.id} was worked on but has no reviewer sign-off. Mark it done with force.` };
 }
 let state = null;
 
