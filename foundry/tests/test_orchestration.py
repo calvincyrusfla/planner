@@ -894,3 +894,151 @@ def test_workspace_copy_failure_is_an_infrastructure_error(tmp_path: Path) -> No
             fm._copy_workspace = real
 
     _run(go())
+
+
+# --------------------------------------------------------------------------- round 3: repo scoping (G1), patch files (G2), symlinks (G4), explanations (G5)
+
+
+def test_real_mode_only_dispatches_tasks_of_the_current_repo(tmp_path: Path) -> None:
+    """charlie-6's real2.py: an unfinished task of repo A must not be built against repo B."""
+    from foundry.main import EXIT_DONE, EXIT_IN_PROGRESS, run_real
+
+    a = write_demo_repo(tmp_path / "repoA")
+    b = write_demo_repo(tmp_path / "repoB")
+    (b / "shop/mathx.py").write_text('"""repo B mathx - different project."""\n\n\ndef other(value):\n    return value\n', encoding="utf-8")
+    cfg = _real_config(tmp_path)
+    slow = demo_claude(a, fail_first=None)
+    slow.latency = 1.0
+    out1: list[str] = []
+    assert _run(run_real(_real_args(a, 0.2, "Add clamp helper to A"), cfg, slow, SimulatedGemmaClient(), out=out1.append)) == EXIT_IN_PROGRESS
+
+    cb = demo_claude(b, fail_first=None)
+    out2: list[str] = []
+    args_b = _real_args(b, 15, "Add slug helper to B")
+    args_b.files = ["shop/slug.py"]
+    assert _run(run_real(args_b, cfg, cb, SimulatedGemmaClient(), out=out2.append)) == EXIT_DONE
+    text = "\n".join(out2)
+    assert re.search(r"F-001 \(repo .*repoA\) is unfinished - rerun with --repo \".*repoA\" to resume it", text), text
+    assert all("Task F-002" in c.prompt or "review task F-002" in c.prompt.lower() for c in cb.history), "B's run touched A's task"
+    assert {c.cwd for c in cb.history} == {str(b.resolve())}
+    patches = sorted(p.name for p in (tmp_path / "patches").glob("*.patch"))
+    assert patches == ["F-002.patch"]
+    assert "+++ b/shop/slug.py" in (tmp_path / "patches" / "F-002.patch").read_text(encoding="utf-8")
+
+    # back on repo A, the same command resumes F-001 there
+    out3: list[str] = []
+    assert _run(run_real(_real_args(a, 15, "Add clamp helper to A"), cfg, demo_claude(a, fail_first=None),
+                         SimulatedGemmaClient(), out=out3.append)) == EXIT_DONE
+    assert "F-001: resuming" in "\n".join(out3)
+
+
+def _manager_only(tmp_path: Path) -> Factory:
+    return _factory(tmp_path, SimulatedClaudeClient(), teams=["alpha"])
+
+
+def test_patch_writer_removes_the_stale_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import foundry.floor_manager as fm
+
+    f = _manager_only(tmp_path)
+    pd = tmp_path / "patches"
+    summary = {"commit_message": "feat: x", "pr_body": "body"}
+    monkeypatch.setattr(fm, "_git_check", lambda text, repo: "error: patch does not apply")
+    _run(f.manager._write_patch("F-001", "--- a/x\n+++ b/x\n", summary))
+    assert sorted(p.name for p in pd.iterdir()) == ["F-001.md", "F-001.patch.rejected"]
+    monkeypatch.setattr(fm, "_git_check", lambda text, repo: None)
+    _run(f.manager._write_patch("F-001", "--- a/y\n+++ b/y\n", summary))
+    assert sorted(p.name for p in pd.iterdir()) == ["F-001.md", "F-001.patch"]  # no stale .rejected
+    assert f.manager.patch_paths["F-001"].name == "F-001.patch" and "F-001" not in f.manager.rejected_patches
+    f.close()
+
+
+def test_patch_writer_never_overwrites_someone_elses_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import foundry.floor_manager as fm
+
+    monkeypatch.setattr(fm, "_git_check", lambda text, repo: None)
+    pd = tmp_path / "patches"
+    pd.mkdir()
+    (pd / "F-001.patch").write_text("an older project's patch\n", encoding="utf-8")
+    f = _manager_only(tmp_path)
+    summary = {"commit_message": "feat: x", "pr_body": "body"}
+    _run(f.manager._write_patch("F-001", "--- a/x\n+++ b/x\n", summary))
+    assert (pd / "F-001.patch").read_text(encoding="utf-8") == "an older project's patch\n"
+    assert f.manager.patch_paths["F-001"] == pd / "F-001-2.patch"
+    assert (pd / "F-001-2.md").read_text(encoding="utf-8").startswith("feat: x")
+    # identical content is reused, not duplicated
+    _run(f.manager._write_patch("F-001", "--- a/x\n+++ b/x\n", summary))
+    assert sorted(p.name for p in pd.iterdir()) == ["F-001-2.md", "F-001-2.patch", "F-001.patch"]
+    f.close()
+
+
+def test_two_subtasks_on_one_file_give_one_honest_output(tmp_path: Path) -> None:
+    """charlie-6's patch.py: two subtasks append to the same file; whatever is written must apply or be marked rejected."""
+    import shutil as _sh
+    import subprocess as _sp
+
+    from foundry.schemas import SubtaskAllocation, TaskSizingDirective
+
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, demo_claude(repo, fail_first=None), repo=repo, teams=["alpha"])
+
+    async def size(task: Any) -> TaskSizingDirective:
+        return TaskSizingDirective(
+            task_id=task["task_id"], team_id=task["team_id"], complexity="M", allocated_builders=2, rationale="x",
+            subtasks=[SubtaskAllocation(subtask_id=f"{task['task_id']}.{i}", title=f"part {i}", acceptance_criteria=[f"c{i}"],
+                                        allowed_files=["shop/mathx.py"]) for i in (1, 2)],
+        )
+
+    f.foreman.size_task_scope = size  # type: ignore[method-assign]
+    ids, states = _run(_submit_and_run(f, {"title": "two parts one file", "files": ["shop/mathx.py"]}))
+    assert states[ids[0]] == "complete"
+    names = sorted(p.name for p in (tmp_path / "patches").iterdir())
+    assert names in (["F-001.md", "F-001.patch"], ["F-001.md", "F-001.patch.rejected"])
+    if "F-001.patch" in names and _sh.which("git"):
+        r = _sp.run(["git", "apply", "--check", str(tmp_path / "patches" / "F-001.patch")], cwd=repo, capture_output=True)
+        assert r.returncode == 0
+    if _sh.which("git"):
+        assert names == ["F-001.md", "F-001.patch.rejected"]  # both append at the same line: conflict
+    f.close()
+
+
+def test_default_patches_dir_is_next_to_the_db(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    config = FoundryConfig(db_path=tmp_path / "db" / "foundry.db", teams=["alpha"], board_bridge_mode="dry")
+    f = build_factory(config, claude=SimulatedClaudeClient(), gemma=None, repo_root=repo, bridge=BoardBridge("dry"))
+    assert f.manager.patches_dir == tmp_path / "db" / "patches"
+    f.close()
+
+
+def test_scratch_copy_keeps_symlinks_as_links(tmp_path: Path) -> None:
+    from foundry.floor_manager import _copy_workspace
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("not part of the repo", encoding="utf-8")
+    repo = write_demo_repo(tmp_path / "repo")
+    try:
+        (repo / "link").symlink_to(outside, target_is_directory=True)
+        (repo / "loop").symlink_to(repo, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available")
+    _copy_workspace(repo, tmp_path / "copy")
+    assert (tmp_path / "copy" / "link").is_symlink() and (tmp_path / "copy" / "loop").is_symlink()
+
+
+def test_explanations_name_the_real_cause(tmp_path: Path) -> None:
+    from datetime import datetime as _dt
+
+    from foundry.main import explain_task, format_local_time
+
+    assert format_local_time(_dt(2026, 11, 7, 15, 0), now=_dt(2026, 11, 7, 9, 0)) == "15:00"
+    assert format_local_time(_dt(2026, 11, 8, 15, 0), now=_dt(2026, 11, 7, 9, 0)) == "Sun 8 Nov 15:00"
+    f = _manager_only(tmp_path)
+    tid = _run(f.manager.submit(WorkOrder(**S_ORDER)))
+    f.queue.kv_set("last_account_error", {"type": "ClaudeAuthError", "message": "Please run /login", "at": "x"})
+    state, lines = explain_task(f, tid)
+    assert state == "building" and any("not logged in - run claude and /login" in ln for ln in lines)
+    f.queue.kv_set("last_account_error", {"type": "ClaudeRateLimited", "message": "limit", "at": "x"})
+    f.limiter.pause_until(seconds=3600)
+    _, lines = explain_task(f, tid)
+    assert any(re.search(r"paused until .*\(usage limit\) - rerun", ln) for ln in lines)
+    f.close()
