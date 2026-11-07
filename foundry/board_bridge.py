@@ -54,9 +54,6 @@ DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPT_CLI = REPO_ROOT / "department" / "dept.mjs"
 
-#: Foundry complexity -> department task size.
-SIZE_FOR = {"S": "small", "M": "small", "L": "large", "XL": "large"}
-
 #: Foundry reviewer verdict -> department verdict word.
 VERDICT_FOR = {"APPROVED": "approved", "REVISE": "changes", "REJECTED": "changes"}
 

@@ -423,7 +423,7 @@ class FoundryQueue:
         with self.transaction() as conn:
             self._transition(conn, task_id, TaskState.FAILED, reason)
             conn.execute(
-                "UPDATE tickets SET status='blocked', updated_at=?"
+                "UPDATE tickets SET status='blocked', in_review=0, updated_at=?"
                 " WHERE task_id=? AND status IN ('open','claimed')",
                 (now, task_id),
             )
@@ -628,9 +628,14 @@ class FoundryQueue:
         return [self._ticket_from_row(r) for r in rows]
 
     def tickets(
-        self, *, team_id: str | None = None, status: TicketStatus | None = None
+        self,
+        *,
+        team_id: str | None = None,
+        status: TicketStatus | None = None,
+        in_review: bool | None = None,
+        task_id: str | None = None,
     ) -> list[Ticket]:
-        """Tickets filtered by team and/or status (oldest first)."""
+        """Tickets filtered by team, status, review flag and/or task (oldest first)."""
         sql, args = "SELECT * FROM tickets WHERE 1=1", []
         if team_id is not None:
             sql += " AND team_id=?"
@@ -638,6 +643,12 @@ class FoundryQueue:
         if status is not None:
             sql += " AND status=?"
             args.append(status)
+        if in_review is not None:
+            sql += " AND in_review=?"
+            args.append(1 if in_review else 0)
+        if task_id is not None:
+            sql += " AND task_id=?"
+            args.append(task_id)
         with self.lock:
             rows = self.conn.execute(sql + " ORDER BY rowid", args).fetchall()
         return [self._ticket_from_row(r) for r in rows]
@@ -651,8 +662,8 @@ class FoundryQueue:
         now = self.now()
         with self.transaction() as conn:
             t = self._require_ticket(conn, ticket_id)
-            conn.execute("UPDATE tickets SET status='done', updated_at=? WHERE ticket_id=?",
-                         (now, ticket_id))
+            conn.execute("UPDATE tickets SET status='done', in_review=0, updated_at=?"
+                         " WHERE ticket_id=?", (now, ticket_id))
             self._event(conn, "ticket_done", t["task_id"], {"ticket_id": ticket_id})
             left = conn.execute(
                 "SELECT COUNT(*) FROM tickets WHERE task_id=? AND status!='done'",
@@ -672,8 +683,8 @@ class FoundryQueue:
         now = self.now()
         with self.transaction() as conn:
             t = self._require_ticket(conn, ticket_id)
-            conn.execute("UPDATE tickets SET status='blocked', fix_hint=COALESCE(?, fix_hint),"
-                         " updated_at=? WHERE ticket_id=?", (notes or None, now, ticket_id))
+            conn.execute("UPDATE tickets SET status='blocked', in_review=0,"
+                         " fix_hint=COALESCE(?, fix_hint), updated_at=? WHERE ticket_id=?", (notes or None, now, ticket_id))
             self._event(conn, "ticket_blocked", t["task_id"],
                         {"ticket_id": ticket_id, "notes": notes})
 
@@ -684,11 +695,24 @@ class FoundryQueue:
         quarantined instead (its tickets blocked) and False is returned; the
         ticket is not reopened, so no further build happens. Otherwise the
         ticket is open again (moved onto a slot within the current allocation
-        if needed), the task returns to ``building`` and True is returned.
+        if needed, ``in_review`` cleared), the task returns to ``building`` and
+        True is returned.
+
+        This consumes an attempt, so use it only for real build/review
+        outcomes (gate failure, REVISE, blocked reply). For infrastructure
+        failures (usage limit, timeout, missing CLI) use :meth:`release_ticket`.
+
+        Raises:
+            KeyError: unknown ticket.
+            ValueError: the ticket is ``done`` or ``blocked`` (only ``claimed``
+                or ``open`` tickets can be reopened).
         """
         now = self.now()
         with self.transaction() as conn:
             t = self._require_ticket(conn, ticket_id)
+            if t["status"] not in ("claimed", "open"):
+                raise ValueError(
+                    f"cannot reopen ticket {ticket_id!r} with status {t['status']!r}")
             task = self._require_task(conn, t["task_id"])
             cur = TaskState(task["state"])
             if cur in TERMINAL_STATES:
@@ -706,7 +730,7 @@ class FoundryQueue:
                 slot = self._least_loaded_slot(conn, t["task_id"], alloc)
             conn.execute(
                 "UPDATE tickets SET status='open', attempt=?, fix_hint=?, slot=?, claimed_by=NULL,"
-                " claimed_at=NULL, updated_at=? WHERE ticket_id=?",
+                " claimed_at=NULL, in_review=0, updated_at=? WHERE ticket_id=?",
                 (attempt, fix_hint, slot, now, ticket_id),
             )
             self._event(conn, "ticket_reopened", t["task_id"],
@@ -719,6 +743,55 @@ class FoundryQueue:
                     self._set_state_row(conn, t["task_id"], cur, TaskState.BUILDING,
                                         f"retry {attempt}")
             return True
+
+    def release_ticket(self, ticket_id: str, reason: str = "") -> bool:
+        """Hand a claimed ticket back to the queue *without* spending an attempt.
+
+        For infrastructure failures (usage/rate limit, timeout, Claude CLI
+        missing or logged out, a worker reset): the ticket goes back to
+        ``open`` with ``attempt`` and ``fix_hint`` unchanged, its claim and
+        ``in_review`` flag cleared, and moved onto a slot within the current
+        allocation if it sits above it. Returns True when a claimed ticket was
+        released; False (no change) when the ticket is not claimed or its task
+        is already terminal. KeyError for an unknown ticket.
+        """
+        now = self.now()
+        with self.transaction() as conn:
+            t = self._require_ticket(conn, ticket_id)
+            if t["status"] != "claimed":
+                return False
+            task = self._require_task(conn, t["task_id"])
+            if TaskState(task["state"]) in TERMINAL_STATES:
+                return False
+            slot = int(t["slot"])
+            alloc = int(task["allocated_builders"]) or 1
+            if slot > alloc:
+                slot = self._least_loaded_slot(conn, t["task_id"], alloc)
+            conn.execute(
+                "UPDATE tickets SET status='open', slot=?, claimed_by=NULL, claimed_at=NULL,"
+                " in_review=0, updated_at=? WHERE ticket_id=?",
+                (slot, now, ticket_id),
+            )
+            self._event(conn, "ticket_released", t["task_id"],
+                        {"ticket_id": ticket_id, "was_claimed_by": t["claimed_by"],
+                         "attempt": int(t["attempt"]), "reason": reason})
+            return True
+
+    def set_in_review(self, ticket_id: str, in_review: bool) -> None:
+        """Flag a ticket as handed to (True) or finished with (False) the review inbox.
+
+        Stall detection ignores ``in_review`` tickets: their builder is done
+        and they are waiting on a reviewer. KeyError for an unknown ticket.
+        """
+        now = self.now()
+        with self.transaction() as conn:
+            t = self._require_ticket(conn, ticket_id)
+            if bool(t["in_review"]) == bool(in_review):
+                return
+            conn.execute("UPDATE tickets SET in_review=?, updated_at=? WHERE ticket_id=?",
+                         (1 if in_review else 0, now, ticket_id))
+            self._event(conn, "ticket_in_review" if in_review else "ticket_review_cleared",
+                        t["task_id"], {"ticket_id": ticket_id})
 
     def resume(self) -> int:
         """Recover after a crash: reopen every ticket left ``claimed``.
@@ -738,7 +811,7 @@ class FoundryQueue:
             for r in rows:
                 conn.execute(
                     "UPDATE tickets SET status='open', claimed_by=NULL, claimed_at=NULL,"
-                    " updated_at=? WHERE ticket_id=?",
+                    " in_review=0, updated_at=? WHERE ticket_id=?",
                     (now, r["ticket_id"]),
                 )
                 self._event(conn, "ticket_resumed", r["task_id"],
@@ -925,7 +998,7 @@ class FoundryQueue:
         now = self.now()
         conn.execute("UPDATE tasks SET quarantine_reason=?, updated_at=? WHERE task_id=?",
                      (reason, now, task_id))
-        conn.execute("UPDATE tickets SET status='blocked', updated_at=?"
+        conn.execute("UPDATE tickets SET status='blocked', in_review=0, updated_at=?"
                      " WHERE task_id=? AND status IN ('open','claimed')", (now, task_id))
         self._event(conn, "quarantined", task_id, {"reason": reason})
 

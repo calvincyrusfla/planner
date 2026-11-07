@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from foundry.board_bridge import BoardBridge, cli_args
+from foundry.board_bridge import BoardBridge, cli_args, parse_cli_add
 from foundry.schemas import ForemanEscalation
 
 
@@ -39,13 +39,37 @@ def test_dry_mode_records_resolved_ops() -> None:
     types = [op["type"] for op in bridge.ops]
     assert types == ["addTask", "assignTeam", "reportProgress", "updateTask", "reviewTask", "reportProgress", "updateTask"]
     add = bridge.ops[0]["args"]
-    assert add == {"title": "Add login", "description": "[Foundry F-1 · L] desc", "size": "large", "builders": 5}
+    # always "small" (a large board task would grab every free team), crew = Foundry allocation
+    assert add == {"title": "Add login", "description": "[Foundry F-1 · L] desc", "size": "small", "builders": 5}
     board_id = bridge.board_ids["F-1"]
-    assert bridge.ops[1]["args"]["taskId"] == board_id
+    assert bridge.ops[1]["args"] == {"taskId": board_id, "teamId": "alpha", "focus": "Foundry L", "by": "foundry"}
     assert bridge.ops[2]["args"] == {"taskId": board_id, "message": "alpha-1 started", "teamId": "alpha", "agentId": "alpha-1", "progress": 20}
     assert bridge.ops[3]["args"]["patch"] == {"status": "review"}
     assert bridge.ops[4]["args"]["verdict"] == "approved" and bridge.ops[4]["args"]["by"] == "alpha-6"
     assert bridge.ops[-1]["args"] == {"id": board_id, "patch": {"status": "done"}, "by": "foundry"}
+
+
+def test_board_autoassigned_teams_are_unassigned_except_the_foundry_team() -> None:
+    bridge = BoardBridge(mode="dry", dry_autoassign=("alpha", "bravo"))
+    bridge.register_task("F-1", "t", complexity="S", builders=1, team_id="charlie")
+    ops = [(op["type"], op["args"].get("teamId")) for op in bridge.ops]
+    assert ops == [("addTask", None), ("unassignTeam", "alpha"), ("unassignTeam", "bravo"), ("assignTeam", "charlie")]
+    bridge2 = BoardBridge(mode="dry", dry_autoassign=("alpha", "charlie"))
+    bridge2.register_task("F-1", "t", complexity="M", builders=2, team_id="charlie")
+    assert [(op["type"], op["args"].get("teamId")) for op in bridge2.ops] == [("addTask", None), ("unassignTeam", "alpha")]
+
+
+def test_register_is_idempotent_and_restore_skips_known_tasks() -> None:
+    bridge = BoardBridge(mode="dry")
+    bridge.register_task("F-1", "t", team_id="alpha")
+    bridge.register_task("F-1", "t", team_id="alpha")
+    assert [op["type"] for op in bridge.ops].count("addTask") == 1
+    restarted = BoardBridge(mode="dry")
+    restarted.restore({"F-1": "T-042"})
+    restarted.register_task("F-1", "t", team_id="alpha")
+    restarted.progress("F-1", "back")
+    assert [op["type"] for op in restarted.ops] == ["reportProgress"]
+    assert restarted.ops[0]["args"]["taskId"] == "T-042"
 
 
 def test_small_sizes_map_to_small_and_builders_clamped() -> None:
@@ -114,7 +138,7 @@ class _FakeDashboard(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         type(self).received.append(body)
         if body["type"] == "addTask":
-            result: Any = {"task": {"id": "T-077"}, "assigned": ["alpha"]}
+            result: Any = {"task": {"id": "T-077"}, "assigned": ["alpha", "bravo"]}
         elif body["type"] == "reviewTask":
             self.send_response(400)
             self.end_headers()
@@ -139,7 +163,7 @@ def test_auto_mode_posts_to_dashboard_and_resolves_board_id(tmp_path: Path) -> N
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         bridge = BoardBridge(mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs")
-        bridge.register_task("F-1", "Add login", complexity="M", builders=2)
+        bridge.register_task("F-1", "Add login", complexity="M", builders=2, team_id="alpha")
         bridge.progress("F-1", "hello", agent_id="alpha-1")
         bridge.review("F-1", "alpha", "REVISE")  # board refuses reviewTask: logged, not raised
         assert bridge.flush(5.0)
@@ -147,9 +171,10 @@ def test_auto_mode_posts_to_dashboard_and_resolves_board_id(tmp_path: Path) -> N
     finally:
         server.shutdown()
     assert bridge.board_ids == {"F-1": "T-077"}
-    assert [r["type"] for r in _FakeDashboard.received] == ["addTask", "reportProgress", "updateTask", "reviewTask"]
-    assert _FakeDashboard.received[1]["args"]["taskId"] == "T-077"
-    assert _FakeDashboard.received[3]["args"]["verdict"] == "changes"
+    assert [r["type"] for r in _FakeDashboard.received] == ["addTask", "unassignTeam", "reportProgress", "updateTask", "reviewTask"]
+    assert _FakeDashboard.received[1]["args"] == {"taskId": "T-077", "teamId": "bravo", "by": "foundry"}
+    assert _FakeDashboard.received[2]["args"]["taskId"] == "T-077"
+    assert _FakeDashboard.received[4]["args"]["verdict"] == "changes"
     assert bridge.stats.transport == "dashboard"
 
 
@@ -165,4 +190,15 @@ def test_cli_args_translation() -> None:
     assert cli_args({"type": "reviewTask", "args": {"taskId": "T-1", "teamId": "alpha", "verdict": "approved", "note": "n", "issues": 0}})[:5] == [
         "verdict", "T-1", "--team", "alpha", "approve",
     ]
+    assert cli_args({"type": "unassignTeam", "args": {"taskId": "T-1", "teamId": "bravo"}}) == ["unassign", "T-1", "bravo"]
     assert cli_args({"type": "dispatch", "args": {}}) is None
+
+
+def test_parse_cli_add_output() -> None:
+    assert parse_cli_add("T-012 created → alpha, bravo · 2 builders + reviewer per team\n") == {
+        "task": {"id": "T-012"}, "assigned": ["alpha", "bravo"],
+    }
+    assert parse_cli_add("T-013 created → queued (no free team) · 1 builder + reviewer per team") == {
+        "task": {"id": "T-013"}, "assigned": [],
+    }
+    assert parse_cli_add("Error: nope") is None

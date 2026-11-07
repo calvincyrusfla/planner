@@ -347,3 +347,139 @@ def test_introspection_window_slides() -> None:
     asyncio.run(main())
     snap = limiter.snapshot()
     assert snap["in_flight"] == 0 and snap["peak_in_flight"] == 1
+
+
+# ---------------------------------------------------------------- round 1: D1 pauses
+def test_pause_until_holds_every_caller_and_resumes_without_burst() -> None:
+    ft = FakeTime()
+    limiter = make(ft, rpm=60, max_concurrent=10)
+    grants: list[float] = []
+
+    async def request() -> None:
+        async with limiter.slot(estimated_tokens=10):
+            grants.append(ft.now)
+
+    async def main() -> None:
+        deadline = limiter.pause_until(seconds=600.0)
+        assert deadline == 600.0 and limiter.is_paused
+        assert limiter.snapshot()["paused_for_s"] == 600.0
+        await asyncio.gather(*(request() for _ in range(5)))
+
+    asyncio.run(main())
+    assert len(grants) == 5
+    assert min(grants) >= 600.0
+    # Buckets were emptied and accrued nothing while paused: the normal
+    # 1 req/s pace resumes instead of 5 requests at once.
+    assert grants == pytest.approx([601.0, 602.0, 603.0, 604.0, 605.0])
+    assert not limiter.is_paused and limiter.pause_remaining() == 0.0
+
+
+def test_pause_until_deadline_only_extends_and_validates() -> None:
+    ft = FakeTime()
+    limiter = make(ft)
+    assert limiter.pause_until(100.0) == 100.0
+    assert limiter.pause_until(seconds=10.0) == 100.0  # shorter pause ignored
+    assert limiter.pause_until(seconds=250.0) == 250.0  # longer pause extends
+    assert limiter.pause_until(5.0) == 250.0  # past/earlier deadline is a no-op
+    with pytest.raises(ValueError):
+        limiter.pause_until()
+    with pytest.raises(ValueError):
+        limiter.pause_until(10.0, seconds=10.0)
+    with pytest.raises(ValueError):
+        limiter.pause_until(seconds=-1.0)
+
+
+def test_pause_applied_while_a_slot_is_held_blocks_the_next_caller() -> None:
+    ft = FakeTime()
+    limiter = make(ft, max_concurrent=5)
+    started: list[float] = []
+
+    async def first() -> None:
+        async with limiter.slot():
+            started.append(ft.now)
+            limiter.pause_until(seconds=1200.0)  # e.g. a usage limit reported mid-call
+            await asyncio.sleep(0)
+
+    async def second() -> None:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        async with limiter.slot():
+            started.append(ft.now)
+
+    async def main() -> None:
+        await asyncio.gather(first(), second())
+
+    asyncio.run(main())
+    assert started[0] == 0.0
+    assert started[1] >= 1200.0
+
+
+def test_backoff_long_retry_after_pauses_and_reraises_immediately() -> None:
+    ft = FakeTime()
+    limiter = RateLimiter(60, 100_000, 3, clock=ft.clock, sleep=ft.sleep, rng=lambda: 0.5)
+    calls = 0
+
+    async def usage_limited() -> None:
+        nonlocal calls
+        calls += 1
+        raise Limited(retry_after=3600.0)  # "resets 3pm": far longer than cap
+
+    with pytest.raises(Limited):
+        asyncio.run(
+            limiter.call_with_backoff(usage_limited, max_attempts=5, cap=60.0, retry_on=(Limited,))
+        )
+    assert calls == 1  # no spinning through the remaining attempts
+    assert ft.sleeps == []  # and no waiting inside call_with_backoff
+    assert limiter.is_paused and limiter.paused_until == pytest.approx(3600.0)
+    assert limiter.rate_limit_hits == 1
+
+    async def next_call() -> float:
+        async with limiter.slot(1):
+            return ft.now
+
+    assert asyncio.run(next_call()) >= 3600.0
+
+
+def test_backoff_long_retry_after_with_slot_releases_concurrency() -> None:
+    ft = FakeTime()
+    limiter = RateLimiter(60, 100_000, 1, clock=ft.clock, sleep=ft.sleep, rng=lambda: 0.5)
+
+    async def usage_limited() -> None:
+        raise Limited(retry_after=7200.0)
+
+    with pytest.raises(Limited):
+        asyncio.run(
+            limiter.call_with_backoff(usage_limited, estimated_tokens=100, retry_on=(Limited,))
+        )
+    assert limiter.in_flight == 0
+    assert limiter.pause_remaining() == pytest.approx(7200.0)
+
+
+def test_backoff_retry_after_equal_to_cap_still_retries() -> None:
+    ft = FakeTime()
+    limiter = RateLimiter(60, 100_000, 3, clock=ft.clock, sleep=ft.sleep, rng=lambda: 0.0)
+    calls = 0
+
+    async def fn() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise Limited(retry_after=60.0)
+        return "ok"
+
+    assert asyncio.run(limiter.call_with_backoff(fn, cap=60.0, retry_on=(Limited,))) == "ok"
+    assert ft.sleeps == [pytest.approx(60.0)]
+    assert not limiter.is_paused
+
+
+def test_default_retry_on_long_usage_limit_with_real_exception() -> None:
+    claude_client = pytest.importorskip("foundry.claude_client")
+    ft = FakeTime()
+    limiter = RateLimiter(10, 10_000, 2, clock=ft.clock, sleep=ft.sleep, rng=lambda: 0.0)
+
+    async def fn() -> None:
+        raise claude_client.ClaudeRateLimited(retry_after=1200.0)
+
+    with pytest.raises(claude_client.ClaudeRateLimited):
+        asyncio.run(limiter.call_with_backoff(fn))
+    assert limiter.pause_remaining() == pytest.approx(1200.0)

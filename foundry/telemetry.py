@@ -13,8 +13,10 @@ Metrics
 * deterministic gate failures and retries (``record_gate_failure``,
   ``record_retry``)
 * idle agent count per team (``set_idle``)
-* queue dwell: time a task spends waiting for a reviewer
-  (``mark_review_wait`` / ``mark_review_start`` / ``queue_dwell``)
+* queue dwell: time each submission spends waiting for a reviewer
+  (``mark_review_wait`` / ``mark_review_start`` / ``queue_dwell``); a task
+  reports its oldest unstarted submission
+* cache-read tokens, stored apart and excluded from burn rates / TPM
 * moving burn rates over 1- and 15-minute windows, including RPM
   (``burn_rate``)
 
@@ -395,53 +397,59 @@ class Telemetry:
     def burn_rate(self, window_minutes: float = 1) -> dict[str, float]:
         """Moving burn rate over the last ``window_minutes``.
 
-        Returns ``{input_per_min, output_per_min, tokens_per_min, rpm}`` where
-        ``rpm`` counts recorded model calls (one ``record_tokens`` = one request).
-        The window is ``(now - window, now]``.
+        Returns ``{input_per_min, output_per_min, tokens_per_min, rpm,
+        cache_read_per_min}``. ``tokens_per_min`` is uncached input + output
+        only (what the rate limiter is charged); cache reads are reported on
+        their own in ``cache_read_per_min`` and never counted in the burn.
+        ``rpm`` counts recorded model calls (one ``record_tokens`` = one
+        request). The window is ``(now - window, now]``.
         """
         if window_minutes <= 0:
             raise ValueError("window_minutes must be > 0")
         now = self._now()
         start = now - window_minutes * 60.0
         rows = self._query(
-            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COUNT(*)"
-            " FROM telemetry_tokens WHERE ts > ? AND ts <= ?",
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COUNT(*),"
+            " COALESCE(SUM(cache_read_tokens),0) FROM telemetry_tokens WHERE ts > ? AND ts <= ?",
             (start, now),
         )
-        inp, out, calls = rows[0]
+        inp, out, calls, cached = rows[0]
         return {
             "input_per_min": float(inp) / window_minutes,
             "output_per_min": float(out) / window_minutes,
             "tokens_per_min": float(inp + out) / window_minutes,
             "rpm": float(calls) / window_minutes,
+            "cache_read_per_min": float(cached) / window_minutes,
         }
 
     def current_tpm(self) -> float:
-        """Total tokens per minute over the last minute (for TOKEN_VELOCITY_SPIKE)."""
+        """Uncached input + output tokens per minute over the last minute (cache reads excluded)."""
         return self.burn_rate(1)["tokens_per_min"]
 
-    def tokens_by_role(self) -> dict[str, dict[str, int]]:
-        """``{role: {input, output, total, calls}}`` over all time."""
+    def _tokens_grouped(self, column: str) -> dict[str, dict[str, int]]:
         rows = self._query(
-            "SELECT role, SUM(input_tokens), SUM(output_tokens), COUNT(*) FROM telemetry_tokens GROUP BY role ORDER BY role"
+            f"SELECT {column}, SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), COUNT(*)"
+            f" FROM telemetry_tokens GROUP BY {column} ORDER BY {column}"
         )
-        return {r: {"input": int(i), "output": int(o), "total": int(i + o), "calls": int(c)} for r, i, o, c in rows}
+        return {
+            key: {"input": int(i), "output": int(o), "total": int(i + o), "cache_read": int(cr), "calls": int(c)}
+            for key, i, o, cr, c in rows
+        }
+
+    def tokens_by_role(self) -> dict[str, dict[str, int]]:
+        """``{role: {input, output, total, cache_read, calls}}`` over all time.
+
+        ``total`` = uncached input + output; ``cache_read`` is separate.
+        """
+        return self._tokens_grouped("role")
 
     def tokens_by_task(self) -> dict[str, dict[str, int]]:
-        """``{task_id: {input, output, total, calls}}`` over all time."""
-        rows = self._query(
-            "SELECT task_id, SUM(input_tokens), SUM(output_tokens), COUNT(*) FROM telemetry_tokens"
-            " GROUP BY task_id ORDER BY task_id"
-        )
-        return {t: {"input": int(i), "output": int(o), "total": int(i + o), "calls": int(c)} for t, i, o, c in rows}
+        """``{task_id: {input, output, total, cache_read, calls}}`` over all time."""
+        return self._tokens_grouped("task_id")
 
     def tokens_by_agent(self) -> dict[str, dict[str, int]]:
-        """``{agent_id: {input, output, total, calls}}`` over all time."""
-        rows = self._query(
-            "SELECT agent_id, SUM(input_tokens), SUM(output_tokens), COUNT(*) FROM telemetry_tokens"
-            " GROUP BY agent_id ORDER BY agent_id"
-        )
-        return {a: {"input": int(i), "output": int(o), "total": int(i + o), "calls": int(c)} for a, i, o, c in rows}
+        """``{agent_id: {input, output, total, cache_read, calls}}`` over all time."""
+        return self._tokens_grouped("agent_id")
 
     def tokens_saved_by_source(self) -> dict[str, int]:
         """``{source: tokens}`` for every source (0 when none recorded)."""
@@ -471,13 +479,15 @@ class Telemetry:
         Keys: ``generated_at``, ``tokens`` (totals, by_role, by_task, by_agent),
         ``tokens_saved_by_gemma`` (by_source, total), ``durations``,
         ``idle_agent_count`` (per team, total), ``gates`` (failures/retries in
-        total and per task), ``queue_dwell`` (waiting tasks, max), ``burn_rate``
+        total and per task), ``queue_dwell`` (per task the oldest waiting
+        submission, number of waiting submissions, max), ``burn_rate``
         (``1m`` and ``15m``), ``current_tpm`` and ``current_rpm``.
         """
         now = self._now()
         by_role = self.tokens_by_role()
         total_in = sum(v["input"] for v in by_role.values())
         total_out = sum(v["output"] for v in by_role.values())
+        total_cache = sum(v["cache_read"] for v in by_role.values())
         saved = self.tokens_saved_by_source()
         idle = self.idle_counts()
         failures = {t: int(n) for t, n in self._query(
@@ -495,6 +505,7 @@ class Telemetry:
                 "input": total_in,
                 "output": total_out,
                 "total": total_in + total_out,
+                "cache_read": total_cache,
                 "by_role": by_role,
                 "by_task": self.tokens_by_task(),
                 "by_agent": self.tokens_by_agent(),
@@ -510,6 +521,7 @@ class Telemetry:
             },
             "queue_dwell": {
                 "waiting": waiting,
+                "waiting_submissions": len(self.waiting_submissions()),
                 "max_seconds": max(waiting.values(), default=0.0),
             },
             "burn_rate": {"1m": burn_1, "15m": burn_15},
