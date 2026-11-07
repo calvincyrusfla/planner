@@ -11,6 +11,7 @@ import { load, save, DATA_FILE } from './lib/store.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(here, 'public');
+const ASSETS = path.join(here, 'assets');
 const args = process.argv.slice(2);
 const argPort = args.includes('--port') ? Number(args[args.indexOf('--port') + 1]) : null;
 const PORT = argPort || Number(process.env.PORT) || 4300;
@@ -45,7 +46,8 @@ fs.watchFile(DATA_FILE, { interval: 1000 }, (cur) => {
   broadcast();
 });
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml',
+  '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json', '.json': 'application/manifest+json' };
 
 function send(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -103,8 +105,12 @@ const server = http.createServer(async (req, res) => {
       }
       return send(res, 404, { ok: false, error: 'Not found' });
     }
-    const file = path.join(PUBLIC, url.pathname === '/' ? 'index.html' : path.normalize(url.pathname));
-    if (!file.startsWith(PUBLIC) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    // /assets/* comes from department/assets (icons); everything else from public/.
+    const inAssets = url.pathname.startsWith('/assets/');
+    const root = inAssets ? ASSETS : PUBLIC;
+    const rel = inAssets ? url.pathname.slice('/assets'.length) : url.pathname;
+    const file = path.join(root, rel === '/' ? 'index.html' : path.normalize(rel));
+    if (!file.startsWith(root + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
       res.writeHead(404).end('Not found');
       return;
     }

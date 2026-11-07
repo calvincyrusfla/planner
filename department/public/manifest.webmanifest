@@ -1,0 +1,12 @@
+{
+  "name": "Agent Department",
+  "short_name": "Agents",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1d3a",
+  "theme_color": "#0b1d3a",
+  "icons": [
+    { "src": "/assets/icon-256.png", "sizes": "256x256", "type": "image/png" },
+    { "src": "/assets/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
