@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import tempfile
@@ -387,20 +388,66 @@ def claude_args(config: FoundryConfig) -> list[str]:
 EXIT_DONE, EXIT_FAILED, EXIT_IN_PROGRESS = 0, 1, 3
 
 
-def _find_open_order(factory: Factory, order: WorkOrder) -> str | None:
-    """A not-yet-finished task from an earlier run with the same title and files (to resume it)."""
+_TERMINAL_STATES = ("complete", "quarantined", "failed")
+
+
+def _state(task: Any) -> str:
+    raw = (task or {}).get("state", "unknown")
+    return str(getattr(raw, "value", raw))
+
+
+def _same_repo(a: str | None, b: Path) -> bool:
+    """Same repository? (case-insensitive on Windows, like the queue's repo_root matching)."""
+    if not a:
+        return False
+    norm = lambda p: os.path.normcase(os.path.normpath(os.path.abspath(str(p))))  # noqa: E731
+    return norm(a) == norm(b)
+
+
+def _find_open_order(factory: Factory, order: WorkOrder, repo: Path) -> str | None:
+    """A not-yet-finished task of *this* repo from an earlier run with the same title and files."""
     for tid, old in factory.manager.orders.items():
         if old.title == order.title and sorted(old.files) == sorted(order.files):
-            task = factory.queue.get_task(tid)
-            if task and str(getattr(task["state"], "value", task["state"])) not in ("complete", "quarantined", "failed"):
+            if not _same_repo(factory.manager.task_repo(tid), repo):
+                continue
+            if _state(factory.queue.get_task(tid)) not in _TERMINAL_STATES:
                 return tid
     return None
+
+
+def other_repo_tasks(factory: Factory, repo: Path) -> list[str]:
+    """Lines naming every unfinished task that belongs to another (or an unknown) repository."""
+    lines = []
+    for task in factory.queue.all_tasks():
+        if _state(task) in _TERMINAL_STATES:
+            continue
+        tid = task["task_id"]
+        other = factory.manager.task_repo(tid)
+        if other is None:
+            lines.append(f"{tid} (unknown repo) is unfinished and is not dispatched by --real")
+        elif not _same_repo(other, repo):
+            lines.append(f"{tid} (repo {other}) is unfinished - rerun with --repo \"{other}\" to resume it")
+    return lines
+
+
+def format_local_time(when: datetime, now: datetime | None = None) -> str:
+    """``15:00`` today, otherwise ``Sun 8 Nov 15:00``."""
+    now = now or datetime.now()
+    if when.date() == now.date():
+        return when.strftime("%H:%M")
+    return f"{when:%a} {when.day} {when:%b %H:%M}"
+
+
+def _account_error(factory: Factory) -> dict[str, Any] | None:
+    fn = getattr(factory.queue, "kv_get", None)
+    err = fn("last_account_error") if callable(fn) else None
+    return err if isinstance(err, dict) else None
 
 
 def explain_task(factory: Factory, tid: str) -> tuple[str, list[str]]:
     """Return ``(state, lines)`` describing where a task stands, for the end of ``--real``."""
     task = factory.queue.get_task(tid) or {}
-    state = str(getattr(task.get("state"), "value", task.get("state", "unknown")))
+    state = _state(task)
     d = factory.manager.directives.get(tid)
     lines = [f"{tid}: {state}" + (f" ({d.complexity}, {d.allocated_builders} builder(s) on {d.team_id})" if d else "")]
     if state in ("quarantined", "failed") and task.get("quarantine_reason"):
@@ -408,14 +455,23 @@ def explain_task(factory: Factory, tid: str) -> tuple[str, list[str]]:
     errors = [t.infra_last_error for t in factory.queue.tickets_for_task(tid) if getattr(t, "infra_last_error", None)]
     if errors:
         lines.append(f"  last infrastructure error: {errors[-1][:160]}")
+    if state in _TERMINAL_STATES:
+        return state, lines
     limiter = factory.limiter
     remaining = float(limiter.pause_remaining()) if hasattr(limiter, "pause_remaining") else 0.0
-    if state not in ("complete", "quarantined", "failed"):
-        if remaining > 0:
-            until = (datetime.now() + timedelta(seconds=remaining)).strftime("%H:%M")
-            lines.append(f"  paused until {until} (usage limit) - rerun the same command to resume")
-        else:
-            lines.append("  still in progress - rerun the same command to resume where it stopped")
+    err = _account_error(factory)
+    kind = str((err or {}).get("type", ""))
+    detail = str((err or {}).get("message", ""))[:160]
+    if "Auth" in kind:
+        lines.append("  Claude Code is not logged in - run claude and /login, then rerun the same command")
+    elif "NotFound" in kind:
+        lines.append("  Claude Code was not found - install it or set FOUNDRY_CLAUDE_BIN, then rerun the same command")
+    elif remaining > 0:
+        until = format_local_time(datetime.now() + timedelta(seconds=remaining))
+        cause = "usage limit" if (not kind or "RateLimited" in kind) else f"{kind}: {detail}"
+        lines.append(f"  paused until {until} ({cause}) - rerun the same command to resume")
+    else:
+        lines.append("  still in progress - rerun the same command to resume where it stopped")
     return state, lines
 
 
@@ -443,10 +499,19 @@ async def run_real(
 
         gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model)
     repo = Path(args.repo).resolve()
-    factory = build_factory(config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo)
+    factory = build_factory(
+        config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo, dispatch_repo=repo
+    )
     try:
-        order = WorkOrder(title=args.title, description=args.desc or "", files=list(args.files or []))
-        tid = _find_open_order(factory, order)
+        forget = getattr(factory.queue, "kv_delete", None)
+        if callable(forget):
+            forget("last_account_error")  # only explain errors from this run
+        for line in other_repo_tasks(factory, repo):
+            out(line)
+        order = WorkOrder(
+            title=args.title, description=args.desc or "", files=list(args.files or []), repo_root=str(repo)
+        )
+        tid = _find_open_order(factory, order, repo)
         if tid:
             out(f"{tid}: resuming the unfinished task from the last run")
         else:

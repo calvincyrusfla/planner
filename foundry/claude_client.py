@@ -407,21 +407,26 @@ _CMD_UNSAFE = frozenset('"%\r\n\x00')
 
 
 def _join_unique(*parts: str | None) -> str:
-    """Join non-empty parts, skipping any already contained in an earlier part.
+    """Join non-empty parts, dropping repeats.
 
-    ``ClaudeResult.error`` is usually a truncated copy of ``text``; joining both
-    would repeat the excerpt in exception messages.
+    ``ClaudeResult.error`` is usually a truncated copy (a prefix) of ``text``, and
+    stderr often repeats it; joining them all would repeat the excerpt in exception
+    messages. A part equal to, or a prefix of, an earlier part is dropped; an
+    earlier part that is a prefix of a later one is replaced by the longer one.
     """
     kept: list[str] = []
-    for part in parts:
-        part = (part or "").strip()
-        if part and not any(part in k or k in part for k in kept):
+    for raw in parts:
+        part = (raw or "").strip()
+        if not part:
+            continue
+        for i, k in enumerate(kept):
+            if k.startswith(part):
+                break
+            if part.startswith(k):
+                kept[i] = part
+                break
+        else:
             kept.append(part)
-        elif part:
-            # keep the longer of two overlapping parts
-            for i, k in enumerate(kept):
-                if k in part and len(part) > len(k):
-                    kept[i] = part
     return " ".join(kept)
 
 

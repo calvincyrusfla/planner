@@ -110,7 +110,7 @@ def test_small_sizes_map_to_small_and_builders_clamped() -> None:
 
 def test_escalation_message_format() -> None:
     bridge = BoardBridge(mode="dry")
-    bridge.register_task("F-1", "t", complexity="S", builders=1)
+    bridge.register_task("F-1", "t", complexity="S", builders=1, team_id="alpha")
     bridge.escalation(_alert(task_id="F-1", team_id="alpha"))
     op = bridge.ops[-1]
     assert op["type"] == "reportProgress"
@@ -301,3 +301,21 @@ def test_auto_mode_unreadable_board_state_counts_as_busy(tmp_path: Path) -> None
     finally:
         server.shutdown()
     assert [r["type"] for r in _FakeDashboard.received] == ["addTask"]
+
+
+def test_progress_for_a_team_not_on_the_board_task_keeps_only_the_message() -> None:
+    """G3: alpha is busy elsewhere, so progress must not touch alpha's agents or the board's teams."""
+    bridge = BoardBridge(mode="dry", dry_autoassign=("bravo",), dry_busy=("alpha",))
+    bridge.register_task("F-1", "t", team_id="alpha")
+    bridge.progress("F-1", "alpha-1 approved", team_id="alpha", agent_id="alpha-1", status="done")
+    bridge.progress("F-1", "agent only", agent_id="alpha-2")
+    bridge.escalation(_alert(task_id="F-1", team_id="alpha"))
+    progress = [op["args"] for op in bridge.ops if op["type"] == "reportProgress"]
+    assert progress[0] == {"taskId": bridge.board_ids["F-1"], "message": "alpha-1 approved"}
+    assert progress[1] == {"taskId": bridge.board_ids["F-1"], "message": "agent only"}
+    assert set(progress[2]) == {"taskId", "message"}
+    # when the Foundry team is on the board task, the full progress goes through
+    ok = BoardBridge(mode="dry")
+    ok.register_task("F-1", "t", team_id="alpha")
+    ok.progress("F-1", "m", agent_id="alpha-1", status="done")
+    assert ok.ops[-1]["args"]["agentId"] == "alpha-1" and ok.ops[-1]["args"]["status"] == "done"
