@@ -664,6 +664,23 @@ class _StepClock:
         await asyncio.sleep(0)
 
 
+class _SkewClock:
+    """Real monotonic time plus a skew; async sleep adds to the skew instead of waiting."""
+
+    def __init__(self) -> None:
+        import time
+
+        self._mono = time.monotonic
+        self.skew = 0.0
+
+    def __call__(self) -> float:
+        return self._mono() + self.skew
+
+    async def sleep(self, seconds: float) -> None:
+        self.skew += max(0.0, seconds)
+        await asyncio.sleep(0)
+
+
 @pytest.mark.parametrize("retry_after", [3600.0, None])
 def test_permanent_usage_limit_never_quarantines(tmp_path: Path, retry_after: float | None) -> None:
     """bravo-6 repro: a usage limit that never lifts must not burn attempts or quarantine."""
@@ -1025,6 +1042,8 @@ def test_gate_infrastructure_error_is_counted(tmp_path: Path) -> None:
 def test_usage_limit_is_not_counted_toward_infra_cap(tmp_path: Path) -> None:
     """Many limit/pause/release cycles in a row never quarantine (account-wide errors aren't counted)."""
     rig = Rig(tmp_path, lambda p, agent: fenced(GOOD_DIFF))
+    clock = _SkewClock()  # backoff sleeps advance instantly; the 0.02 s pause passes in real time
+    rig.limiter = RateLimiter(rpm=10**6, tpm=10**9, max_concurrent=3, clock=clock, sleep=clock.sleep)
     rig.client.inject_rate_limit(times=10_000, retry_after=0.02)
     rig.submit("T-UL", "S")
     pool = asyncio.run(_run_for(rig, 0.6))

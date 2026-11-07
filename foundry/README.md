@@ -149,18 +149,31 @@ Tip: Ollama's default context window is small. For long sizing and PR prompts, s
 
 Before doing anything, real mode runs two preflight checks. If either fails it prints how to fix it and exits with code **2**:
 
-1. It looks up the Claude Code executable (`claude.exe` or `claude.cmd` on Windows, or `FOUNDRY_CLAUDE_BIN`).
-2. It probes the Gemma Shop Foreman: is Gemma reachable, and is the model installed?
+1. **Claude Code.** It looks up the executable (`claude.exe` or `claude.cmd` on Windows, or `FOUNDRY_CLAUDE_BIN`). It then builds the launch command once (`validate_launch()`), so flags that can't be passed (for example a `"` or `%` through `claude.cmd`) fail now rather than on every ticket.
+2. **Gemma.** It probes the Shop Foreman: is Gemma reachable, and is the model installed?
 
 It then sizes the order and runs the teams with `ClaudeCodeClient` and `OllamaGemmaClient`. Claude Code must be logged in under your subscription.
+
+When the run ends, real mode prints each task's state. As applicable, it also prints the quarantine reason, the last infrastructure error, and `paused until HH:MM (usage limit) - rerun the same command to resume`. The factory is always shut down cleanly, even after `--timeout`.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | done; the patch was written |
+| `1` | quarantined or failed (the reason is printed) |
+| `2` | preflight failed (Claude Code or Gemma not ready) |
+| `3` | still in progress: `--timeout` was reached, or the line is paused at the usage limit |
+
+**Resuming.** Run the same command again. An unfinished task with the same `--title` and `--files` is resumed from the database, not submitted a second time.
 
 **Your working tree is never modified:**
 
 - Claude runs with `cwd` = the target repo, but only as a diff-only builder or reviewer.
 - Gates apply each diff to a scratch copy of the repo (`.git`, `node_modules`, `.venv` and caches are left out).
 - Each approved task ends up as two files in `FOUNDRY_PATCHES_DIR` (default `foundry\data\patches\`):
-  - `<task>.patch`: the combined approved diff;
+  - `<task>.patch`: the combined approved diff, one hunk set per subtask. A subtask approved again after a resume replaces its earlier diff instead of being added twice;
   - `<task>.md`: the commit message and PR body.
+
+  When git is installed, Foundry first runs `git apply --check` on the combined patch against a scratch copy. If the subtasks' diffs conflict, the patch is saved as `<task>.patch.rejected` for a manual merge, and a warning is logged.
 
 Review the patch, then apply it yourself from the target repo's root:
 
@@ -173,10 +186,11 @@ git commit -F C:\path\to\planner\foundry\data\patches\F-001.md
 **Claude flags.** Every Claude Code call gets the safe defaults from `FoundryConfig.claude_extra_args`:
 
 - `--max-turns 3`;
-- `--disallowedTools "Bash Edit Write NotebookEdit Task WebFetch WebSearch"`;
+- `--disallowedTools "Bash Edit Write NotebookEdit Task Agent WebFetch WebSearch"`;
+- `--strict-mcp-config`;
 - `--append-system-prompt` with `claude_append_prompt`. That prompt says the agent is a Foundry builder or reviewer whose only output is the diff or JSON, and that it must ignore repository instructions (such as this repo's `CLAUDE.md`) to register tasks or spawn agents.
 
-To change them, set `FOUNDRY_CLAUDE_ARGS` (split like a shell command line) and `FOUNDRY_CLAUDE_APPEND_PROMPT`. Either can be set to `none`.
+Flags in `FOUNDRY_CLAUDE_ARGS` are **appended** to these defaults. Set `FOUNDRY_CLAUDE_ARGS_REPLACE=1` to use only your flags instead. On Windows the value is split the Windows way, and surrounding quotes are removed. `FOUNDRY_CLAUDE_APPEND_PROMPT` replaces the role prompt; `none` turns it off.
 
 ### What happens at the Claude usage limit
 
@@ -187,7 +201,21 @@ A subscription usage limit is not the builder's fault, so **it never uses up a t
 3. If the reset time can't be read, the pause lasts `FOUNDRY_LIMIT_COOLDOWN_S` (default 1200 s).
 4. After the pause, work resumes where it stopped, with no burst of catch-up calls.
 
-Timeouts, a missing `claude` executable and "please run /login" are handled the same way. Only real outcomes count as attempts: a failed gate, a REVISE verdict or an unusable reply.
+If the run stops while paused, real mode exits with code 3 and prints the local time the pause ends. Rerun the same command after that time to continue.
+
+Problems that affect the whole account also pause the line and never count against a ticket: usage limits, "please run /login" and a missing `claude`.
+
+Other infrastructure failures are counted per ticket. These include:
+
+- a timeout;
+- Claude exiting without its JSON result;
+- a launch error;
+- a reviewer error reply;
+- a failed scratch copy of the workspace.
+
+Each failure releases the ticket without spending an attempt and logs one WARNING line (error type plus a short excerpt; never the prompt). A successful Claude call resets the count. After `FOUNDRY_INFRA_FAILURE_CAP` (default 3) consecutive failures on one ticket, the task is quarantined with the reason `infrastructure: <error>`, so a broken setup can't loop forever.
+
+Only real outcomes count as attempts: a failed gate, a REVISE verdict or an unusable reply.
 
 ### Restarts
 
@@ -196,6 +224,7 @@ Foundry is restart-safe on the same database:
 - On start, `build_factory` calls `queue.resume()`, which reopens tickets a crashed worker left claimed.
 - The Floor Manager reloads its state from the queue's key-value table: directives, orders, allocations, board task ids, PR drafts, reported quarantines and applied alert ids.
 - New work orders continue numbering after the highest `F-###` in the database.
+- `--real` resumes an unfinished task with the same title and files.
 - Escalations are idempotent per `alert_id`: an alert that was already applied is not applied or posted again.
 
 ## How it feeds the Agent Department dashboard
@@ -204,10 +233,10 @@ Foundry is restart-safe on the same database:
 
 | Foundry event | Board op |
 |---|---|
-| work order sized | `addTask {title, description, size: "small", builders: <allocation>}`, then `unassignTeam` for every team the board auto-assigned except the Foundry team, and `assignTeam` for the Foundry team if the board didn't pick it |
+| work order sized | `addTask {title, description, size: "small", builders: <allocation>}`, then team fix-ups (see below) |
 | builder approved, retries, notes | `reportProgress {taskId, teamId, agentId, message, status}` |
 | Foreman escalation | `reportProgress` with message `[Foreman] <severity> <category>: <diagnosis> -> <action>` |
-| reviewer verdict | `updateTask {status: "review"}` + `reviewTask {verdict: approved/changes, by: <team>-6}` |
+| reviewer verdict | `updateTask {status: "review"}` + one `reviewTask {verdict: approved/changes, by: <team>-6}` per team on the board task |
 | task complete | `updateTask {status: "done"}` (after the PR summary is posted as progress) |
 | task quarantined | `updateTask {status: "paused"}` + a progress note with the reason |
 
@@ -217,7 +246,12 @@ The bridge never blocks or crashes the factory:
 - Every error is caught.
 - Board task ids (`T-0xx`) are resolved in that thread.
 
-Every board task is registered as `small` with `builders` = the Foundry allocation; a `large` task would take every free team. After that only the Foundry team stays on it, so the board's review sign-off waits for exactly one verdict: the one Foundry posts.
+Every board task is registered as `small` with `builders` = the Foundry allocation; a `large` task would take every free team. Then the bridge reads the board's state.
+
+- **The Foundry team is free on the board** (or the board already picked it): the bridge assigns it and unassigns the other teams the board just auto-assigned. Those teams were free a moment earlier.
+- **The Foundry team is busy on another open board task**, for example one of your own (or the board state can't be read): **the bridge never moves it**. The board's own assignment stays as it is. At review time Foundry posts a verdict for *every* team on that board task, so `done` is never refused.
+
+Your own board work is never paused or left without a team by Foundry.
 
 Run `npm run dashboard` to watch Foundry tasks appear live. If a shared board (hub) is configured, the dashboard forwards to it like any other client. In tests use `mode="dry"`: it records ops in `bridge.ops` and makes no I/O.
 
@@ -243,7 +277,9 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_BOARD_BRIDGE_MODE` | `auto` (`auto`, `dry`, `off`) |
 | `FOUNDRY_TRUST_CACHE` | `false`: a cache hit skips only the builder's Claude call; the gates and the reviewer still run. `true` also skips the reviewer |
 | `FOUNDRY_LIMIT_COOLDOWN_S` | `1200` (pause after a usage limit whose reset time can't be parsed) |
-| `FOUNDRY_CLAUDE_ARGS` | safe defaults above; split like a shell command line; `none` = no extra flags |
+| `FOUNDRY_CLAUDE_ARGS` | extra flags **appended** to the safe defaults above |
+| `FOUNDRY_CLAUDE_ARGS_REPLACE` | `1` = `FOUNDRY_CLAUDE_ARGS` replaces the defaults instead |
+| `FOUNDRY_INFRA_FAILURE_CAP` | `3` consecutive infrastructure failures on one ticket before it is quarantined |
 | `FOUNDRY_CLAUDE_APPEND_PROMPT` | the Foundry role prompt; `none` = no `--append-system-prompt` |
 | `FOUNDRY_PATCHES_DIR` | `foundry/data/patches` |
 
@@ -266,7 +302,7 @@ Every escalation is validated as a `ForemanEscalation`, stored in the queue and 
 - **The solution cache matches exactly.** It hits only on identical criteria, files and context; fuzzy matching is phase 2.
 - **The context engine uses AST and regex, not semantics.** Python is pruned with `ast` (signatures, fields, docstring first lines) and TS/JS with signature regexes. Snippet relevance comes from keyword overlap, which Gemma can re-rank.
 - **The default lint is light.** Without `ruff` installed, the linter gate is a small AST check (unused imports, bare `except`, and so on).
-- **Patches are not applied for you.** Foundry writes `.patch` files; you apply them with `git apply`. A patch can conflict if the repo changed since the run.
+- **Patches are not applied for you.** Foundry writes `.patch` files; you apply them with `git apply`. A patch can conflict if the repo changed since the run. Without git installed, the `--check` step is skipped.
 - **Everything runs in one process.** The queue is safe across processes (WAL, `BEGIN IMMEDIATE`), but teams run as asyncio tasks in one process. A crash is recovered with `queue.resume()`.
 - **The bridge is fire-and-forget.** If the board refuses an op (for example the team is busy on another task), the bridge only logs it; Foundry state stays authoritative in SQLite. Through the CLI fallback, the ops go wherever `dept.mjs` is configured to send them, which may be the shared hub.
 - **Demo timing is simulated.** The demo's TPM spike comes from realistic per-call session overhead on the simulated client, and its waits use virtual time.
