@@ -317,10 +317,10 @@ node department/dept.mjs usage report --five 42 --five-reset 2026-11-07T15:10:00
 [Foundry](../foundry/README.md) is the Python factory that can run coding work for the department. When its service is running (`foundry\start_foundry.bat` on Windows, `./foundry/start_foundry.sh` elsewhere), the dashboard shows three extra things:
 
 - a **Foundry** chip in the header: running or not running, the repository it works on and whether Gemma is reachable (checked every 10 seconds);
-- a **Send to Foundry** switch and an optional **Files** box (comma separated) on the new-task form. With the switch on, the task goes to Foundry, which registers it on the board itself;
+- a **Send to Foundry** switch on the new-task form, with an optional **Files** box (comma separated) that appears when it is on. With the switch on, the task goes to Foundry, which picks the team and builders and registers it on the board itself;
 - an **Ask the Foreman** panel, where the Shop Foreman's answer appears as it is written. It is greyed out while Foundry isn't running.
 
-The dashboard server passes `/api/foundry/*` on to the service at `http://127.0.0.1:4310/api/*`. It only does so for requests from this PC; when Foundry is down it answers 503 with how to start it. Everything else on the dashboard works the same with or without Foundry. To stop Foundry, press Ctrl+C in its window or close it. See [Run Foundry in the background](../foundry/README.md#run-foundry-in-the-background) and [Dashboard integration](../foundry/README.md#dashboard-integration).
+The dashboard server passes `/api/foundry/*` on to the service at `http://127.0.0.1:4310/api/*` (another port if `FOUNDRY_SERVE_PORT` is set when the dashboard starts; use the same value for Foundry). It only does so for requests from this PC; when Foundry is down it answers 503 with how to start it. Everything else on the dashboard works the same with or without Foundry. To stop Foundry, press Ctrl+C in its window or close it. See [Run Foundry in the background](../foundry/README.md#run-foundry-in-the-background) and [Dashboard integration](../foundry/README.md#dashboard-integration).
 
 ## How the agents use it
 

@@ -12,7 +12,12 @@ Routes
 ``GET  /api/status``  -> ``{ok, tasks, foreman, paused_until, last_account_error}``
 ``POST /api/orders``  ``{title, description?, files?, size?}`` -> ``{ok, task_id}``
 ``POST /api/ask``     ``{question}`` -> ``text/event-stream`` of
-``data: {"text": "..."}`` chunks, then ``event: done``.
+``data: {"text": "..."}`` chunks, then ``event: done`` (``event: error`` first
+if the answer fails mid-stream).
+
+Errors are JSON ``{ok: false, error, code}``: 400 ``invalid``, 403 ``not_local``,
+404, 405 ``method``, 413 ``too_large``, 503 ``not_running`` (orders/ask while
+``service.running`` is False), 500 ``internal`` (details only in the log).
 
 The API talks to a *service* object (``foundry.serve.Service``) and only uses
 duck-typed methods, so tests can pass a simulated one:
@@ -210,6 +215,24 @@ async def _as_coro(awaitable: Any) -> Any:
     return await awaitable
 
 
+def _call(service: Any, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call a service method; on the service loop when it runs (keeps factory state single-threaded)."""
+    loop = _service_loop(service)
+    if loop is None:
+        return _resolve(service, fn(*args, **kwargs))
+
+    async def run() -> Any:
+        value = fn(*args, **kwargs)
+        return await value if inspect.isawaitable(value) else value
+
+    return asyncio.run_coroutine_threadsafe(run(), loop).result(CALL_TIMEOUT_S)
+
+
+def _not_running(service: Any) -> bool:
+    """True when the service says it is not running (``running`` attribute False)."""
+    return getattr(service, "running", True) is False
+
+
 class _ChunkPump:
     """Iterate a sync or async iterator of chunks from a request thread."""
 
@@ -376,7 +399,7 @@ class _Handler(BaseHTTPRequestHandler):
         data: dict[str, Any] = {}
         fn = getattr(svc, "health", None)
         if callable(fn):
-            data = dict(_resolve(svc, fn()) or {})
+            data = dict(_call(svc, fn) or {})
         repo = data.get("repo", getattr(svc, "repo", None))
         out = {
             "ok": bool(data.get("ok", True)),
@@ -392,9 +415,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _status(self) -> None:
         svc = self.service
-        data = dict(_resolve(svc, svc.status()) or {})
+        data = dict(_call(svc, svc.status) or {})
         out: dict[str, Any] = {
-            "ok": True,
+            "ok": bool(data.get("ok", True)),
             "tasks": list(data.get("tasks") or []),
             "foreman": data.get("foreman") or {},
             "paused_until": data.get("paused_until"),
@@ -407,8 +430,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _orders(self) -> None:
         order = validate_order(self._read_json())
         svc = self.service
+        if _not_running(svc):
+            return self._error(503, "Foundry is not running.", "not_running")
         try:
-            result = _resolve(svc, svc.submit(**order))
+            result = _call(svc, svc.submit, **order)
         except OrderError:
             raise
         except ValueError as exc:  # incl. pydantic ValidationError
@@ -421,6 +446,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _ask(self) -> None:
         question = _validate_question(self._read_json())
         svc = self.service
+        if _not_running(svc):
+            return self._error(503, "Foundry is not running.", "not_running")
         source = svc.ask(question)
         if inspect.isawaitable(source) and not hasattr(source, "__anext__"):
             source = _resolve(svc, source)

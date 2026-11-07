@@ -22,6 +22,10 @@ service's event loop; ``*_threadsafe`` wrappers are for handler threads):
 * ``service.ask(question)`` - async iterator of answer text chunks
 * ``service.call_threadsafe(fn_or_coro_fn, *args, timeout=...)`` - run on the loop from a thread
 * ``service.ask_threadsafe(question)`` - plain generator of chunks, for a thread
+
+``run_service`` starts ``serve_api.FoundryAPI(service, host, port)`` (a
+threaded ``http.server``) after ``service.start()`` and stops it before
+``service.stop()``. Handlers reach the loop through ``service.loop``.
 """
 
 from __future__ import annotations
@@ -55,7 +59,7 @@ DEFAULT_MONITOR_S = 60.0
 MAX_TITLE = 200
 MAX_DESCRIPTION = 20_000
 MAX_FILES = 200
-SIZES = ("S", "M", "L")
+SIZES = ("S", "M", "L", "XL")
 
 _TERMINAL = ("complete", "quarantined", "failed")
 
@@ -149,6 +153,8 @@ class Service:
         self.last_action: dict[str, Any] | None = None
         self.last_monitor_error: str | None = None
         self.resumed: list[str] = []
+        self.closed_factory: Any = None
+        self.api: Any = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -232,12 +238,9 @@ class Service:
                 await f.manager.drain()
         finally:
             f.close()  # flushes the board bridge, saves the manager, closes the databases
-            self.factory = None if self._built_here else f
+            self.factory = None
+            self.closed_factory = f
             log.info("foundry serve: stopped")
-
-    @property
-    def _built_here(self) -> bool:
-        return False
 
     # ------------------------------------------------------------------ monitor
 
@@ -278,10 +281,10 @@ class Service:
         """Re-probe Gemma (in a thread; the probe does network I/O)."""
         probe = self._probe
         if probe is None:
-            if self.gemma is None and self._factory_kwargs.get("gemma") is None and self.factory is not None \
-                    and getattr(self.factory, "gemma", None) is None:
-                self.gemma_ok = False
-                return False
+            gemma = self.gemma if self.gemma is not None else getattr(self.factory, "gemma", None)
+            if gemma is None or not type(gemma).__name__.startswith("Ollama"):
+                self.gemma_ok = gemma is not None  # simulated clients need no probe
+                return self.gemma_ok
 
             def probe() -> bool:
                 from foundry.foreman_probe import probe as real_probe
@@ -408,15 +411,23 @@ class Service:
         if size in (None, ""):
             size = None
         elif not isinstance(size, str) or size.strip().upper() not in SIZES:
-            raise OrderError("size must be S, M or L")
+            raise OrderError("size must be S, M, L or XL")
         else:
             size = size.strip().upper()
         return {"title": title, "description": desc, "files": clean, "size": size}
 
-    async def submit(self, payload: Any) -> str:
-        """Submit a work order for the service's repo; returns the Foundry task id."""
+    async def submit(self, payload: Any = None, **fields: Any) -> str:
+        """Submit a work order for the service's repo; returns the Foundry task id.
+
+        Takes a body dict (``submit({...})``) or keywords
+        (``submit(title=, description=, files=, size=)``, as ``serve_api`` calls it).
+        """
         if not self.running or self.factory is None:
             raise RuntimeError("Foundry is not running")
+        if payload is None:
+            payload = {k: v for k, v in fields.items() if v is not None}
+        elif fields:
+            raise OrderError("pass a body dict or keywords, not both")
         fields = self.validate_order(payload)
         from foundry.floor_manager import WorkOrder
 
@@ -511,16 +522,14 @@ async def run_service(service: Service, *, host: str = DEFAULT_HOST, port: int |
     await service.start()
     api = None
     try:
-        api = await _maybe_await(serve_api.start_api(service, host, port if port is not None else serve_port()))
-        bound = getattr(api, "port", port)
-        out(f"Foundry is running for {service.repo} on http://{host}:{bound} - press Ctrl+C to stop")
+        api = serve_api.FoundryAPI(service, host, port if port is not None else serve_port()).start()
+        service.api = api
+        out(f"Foundry is running for {service.repo} on http://{host}:{api.port} - press Ctrl+C to stop")
         await stop_event.wait()
     finally:
         out("Foundry is stopping (finishing in-flight work)...")
         if api is not None:
-            closer = getattr(api, "close", None) or getattr(api, "shutdown", None)
-            if callable(closer):
-                await _maybe_await(closer())
+            await asyncio.to_thread(api.stop)
         await service.stop()
         out("Foundry stopped.")
     return 0
@@ -541,7 +550,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     from foundry.claude_client import ClaudeCodeClient, ClaudeError, resolve_claude_bin
     from foundry.gemma_client import OllamaGemmaClient
 
-    claude_ok = True
     try:
         claude = ClaudeCodeClient(resolve_claude_bin(config.claude_bin), extra_args=claude_args(config))
         validate = getattr(claude, "validate_launch", None)
@@ -551,9 +559,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Claude Code is not ready: {exc}", file=sys.stderr)
         return 2
     gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model)
-    service = Service(config, repo=repo, claude=claude, gemma=gemma, monitor_s=args.monitor, claude_ok=claude_ok)
+    service = Service(config, repo=repo, claude=claude, gemma=gemma, monitor_s=args.monitor, claude_ok=True)
     try:
         return asyncio.run(run_service(service, host=DEFAULT_HOST, port=args.port))
+    except OSError as exc:  # the port is taken (another Foundry is running?)
+        print(f"Foundry could not listen on port {args.port or serve_port()}: {exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:  # Windows Ctrl+C; run_service's finally already shut down
         return 0
 
