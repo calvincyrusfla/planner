@@ -91,8 +91,8 @@ Not every task needs all 5 builders. Each task has a crew: how many builders eac
 
 - **Defaults:** a small task gets 2 builders, a large task 5.
 - **New task form:** the **Builders** picker (1–5) sits next to Small/Large. Choosing Small or Large sets it to 2 or 5 unless you've changed it yourself.
-- **Task cards:** show the crew as "N builders + reviewer". On an open task you can change it there.
-- **Standby builders:** builders beyond the crew (for example `alpha-3` to `alpha-5` on a 2-builder task) are shown dimmed as **Standby** on the team card and don't count as busy.
+- **Task cards:** show the crew as "N builders + reviewer", with a picker to change it on an open task. Team cards show the same line.
+- **Standby builders:** builders beyond the crew (for example `alpha-3` to `alpha-5` on a 2-builder task) are shown dimmed with a **Standby** tag on the team card and don't count as busy. Changing the crew moves builders between assigned and standby; one that is already working keeps its status.
 
 From the CLI:
 
@@ -101,7 +101,7 @@ node department/dept.mjs add "Fix typo in footer" --builders 1
 node department/dept.mjs set T-002 --builders 3
 ```
 
-`status` shows each open task's crew and marks standby builders.
+`status` shows each task's crew ("2 builders + reviewer") and lists builders beyond it as `standby`.
 
 ## What the dashboard does
 

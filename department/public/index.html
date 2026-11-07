@@ -257,12 +257,13 @@
   @media (prefers-reduced-motion: reduce) { .meter-bar > i { transition: none; } }
   /* "Update" (live usage from Anthropic): one persistent button moved into the band on each redraw, so its busy and
      countdown state survive. Text is --text on --surface-2 (>= 12:1); waiting/busy states keep the same colours. */
-  .usage-update { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; align-self: center; }
-  .usage-update[aria-disabled="true"] { cursor: not-allowed; }
+  .usage-update { margin-left: auto; color: var(--text); display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; align-self: center; }
+  .usage-update[aria-busy="true"] { cursor: progress; }
+  .usage-update.waiting { cursor: default; }
   .usage-update[aria-disabled="true"]:hover { border-color: var(--border); background: var(--surface-2); }
   .usage-update .spin { display: none; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--muted); border-top-color: transparent; animation: usage-spin .8s linear infinite; }
   .usage-update[aria-busy="true"] .spin { display: inline-block; }
-  .usage-update .wait { font-variant-numeric: tabular-nums; }
+  .usage-update .lbl { font-variant-numeric: tabular-nums; }
   @keyframes usage-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .usage-update .spin { animation: none; border-top-color: var(--muted); border-right-color: transparent; } }
 </style>
@@ -500,8 +501,9 @@ function syncUsageBtn(now = Date.now()) {
   if (usageBtn.getAttribute('aria-label') !== aria) usageBtn.setAttribute('aria-label', aria);
   usageBtn.title = 'Read the current usage from Anthropic with the Claude Code login saved on this PC';
   usageBtn.setAttribute('aria-busy', String(usageRefresh.busy));
-  // aria-disabled, not disabled: it stays focusable, and a click while waiting says how long is left.
-  usageBtn.setAttribute('aria-disabled', String(usageRefresh.busy || wait > 0));
+  // aria-disabled (not disabled) while busy keeps focus on it; while waiting it stays usable and a click says how long is left.
+  usageBtn.setAttribute('aria-disabled', String(usageRefresh.busy));
+  usageBtn.classList.toggle('waiting', wait > 0);
 }
 async function refreshUsage() {
   if (usageRefresh.busy) return;
