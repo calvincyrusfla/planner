@@ -199,6 +199,7 @@ class _FakeDashboard(BaseHTTPRequestHandler):
 def test_auto_mode_posts_to_dashboard_and_resolves_board_id(tmp_path: Path) -> None:
     _FakeDashboard.received = []
     _FakeDashboard.assigned = ["alpha", "bravo"]
+    _FakeDashboard.teams = [{"id": "alpha", "taskId": "T-077"}, {"id": "bravo", "taskId": None}]  # after the unassign
     server = HTTPServer(("127.0.0.1", 0), _FakeDashboard)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -319,3 +320,70 @@ def test_progress_for_a_team_not_on_the_board_task_keeps_only_the_message() -> N
     ok.register_task("F-1", "t", team_id="alpha")
     ok.progress("F-1", "m", agent_id="alpha-1", status="done")
     assert ok.ops[-1]["args"]["agentId"] == "alpha-1" and ok.ops[-1]["args"]["status"] == "done"
+
+
+def test_queued_board_task_later_dispatched_gets_verdicts_from_the_live_teams_dry() -> None:
+    """R1: queued at add (Foundry team busy, nobody free), the dispatcher later gives it charlie."""
+    bridge = BoardBridge(mode="dry", dry_busy=("alpha",))
+    bridge.register_task("F-1", "t", team_id="alpha")
+    assert bridge.board_teams["F-1"] == []
+    bridge.dry_dispatch("F-1", ["charlie"])
+    bridge.review("F-1", "alpha", "APPROVED")
+    bridge.done("F-1")
+    types = [op["type"] for op in bridge.ops]
+    assert types == ["addTask", "updateTask", "reviewTask", "updateTask"]
+    verdict = bridge.ops[2]["args"]
+    assert (verdict["teamId"], verdict["by"]) == ("charlie", "charlie-6")
+    assert bridge.board_teams["F-1"] == ["charlie"]
+
+
+def test_still_queued_board_task_skips_review_and_goes_done() -> None:
+    bridge = BoardBridge(mode="dry", dry_busy=("alpha",))
+    bridge.register_task("F-1", "t", team_id="alpha")
+    bridge.review("F-1", "alpha", "APPROVED")
+    bridge.done("F-1")
+    assert [op["type"] for op in bridge.ops] == ["addTask", "updateTask"]
+    assert bridge.ops[-1]["args"]["patch"] == {"status": "done"}
+
+
+def test_auto_mode_review_uses_the_live_board_teams(tmp_path: Path) -> None:
+    """R1 on a fake dashboard: queued at add, assigned to charlie by the dispatcher before review."""
+    _FakeDashboard.received = []
+    _FakeDashboard.assigned = []  # nobody free when the task was added
+    _FakeDashboard.teams = [{"id": "alpha", "taskId": "T-001"}, {"id": "bravo", "taskId": "T-002"}, {"id": "charlie", "taskId": "T-003"}]
+    server = _serve()
+    try:
+        bridge = BoardBridge(mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs")
+        bridge.register_task("F-1", "t", team_id="alpha")
+        assert bridge.flush(5.0)
+        assert bridge.board_teams["F-1"] == []
+        # charlie finishes T-003; the board's dispatcher moves it onto the queued T-077
+        _FakeDashboard.teams = [{"id": "alpha", "taskId": "T-001"}, {"id": "bravo", "taskId": "T-002"}, {"id": "charlie", "taskId": "T-077"}]
+        bridge.review("F-1", "alpha", "APPROVED")
+        bridge.done("F-1")
+        assert bridge.flush(5.0)
+        bridge.close()
+    finally:
+        server.shutdown()
+    sent = [(r["type"], r["args"].get("teamId"), (r["args"].get("patch") or {}).get("status")) for r in _FakeDashboard.received]
+    assert sent == [("addTask", None, None), ("updateTask", None, "review"), ("reviewTask", "charlie", None), ("updateTask", None, "done")]
+    assert bridge.board_teams["F-1"] == ["charlie"]
+
+
+def test_auto_mode_review_falls_back_to_known_teams_when_state_unreadable(tmp_path: Path) -> None:
+    _FakeDashboard.received = []
+    _FakeDashboard.assigned = ["bravo"]
+    _FakeDashboard.teams = [{"id": "alpha", "taskId": "T-001"}, {"id": "bravo", "taskId": "T-077"}]
+    server = _serve()
+    try:
+        bridge = BoardBridge(mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs")
+        bridge.register_task("F-1", "t", team_id="alpha")
+        assert bridge.flush(5.0)
+        _FakeDashboard.teams = "broken"  # type: ignore[assignment]
+        bridge.review("F-1", "alpha", "APPROVED")
+        assert bridge.flush(5.0)
+        bridge.close()
+    finally:
+        server.shutdown()
+    verdicts = [r["args"]["teamId"] for r in _FakeDashboard.received if r["type"] == "reviewTask"]
+    assert verdicts == ["bravo"]

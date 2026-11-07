@@ -272,7 +272,9 @@ The bridge never blocks or crashes the factory:
 Every board task is registered as `small` with `builders` = the Foundry allocation; a `large` task would take every free team. Then the bridge reads the board's state.
 
 - **The Foundry team is free on the board** (or the board already picked it): the bridge assigns it and unassigns the other teams the board just auto-assigned. Those teams were free a moment earlier.
-- **The Foundry team is busy on another open board task**, for example one of your own (or the board state can't be read): **the bridge never moves it**. The board's own assignment stays as it is. At review time Foundry posts a verdict for *every* team on that board task, so `done` is never refused.
+- **The Foundry team is busy on another open board task**, for example one of your own (or the board state can't be read): **the bridge never moves it**. The board's own assignment stays as it is.
+
+At review time the bridge reads the **live** board and posts a verdict for *every* team on that board task right then, so `done` is never refused. This includes a team the board's dispatcher gave a queued task after it was added. A board task that is still queued with no team gets no review step; it is marked done directly. Only when the board state can't be read does the bridge fall back to the teams it saw when the task was added.
 
 In that busy case the verdicts Foundry posts are *Foundry's* review result, recorded under each board team's reviewer id (`<team>-6`). They are not a review by those teams. Progress for that task is posted as plain messages: no agent, team or status, so it never changes the busy team's agents. Your own board work is never paused or left without a team by Foundry.
 
