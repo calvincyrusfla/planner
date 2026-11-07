@@ -4,6 +4,7 @@
 // when it is not.
 import * as core from './lib/core.mjs';
 import fs from 'node:fs';
+import os from 'node:os';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
@@ -48,6 +49,12 @@ const HELP = `Agent Department CLI
   node department/dept.mjs auto on|off                 Toggle automatic dispatch
   node department/dept.mjs times [task]                Time per team (total, tasks done, average)
                                                        and finished tasks; or one task's breakdown
+  node department/dept.mjs usage                       Claude usage meter: 5-hour and weekly limits,
+                                                       when they reset, age and source of the report
+  node department/dept.mjs usage report [--five <pct>] [--five-reset <iso|epoch>]
+                       [--week <pct>] [--week-reset <iso|epoch>] [--source X]
+                                                       Store a usage report by hand (testing); the
+                                                       status line (npm run usage-meter) does this
   node department/dept.mjs json                        Dump the full state
   node department/dept.mjs reset                       Wipe all tasks and reset the teams
 
@@ -156,6 +163,83 @@ function signOffMissing(s, task) {
   if (!on.length) return false;
   const rs = reviewState(s, task);
   return rs.approved.length < on.length;
+}
+
+// ---------------------------------------------------------------- usage meter
+
+const USAGE_STALE_MS = 15 * 60 * 1000;
+const USAGE_HELP = 'Usage: usage report [--five <pct>] [--five-reset <iso|epoch>] [--week <pct>] [--week-reset <iso|epoch>] [--source X]';
+
+function usageWindowArg(opt, pctKey, resetKey) {
+  const pct = opt[pctKey];
+  const reset = opt[resetKey];
+  if (pct === undefined) {
+    if (reset !== undefined) throw new core.DeptError(`--${resetKey} needs --${pctKey} <pct> too`);
+    return null;
+  }
+  if (typeof pct !== 'string' || pct.trim() === '' || !Number.isFinite(Number(pct))) {
+    throw new core.DeptError(`--${pctKey} must be a percentage (0-100)`);
+  }
+  if (reset !== undefined && typeof reset !== 'string') throw new core.DeptError(`--${resetKey} needs a time (ISO or epoch seconds)`);
+  return { usedPct: Number(pct), resetsAt: reset ?? null };
+}
+
+function clockTime(ms, at) {
+  const d = new Date(ms);
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (Math.abs(ms - at) < 20 * 3600 * 1000 && d.getDate() === new Date(at).getDate()) return time;
+  return `${d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' })} ${time}`;
+}
+
+function usageRow(label, win, at) {
+  if (!win) return `  ${label.padEnd(9)} no data`;
+  const reset = ts(win.resetsAt);
+  if (Number.isFinite(reset) && reset <= at) {
+    return `  ${label.padEnd(9)} reset at ${clockTime(reset, at)}; will update on next report (was ${win.usedPct}%)`;
+  }
+  const pct = Number(win.usedPct) || 0;
+  const level = pct >= 90 ? '  HIGH' : pct >= 70 ? '  getting high' : '';
+  const when = Number.isFinite(reset) ? `  resets in ${dur(reset - at)} (${clockTime(reset, at)})` : '';
+  const filled = Math.max(0, Math.min(20, Math.round((pct / 100) * 20)));
+  return `  ${label.padEnd(9)} ${'█'.repeat(filled)}${'░'.repeat(20 - filled)} ${`${pct}%`.padStart(6)}${when}${level}`;
+}
+
+function printUsage(s) {
+  const u = s.usage;
+  if (!u || (!u.fiveHour && !u.sevenDay)) {
+    console.log('Usage meter not connected: run `npm run usage-meter` on your PC, then restart Claude Code.');
+    return;
+  }
+  const at = core.clockNow();
+  console.log('Claude usage');
+  console.log(usageRow('5-hour', u.fiveHour, at));
+  console.log(usageRow('Weekly', u.sevenDay, at));
+  const reported = ts(u.reportedAt);
+  const age = Number.isFinite(reported) ? Math.max(0, at - reported) : NaN;
+  const from = u.source ? ` from ${u.source}` : '';
+  console.log(`  Updated ${Number.isFinite(age) ? `${dur(age)} ago` : 'at an unknown time'}${from}`);
+  if (!Number.isFinite(age) || age > USAGE_STALE_MS) {
+    console.log('  No Claude Code session is reporting; numbers may be out of date.');
+  }
+}
+
+async function usageCommand(sub, opt) {
+  if (sub === undefined || sub === 'show' || sub === 'status') return printUsage(await currentState());
+  if (sub !== 'report') throw new core.DeptError(`Unknown usage command ${sub}; use \`usage\` or \`usage report ...\``);
+  const fiveHour = usageWindowArg(opt, 'five', 'five-reset');
+  const sevenDay = usageWindowArg(opt, 'week', 'week-reset');
+  if (!fiveHour && !sevenDay) throw new core.DeptError(USAGE_HELP);
+  const source = typeof opt.source === 'string' ? opt.source : os.hostname();
+  const args = { fiveHour, sevenDay, reportedAt: new Date(core.clockNow()).toISOString(), source };
+  const r = await run('POST', '/api/op', { type: 'reportUsage', args }, { type: 'reportUsage', args });
+  if (r && r.stored === false) console.log('Not stored: the board already has a newer usage report.');
+  else console.log('Usage report stored.');
+  const at = core.clockNow();
+  const u = r?.usage;
+  if (u) {
+    console.log(usageRow('5-hour', u.fiveHour, at));
+    console.log(usageRow('Weekly', u.sevenDay, at));
+  }
 }
 
 const VERDICTS = { approve: 'approved', approved: 'approved', ok: 'approved', changes: 'changes', change: 'changes', reject: 'changes' };
@@ -355,6 +439,8 @@ async function main() {
       return printTimes(await currentState(), pos[0]);
     case 'hub':
       return hubCommand(pos[0], pos.slice(1), opt);
+    case 'usage':
+      return usageCommand(pos[0], opt);
     case 'json':
       return console.log(JSON.stringify(await currentState(), null, 2));
     case 'add': {
