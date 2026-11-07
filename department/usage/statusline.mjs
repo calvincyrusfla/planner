@@ -16,6 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const REPORT_SCRIPT = path.join(here, 'report.mjs');
 export const RESEND_MS = 60_000;
+export const MIN_GAP_MS = 15_000; // never send more often than this, even when values change
 const STDIN_WAIT_MS = 1000;
 
 // Same data dir as lib/store.mjs (DEPT_DATA's folder, else department/data),
@@ -31,7 +32,9 @@ export function toIso(v) {
   if (typeof v === 'number' || (typeof v === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(v))) {
     const n = Number(v);
     if (!Number.isFinite(n) || n <= 0) return null;
-    ms = n < 1e12 ? n * 1000 : n; // seconds below ~2001-09 in ms terms
+    // Same cutoff as core's USAGE_EPOCH_MS_CUTOFF (literal here so the status
+    // line doesn't load the core): below 1e11 is seconds, above it ms.
+    ms = n < 1e11 ? n * 1000 : n;
   } else if (typeof v === 'string') {
     ms = Date.parse(v);
   } else return null;
@@ -103,8 +106,10 @@ function readCache() {
 export function shouldSend(usage, cache, now = Date.now()) {
   if (!usage) return false;
   if (!cache || typeof cache.key !== 'string' || !Number.isFinite(cache.sentAt)) return true;
-  if (cache.key !== usageKey(usage)) return true;
-  return now - cache.sentAt >= RESEND_MS || now < cache.sentAt; // clock went back: send
+  if (now < cache.sentAt) return true; // clock went back
+  const since = now - cache.sentAt;
+  if (since < MIN_GAP_MS) return false;
+  return cache.key !== usageKey(usage) || since >= RESEND_MS;
 }
 
 function writeCache(usage, now) {

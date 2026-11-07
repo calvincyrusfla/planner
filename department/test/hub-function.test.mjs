@@ -190,3 +190,33 @@ test('other methods are 405', () => withKey('sesame', async () => {
     assert.equal((await r.json()).ok, false);
   }
 }));
+
+test('an ignored (older) usage report is not written and keeps the rev', () => withKey('sesame', async () => {
+  const { handler, store } = setup();
+  const newer = new Date(Date.now() - 1000).toISOString();
+  const older = new Date(Date.now() - 60_000).toISOString();
+  const first = await (await handler(post({ type: 'reportUsage', args: { fiveHour: { usedPct: 50 }, reportedAt: newer, source: 'PC' } }))).json();
+  assert.equal(first.ok, true);
+  assert.equal(first.result.stored, true);
+  assert.equal(first.rev, 1);
+  assert.equal(store.writes, 1);
+  const etagBefore = (await store.getWithMetadata('state')).etag;
+
+  const r = await handler(post({ type: 'reportUsage', args: { fiveHour: { usedPct: 10 }, reportedAt: older, source: 'old' } }));
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.result.stored, false);
+  assert.equal(body.rev, 1);
+  assert.equal(body.state.usage.fiveHour.usedPct, 50);
+  assert.equal(store.writes, 1, 'no write for an ignored report');
+  assert.equal((await store.getWithMetadata('state')).etag, etagBefore);
+  assert.equal(store.raw('state').rev, 1);
+  assert.equal(store.raw('state').state.usage.source, 'PC');
+
+  // A newer report is written as usual.
+  const next = await (await handler(post({ type: 'reportUsage', args: { fiveHour: { usedPct: 55 }, source: 'PC' } }))).json();
+  assert.equal(next.result.stored, true);
+  assert.equal(next.rev, 2);
+  assert.equal(store.writes, 2);
+}));

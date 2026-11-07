@@ -11,6 +11,9 @@ import {
   isOurStatusLine,
   planInstall,
   planUninstall,
+  sidecarText,
+  parseSidecar,
+  SIDECAR_NAME,
 } from '../scripts/install-usage-meter.mjs';
 
 const INSTALLER = fileURLToPath(new URL('../scripts/install-usage-meter.mjs', import.meta.url));
@@ -157,8 +160,91 @@ test('CLI end to end in a scratch config dir: install, refuse, force, uninstall'
 
     r = run('--uninstall');
     assert.equal(r.status, 0, r.stderr);
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { model: 'x' });
+    // The replaced status line comes back; the sidecar is gone.
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { statusLine: { type: 'command', command: 'mine.sh' }, model: 'x' });
     assert.deepEqual(fs.readdirSync(dir).sort(), ['settings.json', 'settings.json.bak-agent-department']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('planUninstall restores a saved statusLine; sidecar round trip', () => {
+  const saved = { type: 'command', command: 'mine.sh', padding: 2 };
+  const r = planUninstall(JSON.stringify({ a: 1, statusLine: { type: 'command', command: CMD } }), { restore: saved });
+  assert.equal(r.action, 'restore');
+  assert.deepEqual(JSON.parse(r.text), { a: 1, statusLine: saved });
+  assert.deepEqual(parseSidecar(sidecarText(saved)), saved);
+  assert.throws(() => parseSidecar('{oops'), /not valid JSON/);
+  assert.throws(() => parseSidecar('{"x":1}'), /saved statusLine/);
+  // A foreign line is never touched, even with something to restore.
+  assert.equal(planUninstall('{"statusLine":{"type":"command","command":"other.sh"}}', { restore: saved }).action, 'foreign');
+});
+
+// bravo-6's repro: foreign line -> --force -> (update) -> --uninstall must give
+// the user's original status line back, and the backup must keep the original.
+for (const withUpdate of [false, true]) {
+  test(`foreign statusLine survives --force${withUpdate ? ' -> path update' : ''} -> --uninstall`, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-cfg-'));
+    const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, HOME: dir, USERPROFILE: dir };
+    const run = (...args) => spawnSync(process.execPath, [INSTALLER, ...args], { env, encoding: 'utf8' });
+    const file = path.join(dir, 'settings.json');
+    const backup = file + '.bak-agent-department';
+    const sidecar = path.join(dir, SIDECAR_NAME);
+    const mine = { type: 'command', command: 'bash ~/.claude/my-line.sh', padding: 0 };
+    const original = JSON.stringify({ theme: 'dark', statusLine: mine }, null, 2) + '\n';
+    try {
+      fs.writeFileSync(file, original);
+      let r = run('--force');
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(JSON.parse(fs.readFileSync(sidecar, 'utf8')).statusLine, mine);
+      assert.equal(fs.readFileSync(backup, 'utf8'), original);
+
+      if (withUpdate) {
+        // Simulate a moved repo / new node: our entry with another path.
+        const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+        s.statusLine.command = '"/old/node" "/old/repo/department/usage/statusline.mjs"';
+        fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n');
+        r = run();
+        assert.equal(r.status, 0, r.stderr);
+        assert.match(r.stdout, /updating/);
+        assert.ok(isOurStatusLine(JSON.parse(fs.readFileSync(file, 'utf8')).statusLine));
+        assert.ok(fs.existsSync(sidecar), 'update keeps the sidecar');
+        assert.equal(fs.readFileSync(backup, 'utf8'), original, 'backup is never overwritten');
+      }
+
+      r = run('--uninstall', '--dry-run');
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /would put back/);
+      assert.ok(fs.existsSync(sidecar));
+
+      r = run('--uninstall');
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /my-line\.sh/);
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { theme: 'dark', statusLine: mine });
+      assert.ok(!fs.existsSync(sidecar), 'sidecar removed after restoring');
+      assert.equal(fs.readFileSync(backup, 'utf8'), original);
+
+      // Uninstalling again leaves the restored foreign line alone.
+      r = run('--uninstall');
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).statusLine, mine);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('backup is made once and kept across install, uninstall and reinstall', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-cfg-'));
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, HOME: dir, USERPROFILE: dir };
+  const run = (...args) => spawnSync(process.execPath, [INSTALLER, ...args], { env, encoding: 'utf8' });
+  const file = path.join(dir, 'settings.json');
+  const original = '{"model":"opus"}';
+  try {
+    fs.writeFileSync(file, original);
+    for (const args of [[], ['--uninstall'], []]) assert.equal(run(...args).status, 0);
+    assert.equal(fs.readFileSync(file + '.bak-agent-department', 'utf8'), original);
+    assert.ok(!fs.existsSync(path.join(dir, SIDECAR_NAME)));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -60,6 +60,10 @@ export function makeHandler(getStoreFn = defaultStore) {
         if (e instanceof core.DeptError) return json({ ok: false, error: e.message }, e.status || 400);
         return json({ ok: false, error: "bad_op" }, 400);
       }
+      // An ignored report (e.g. an older usage report) changed nothing: no write, same rev.
+      if (result && typeof result === "object" && result.stored === false) {
+        return json({ ok: true, result, state, rev });
+      }
       const next = { state, rev: rev + 1 };
       const w = await s.setJSON(KEY, next, etag ? { onlyIfMatch: etag } : { onlyIfNew: true });
       if (w && w.modified) return json({ ok: true, result: result === undefined ? null : result, state, rev: next.rev });

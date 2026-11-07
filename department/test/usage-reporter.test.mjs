@@ -9,7 +9,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { formatLine, readUsage, toIso, shouldSend, usageKey, RESEND_MS } from '../usage/statusline.mjs';
+import { formatLine, readUsage, toIso, shouldSend, usageKey, RESEND_MS, MIN_GAP_MS } from '../usage/statusline.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const STATUSLINE = path.join(here, '..', 'usage', 'statusline.mjs');
@@ -42,8 +42,8 @@ async function freePort() {
 // Env for child processes: scratch data, no shared board, no proxy, a dead port.
 function env(dir, port, extra = {}) {
   const e = { ...process.env };
-  for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NODE_USE_ENV_PROXY', 'DEPT_URL', 'DEPT_USAGE_PAYLOAD', 'DEPT_USAGE_SOURCE', 'DEPT_USAGE_SEND']) delete e[k];
-  return { ...e, DEPT_DATA: path.join(dir, 'state.json'), DEPT_HUB: 'off', DEPT_HUB_URL: '', PORT: String(port), ...extra };
+  for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NODE_USE_ENV_PROXY', 'DEPT_URL', 'DEPT_PORT', 'DEPT_USAGE_PAYLOAD', 'DEPT_USAGE_SOURCE', 'DEPT_USAGE_SEND']) delete e[k];
+  return { ...e, DEPT_DATA: path.join(dir, 'state.json'), DEPT_HUB: 'off', DEPT_HUB_URL: '', PORT: String(port), DEPT_PORT: String(port), ...extra };
 }
 
 async function waitFor(fn, ms = 8000) {
@@ -93,6 +93,9 @@ function runStatusline(input, e) {
 test('toIso accepts epoch seconds, epoch ms, numeric strings and ISO', () => {
   assert.equal(toIso(1762520400), '2025-11-07T13:00:00.000Z');
   assert.equal(toIso(1762520400000), '2025-11-07T13:00:00.000Z');
+  // 1e11 cutoff (as core's USAGE_EPOCH_MS_CUTOFF): just below is seconds, from it on ms
+  assert.equal(toIso(99_999_999_999), new Date(99_999_999_999 * 1000).toISOString());
+  assert.equal(toIso(100_000_000_000), new Date(100_000_000_000).toISOString());
   assert.equal(toIso('1762520400'), '2025-11-07T13:00:00.000Z');
   assert.equal(toIso('2025-11-07T13:00:00Z'), '2025-11-07T13:00:00.000Z');
   assert.equal(toIso('2025-11-07T14:00:00+01:00'), '2025-11-07T13:00:00.000Z');
@@ -150,7 +153,13 @@ test('shouldSend: first time, changed values, 60 s resend, unchanged within 60 s
   assert.equal(shouldSend(u, { key: usageKey(u), sentAt: now - 5000 }, now), false);
   assert.equal(shouldSend(u, { key: usageKey(u), sentAt: now - RESEND_MS }, now), true);
   const changed = { ...u, fiveHour: { ...u.fiveHour, usedPct: 43 } };
-  assert.equal(shouldSend(changed, { key: usageKey(u), sentAt: now - 1000 }, now), true);
+  // changed values: not within the 15 s floor, at once after it
+  assert.equal(MIN_GAP_MS, 15_000);
+  assert.equal(shouldSend(changed, { key: usageKey(u), sentAt: now - 1000 }, now), false);
+  assert.equal(shouldSend(changed, { key: usageKey(u), sentAt: now - MIN_GAP_MS + 1 }, now), false);
+  assert.equal(shouldSend(changed, { key: usageKey(u), sentAt: now - MIN_GAP_MS }, now), true);
+  // unchanged values after the floor but before 60 s: no
+  assert.equal(shouldSend(u, { key: usageKey(u), sentAt: now - 30_000 }, now), false);
   assert.equal(shouldSend(u, { key: usageKey(u), sentAt: now + 60_000 }, now), true, 'clock went back');
   assert.equal(shouldSend(u, { garbage: true }, now), true);
 });
@@ -219,9 +228,14 @@ test('statusline sends in the background, throttles via the cache, and returns f
   runStatusline(sample(), e);
   assert.deepEqual(JSON.parse(fs.readFileSync(cache, 'utf8')), c1);
 
-  // Changed values: sends again at once.
+  // Changed values within 15 s of the last send: held back by the floor.
   const more = sample();
   more.rate_limits.five_hour.used_percentage = 50;
+  runStatusline(more, e);
+  assert.deepEqual(JSON.parse(fs.readFileSync(cache, 'utf8')), c1, '15 s floor');
+
+  // Changed values once 15 s have passed: sends.
+  fs.writeFileSync(cache, JSON.stringify({ ...c1, sentAt: Date.now() - MIN_GAP_MS - 500 }));
   runStatusline(more, e);
   const c2 = JSON.parse(fs.readFileSync(cache, 'utf8'));
   assert.notEqual(c2.key, c1.key);
@@ -362,4 +376,97 @@ test('report.mjs uses the shared board when no local server runs and a hub is co
   assert.equal(seen[0].body.type, 'reportUsage');
   assert.equal(board.usage.fiveHour.usedPct, 88);
   assert.equal(readState(dir), null, 'the local file is left alone in hub mode');
+});
+
+test('report.mjs never overwrites a state file it could not read or parse', async () => {
+  const dir = scratch();
+  const port = await freePort();
+  const file = path.join(dir, 'state.json');
+  const payload = { fiveHour: { usedPct: 5, resetsAt: null }, reportedAt: new Date().toISOString() };
+
+  // Corrupt JSON (e.g. caught half-written): left as is, one log line.
+  fs.writeFileSync(file, '{"tasks": [ half');
+  const r = runReport(dir, port, payload);
+  assert.notEqual(r.status, 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{"tasks": [ half');
+  assert.match(fs.readFileSync(path.join(dir, 'usage-report.log'), 'utf8'), /could not parse .*not writing/);
+
+  // Unreadable (a directory stands in for EPERM/EBUSY on Windows): not replaced.
+  const dir2 = scratch();
+  fs.mkdirSync(path.join(dir2, 'state.json'));
+  const r2 = runReport(dir2, port, payload);
+  assert.notEqual(r2.status, 0);
+  assert.ok(fs.statSync(path.join(dir2, 'state.json')).isDirectory());
+  assert.match(fs.readFileSync(path.join(dir2, 'usage-report.log'), 'utf8'), /could not read .*not writing/);
+
+  // A good board keeps its tasks and gains the usage.
+  const { createInitialState, addTask } = await import('../lib/core.mjs');
+  const st = createInitialState();
+  addTask(st, { title: 'Keep me' });
+  fs.writeFileSync(file, JSON.stringify(st));
+  assert.equal(runReport(dir, port, payload).status, 0);
+  const after = readState(dir);
+  assert.equal(after.tasks[0].title, 'Keep me');
+  assert.equal(after.usage.fiveHour.usedPct, 5);
+});
+
+test('report.mjs ignores a stray PORT and falls through past a foreign server', async (t) => {
+  const http = await import('node:http');
+  // Some other app on the port: answers HTML, or JSON that isn't ours.
+  const answers = ['<html>hello</html>', JSON.stringify({ status: 'fine' })];
+  let hits = 0;
+  const other = http.createServer((req, res) => {
+    const body = answers[hits++ % answers.length];
+    res.writeHead(hits === 1 ? 404 : 200, { 'content-type': hits === 1 ? 'text/html' : 'application/json' });
+    res.end(body);
+  });
+  await new Promise((r) => other.listen(0, '127.0.0.1', r));
+  t.after(() => other.close());
+  const otherPort = other.address().port;
+  const deadPort = await freePort();
+  const run = (dir, extra) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [REPORT], {
+      env: env(dir, deadPort, { DEPT_USAGE_PAYLOAD: JSON.stringify({ fiveHour: { usedPct: 21, resetsAt: null }, reportedAt: new Date().toISOString() }), ...extra }),
+      stdio: 'ignore',
+    });
+    child.on('exit', resolve);
+  });
+
+  // PORT points at the other app: never used, only DEPT_URL / DEPT_PORT are.
+  // (With neither set the default is 4300; not exercised here so a real
+  // dashboard on this machine is never touched.)
+  const d1 = scratch();
+  const e1 = await run(d1, { PORT: String(otherPort), DEPT_PORT: String(deadPort) });
+  assert.equal(e1, 0);
+  assert.equal(hits, 0, 'PORT alone is not used');
+  assert.equal(readState(d1).usage.fiveHour.usedPct, 21);
+
+  // DEPT_PORT / DEPT_URL at the other app (HTML, then foreign JSON): falls through to the file.
+  const d2 = scratch();
+  assert.equal(await run(d2, { DEPT_PORT: String(otherPort) }), 0);
+  const d3 = scratch();
+  assert.equal(await run(d3, { DEPT_URL: `http://127.0.0.1:${otherPort}` }), 0);
+  assert.equal(hits, 2);
+  assert.equal(readState(d2).usage.fiveHour.usedPct, 21);
+  assert.equal(readState(d3).usage.fiveHour.usedPct, 21);
+});
+
+test('report.mjs stops (no fallback) on a genuine {ok:false} from our server', async (t) => {
+  const http = await import('node:http');
+  const ours = http.createServer((req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Unknown operation reportUsage' }));
+  });
+  await new Promise((r) => ours.listen(0, '127.0.0.1', r));
+  t.after(() => ours.close());
+  const dir = scratch();
+  const code = await new Promise((resolve) => {
+    spawn(process.execPath, [REPORT], {
+      env: env(dir, ours.address().port, { DEPT_USAGE_PAYLOAD: JSON.stringify({ fiveHour: { usedPct: 1, resetsAt: null } }) }),
+      stdio: 'ignore',
+    }).on('exit', resolve);
+  });
+  assert.notEqual(code, 0);
+  assert.equal(readState(dir), null, 'no fallback write to the file');
+  assert.match(fs.readFileSync(path.join(dir, 'usage-report.log'), 'utf8'), /Unknown operation reportUsage/);
 });

@@ -10,7 +10,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { load, save, DATA_FILE } from '../lib/store.mjs';
+import { save, DATA_FILE } from '../lib/store.mjs';
+import { createInitialState, normalize } from '../lib/core.mjs';
 import { applyOp } from '../lib/ops.mjs';
 import { hubConfig, hubOp } from '../lib/hub.mjs';
 
@@ -45,7 +46,9 @@ if ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_US
   process.exit(r.status ?? 1);
 }
 
-const BASE = process.env.DEPT_URL || `http://127.0.0.1:${process.env.PORT || 4300}`;
+// PORT alone is not trusted: the user's shell may set it for some other app.
+// DEPT_URL, else DEPT_PORT, else the dashboard's default 4300.
+const BASE = process.env.DEPT_URL || `http://127.0.0.1:${process.env.DEPT_PORT || 4300}`;
 
 function defaultSource() {
   const s = process.env.DEPT_USAGE_SOURCE ||
@@ -83,10 +86,30 @@ async function viaServer(op) {
   try {
     json = await res.json();
   } catch {
-    throw new Error(`dashboard server at ${BASE} gave an unexpected answer (HTTP ${res.status})`);
+    json = null;
   }
-  if (!json || !json.ok) throw new Error(`dashboard server: ${(json && json.error) || `HTTP ${res.status}`}`);
+  // Not Agent Department JSON: something else listens on that port.
+  if (!json || typeof json !== 'object' || typeof json.ok !== 'boolean') return { offline: true, foreign: res.status };
+  if (!json.ok) throw new Error(`dashboard server: ${json.error || `HTTP ${res.status}`}`);
   return { result: json.result, via: 'server' };
+}
+
+// Like store.load(), except that an unreadable or corrupt file (EPERM/EBUSY
+// mid-rename on Windows, half-written JSON) throws instead of turning into an
+// empty board that save() would then write over the real one.
+function loadForWrite() {
+  let raw;
+  try {
+    raw = fs.readFileSync(DATA_FILE, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return createInitialState();
+    throw new Error(`could not read ${DATA_FILE} (${err.code || err.message}); not writing`);
+  }
+  try {
+    return normalize(JSON.parse(raw));
+  } catch (err) {
+    throw new Error(`could not parse ${DATA_FILE} (${err.message}); not writing`);
+  }
 }
 
 async function send(args) {
@@ -95,7 +118,7 @@ async function send(args) {
   if (!r.offline) return r;
   const cfg = hubConfig();
   if (cfg) return { result: (await hubOp(cfg, op)).result, via: 'hub' };
-  const state = load();
+  const state = loadForWrite();
   const result = applyOp(state, op);
   if (!result || result.stored !== false) save(state);
   return { result, via: 'file' };

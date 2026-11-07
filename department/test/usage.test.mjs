@@ -142,8 +142,49 @@ test('an older report is ignored; equal or newer replaces', () => {
   at += 5000;
   const newer = core.reportUsage(s, { sevenDay: { usedPct: 9 }, source: 'D' });
   assert.equal(newer.stored, true);
-  assert.equal(s.usage.fiveHour, null, 'a report replaces the whole object, not merges windows');
+  assert.equal(s.usage.fiveHour, null, 'an omitted window with no reset time is not carried over');
   assert.equal(s.usage.sevenDay.usedPct, 9);
+});
+
+test('an omitted window keeps the stored one while its reset is ahead, else null', () => {
+  const s = fresh();
+  const weekReset = '2026-11-12T00:00:00.000Z';
+  core.reportUsage(s, {
+    fiveHour: { usedPct: 40, resetsAt: RESET_ISO },
+    sevenDay: { usedPct: 18, resetsAt: weekReset },
+    source: 'PC',
+  });
+  // Only fiveHour: the weekly window survives.
+  at += 60_000;
+  core.reportUsage(s, { fiveHour: { usedPct: 45, resetsAt: RESET_SEC } });
+  assert.deepEqual(s.usage.fiveHour, { usedPct: 45, resetsAt: RESET_ISO });
+  assert.deepEqual(s.usage.sevenDay, { usedPct: 18, resetsAt: weekReset });
+  // Explicit null counts as omitted too; the carried window is a copy.
+  at += 60_000;
+  core.reportUsage(s, { sevenDay: { usedPct: 20, resetsAt: weekReset }, fiveHour: null });
+  assert.deepEqual(s.usage.fiveHour, { usedPct: 45, resetsAt: RESET_ISO });
+  assert.deepEqual(s.usage.sevenDay, { usedPct: 20, resetsAt: weekReset });
+  // Once the 5-hour window has reset, an omitted fiveHour is dropped.
+  at = Date.parse(RESET_ISO) + 1000;
+  core.reportUsage(s, { sevenDay: { usedPct: 21, resetsAt: weekReset } });
+  assert.equal(s.usage.fiveHour, null);
+  // Exactly at the reset time it counts as passed.
+  const t = fresh();
+  at = T0;
+  core.reportUsage(t, { fiveHour: { usedPct: 5, resetsAt: RESET_ISO } });
+  at = Date.parse(RESET_ISO);
+  core.reportUsage(t, { sevenDay: { usedPct: 1 } });
+  assert.equal(t.usage.fiveHour, null);
+  // An ignored (older) report carries nothing and changes nothing.
+  const before = structuredClone(t.usage);
+  core.reportUsage(t, { fiveHour: { usedPct: 99, resetsAt: RESET_ISO }, reportedAt: iso(T0) });
+  assert.deepEqual(t.usage, before);
+});
+
+test('EPOCH_MS_THRESHOLD splits epoch seconds from ms', () => {
+  assert.equal(core.EPOCH_MS_THRESHOLD, 1e11);
+  assert.equal(core.usageTimeToIso(core.EPOCH_MS_THRESHOLD), new Date(1e11).toISOString());
+  assert.equal(core.usageTimeToIso(core.EPOCH_MS_THRESHOLD - 1), new Date((1e11 - 1) * 1000).toISOString());
 });
 
 test('source is a short single-line label', () => {

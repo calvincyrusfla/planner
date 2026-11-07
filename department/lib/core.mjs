@@ -577,14 +577,15 @@ export function updateSettings(state, patch = {}) {
 //   fiveHour: { usedPct: 0-100 (1 decimal), resetsAt: ISO|null } | null,
 //   sevenDay: { same } | null,
 //   reportedAt: ISO,  // when the reporter took it (never later than receivedAt)
+//   (a report that omits a window keeps the stored one while its resetsAt is ahead)
 //   receivedAt: ISO,  // when this board stored it
 //   source: string,   // short label, <= 40 chars
 // }
 
 export const USAGE_SOURCE_MAX = 40;
-// Epoch numbers above this are milliseconds, below it seconds (1e11 s is the
-// year 5138; 1e11 ms is 1973).
-const EPOCH_MS_THRESHOLD = 1e11;
+// Epoch numbers at or above this are milliseconds, below it seconds (1e11 s is
+// the year 5138; 1e11 ms is 1973). statusline.mjs and index.html use the same cutoff.
+export const EPOCH_MS_THRESHOLD = 1e11;
 
 // Epoch seconds, epoch ms, numeric strings of either, ISO strings or Dates ->
 // ISO string; anything unusable -> null.
@@ -659,7 +660,16 @@ export function reportUsage(state, { fiveHour, sevenDay, reportedAt, source } = 
     state.usage = current;
     return { stored: false, usage: current };
   }
-  state.usage = { fiveHour: five, sevenDay: seven, reportedAt: at, receivedAt, source: cleanSource(source) };
+  // Claude Code sometimes leaves a window out: keep the stored one while its
+  // reset time is still ahead, so one partial report doesn't blank a meter.
+  const carry = (win) => (win && win.resetsAt && Date.parse(win.resetsAt) > clockNow() ? { ...win } : null);
+  state.usage = {
+    fiveHour: five || carry(current?.fiveHour),
+    sevenDay: seven || carry(current?.sevenDay),
+    reportedAt: at,
+    receivedAt,
+    source: cleanSource(source),
+  };
   return { stored: true, usage: state.usage };
 }
 

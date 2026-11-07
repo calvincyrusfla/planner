@@ -369,7 +369,8 @@ const USAGE_WINDOWS = [['fiveHour', '5-hour limit'], ['sevenDay', 'Weekly limit'
 // resetsAt is ISO from the board; epoch seconds/ms are accepted too, just in case.
 function usageTime(v) {
   if (v === null || v === undefined || v === '') return NaN;
-  if (typeof v === 'number' || /^\d+(\.\d+)?$/.test(String(v))) { const n = Number(v); return n < 1e12 ? n * 1000 : n; }
+  // Below 1e11 = epoch seconds, else ms; matches core.mjs EPOCH_MS_THRESHOLD.
+  if (typeof v === 'number' || /^\d+(\.\d+)?$/.test(String(v))) { const n = Number(v); return n < 1e11 ? n * 1000 : n; }
   return new Date(v).getTime();
 }
 const usageLevel = (pct) => (pct >= 90 ? 'bad' : pct >= 70 ? 'warn' : 'ok');

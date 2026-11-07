@@ -8,9 +8,11 @@
 //
 // It edits the USER's Claude Code settings: %USERPROFILE%\.claude\settings.json on
 // Windows, ~/.claude/settings.json elsewhere, or <CLAUDE_CONFIG_DIR>/settings.json
-// when that is set. It backs the file up first (settings.json.bak-agent-department),
-// keeps every other key, and never replaces a status line that isn't ours unless
-// --force is given. Claude Code then runs department/usage/statusline.mjs, which
+// when that is set. Before its first change it backs the file up once
+// (settings.json.bak-agent-department, never overwritten), keeps every other key,
+// and never replaces a status line that isn't ours unless --force is given; a
+// replaced one is saved in statusline.replaced-by-agent-department.json next to
+// settings.json and --uninstall puts it back. Claude Code then runs department/usage/statusline.mjs, which
 // reads the rate limits Claude Code passes it and reports them to the dashboard.
 // Nothing here reads passwords, tokens or credential files.
 import fs from 'node:fs';
@@ -22,6 +24,9 @@ const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const DEPT_DIR = path.resolve(path.dirname(SCRIPT_FILE), '..');
 export const STATUSLINE_SCRIPT = path.join(DEPT_DIR, 'usage', 'statusline.mjs');
 export const BACKUP_SUFFIX = '.bak-agent-department';
+// When --force replaces someone else's statusLine, it is saved here (next to
+// settings.json) so --uninstall can put it back.
+export const SIDECAR_NAME = 'statusline.replaced-by-agent-department.json';
 
 // ---------------------------------------------------------------- pure helpers
 
@@ -119,15 +124,39 @@ export function planInstall(original, command, { force = false, file = 'settings
   return { action, text: serialize(data, original), previous: prev };
 }
 
-// Pure: what uninstalling does. Returns { action: 'missing'|'none'|'foreign'|'remove', text?, previous? }.
-export function planUninstall(original, { file = 'settings.json' } = {}) {
+// Pure: what uninstalling does. `restore` is the statusLine --force replaced
+// (from the sidecar), put back instead of leaving no status line.
+// Returns { action: 'missing'|'none'|'foreign'|'remove'|'restore', text?, previous?, restored? }.
+export function planUninstall(original, { file = 'settings.json', restore } = {}) {
   if (original == null) return { action: 'missing' };
   const data = parseSettings(original, file);
   const prev = data.statusLine;
   if (prev === undefined) return { action: 'none' };
   if (!isOurStatusLine(prev)) return { action: 'foreign', previous: prev };
+  if (restore !== undefined && restore !== null) {
+    data.statusLine = restore;
+    return { action: 'restore', text: serialize(data, original), previous: prev, restored: restore };
+  }
   delete data.statusLine;
   return { action: 'remove', text: serialize(data, original), previous: prev };
+}
+
+// Pure: the sidecar file's text for a replaced statusLine, and reading it back.
+export function sidecarText(statusLine, savedAt = new Date().toISOString()) {
+  return JSON.stringify({ savedAt, note: 'statusLine replaced by the Agent Department usage meter (--force); --uninstall puts it back', statusLine }, null, 2) + '\n';
+}
+
+export function parseSidecar(text, file = SIDECAR_NAME) {
+  let data;
+  try {
+    data = JSON.parse(String(text).replace(/^\uFEFF/, ''));
+  } catch (err) {
+    throw new Error(`${file} is not valid JSON (${err.message}); fix or remove it, then run this again`);
+  }
+  if (!data || typeof data !== 'object' || data.statusLine === undefined || data.statusLine === null) {
+    throw new Error(`${file} does not hold a saved statusLine; fix or remove it, then run this again`);
+  }
+  return data.statusLine;
 }
 
 // ---------------------------------------------------------------- CLI
@@ -166,23 +195,34 @@ function show(statusLine) {
   return JSON.stringify(statusLine, null, 2).split('\n').map((l) => `    | ${l}`).join('\n');
 }
 
+// Write next to the target and rename, so a crash can't leave half a file.
+function atomicWrite(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, file);
+}
+
+// The backup is made once, before our first change, and never overwritten, so
+// it always holds the settings as they were before the usage meter.
 function writeSettings(file, original, text, dryRun) {
   const backup = file + BACKUP_SUFFIX;
+  const haveBackup = fs.existsSync(backup);
   if (dryRun) {
-    if (original != null) console.log(`  would back up ${file} -> ${backup}`);
+    if (original != null) console.log(haveBackup ? `  would keep the existing backup ${backup}` : `  would back up ${file} -> ${backup}`);
     console.log(`  would write ${file}:`);
     console.log(text.replace(/\r?\n$/, '').split(/\r?\n/).map((l) => `    | ${l}`).join('\n'));
     return;
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   if (original != null) {
-    fs.copyFileSync(file, backup);
-    console.log(`  backed up ${file} -> ${backup}`);
+    if (haveBackup) console.log(`  kept the existing backup ${backup} (settings from before the first change)`);
+    else {
+      fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
+      console.log(`  backed up ${file} -> ${backup}`);
+    }
   }
-  // Write next to it and rename, so a crash can't leave half a settings file.
-  const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
+  atomicWrite(file, text);
   console.log(`  wrote ${file}`);
 }
 
@@ -207,16 +247,34 @@ function main() {
 
   try {
     const original = native ? readOrNull(file) : null;
+    const pathMod = opts.platform === 'win32' ? path.win32 : path.posix;
+    const sidecar = pathMod.join(pathMod.dirname(file), SIDECAR_NAME);
     if (opts.uninstall) {
-      const plan = planUninstall(original, { file });
+      const sideText = native ? readOrNull(sidecar) : null;
+      const restore = sideText == null ? undefined : parseSidecar(sideText, sidecar);
+      const plan = planUninstall(original, { file, restore });
       if (plan.action === 'missing') console.log('  no settings file; nothing to remove');
       else if (plan.action === 'none') console.log('  no statusLine set; nothing to remove');
       else if (plan.action === 'foreign') {
         console.log("  the statusLine there isn't the usage meter, so it was left alone:");
         console.log(show(plan.previous));
       } else {
+        if (plan.action === 'restore') {
+          console.log(`  ${opts.dryRun ? 'would put' : 'putting'} back the status line the usage meter replaced:`);
+          console.log(show(plan.restored));
+        }
         writeSettings(file, original, plan.text, opts.dryRun);
-        if (!opts.dryRun) console.log('Done. Restart Claude Code to drop the status line.');
+        if (plan.action === 'restore') {
+          if (opts.dryRun) console.log(`  would remove ${sidecar}`);
+          else {
+            fs.rmSync(sidecar, { force: true });
+            console.log(`  removed ${sidecar}`);
+          }
+        }
+        if (!opts.dryRun) console.log(plan.action === 'restore' ? 'Done. Restart Claude Code to get your old status line back.' : 'Done. Restart Claude Code to drop the status line.');
+      }
+      if (plan.action !== 'restore' && sideText != null) {
+        console.log(`  note: ${sidecar} still holds a status line saved by --force; it was left in place`);
       }
       return;
     }
@@ -228,7 +286,7 @@ function main() {
     if (plan.action === 'refuse') {
       console.log('  Claude Code already has a different status line:');
       console.log(show(plan.previous));
-      console.log('  Left it as it is. Run again with --force to replace it (the old file is backed up first).');
+      console.log('  Left it as it is. Run again with --force to replace it (it is saved, and --uninstall puts it back).');
       process.exitCode = 1;
       return;
     }
@@ -238,6 +296,12 @@ function main() {
       if (plan.action === 'replace') {
         console.log('  replacing this status line (--force):');
         console.log(show(plan.previous));
+        // Save it before touching settings.json; --uninstall puts it back.
+        if (opts.dryRun) console.log(`  would save it to ${sidecar}`);
+        else {
+          atomicWrite(sidecar, sidecarText(plan.previous));
+          console.log(`  saved it to ${sidecar} (npm run usage-meter:remove puts it back)`);
+        }
       } else if (plan.action === 'update') console.log('  updating the usage meter command (node or repo path changed)');
       writeSettings(file, original, plan.text, opts.dryRun);
     }
