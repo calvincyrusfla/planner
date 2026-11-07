@@ -1,0 +1,456 @@
+"""Board bridge: reports Foundry events to the existing Agent Department board.
+
+Foundry does not replace the Agent Department (``department/``, Node). It feeds
+it. Every Foundry event that matters to a human (a task was sized, a builder
+made progress, a reviewer gave a verdict, the Foreman raised an escalation, a
+task is complete) is mapped onto one of the department's serialisable
+operations (``department/lib/ops.mjs``)::
+
+    addTask        {title, description, size, builders}
+    updateTask     {id, patch, by}
+    assignTeam     {taskId, teamId, focus, by}
+    reportProgress {taskId, teamId, agentId, progress, message, status}
+    reviewTask     {taskId, teamId, verdict, note, issues, by}
+
+Transports, in order (``mode="auto"``):
+
+1. the local dashboard: ``POST http://127.0.0.1:4300/api/op`` with ``{type, args}``
+   (``npm run dashboard``; the dashboard itself forwards to the shared board
+   when one is configured);
+2. the department CLI: ``node department/dept.mjs ...``;
+3. nothing: the op is dropped with a single warning.
+
+``mode="dry"`` records every op in :attr:`BoardBridge.ops` without any I/O (used
+by the tests and by ``python -m foundry.main --simulate``); ``mode="off"`` drops
+everything silently.
+
+The bridge must never block or crash the factory. In ``auto`` mode ops are put
+on an in-memory queue and sent by one daemon thread with short timeouts; every
+error is caught and logged. Board task ids (``T-0xx``) are resolved inside that
+thread, so a later op for the same Foundry task waits for its ``addTask``
+without the caller waiting at all.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import queue as queue_mod
+import shutil
+import subprocess
+import threading
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+log = logging.getLogger(__name__)
+
+BridgeMode = Literal["auto", "off", "dry"]
+
+DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEPT_CLI = REPO_ROOT / "department" / "dept.mjs"
+
+#: Foundry complexity -> department task size.
+SIZE_FOR = {"S": "small", "M": "small", "L": "large", "XL": "large"}
+
+#: Foundry reviewer verdict -> department verdict word.
+VERDICT_FOR = {"APPROVED": "approved", "REVISE": "changes", "REJECTED": "changes"}
+
+
+@dataclass
+class BoardOp:
+    """One department operation, before Foundry task ids are resolved.
+
+    ``foundry_task`` names the Foundry task the op is about; the sender replaces
+    the ``taskId``/``id`` placeholder in ``args`` with the board's task id.
+    """
+
+    type: str
+    args: dict[str, Any]
+    foundry_task: str | None = None
+    #: arg name that should receive the board task id ("taskId" or "id").
+    task_key: str | None = None
+
+    def resolved(self, board_id: str | None) -> dict[str, Any]:
+        """Return ``{type, args}`` with the board task id filled in."""
+        args = dict(self.args)
+        if self.task_key:
+            args[self.task_key] = board_id
+        return {"type": self.type, "args": args}
+
+
+@dataclass
+class _Stats:
+    sent: int = 0
+    failed: int = 0
+    dropped: int = 0
+    transport: str = "none"
+    warnings: list[str] = field(default_factory=list)
+
+
+class BoardBridge:
+    """Maps Foundry events onto Agent Department board operations.
+
+    Args:
+        mode: ``"auto"`` (dashboard, then CLI, then no-op), ``"dry"`` (record
+            ops in :attr:`ops`, no I/O) or ``"off"`` (drop everything).
+        dashboard_url: base URL of the local dashboard.
+        timeout: per-request timeout in seconds (HTTP and CLI).
+        node_bin: Node executable for the CLI fallback.
+        cli_path: path to ``department/dept.mjs``.
+    """
+
+    def __init__(
+        self,
+        mode: BridgeMode = "auto",
+        *,
+        dashboard_url: str = DEFAULT_DASHBOARD_URL,
+        timeout: float = 3.0,
+        node_bin: str = "node",
+        cli_path: str | Path = DEPT_CLI,
+    ) -> None:
+        if mode not in ("auto", "off", "dry"):
+            raise ValueError(f"unknown board bridge mode {mode!r}")
+        self.mode: BridgeMode = mode
+        self.dashboard_url = dashboard_url.rstrip("/")
+        self.timeout = timeout
+        self.node_bin = node_bin
+        self.cli_path = Path(cli_path)
+        #: Every op the bridge produced, resolved (dry mode) or attempted (auto).
+        self.ops: list[dict[str, Any]] = []
+        #: Foundry task id -> board task id.
+        self.board_ids: dict[str, str] = {}
+        self.stats = _Stats()
+        self._dry_seq = 0
+        self._lock = threading.Lock()
+        self._q: queue_mod.Queue[BoardOp | None] = queue_mod.Queue()
+        self._thread: threading.Thread | None = None
+        self._warned = False
+        self._dashboard_down = False
+        self._registered: list[str] = []
+
+    # ------------------------------------------------------------------ events
+
+    def register_task(
+        self,
+        task_id: str,
+        title: str,
+        description: str = "",
+        *,
+        complexity: str = "S",
+        builders: int = 1,
+        team_id: str | None = None,
+    ) -> None:
+        """A work order was sized: create the board task (and put the team on it)."""
+        self._registered.append(task_id)
+        size = SIZE_FOR.get(complexity, "small")
+        desc = f"[Foundry {task_id} · {complexity}] {description}".strip()
+        self._emit(
+            BoardOp(
+                "addTask",
+                {"title": title, "description": desc, "size": size, "builders": max(1, min(5, int(builders)))},
+                foundry_task=task_id,
+            )
+        )
+        if team_id:
+            self._emit(
+                BoardOp(
+                    "assignTeam",
+                    {"taskId": None, "teamId": team_id, "focus": f"Foundry {complexity}", "by": "foundry"},
+                    foundry_task=task_id,
+                    task_key="taskId",
+                )
+            )
+
+    def progress(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        team_id: str | None = None,
+        agent_id: str | None = None,
+        pct: int | None = None,
+        status: str | None = None,
+    ) -> None:
+        """Report progress (a builder started, a gate failed, a retry ...)."""
+        args: dict[str, Any] = {"taskId": None, "message": message}
+        if team_id:
+            args["teamId"] = team_id
+        if agent_id:
+            args["agentId"] = agent_id
+        if pct is not None:
+            args["progress"] = max(0, min(100, int(pct)))
+        if status:
+            args["status"] = status
+        self._emit(BoardOp("reportProgress", args, foundry_task=task_id, task_key="taskId"))
+
+    def escalation(self, alert: Any) -> None:
+        """Post a Foreman escalation as ``[Foreman] <severity> <category>: <diagnosis>``."""
+        target = _get(alert, "target_entity")
+        task_id = _get(target, "task_id")
+        team_id = _get(target, "team_id")
+        msg = f"[Foreman] {_enum(_get(alert, 'severity'))} {_enum(_get(alert, 'category'))}: {_get(alert, 'diagnosis')}"
+        action = _enum(_get(alert, "prescribed_action"))
+        if action and action != "NONE":
+            msg += f" -> {action}"
+        if task_id is None:
+            # The board needs a task; use any task Foundry registered for this team.
+            task_id = self._registered[-1] if self._registered else None
+        if task_id is None:
+            log.info("board bridge: escalation without a task, not posted: %s", msg)
+            return
+        self.progress(task_id, msg, team_id=team_id)
+
+    def review(self, task_id: str, team_id: str, verdict: str, *, note: str = "", issues: int = 0, by: str | None = None) -> None:
+        """Send the task to review and record the team reviewer's verdict."""
+        self._emit(
+            BoardOp("updateTask", {"id": None, "patch": {"status": "review"}, "by": "foundry"}, foundry_task=task_id, task_key="id")
+        )
+        self._emit(
+            BoardOp(
+                "reviewTask",
+                {
+                    "taskId": None,
+                    "teamId": team_id,
+                    "verdict": VERDICT_FOR.get(verdict, "changes"),
+                    "note": note,
+                    "issues": max(0, int(issues)),
+                    "by": by or f"{team_id}-6",
+                },
+                foundry_task=task_id,
+                task_key="taskId",
+            )
+        )
+
+    def done(self, task_id: str, summary: str = "") -> None:
+        """Mark the board task done (after the reviewer approved)."""
+        if summary:
+            self.progress(task_id, summary[:300], pct=100)
+        self._emit(BoardOp("updateTask", {"id": None, "patch": {"status": "done"}, "by": "foundry"}, foundry_task=task_id, task_key="id"))
+
+    def quarantined(self, task_id: str, reason: str) -> None:
+        """Report a quarantined task as blocked on the board."""
+        self._emit(
+            BoardOp("updateTask", {"id": None, "patch": {"status": "paused"}, "by": "foundry"}, foundry_task=task_id, task_key="id")
+        )
+        self.progress(task_id, f"[Foundry] quarantined: {reason}")
+
+    # --------------------------------------------------------------- plumbing
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait (bounded) until queued ops are sent. Returns True when drained."""
+        if self.mode != "auto" or self._thread is None:
+            return True
+        done = threading.Event()
+
+        def _waiter() -> None:
+            self._q.join()
+            done.set()
+
+        threading.Thread(target=_waiter, daemon=True).start()
+        return done.wait(timeout)
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Flush and stop the sender thread."""
+        self.flush(timeout)
+        if self._thread is not None:
+            self._q.put(None)
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def _emit(self, op: BoardOp) -> None:
+        """Never raises."""
+        try:
+            if self.mode == "off":
+                return
+            if self.mode == "dry":
+                self._send_dry(op)
+                return
+            self._ensure_thread()
+            self._q.put_nowait(op)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.stats.dropped += 1
+            log.warning("board bridge: dropped %s (%s)", op.type, exc)
+
+    def _send_dry(self, op: BoardOp) -> None:
+        board_id = self._board_id_for(op)
+        resolved = op.resolved(board_id)
+        with self._lock:
+            self.ops.append(resolved)
+            if op.type == "addTask" and op.foundry_task:
+                self._dry_seq += 1
+                self.board_ids[op.foundry_task] = f"DRY-{self._dry_seq:03d}"
+        self.stats.sent += 1
+        self.stats.transport = "dry"
+
+    def _board_id_for(self, op: BoardOp) -> str | None:
+        if not op.task_key:
+            return None
+        if op.foundry_task and op.foundry_task in self.board_ids:
+            return self.board_ids[op.foundry_task]
+        return None
+
+    def _ensure_thread(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="foundry-board-bridge", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            op = self._q.get()
+            try:
+                if op is None:
+                    return
+                self._deliver(op)
+            except Exception as exc:  # never let the thread die
+                self.stats.failed += 1
+                log.warning("board bridge: %s failed: %s", getattr(op, "type", "?"), exc)
+            finally:
+                self._q.task_done()
+
+    def _deliver(self, op: BoardOp) -> None:
+        if op.task_key and op.foundry_task not in self.board_ids:
+            self.stats.dropped += 1
+            log.info("board bridge: %s skipped, Foundry task %s is not on the board", op.type, op.foundry_task)
+            return
+        payload = op.resolved(self._board_id_for(op))
+        with self._lock:
+            self.ops.append(payload)
+        result = self._post(payload)
+        transport = "dashboard"
+        if result is _UNAVAILABLE:
+            result = self._cli(payload)
+            transport = "cli"
+        if result is _UNAVAILABLE:
+            self.stats.dropped += 1
+            if not self._warned:
+                self._warned = True
+                warning = "Agent Department board not reachable (dashboard and CLI); Foundry keeps running without it."
+                self.stats.warnings.append(warning)
+                log.warning(warning)
+            return
+        self.stats.sent += 1
+        self.stats.transport = transport
+        if op.type == "addTask" and op.foundry_task and isinstance(result, dict):
+            task = result.get("task") if isinstance(result.get("task"), dict) else result
+            board_id = task.get("id") if isinstance(task, dict) else None
+            if board_id:
+                self.board_ids[op.foundry_task] = str(board_id)
+
+    def _post(self, payload: dict[str, Any]) -> Any:
+        """POST /api/op. Returns the op result, or _UNAVAILABLE when the dashboard is down."""
+        if self._dashboard_down:
+            return _UNAVAILABLE
+        req = urllib.request.Request(
+            f"{self.dashboard_url}/api/op",
+            data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            # The board answered but refused the op (e.g. a team is busy): not a transport failure.
+            try:
+                detail = json.loads(exc.read() or b"{}").get("error", "")
+            except Exception:
+                detail = ""
+            log.info("board bridge: board refused %s: %s %s", payload["type"], exc.code, detail)
+            return None
+        except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+            self._dashboard_down = True
+            return _UNAVAILABLE
+        if isinstance(body, dict) and body.get("ok") is False:
+            log.info("board bridge: board refused %s: %s", payload["type"], body.get("error"))
+            return None
+        return body.get("result") if isinstance(body, dict) else body
+
+    def _cli(self, payload: dict[str, Any]) -> Any:
+        """Fallback: run the equivalent ``node department/dept.mjs`` command."""
+        argv = cli_args(payload)
+        node = shutil.which(self.node_bin)
+        if argv is None or node is None or not self.cli_path.exists():
+            return _UNAVAILABLE
+        try:
+            proc = subprocess.run(
+                [node, str(self.cli_path), *argv],
+                capture_output=True,
+                text=True,
+                timeout=max(self.timeout, 10.0),
+                cwd=str(self.cli_path.parent.parent),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return _UNAVAILABLE
+        if proc.returncode != 0:
+            log.info("board bridge: CLI %s failed: %s", argv[0], proc.stderr.strip()[:200])
+            return None
+        if payload["type"] == "addTask":
+            # "T-012 created → alpha · ..." -> board id
+            first = proc.stdout.strip().split(" ", 1)[0]
+            return {"task": {"id": first}} if first.startswith("T-") else None
+        return {"ok": True}
+
+
+_UNAVAILABLE = object()
+
+
+def cli_args(payload: dict[str, Any]) -> list[str] | None:
+    """Translate a ``{type, args}`` op into ``dept.mjs`` arguments (None if no CLI form)."""
+    t, a = payload["type"], payload.get("args", {})
+    if t == "addTask":
+        argv = ["add", str(a.get("title", "")), "--desc", str(a.get("description", ""))]
+        if a.get("size") == "large":
+            argv.append("--large")
+        if a.get("builders"):
+            argv += ["--builders", str(a["builders"])]
+        return argv
+    if t == "assignTeam":
+        return ["assign", str(a["taskId"]), str(a["teamId"]), "--focus", str(a.get("focus", ""))]
+    if t == "reportProgress":
+        argv = ["progress", str(a["taskId"]), "-m", str(a.get("message", ""))]
+        if a.get("teamId"):
+            argv += ["--team", str(a["teamId"])]
+        if a.get("agentId"):
+            argv += ["--agent", str(a["agentId"])]
+        if a.get("progress") is not None:
+            argv += ["--pct", str(a["progress"])]
+        if a.get("status"):
+            argv += ["--status", str(a["status"])]
+        return argv
+    if t == "reviewTask":
+        return [
+            "verdict",
+            str(a["taskId"]),
+            "--team",
+            str(a["teamId"]),
+            "approve" if a.get("verdict") == "approved" else "changes",
+            "-m",
+            str(a.get("note", "")),
+            "--issues",
+            str(a.get("issues", 0)),
+        ]
+    if t == "updateTask":
+        status = (a.get("patch") or {}).get("status")
+        if status == "review":
+            return ["review", str(a["id"])]
+        if status == "done":
+            return ["done", str(a["id"])]
+        if status:
+            return ["set", str(a["id"]), "--status", str(status)]
+    return None
+
+
+def _get(obj: Any, name: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _enum(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
