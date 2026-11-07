@@ -508,7 +508,7 @@ function syncUsageBtn(now = Date.now()) {
 async function refreshUsage() {
   if (usageRefresh.busy) return;
   const wait = usageWaitS();
-  if (wait) { toast(`Wait ${wait} s before updating the usage again`); return; }
+  if (wait) { syncUsageBtn(); toast(`Wait ${wait} s before refreshing again`); return; }
   usageRefresh.busy = true;
   syncUsageBtn();
   try {
