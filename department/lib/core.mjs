@@ -217,7 +217,9 @@ function attach(state, task, team, { focus = '', by = 'dispatcher' } = {}) {
   return true;
 }
 
-function detach(state, task, team, { by = 'dispatcher', reason = '' } = {}) {
+// settle: re-check the review round for the teams still on the task. Off when
+// the whole task is leaving its teams (status change, delete).
+function detach(state, task, team, { by = 'dispatcher', reason = '', settle = true } = {}) {
   if (team.taskId !== task.id) return false;
   closeTeam(task, team);
   team.taskId = null;
@@ -237,6 +239,8 @@ function detach(state, task, team, { by = 'dispatcher', reason = '' } = {}) {
     teamId: team.id,
     message: `${team.name} removed from ${task.id} by ${by}${reason ? ` (${reason})` : ''}`,
   });
+  // The team that left may have been the last one the round was waiting on.
+  if (settle && remaining.length && task.status === 'review') settleReview(state, task);
   return true;
 }
 
@@ -291,6 +295,7 @@ export function addTask(state, { title, description = '', size = 'small' } = {})
     approvedRound: 0, // last round every reviewer approved (0 = none)
     reviews: {},
     issuesFound: 0,
+    teamIssues: {}, // {teamId: issues caught across all rounds}
   };
   state.tasks.push(task);
   log(state, { kind: 'create', taskId: id, message: `${id} created (${size}): ${title}` });
@@ -356,7 +361,7 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
       for (const team of onTask) setAgent(reviewerOf(team), 'working', `Reviewing round ${task.reviewRound}`);
     }
     if (status === 'done' || status === 'cancelled' || status === 'paused' || status === 'queued') {
-      for (const team of teamsOn(state, task.id)) detach(state, task, team, { by, reason: `task ${status}` });
+      for (const team of teamsOn(state, task.id)) detach(state, task, team, { by, reason: `task ${status}`, settle: false });
     }
     task.status = status;
     syncActive(task);
@@ -439,6 +444,9 @@ export function reviewTask(state, { taskId, teamId, verdict, note = '', issues =
   task.reviews[team.id] = { verdict, note, issues: count, at: now(), round };
   task.issuesFound = Math.max(0, (task.issuesFound || 0) - prevIssues + count);
   team.issuesFound = Math.max(0, (team.issuesFound || 0) - prevIssues + count);
+  // Running per-team total across all rounds (what importState credits).
+  if (!task.teamIssues || typeof task.teamIssues !== 'object') task.teamIssues = {};
+  task.teamIssues[team.id] = Math.max(0, (task.teamIssues[team.id] || 0) - prevIssues + count);
   const reviewer = reviewerOf(team);
   const byNote = by && by !== 'reviewer' ? ` (by ${by})` : '';
   if (verdict === 'approved') {
@@ -454,28 +462,41 @@ export function reviewTask(state, { taskId, teamId, verdict, note = '', issues =
       message: `${team.name} reviewer requested changes on ${task.id}: ${note}${byNote}`,
     });
   }
-  // The task stays in review until every team on it has a verdict this round.
+  const { status, approved, complete } = settleReview(state, task);
+  touch(task);
+  return { task, team, approved, pending: status.pending, changes: status.changes, complete };
+}
+
+// Close the current review round once every team on the task has a verdict:
+// all approved -> stays in review, approvedRound = round; any changes -> back
+// to 'active'. Still pending -> nothing happens. Used after each verdict and
+// when a team leaves a task in review.
+function settleReview(state, task) {
   const status = reviewStatus(state, task);
-  const complete = status.pending.length === 0;
+  const round = status.round;
+  const onTask = status.approved.length + status.changes.length + status.pending.length;
+  const complete = task.status === 'review' && onTask > 0 && status.pending.length === 0;
   const approved = complete && status.changes.length === 0;
   if (complete) {
     if (approved) {
-      task.approvedRound = round;
-      log(state, { kind: 'review', taskId: task.id, message: `${task.id} approved by all reviewers (round ${round})` });
+      if (task.approvedRound !== round) {
+        task.approvedRound = round;
+        log(state, { kind: 'review', taskId: task.id, message: `${task.id} approved by all reviewers (round ${round})` });
+      }
     } else {
       task.status = 'active'; // back to the builders
       syncActive(task);
       const names = status.changes.map((id) => getTeam(state, id).name).join(', ');
       log(state, { kind: 'review', taskId: task.id, message: `${task.id} back to the builders: changes requested by ${names}` });
     }
+    touch(task);
   }
-  touch(task);
-  return { task, team, approved, pending: status.pending, changes: status.changes, complete };
+  return { status, approved, complete };
 }
 
 export function deleteTask(state, taskId, { by = 'user' } = {}) {
   const task = getTask(state, taskId);
-  for (const team of teamsOn(state, task.id)) detach(state, task, team, { by, reason: 'task deleted' });
+  for (const team of teamsOn(state, task.id)) detach(state, task, team, { by, reason: 'task deleted', settle: false });
   if (task.activeSince) {
     task.activeMs = (task.activeMs || 0) + since(task.activeSince, clockNow());
     task.activeSince = null;
@@ -547,6 +568,11 @@ export function normalize(state) {
     if (!Number.isInteger(task.approvedRound) || task.approvedRound < 0) task.approvedRound = 0;
     if (!task.reviews || typeof task.reviews !== 'object' || Array.isArray(task.reviews)) task.reviews = {};
     if (typeof task.issuesFound !== 'number' || !Number.isFinite(task.issuesFound)) task.issuesFound = 0;
+    if (!task.teamIssues || typeof task.teamIssues !== 'object' || Array.isArray(task.teamIssues)) task.teamIssues = {};
+    for (const [teamId, r] of Object.entries(task.reviews)) {
+      const n = Number(r?.issues);
+      if (!(teamId in task.teamIssues)) task.teamIssues[teamId] = Number.isInteger(n) && n > 0 ? n : 0;
+    }
     if (isRunning(task)) task.activeSince ||= task.startedAt || task.updatedAt || now();
     else task.activeSince = null;
   }

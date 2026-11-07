@@ -59,7 +59,7 @@ export function applyOp(state, op) {
 //   tasks have no team. A kept team keeps this board's roster (so an older
 //   5-agent board can't drop the reviewer); saved agent status/work is taken.
 //   Team issuesFound is not overwritten; like totalMs, it is credited from the
-//   added tasks only (reviews[team].issues), so a re-push can't double count.
+//   added tasks only (teamIssues[team], all rounds), so a re-push can't double count.
 // - Logs are merged (duplicates dropped), sorted by `at` and capped at 500.
 // - Finally dispatch runs so queued work picks up free teams.
 
@@ -123,10 +123,15 @@ export function importState(state, other) {
       const team = state.teams.find((t) => t.id === teamId);
       if (team && Number.isFinite(ms)) team.totalMs = (team.totalMs || 0) + ms;
     }
-    // Same for issues caught: credit each team's recorded verdict issues.
-    for (const [teamId, review] of Object.entries(task.reviews && typeof task.reviews === 'object' ? task.reviews : {})) {
+    // Same for issues caught: credit each team's running total on the task
+    // (teamIssues, all rounds). Boards from before teamIssues fall back to the
+    // latest verdict in reviews.
+    const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : null);
+    const perTeam = obj(task.teamIssues) ||
+      Object.fromEntries(Object.entries(obj(task.reviews) || {}).map(([id, r]) => [id, r?.issues]));
+    for (const [teamId, issues] of Object.entries(perTeam)) {
       const team = state.teams.find((t) => t.id === teamId);
-      const n = Number(review?.issues);
+      const n = Number(issues);
       if (team && Number.isInteger(n) && n > 0) team.issuesFound = (team.issuesFound || 0) + n;
     }
   }

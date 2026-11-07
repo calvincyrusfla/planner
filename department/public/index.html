@@ -536,7 +536,8 @@ function renderTime() {
   const max = Math.max(0, ...rows.map((r) => r.total));
   $('#time').innerHTML = rows.map(({ team, task, total, done, avg, issues }) => {
     const pct = max ? Math.max(2, Math.round((total / max) * 100)) : 0;
-    const top = max > 0 && total === max;
+    // Compare whole seconds (what the cards show): sub-second live totals read "0s" and must not win the badge.
+    const top = Math.floor(max / 1000) > 0 && Math.floor(total / 1000) === Math.floor(max / 1000);
     return `<article class="card time-card ${top ? 'top' : ''}" style="--team:${team.color}">
       <div class="time-head"><span class="time-name">${esc(team.name)}</span>${top ? '<span class="pill time-top">Most time</span>' : ''}</div>
       <div class="time-total">${liveSpan(team.totalMs, team.assignedAt)}<small>total</small></div>
