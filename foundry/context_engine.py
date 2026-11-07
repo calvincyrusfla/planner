@@ -1004,7 +1004,22 @@ def _is_exc_name(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Warning|Failed|Failure)", text))
 
 
-def _condense_pytest(lines: list[str], root: Path | None) -> str | None:
+_PYTEST_SECTION = re.compile(r"^_{3,} .+ _{3,}$|^={3,}.*={3,}$")
+
+
+def _pytest_sections(lines: list[str]) -> list[list[str]]:
+    """Split pytest output at ``____ test_x ____`` / ``==== ... ====`` banner lines."""
+    sections: list[list[str]] = [[]]
+    for line in lines:
+        if _PYTEST_SECTION.match(line.strip()):
+            sections.append([])
+        else:
+            sections[-1].append(line)
+    return [sec for sec in sections if sec]
+
+
+def _condense_pytest_section(lines: list[str], root: Path | None) -> str | None:
+    """Condense one failure section: deepest location plus its ``E`` message."""
     locs: list[tuple[int, str, str, str]] = []
     e_blocks: list[tuple[int, list[str]]] = []
     current: list[str] | None = None
@@ -1018,45 +1033,55 @@ def _condense_pytest(lines: list[str], root: Path | None) -> str | None:
                 current.append(text)
             continue
         current = None
-        m = _PYTEST_LOC.match(line.strip()) if not line.startswith(" ") else None
-        if m and not _RUFF_LINE.match(line.strip()):
+        if line.startswith((" ", "\t")) or _RUFF_LINE.match(line.strip()):
+            continue
+        m = _PYTEST_LOC.match(line.strip())
+        if m:
             locs.append((k, m["path"], m["line"], (m["rest"] or "").strip()))
-    failed = [_PYTEST_FAILED.match(line.strip()) for line in lines]
-    failed_hits = [m for m in failed if m]
-    if not locs and not e_blocks and not failed_hits:
+    if not locs:
         return None
-    if locs:
-        idx, path, lineno, rest = locs[-1]
-        # Prefer the deepest project frame if the last location is library code.
-        if _LIB_PATH.search(path):
-            for _, p, ln, r in reversed(locs):
-                if not _LIB_PATH.search(p):
-                    path, lineno, rest = p, ln, r
-                    break
-        block = next((b for start, b in reversed(e_blocks) if start < idx and b), None) or next(
-            (b for _, b in reversed(e_blocks) if b), None
-        )
-        msg = block[0] if block else ""
-        exc = rest[3:].strip() if rest.startswith("in ") else rest
-        if rest.startswith("in "):
-            exc = ""
-        if msg:
-            head = msg.split(":", 1)[0]
-            if exc and _is_exc_name(exc) and not _is_exc_name(head) and not msg.startswith(exc):
-                msg = f"{exc}: {msg}"
-            elif not exc or not _is_exc_name(head):
-                if msg.startswith("assert ") and not exc:
-                    msg = f"AssertionError: {msg}"
-        else:
-            msg = exc or (failed_hits[0]["msg"] if failed_hits and failed_hits[0]["msg"] else "test failed")
-        return _finish(f"{_relpath(path, root)}:{lineno}", msg)
-    if failed_hits:
-        m = failed_hits[0]
+    pick = locs[-1]
+    if _LIB_PATH.search(pick[1]):  # prefer the deepest project frame over library code
+        pick = next((loc for loc in reversed(locs) if not _LIB_PATH.search(loc[1])), pick)
+    idx, path, lineno, rest = pick
+    blocks = [(start, b) for start, b in e_blocks if b]
+    if rest.startswith("in ") or not rest:
+        # --tb=short: "path:line: in func" is followed by its E lines.
+        block = next((b for start, b in blocks if start > idx), None) or (blocks[-1][1] if blocks else None)
+        exc = ""
+    else:
+        # --tb=long / --tb=line: E lines precede "path:line: ExcType" (or it carries the message).
+        block = next((b for start, b in reversed(blocks) if start < idx), None)
+        exc = rest
+    msg = block[0] if block else ""
+    if msg:
+        head = msg.split(":", 1)[0].strip()
+        if exc and _is_exc_name(exc) and not _is_exc_name(head):
+            msg = f"{exc}: {msg}"
+        elif not exc and msg.startswith("assert"):
+            msg = f"AssertionError: {msg}"
+    else:
+        msg = exc or "test failed"
+    return _finish(f"{_relpath(path, root)}:{lineno}", msg)
+
+
+def _condense_pytest(lines: list[str], root: Path | None) -> str | None:
+    """Condense the first failure of a pytest report (falls back to the summary lines)."""
+    for section in _pytest_sections(lines):
+        if any(line.startswith("E ") for line in section) or any(
+            _PYTEST_LOC.match(line.strip()) and not line.startswith((" ", "\t")) for line in section
+        ):
+            result = _condense_pytest_section(section, root)
+            if result:
+                return result
+    failed = [m for m in (_PYTEST_FAILED.match(line.strip()) for line in lines) if m]
+    if failed:
+        m = failed[0]
         where = _relpath(m["path"], root) + (f"::{m['test']}" if m["test"] else "")
-        more = f" (+{len(failed_hits) - 1} more)" if len(failed_hits) > 1 else ""
+        more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         return _finish(where, (m["msg"] or "failed") + more)
-    block = next((b for _, b in reversed(e_blocks) if b), [])
-    return _finish(None, block[0] if block else "test failed")
+    e_lines = [line[1:].strip() for line in lines if line.startswith("E ") and line[1:].strip()]
+    return _finish(None, e_lines[0]) if e_lines else None
 
 
 def _condense_node(lines: list[str], root: Path | None) -> str | None:
