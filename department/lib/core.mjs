@@ -20,7 +20,18 @@ export class DeptError extends Error {
   }
 }
 
-const now = () => new Date().toISOString();
+// ---------- clock ----------
+// Every timestamp in core comes from this clock, so tests can control time.
+let clock = () => Date.now();
+export function setClock(fn) {
+  clock = typeof fn === 'function' ? fn : () => Date.now();
+}
+export const clockNow = () => clock();
+const now = () => new Date(clock()).toISOString();
+const since = (iso, at) => {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? Math.max(0, at - t) : 0;
+};
 const clampPct = (n) => Math.max(0, Math.min(100, Math.round(Number(n))));
 
 export function createInitialState() {
@@ -33,6 +44,8 @@ export function createInitialState() {
       taskId: null,
       focus: '',
       progress: 0,
+      assignedAt: null,
+      totalMs: 0,
       agents: Array.from({ length: AGENTS_PER_TEAM }, (_, i) => ({
         id: `${t.id}-${i + 1}`,
         name: `${t.name.replace('Team ', '')} Builder ${i + 1}`,
@@ -84,6 +97,75 @@ function touch(task) {
   task.updatedAt = now();
 }
 
+// ---------- time tracking ----------
+// Open/close the task's active interval so activeSince is set exactly while
+// status === 'active'. Call after every status change.
+function syncActive(task) {
+  if (task.status === 'active') {
+    if (!task.activeSince) task.activeSince = now();
+  } else if (task.activeSince) {
+    task.activeMs = (task.activeMs || 0) + since(task.activeSince, clockNow());
+    task.activeSince = null;
+  }
+}
+
+// Close a team's assignment interval on `task`.
+function closeTeam(task, team) {
+  if (!team.assignedAt) return;
+  const ms = since(team.assignedAt, clockNow());
+  task.teamMs ||= {};
+  task.teamMs[team.id] = (task.teamMs[team.id] || 0) + ms;
+  team.totalMs = (team.totalMs || 0) + ms;
+  team.assignedAt = null;
+}
+
+export function taskActiveMs(task, at = clockNow()) {
+  return (task.activeMs || 0) + (task.activeSince ? since(task.activeSince, at) : 0);
+}
+
+export function taskTeamMs(state, task, at = clockNow()) {
+  const out = { ...(task.teamMs || {}) };
+  for (const team of teamsOn(state, task.id)) {
+    if (team.assignedAt) out[team.id] = (out[team.id] || 0) + since(team.assignedAt, at);
+  }
+  return out;
+}
+
+export function teamTotalMs(team, at = clockNow()) {
+  return (team.totalMs || 0) + (team.taskId && team.assignedAt ? since(team.assignedAt, at) : 0);
+}
+
+export function teamStats(state, at = clockNow()) {
+  return state.teams.map((team) => {
+    const current = team.taskId ? state.tasks.find((t) => t.id === team.taskId) : null;
+    const done = state.tasks.filter((t) => t.status === 'done' && (t.teamMs?.[team.id] || 0) > 0);
+    const doneMs = done.reduce((s, t) => s + t.teamMs[team.id], 0);
+    return {
+      teamId: team.id,
+      name: team.name,
+      color: team.color,
+      totalMs: teamTotalMs(team, at),
+      currentTaskId: current ? current.id : null,
+      // Everything this team has spent on its current task, earlier stints included.
+      currentMs: current ? taskTeamMs(state, current, at)[team.id] || 0 : 0,
+      tasksDone: done.length,
+      avgDoneMs: done.length ? Math.round(doneMs / done.length) : 0,
+    };
+  });
+}
+
+export function formatDuration(ms) {
+  ms = Number(ms);
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${String(m % 60).padStart(2, '0')}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
 function setAgents(team, status, work = '') {
   for (const a of team.agents) {
     a.status = status;
@@ -98,11 +180,13 @@ function attach(state, task, team, { focus = '', by = 'dispatcher' } = {}) {
   if (team.taskId === task.id) return false;
   if (team.taskId) detach(state, getTask(state, team.taskId), team, { by, reason: `moved to ${task.id}` });
   team.taskId = task.id;
+  team.assignedAt = now();
   team.focus = focus;
   team.progress = task.progress;
   setAgents(team, 'assigned');
   if (!task.teamHistory.includes(team.id)) task.teamHistory.push(team.id);
   task.status = 'active';
+  syncActive(task);
   task.startedAt ||= now();
   touch(task);
   log(state, { kind: 'assign', taskId: task.id, teamId: team.id, message: `${team.name} assigned to ${task.id} by ${by}` });
@@ -111,6 +195,7 @@ function attach(state, task, team, { focus = '', by = 'dispatcher' } = {}) {
 
 function detach(state, task, team, { by = 'dispatcher', reason = '' } = {}) {
   if (team.taskId !== task.id) return false;
+  closeTeam(task, team);
   team.taskId = null;
   team.focus = '';
   team.progress = 0;
@@ -120,6 +205,7 @@ function detach(state, task, team, { by = 'dispatcher', reason = '' } = {}) {
   const remaining = teamsOn(state, task.id);
   if (remaining.length) task.progress = Math.round(remaining.reduce((s, t) => s + t.progress, 0) / remaining.length);
   else if (task.status === 'active') task.status = 'paused';
+  syncActive(task);
   touch(task);
   log(state, {
     kind: 'unassign',
@@ -174,6 +260,9 @@ export function addTask(state, { title, description = '', size = 'small' } = {})
     updatedAt: now(),
     startedAt: null,
     finishedAt: null,
+    activeMs: 0,
+    activeSince: null,
+    teamMs: {},
   };
   state.tasks.push(task);
   log(state, { kind: 'create', taskId: id, message: `${id} created (${size}): ${title}` });
@@ -227,6 +316,7 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
       for (const team of teamsOn(state, task.id)) detach(state, task, team, { by, reason: `task ${status}` });
     }
     task.status = status;
+    syncActive(task);
     if (status === 'done') task.progress = 100;
     task.finishedAt = status === 'done' || status === 'cancelled' ? now() : null;
     log(state, { kind: 'status', taskId: task.id, message: `${task.id} marked ${status} by ${by}` });
@@ -239,6 +329,10 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
 export function deleteTask(state, taskId, { by = 'user' } = {}) {
   const task = getTask(state, taskId);
   for (const team of teamsOn(state, task.id)) detach(state, task, team, { by, reason: 'task deleted' });
+  if (task.activeSince) {
+    task.activeMs = (task.activeMs || 0) + since(task.activeSince, clockNow());
+    task.activeSince = null;
+  }
   state.tasks = state.tasks.filter((t) => t.id !== task.id);
   log(state, { kind: 'delete', taskId: task.id, message: `${task.id} deleted by ${by}` });
   dispatch(state);
@@ -299,6 +393,12 @@ export function normalize(state) {
   state.tasks ||= [];
   state.log ||= [];
   state.nextTaskNumber ||= state.tasks.length + 1;
+  for (const task of state.tasks) {
+    if (typeof task.activeMs !== 'number' || !Number.isFinite(task.activeMs)) task.activeMs = 0;
+    if (!task.teamMs || typeof task.teamMs !== 'object') task.teamMs = {};
+    if (task.status === 'active') task.activeSince ||= task.startedAt || task.updatedAt || now();
+    else task.activeSince = null;
+  }
   const existing = new Map((state.teams || []).map((t) => [t.id, t]));
   state.teams = fresh.teams.map((t) => {
     const old = existing.get(t.id);
@@ -306,7 +406,12 @@ export function normalize(state) {
     const agents = new Map((old.agents || []).map((a) => [a.id, a]));
     return { ...t, ...old, agents: t.agents.map((a) => ({ ...a, ...(agents.get(a.id) || {}) })) };
   });
-  const taskIds = new Set(state.tasks.map((t) => t.id));
-  for (const team of state.teams) if (team.taskId && !taskIds.has(team.taskId)) team.taskId = null;
+  const tasks = new Map(state.tasks.map((t) => [t.id, t]));
+  for (const team of state.teams) {
+    if (team.taskId && !tasks.has(team.taskId)) team.taskId = null;
+    if (typeof team.totalMs !== 'number' || !Number.isFinite(team.totalMs)) team.totalMs = 0;
+    if (team.taskId) team.assignedAt ||= tasks.get(team.taskId).startedAt || now();
+    else team.assignedAt = null;
+  }
   return state;
 }

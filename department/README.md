@@ -91,7 +91,25 @@ npm run icons
 - **Tasks:** each open task, with its progress bar and the teams on it. Click **×** on a team to remove it, or use **+ Add team…** to add one (a busy team is moved off its old task). You can also pause, queue, mark done, cancel or delete a task.
 - **Activity:** a live feed of assignments, moves and progress notes from the agents.
 - Updates stream in live while agents report progress.
+- **Time by team:** one card per team with its total time, tasks done, average time per done task and the task it's on now.
 - The dashboard always uses a dark theme.
+
+## Timers
+
+Every task and team keeps time. The numbers tick live on the dashboard.
+
+- **Active time:** how long a task has been active, meaning at least one team was on it. Time while it's queued or paused doesn't count.
+- **Start to finish:** for a finished task, the time from when it was added to when it was done or cancelled, including any waiting.
+- **Team time:** on a task, how long each team has spent on it. A team that was moved off and back again keeps adding to the same number.
+- **Team totals:** in **Time by team**, each team's time across all tasks (deleted tasks too), how many done tasks it worked on, and its average time per done task.
+
+Time only counts while a team is on the task. Removing a team, moving it, or pausing, finishing or cancelling the task stops its clock.
+
+To see the same numbers in the terminal:
+
+```bash
+node department/dept.mjs times
+```
 
 ## CLI
 
@@ -105,8 +123,49 @@ node department/dept.mjs unassign T-002 bravo
 node department/dept.mjs progress T-002 --agent bravo-3 -m "Endpoint done"
 node department/dept.mjs progress T-002 --team bravo --pct 60
 node department/dept.mjs done T-002
+node department/dept.mjs times
 node department/dept.mjs help
 ```
+
+## Shared board
+
+By default each machine keeps its own board, so tasks Claude registers in a cloud session don't show up on your PC. The shared board fixes that: the board is stored on your Netlify site, and the dashboard on your PC and every Claude session read and write the same one.
+
+### Setup
+
+1. The board lives in a function that deploys with the Netlify site, so it works once this is on the branch Netlify deploys.
+2. The passcode is the same `EDIT_KEY` the planner uses (see "One-time setup in Netlify" in the root `README.md`). Without it, nobody can read or change the board.
+3. On your PC, open PowerShell in the repo folder and connect to your site:
+
+   ```powershell
+   node department/dept.mjs hub connect https://<your-site>.netlify.app --key <passcode>
+   ```
+
+4. Copy the tasks already on your PC to the shared board. Do this once; tasks that are already there are skipped:
+
+   ```powershell
+   node department/dept.mjs hub push
+   ```
+
+5. Restart the dashboard. Close its window, stop the server with the PowerShell command under "Desktop shortcut" above, then double-click the shortcut again.
+
+The header now says **Live · Shared board**. Without a shared board it says **Live · This PC only**.
+
+The connection is saved in `department/data/hub.json` (git-ignored). To check it:
+
+```powershell
+node department/dept.mjs hub status
+```
+
+To go back to a board on this PC only:
+
+```powershell
+node department/dept.mjs hub disconnect
+```
+
+### When the site can't be reached
+
+The dashboard keeps showing the last copy it got, and the header says **Shared board offline · showing last copy** in yellow (hover over it for the reason). Changes are refused until the site is back, then it catches up on its own within a few seconds.
 
 ## How the agents use it
 

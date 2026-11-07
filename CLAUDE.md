@@ -31,4 +31,6 @@ When the user assigns a task, you are the department head. Don't do the work alo
 6. Review and integrate the builders' work, run the checks, commit and push. Then `node department/dept.mjs done <task>`; freed teams pick up queued tasks automatically.
 7. Before spawning or continuing work on a task, run `status` again. If the user removed a team from the task, stop using that team for it. If they moved a team to another task, staff that task with it.
 
+**Shared board:** before registering a task, run `node department/dept.mjs hub status`. When a shared board is configured (`department/data/hub.json` on the user's PC, or `DEPT_HUB_URL` in cloud sessions, where the network proxy supplies the passcode), every CLI command goes to it automatically, so tasks from Claude sessions and from the PC land on the same board. If the hub is configured but unreachable, tell the user and log the task locally.
+
 The dashboard (`npm run dashboard`, then http://127.0.0.1:4300) shows all of this live. The CLI works with or without the dashboard running.

@@ -150,6 +150,40 @@
   .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   /* Team colors lifted toward white so they read as text on the dark surfaces (>= 5:1 for all three teams). */
   .log-item .who { color: color-mix(in srgb, var(--team, var(--text)) 70%, white); }
+  .live.warn { color: var(--warn); }
+  .live.warn i { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 25%, transparent); }
+  /* timers (task + team cards) */
+  .dur { font-variant-numeric: tabular-nums; }
+  .task-timer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .task-timer .tt-main .dur { color: var(--text); font-weight: 600; }
+  .task-timer.running .tt-main .dur { color: var(--ok); }
+  .task-timer .tt-teams { display: inline-flex; flex-wrap: wrap; gap: 0 2px; }
+  .task-timer .tt-team { color: color-mix(in srgb, var(--team, var(--text)) 70%, white); font-weight: 600; }
+  .task-timer .tt-team .dur { font-weight: 500; }
+  .task-timer .tt-sep { color: var(--faint); }
+  .task.finished .task-timer .tt-main .dur { color: var(--muted); }
+  .team-time { margin-top: 2px; font-size: 12px; color: var(--faint); }
+  .team-time .dur { color: var(--muted); font-weight: 600; }
+  /* time by team */
+  .time-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  @media (max-width: 720px) { .time-grid { grid-template-columns: 1fr; } }
+  .time-card { padding: 12px 14px; border-left: 4px solid var(--team); min-width: 0; }
+  .time-card.top { box-shadow: var(--shadow), 0 0 0 1px color-mix(in srgb, var(--team) 55%, transparent); }
+  .time-head { display: flex; align-items: center; gap: 8px; }
+  .time-name { font-weight: 650; font-size: 15px; color: color-mix(in srgb, var(--team) 70%, white); }
+  .pill.time-top { color: var(--text); border-color: color-mix(in srgb, var(--team) 60%, transparent); background: color-mix(in srgb, var(--team) 22%, transparent); }
+  .time-total { display: flex; align-items: baseline; gap: 6px; margin-top: 6px; }
+  .time-total .dur { font-size: 24px; font-weight: 650; letter-spacing: -.01em; }
+  .time-total small { color: var(--muted); font-size: 12px; }
+  .time-bar { margin-top: 6px; }
+  .time-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0 0; }
+  .time-facts div { min-width: 0; }
+  .time-facts dt { font-size: 11px; color: var(--muted); }
+  .time-facts dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .time-now { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 13px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .time-now strong { color: var(--text); }
+  .time-now .dur { color: var(--ok); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -182,6 +216,9 @@
   <h2>Teams</h2>
   <div class="teams" id="teams"></div>
 
+  <h2>Time by team</h2>
+  <div class="time-grid" id="time"></div>
+
   <div class="task-groups">
     <section>
       <h2>Tasks</h2>
@@ -201,6 +238,34 @@ const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const OPEN = ['active', 'queued', 'paused'];
 let state = null;
+
+// ---- durations (mirrors core.mjs formatDuration; shared by task/team cards and "Time by team") ----
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${String(m % 60).padStart(2, '0')}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+// Closed base ms plus the open interval since `sinceIso` (null/'' = not running).
+function liveMs(baseMs, sinceIso) {
+  const base = Number(baseMs) || 0;
+  if (!sinceIso) return base;
+  const t = new Date(sinceIso).getTime();
+  return Number.isFinite(t) ? base + Math.max(0, Date.now() - t) : base;
+}
+// A ticking duration label: the 1 s ticker rewrites the textContent of every [data-live-base] element.
+const liveSpan = (baseMs, sinceIso, cls = '') =>
+  `<span class="dur ${cls}" data-live-base="${Number(baseMs) || 0}" data-live-since="${esc(sinceIso || '')}">${fmtDuration(liveMs(baseMs, sinceIso))}</span>`;
+function tickDurations() {
+  for (const el of document.querySelectorAll('[data-live-base]')) {
+    const txt = fmtDuration(liveMs(el.dataset.liveBase, el.dataset.liveSince));
+    if (el.textContent !== txt) el.textContent = txt;
+  }
+}
+setInterval(tickDurations, 1000);
 
 async function api(method, path, body) {
   try {
@@ -263,6 +328,7 @@ function renderTeams() {
       <div class="team-head">
         <div class="team-name">${esc(team.name)} <span class="pill ${task ? 'active' : ''}">${task ? 'On task' : 'Free'}</span></div>
         <div class="team-task">${task ? `<strong>${esc(task.id)}</strong> ${esc(task.title)}` : 'Waiting for a task'}</div>
+        <div class="team-time">${task ? `On this task ${liveSpan((task.teamMs || {})[team.id] || 0, team.assignedAt)} · ` : ''}Total ${liveSpan(team.totalMs || 0, task ? team.assignedAt : null)}</div>
         ${team.focus ? `<div class="focus">Focus: ${esc(team.focus)}</div>` : ''}
         ${task ? `<div class="prow"><div class="progress" role="progressbar" aria-valuenow="${team.progress}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(team.name)} progress"><i style="width:${team.progress}%"></i></div><b>${team.progress}%</b></div>` : ''}
       </div>
@@ -281,6 +347,32 @@ function renderTeams() {
   }).join('');
 }
 
+// Timer line + per-team breakdown for a task card. Open intervals tick via data-live-*.
+function taskTimer(task, finished) {
+  const activeMs = task.activeMs || 0;
+  const since = task.status === 'active' ? task.activeSince : null;
+  const teamMs = task.teamMs || {};
+  const byId = Object.fromEntries(state.teams.map((t) => [t.id, t]));
+  const ids = [...new Set([...Object.keys(teamMs), ...state.teams.filter((t) => t.taskId === task.id).map((t) => t.id)])];
+  const parts = ids.map((id) => {
+    const team = byId[id];
+    const open = team && team.taskId === task.id ? team.assignedAt : null;
+    const base = teamMs[id] || 0;
+    if (!base && !open) return null;
+    return { order: team ? state.teams.indexOf(team) : 99, html: `<span class="tt-team" style="--team:${team ? team.color : 'var(--muted)'}">${esc(team ? team.name : id)} ${liveSpan(base, open)}</span>` };
+  }).filter(Boolean).sort((a, b) => a.order - b.order).map((p) => p.html);
+  let line;
+  if (finished) {
+    const wall = task.finishedAt && task.createdAt ? new Date(task.finishedAt) - new Date(task.createdAt) : 0;
+    line = `Took ${liveSpan(activeMs, null)} active${wall > 0 ? ` · ${liveSpan(wall, null)} start to finish` : ''}`;
+  } else if (activeMs || since) {
+    line = `<span aria-hidden="true">⏱</span> ${liveSpan(activeMs, since)} active`;
+  } else {
+    line = '<span aria-hidden="true">⏱</span> Not started';
+  }
+  return `<div class="task-timer${since ? ' running' : ''}"><span class="tt-main">${line}</span>${parts.length ? `<span class="tt-teams">${parts.join('<span class="tt-sep"> · </span>')}</span>` : ''}</div>`;
+}
+
 function taskCard(task) {
   const teams = state.teams.filter((t) => t.taskId === task.id);
   const finished = !OPEN.includes(task.status);
@@ -294,6 +386,7 @@ function taskCard(task) {
     </div>
     ${task.description ? `<p class="task-desc">${esc(task.description)}</p>` : ''}
     <div class="prow"><div class="progress" role="progressbar" aria-valuenow="${task.progress}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(task.id)} progress"><i style="width:${task.progress}%"></i></div><b>${task.progress}%</b></div>
+    ${taskTimer(task, finished)}
     ${finished ? '' : `<div class="chips">
       ${teams.length ? teams.map((t) => `<span class="chip" style="--team:${t.color}"><i></i>${esc(t.name)} <small>${t.progress}%</small>
         <button title="Remove ${esc(t.name)} from ${esc(task.id)}" aria-label="Remove ${esc(t.name)} from ${esc(task.id)}" data-unassign="${task.id}" data-team="${t.id}">×</button></span>`).join('')
@@ -325,6 +418,33 @@ function renderTasks() {
   $('#finished').innerHTML = finished.map(taskCard).join('');
 }
 
+// "Time by team": per-team totals computed from state (closed ms + the open interval since assignedAt).
+function renderTime() {
+  const rows = state.teams.map((team) => {
+    const task = state.tasks.find((t) => t.id === team.taskId);
+    const done = state.tasks.filter((t) => t.status === 'done' && (t.teamMs?.[team.id] || 0) > 0);
+    const avg = done.length ? done.reduce((sum, t) => sum + t.teamMs[team.id], 0) / done.length : 0;
+    return { team, task, total: liveMs(team.totalMs, team.assignedAt), done: done.length, avg };
+  });
+  const max = Math.max(0, ...rows.map((r) => r.total));
+  $('#time').innerHTML = rows.map(({ team, task, total, done, avg }) => {
+    const pct = max ? Math.max(2, Math.round((total / max) * 100)) : 0;
+    const top = max > 0 && total === max;
+    return `<article class="card time-card ${top ? 'top' : ''}" style="--team:${team.color}">
+      <div class="time-head"><span class="time-name">${esc(team.name)}</span>${top ? '<span class="pill time-top">Most time</span>' : ''}</div>
+      <div class="time-total">${liveSpan(team.totalMs, team.assignedAt)}<small>total</small></div>
+      <div class="progress time-bar" role="img" aria-label="${esc(team.name)}: ${pct}% of the most time spent by a team"><i style="width:${pct}%"></i></div>
+      <dl class="time-facts">
+        <div><dt>Tasks done</dt><dd>${done}</dd></div>
+        <div><dt>Avg per done task</dt><dd>${done ? fmtDuration(avg) : '–'}</dd></div>
+      </dl>
+      <div class="time-now">${task
+        ? `Now: <strong>${esc(task.id)}</strong> <span class="time-task">${esc(task.title)}</span> · ${liveSpan(task.teamMs?.[team.id] || 0, team.assignedAt)}`
+        : '<span class="none">Free, not on a task</span>'}</div>
+    </article>`;
+  }).join('');
+}
+
 function renderLog() {
   const teamName = Object.fromEntries(state.teams.map((t) => [t.id, t]));
   const items = state.log.slice(-80).reverse();
@@ -346,7 +466,7 @@ function render() {
     return;
   }
   pending = false;
-  renderStats(); renderTeams(); renderTasks(); renderLog();
+  renderStats(); renderTeams(); renderTime(); renderTasks(); renderLog();
 }
 document.addEventListener('focusout', () => setTimeout(() => pending && render(), 0));
 
@@ -388,13 +508,33 @@ document.addEventListener('click', async (e) => {
 });
 
 // ---- live updates ----
-function setLive(on) {
-  $('#live').classList.toggle('on', on);
-  $('#live span').textContent = on ? 'Live' : 'Reconnecting…';
+// on = SSE connection is up; sync = the server's {mode, ok, lastSync, error, url}
+function setLive(on, sync) {
+  const el = $('#live');
+  const hub = on && sync && sync.mode === 'hub';
+  const offline = hub && !sync.ok;
+  let text = 'Reconnecting…';
+  let tip = 'Lost the connection to the dashboard server. Retrying…';
+  if (offline) {
+    text = 'Shared board offline · showing last copy';
+    tip = `Can't reach the shared board${sync.url ? ' at ' + sync.url : ''}: ${sync.error || 'no response'}`
+      + (sync.lastSync ? `\nLast synced ${new Date(sync.lastSync).toLocaleString()}` : '')
+      + '\nChanges are paused until it is back.';
+  } else if (hub) {
+    text = 'Live · Shared board';
+    tip = `Synced with the shared board${sync.url ? ' at ' + sync.url : ''}`;
+  } else if (on) {
+    text = 'Live · This PC only';
+    tip = 'Tasks are saved on this PC only. See "Shared board" in department/README.md to share them.';
+  }
+  el.classList.toggle('on', on && !offline);
+  el.classList.toggle('warn', !!offline);
+  el.title = tip;
+  $('#live span').textContent = text;
 }
 function connect() {
   const es = new EventSource('/api/events');
-  es.addEventListener('state', (e) => { state = JSON.parse(e.data); setLive(true); render(); });
+  es.addEventListener('state', (e) => { state = JSON.parse(e.data); setLive(true, state.sync); render(); });
   es.onerror = () => setLive(false);
 }
 connect();
