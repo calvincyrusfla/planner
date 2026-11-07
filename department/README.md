@@ -12,6 +12,63 @@ npm run dashboard
 
 This opens http://127.0.0.1:4300. Use `node department/server.mjs --port 5000` to pick another port. The state is saved to `department/data/state.json`, which is git-ignored and survives restarts.
 
+## Desktop shortcut
+
+You can start the dashboard from a desktop icon instead of a terminal. The icon is a small network: a hub linked to nodes in the three team colors.
+
+### Windows
+
+You need Node 18 or newer, which includes npm. Open PowerShell or Command Prompt in the repo folder and run this once:
+
+```bash
+npm run shortcut
+```
+
+A shortcut named **Agent Department** with the network icon appears on your Desktop (also when your Desktop is in OneDrive). Double-click it. If the server isn't running yet, it starts in the background (its log goes to `department/data/server.log`), then the dashboard opens in your default browser.
+
+To pin it to the taskbar, right-click the shortcut and choose **Pin to taskbar** (on Windows 11, **Show more options** first).
+
+The server keeps running in the background after you close the browser tab. There is no stop button. To stop it without touching other Node programs, run this in PowerShell:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object CommandLine -like '*department*server.mjs*' | Invoke-CimMethod -Name Terminate
+```
+
+### macOS and Linux
+
+Run `npm run shortcut` from the repo folder.
+
+- **macOS:** creates `Agent Department.app` on `~/Desktop`. The app isn't signed, so the first time, right-click it, choose **Open**, then confirm.
+- **Linux:** creates `agent-department.desktop` on your Desktop and in `~/.local/share/applications`, so it also shows up in your app menu.
+
+To stop the background server:
+
+```bash
+pkill -f department/server.mjs
+```
+
+### All systems
+
+Start the dashboard the same way from a terminal, without the shortcut:
+
+```bash
+npm start
+```
+
+Remove the shortcut:
+
+```bash
+npm run shortcut:remove
+```
+
+The shortcut points at this folder and at the Node you ran it with. If you move the folder or switch Node versions, run `npm run shortcut` again.
+
+The icons live in `department/assets/`. To regenerate them after editing `department/assets/icon.svg` (needs Playwright):
+
+```bash
+npm run icons
+```
+
 ## Assignment rules
 
 - Every new task gets one free team.
