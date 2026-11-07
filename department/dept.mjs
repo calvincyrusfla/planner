@@ -5,6 +5,7 @@
 import * as core from './lib/core.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
@@ -263,6 +264,31 @@ function printUsage(s) {
 // `usage refresh`: through the local dashboard server when it runs (it throttles
 // and stores the result), else read the login and ask Anthropic from here and
 // store the report like any other op. The token stays inside usage-direct.mjs.
+// The direct path has the same 30 s throttle as the server, kept in a small file
+// next to the state file; only attempts that reached Anthropic count.
+const REFRESH_GAP_MS = 30 * 1000;
+const REFRESH_LAST_FILE = path.join(path.dirname(DATA_FILE), 'usage-refresh-last.json');
+const OLD_DASHBOARD =
+  'Your dashboard is running older code — restart it (close it, stop the server, reopen the shortcut) to enable usage refresh.';
+
+function lastRefreshAt() {
+  try {
+    const at = Number(JSON.parse(fs.readFileSync(REFRESH_LAST_FILE, 'utf8')).at);
+    return Number.isFinite(at) ? at : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function markRefresh() {
+  try {
+    fs.mkdirSync(path.dirname(REFRESH_LAST_FILE), { recursive: true });
+    fs.writeFileSync(REFRESH_LAST_FILE, JSON.stringify({ at: Date.now() }) + '\n');
+  } catch {
+    /* throttle is best effort */
+  }
+}
+
 async function usageRefresh() {
   let res;
   try {
@@ -272,6 +298,9 @@ async function usageRefresh() {
   }
   let usage;
   if (res) {
+    // A dashboard from before usage refresh has no such route. Don't fall back to the
+    // direct path, so the dashboard's throttle can't be sidestepped.
+    if (res.status === 404) throw new core.DeptError(OLD_DASHBOARD, 404);
     let json;
     try {
       json = await res.json();
@@ -282,10 +311,19 @@ async function usageRefresh() {
     usage = json.result?.usage;
   } else {
     const direct = await import('./lib/usage-direct.mjs');
+    const wait = lastRefreshAt() + REFRESH_GAP_MS - Date.now();
+    if (wait > 0 && direct.isUsageDirectEnabled(process.env)) {
+      throw new core.DeptError(`Wait ${Math.ceil(wait / 1000)} s before refreshing again`, 429);
+    }
+    // Marks the throttle when a request is actually sent; passed straight through otherwise.
+    const fetchImpl = (...a) => {
+      markRefresh();
+      return globalThis.fetch(...a);
+    };
     let args;
     try {
       // Resolves to {type: 'reportUsage', args}; it refuses itself when DEPT_USAGE_DIRECT=off.
-      args = (await direct.refreshUsageFromAnthropic({ env: process.env })).args;
+      args = (await direct.refreshUsageFromAnthropic({ env: process.env, fetchImpl })).args;
     } catch (err) {
       // Only usage-direct's own short, token-free messages are shown.
       throw new core.DeptError(err instanceof direct.UsageDirectError ? err.message : "Couldn't refresh usage from Anthropic.");
