@@ -606,7 +606,7 @@ def test_detect_auth_error() -> None:
         ("resets Sun 6pm (Europe/Berlin)", 29 * 3600),  # Sun 17:00 UTC
         ("resets Mon, 9:30am", (24 + 21.5) * 3600),
         ("resets Nov 6, 3pm", 0),  # date already passed → limit has reset
-        ("resets Jan 2, 3pm", (31 + 23 + 31 + 1) * 86400 + 3 * 3600 - 0),  # next year
+        ("resets Jan 2, 3pm", (23 + 31 + 2) * 86400 + 3 * 3600),  # Dec→Jan wrap: next year
     ],
 )
 def test_parse_weekly_reset_forms(message: str, expected: float) -> None:

@@ -238,7 +238,7 @@ def _seconds_until_clock(
     if month is not None and day is not None:
         for year in (naive_now.year, naive_now.year + 1):
             try:
-                target = datetime(year, month, day, hour, minute)
+                target = datetime(year, month, day, hour, minute)  # noqa: DTZ001 - wall clock, zone attached in at()
             except ValueError:
                 return None
             delta = at(target)
@@ -650,7 +650,7 @@ class ClaudeCodeClient:
         holder: dict[str, subprocess.Popen[bytes]] = {}
 
         def work() -> tuple[int | None, bytes, bytes, bool]:
-            proc = subprocess.Popen(  # noqa: S603 - fixed argv, prompt on stdin
+            proc = subprocess.Popen(
                 spec,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

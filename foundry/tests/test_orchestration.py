@@ -729,3 +729,167 @@ def test_quarantine_is_reported_to_the_board_once(tmp_path: Path) -> None:
     paused = [op for op in f.bridge.ops if op["type"] == "updateTask" and op["args"]["patch"] == {"status": "paused"}]
     assert len(paused) == 1
     f.close()
+
+
+# --------------------------------------------------------------------------- --real exits (E3), with simulated clients
+
+
+def _real_args(repo: Path, timeout: float, title: str = "Add clamp helper") -> Any:
+    import argparse
+
+    return argparse.Namespace(repo=str(repo), title=title, desc="Add clamp(x, lo, hi).", files=["shop/mathx.py"], timeout=timeout)
+
+
+def _real_config(tmp_path: Path) -> FoundryConfig:
+    return FoundryConfig(
+        db_path=tmp_path / "foundry.db", patches_dir=tmp_path / "patches", rpm=1000, tpm=10_000_000,
+        teams=["alpha"], board_bridge_mode="dry",
+    )
+
+
+def test_run_real_done_exits_0_and_prints_the_patch(tmp_path: Path) -> None:
+    from foundry.main import EXIT_DONE, run_real
+
+    repo = write_demo_repo(tmp_path / "repo")
+    lines: list[str] = []
+    code = _run(run_real(_real_args(repo, 15), _real_config(tmp_path), demo_claude(repo, fail_first=None),
+                         SimulatedGemmaClient(), out=lines.append))
+    assert code == EXIT_DONE
+    text = "\n".join(lines)
+    assert "F-001: complete" in text and "git apply" in text and (tmp_path / "patches" / "F-001.patch").is_file()
+
+
+def test_run_real_quarantine_exits_1_with_reason(tmp_path: Path) -> None:
+    from foundry.main import EXIT_FAILED, run_real
+
+    repo = write_demo_repo(tmp_path / "repo")
+    lines: list[str] = []
+    code = _run(run_real(_real_args(repo, 15), _real_config(tmp_path), _always_broken(repo), SimulatedGemmaClient(), out=lines.append))
+    assert code == EXIT_FAILED
+    text = "\n".join(lines)
+    assert "F-001: quarantined" in text and "reason:" in text
+
+
+def test_run_real_timeout_exits_3_and_rerun_resumes(tmp_path: Path) -> None:
+    from foundry.main import EXIT_DONE, EXIT_IN_PROGRESS, run_real
+
+    repo = write_demo_repo(tmp_path / "repo")
+    slow = demo_claude(repo, fail_first=None)
+    slow.latency = 1.0
+    lines: list[str] = []
+    code = _run(run_real(_real_args(repo, 0.2), _real_config(tmp_path), slow, SimulatedGemmaClient(), out=lines.append))
+    assert code == EXIT_IN_PROGRESS
+    text = "\n".join(lines)
+    assert "not finished after 0.2s" in text and "rerun the same command to resume" in text
+    # the rerun picks the same task up instead of submitting a second one
+    lines2: list[str] = []
+    code2 = _run(run_real(_real_args(repo, 15), _real_config(tmp_path), demo_claude(repo, fail_first=None),
+                          SimulatedGemmaClient(), out=lines2.append))
+    assert code2 == EXIT_DONE
+    assert "F-001: resuming" in "\n".join(lines2) and "F-002" not in "\n".join(lines2)
+
+
+def test_run_real_usage_limit_pause_is_explained(tmp_path: Path) -> None:
+    from foundry.main import EXIT_IN_PROGRESS, run_real
+
+    repo = write_demo_repo(tmp_path / "repo")
+    claude = demo_claude(repo, fail_first=None)
+    claude.inject_rate_limit(times=1, retry_after=3600)
+    lines: list[str] = []
+    code = _run(run_real(_real_args(repo, 0.5), _real_config(tmp_path), claude, SimulatedGemmaClient(), out=lines.append))
+    assert code == EXIT_IN_PROGRESS
+    text = "\n".join(lines)
+    assert re.search(r"paused until \d\d:\d\d \(usage limit\) - rerun the same command to resume", text), text
+
+
+def test_main_real_preflight_rejects_a_bad_claude_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry import claude_client
+    from foundry import main as main_mod
+
+    def bad_launch(self: Any, **kw: Any) -> Any:
+        raise claude_client.ClaudeError("argument contains a character claude.cmd cannot pass")
+
+    monkeypatch.setattr(claude_client, "resolve_claude_bin", lambda name="claude", **kw: str(tmp_path / "claude.cmd"))
+    monkeypatch.setattr(claude_client.ClaudeCodeClient, "validate_launch", bad_launch)
+    assert main_mod.main(["--real", "--title", "x"]) == 2
+    assert "Claude Code is not ready: argument contains" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- combined patch (M2) and scratch copies (M3)
+
+
+def test_combined_patch_is_keyed_by_subtask_and_checked_with_git(tmp_path: Path) -> None:
+    import shutil as _sh
+    from types import SimpleNamespace
+
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, SimulatedClaudeClient(), repo=repo, teams=["alpha"])
+    src = (repo / "shop/mathx.py").read_text(encoding="utf-8")
+    good = append_diff("shop/mathx.py", src, ["", "", "def clamp(x, lo, hi):", "    return x"])
+
+    async def go() -> None:
+        tid = await f.manager.submit(WorkOrder(**S_ORDER))
+        sub = f.manager.directives[tid].subtasks[0].subtask_id
+        item = SimpleNamespace(
+            assignment=SimpleNamespace(task_id=tid, subtask_id=sub, team_id="alpha", builder_id="alpha-1"),
+            submission=SimpleNamespace(diff=good), ticket_id="none",
+        )
+        verdict = SimpleNamespace(reviewer_id="alpha-6")
+        await f.manager.on_approved(item, verdict)
+        await f.manager.on_approved(item, verdict)  # re-approved after a resume: not duplicated
+        assert list(f.manager.diffs[tid]) == [sub]
+        await f.manager.on_task_complete(tid)
+
+    _run(go())
+    text = (tmp_path / "patches" / "F-001.patch").read_text(encoding="utf-8")
+    assert text.count("+++ b/shop/mathx.py") == 1
+    f.close()
+
+    if _sh.which("git") is None:
+        pytest.skip("git not installed: the --check step is skipped")
+    # two subtasks appending at the same place conflict -> .patch.rejected, no .patch
+    f2 = _factory(tmp_path / "two", SimulatedClaudeClient(), repo=repo, teams=["alpha"])
+    (tmp_path / "two").mkdir(exist_ok=True)
+
+    async def conflict() -> None:
+        tid = await f2.manager.submit(WorkOrder(**S_ORDER))
+        f2.manager.diffs[tid] = {"F-001.1": good, "F-001.2": good}
+        await f2.manager.on_task_complete(tid)
+
+    _run(conflict())
+    assert (tmp_path / "two" / "patches" / "F-001.patch.rejected").is_file()
+    assert not (tmp_path / "two" / "patches" / "F-001.patch").exists()
+    assert "F-001" in f2.manager.rejected_patches
+    f2.close()
+
+
+def test_workspace_copy_failure_is_an_infrastructure_error(tmp_path: Path) -> None:
+    from foundry.floor_manager import InfrastructureError, WorkspaceGates, _copy_workspace
+
+    target = tmp_path / "exists"
+    target.mkdir()
+    with pytest.raises(InfrastructureError):
+        _copy_workspace(write_demo_repo(tmp_path / "repo"), target)  # destination already exists
+
+    class NeverCalled:
+        async def validate_async(self, *a: Any, **k: Any) -> Any:
+            raise AssertionError("gates must not run without a workspace")
+
+    gates = WorkspaceGates(NeverCalled(), tmp_path / "repo")
+
+    async def go() -> None:
+        import foundry.floor_manager as fm
+
+        real = fm._copy_workspace
+        fm._copy_workspace = lambda s, d: (_ for _ in ()).throw(InfrastructureError("disk full"))  # type: ignore[assignment]
+        try:
+            from types import SimpleNamespace
+
+            with pytest.raises(InfrastructureError, match="disk full"):
+                await gates.run(SimpleNamespace(), SimpleNamespace(allowed_files=[]))
+        finally:
+            fm._copy_workspace = real
+
+    _run(go())

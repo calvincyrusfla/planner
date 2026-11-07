@@ -1023,21 +1023,13 @@ def test_gate_infrastructure_error_is_counted(tmp_path: Path) -> None:
 
 
 def test_usage_limit_is_not_counted_toward_infra_cap(tmp_path: Path) -> None:
+    """Many limit/pause/release cycles in a row never quarantine (account-wide errors aren't counted)."""
     rig = Rig(tmp_path, lambda p, agent: fenced(GOOD_DIFF))
-    rig.client.inject_rate_limit(times=10_000, retry_after=7200.0)
+    rig.client.inject_rate_limit(times=10_000, retry_after=0.02)
     rig.submit("T-UL", "S")
-
-    async def scenario() -> None:
-        pool = rig.pool(limit_cooldown_s=0.0)
-        for w in pool.builders:
-            w.limit_cooldown_s = 0.0
-        async with pool:
-            for _ in range(5):  # lift the pause repeatedly so the builder keeps hitting the limit
-                await asyncio.sleep(0.05)
-                rig.limiter._paused_until = float("-inf")
-
-    asyncio.run(scenario())
-    assert rig.client.calls[f"{TEAM}-1"] >= 3
+    pool = asyncio.run(_run_for(rig, 0.6))
+    cycles = pool.builder(1).outcomes.count("released")
+    assert cycles >= 4  # well past the cap of 3
     assert rig.state("T-UL") == TaskState.BUILDING  # never quarantined
     t = rig.queue.tickets_for_task("T-UL")[0]
     assert t.attempt == 0 and getattr(t, "infra_failures", 0) == 0

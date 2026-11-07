@@ -1263,7 +1263,6 @@ class BuilderWorker(_WorkerBase):
 
         # 3. parse the reply (diff-only contract); a bad reply never reaches gates or reviewer
         submission = parse_builder_reply(result.text, assignment)
-        self._reset_infra(ticket)  # Claude produced a parsed reply (E1)
         self._event(
             "submission",
             task_id,
@@ -1271,6 +1270,7 @@ class BuilderWorker(_WorkerBase):
              "files": submission.modified_files},
         )
         if submission.status == "blocked":
+            self._reset_infra(ticket)  # a parsed reply (E1)
             self._tm("record_gate_failure", task_id)
             note = submission.blocker_notes or "submission blocked"
             return self._send_back(ticket, _one_line(f"Fix the reply: {note}. {_SHORT_CONTRACT}", 300), reason="blocked")
@@ -1285,6 +1285,9 @@ class BuilderWorker(_WorkerBase):
             if not _is_counted_infra(exc):
                 raise
             return await self._infra_release(ticket, exc)  # e.g. scratch copy failed
+        # E1: a parsed reply that also got through the gate runner resets the count
+        # (resetting right after parsing would let a broken scratch copy loop forever).
+        self._reset_infra(ticket)
         self._record_gate_results(gates.results)
         if not gates.passed:
             _restore_files(self.workspace, snapshot)

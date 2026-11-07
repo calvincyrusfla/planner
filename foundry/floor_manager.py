@@ -939,6 +939,7 @@ def build_factory(
             cwd=str(Path(repo_root).resolve()),
             config=config,
             limit_cooldown_s=getattr(config, "limit_cooldown_s", None),
+            infra_failure_cap=int(getattr(config, "infra_failure_cap", 3)),
         )
         for team in config.teams
     }
