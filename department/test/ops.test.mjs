@@ -281,3 +281,17 @@ test('importState credits team time from added tasks only once', () => {
   applyOp(here, { type: 'importState', args: { state: other } });
   assert.equal(here.teams.find((x) => x.id === 'alpha').totalMs, 60_000);
 });
+
+test('pushing the same board twice adds nothing the second time, even after renumbering', () => {
+  const hubBoard = core.createInitialState();
+  core.addTask(hubBoard, { title: 'Already on the hub' });
+  const pc = core.createInitialState();
+  core.addTask(pc, { title: 'From the PC' }); // T-001 here, T-002 on the hub
+  const first = applyOp(hubBoard, { type: 'importState', args: { state: pc } });
+  assert.equal(first.added, 1);
+  assert.equal(first.idMap['T-001'], 'T-002');
+  const second = applyOp(hubBoard, { type: 'importState', args: { state: pc } });
+  assert.equal(second.added, 0);
+  assert.equal(second.skipped, 1);
+  assert.equal(hubBoard.tasks.length, 2);
+});

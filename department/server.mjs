@@ -28,7 +28,10 @@ const UNREACHABLE = 'Shared board unreachable, try again shortly';
 const hubOff = args.includes('--hub-off') || String(process.env.DEPT_HUB || '').toLowerCase() === 'off';
 const hub = hubOff ? null : hubConfig();
 
-let state = load();
+// Hub mode never touches state.json (the local board stays intact for `hub push`);
+// its offline cache is a separate file next to it.
+const CACHE_FILE = path.join(path.dirname(DATA_FILE), 'hub-cache.json');
+let state = hub ? load(CACHE_FILE) : load();
 let lastWrite = 0;
 function persist() {
   save(state);
@@ -63,9 +66,9 @@ function adoptHubState(next, rev) {
   state = next;
   hubRev = rev;
   try {
-    persist(); // offline cache
+    save(state, CACHE_FILE); // offline cache
   } catch (err) {
-    console.warn(`Could not cache the shared board to ${DATA_FILE}: ${err.message}`);
+    console.warn(`Could not cache the shared board to ${CACHE_FILE}: ${err.message}`);
   }
 }
 
@@ -222,7 +225,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   const link = `http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`;
   console.log(`Agent Department dashboard: ${link}`);
-  console.log(hub ? `Shared board: ${hub.url} (cache: ${DATA_FILE})` : `State file: ${DATA_FILE}`);
+  console.log(hub ? `Shared board: ${hub.url} (cache: ${CACHE_FILE})` : `State file: ${DATA_FILE}`);
   if (args.includes('--open')) {
     const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
     spawn(opener, [link], { stdio: 'ignore', detached: true, shell: process.platform === 'win32' }).unref();

@@ -39,7 +39,9 @@ export function applyOp(state, op) {
 
 // ---------- importState ----------
 // Merge another board into this one without losing anything.
-// - A task whose id AND createdAt already exist here is the same task: skipped.
+// - A task with the same createdAt and title as one here is the same task:
+//   skipped. (Not the id: a pushed task gets a new id here, so a second push
+//   must still recognise it.)
 // - Every other task is appended under a fresh id (T-### from nextTaskNumber);
 //   its log entries (and task ids mentioned in them) are rewritten to match.
 // - Open tasks keep a team only if that team is free here; an active task that
@@ -55,13 +57,14 @@ export function importState(state, other) {
     throw new core.DeptError('importState needs a department state with a tasks list');
   }
   const incoming = clone(other);
-  const existing = new Set(state.tasks.map((t) => `${t.id}\u0000${t.createdAt}`));
+  const sameTask = (t) => `${t.createdAt}\u0000${t.title}`;
+  const existing = new Set(state.tasks.map(sameTask));
   const idMap = {};
   const skippedIds = new Set();
   const addedTasks = [];
 
   for (const task of incoming.tasks) {
-    if (existing.has(`${task.id}\u0000${task.createdAt}`)) {
+    if (existing.has(sameTask(task))) {
       skippedIds.add(task.id);
       continue;
     }
