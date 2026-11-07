@@ -41,15 +41,20 @@ function persist() {
 
 // Sync status goes on the payloads only, never into the saved state.
 const sync = hub ? { mode: 'hub', ok: false, lastSync: null, error: null, url: hub.url } : { mode: 'local' };
-// Capabilities, like sync, are computed per payload and never saved.
+// Capabilities, like sync, are computed per payload and never saved. They depend on
+// who asks: usage refresh only works for callers on this computer (see
+// refreshAllowed), so a phone on the LAN is told it can't, and shows no button.
 const usageDirectOff = !isUsageDirectEnabled(process.env); // DEPT_USAGE_DIRECT=off
-const capabilities = () => ({ usageRefresh: !usageDirectOff });
-const payload = () => ({ ...state, sync: { ...sync }, capabilities: capabilities() });
+const capabilities = (local) => ({ usageRefresh: !usageDirectOff && local });
+const payload = (local = false) => ({ ...state, sync: { ...sync }, capabilities: capabilities(local) });
 
-const clients = new Set();
+const clients = new Map(); // SSE response -> whether its request came from this computer
 function broadcast() {
-  const msg = `event: state\ndata: ${JSON.stringify(payload())}\n\n`;
-  for (const res of clients) res.write(msg);
+  const msgs = {};
+  for (const [res, local] of clients) {
+    msgs[local] ??= `event: state\ndata: ${JSON.stringify(payload(local))}\n\n`;
+    res.write(msgs[local]);
+  }
 }
 
 // ---------- hub mode ----------
@@ -194,11 +199,15 @@ let lastRefreshAt = 0;
 
 const hostOf = (value) => String(value || '').toLowerCase().replace(/:\d+$/, '');
 
-// Requests must come from this machine: loopback socket, a local Host header
-// (blocks DNS rebinding) and, if a browser sends an Origin, the same local host.
+// A request from this computer: loopback socket and a local Host header (blocks DNS rebinding).
+function isLocalRequest(req) {
+  return LOOPBACK.has(req.socket.remoteAddress) && LOCAL_HOSTS.has(hostOf(req.headers.host));
+}
+
+// Refresh requests must come from this computer and, if a browser sends an Origin,
+// from the same local host.
 function refreshAllowed(req) {
-  if (!LOOPBACK.has(req.socket.remoteAddress)) return false;
-  if (!LOCAL_HOSTS.has(hostOf(req.headers.host))) return false;
+  if (!isLocalRequest(req)) return false;
   const origin = req.headers.origin;
   if (origin === undefined) return true;
   try {
@@ -244,7 +253,7 @@ async function refreshUsage(req, res) {
 }
 
 const routes = [
-  ['GET', /^\/api\/state$/, () => payload()],
+  ['GET', /^\/api\/state$/, (b, m, req) => payload(isLocalRequest(req))],
   ['POST', /^\/api\/tasks$/, (b) => mutate('addTask', { title: b.title, description: b.description, size: b.size, builders: b.builders })],
   ['PATCH', /^\/api\/tasks\/([\w-]+)$/, (b, [id]) => mutate('updateTask', { id, patch: b, by: b.by || 'user' })],
   ['DELETE', /^\/api\/tasks\/([\w-]+)$/, (b, [id]) => mutate('deleteTask', { id, by: b.by || 'user' })],
@@ -263,8 +272,9 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname === '/api/events') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
-      res.write(`event: state\ndata: ${JSON.stringify(payload())}\n\n`);
-      clients.add(res);
+      const local = isLocalRequest(req);
+      res.write(`event: state\ndata: ${JSON.stringify(payload(local))}\n\n`);
+      clients.set(res, local);
       const ping = setInterval(() => res.write(': ping\n\n'), 25000);
       req.on('close', () => {
         clearInterval(ping);
@@ -281,7 +291,7 @@ const server = http.createServer(async (req, res) => {
         const m = url.pathname.match(re);
         if (m && req.method === method) {
           const body = method === 'GET' ? {} : await readBody(req);
-          return send(res, 200, { ok: true, result: await handler(body, m.slice(1)) });
+          return send(res, 200, { ok: true, result: await handler(body, m.slice(1), req) });
         }
       }
       return send(res, 404, { ok: false, error: 'Not found' });

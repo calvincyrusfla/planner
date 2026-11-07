@@ -278,7 +278,9 @@ Things to know:
 - **Once every 30 seconds.** After it has asked Anthropic, the button counts down until you can press it again.
 - If Anthropic is limiting how often you can check, it asks you to try again in a minute. If it can't reach Anthropic, it says so.
 
-From the terminal, `node department/dept.mjs usage refresh` does the same thing.
+From the terminal, `node department/dept.mjs usage refresh` does the same thing, with the same 30-second limit.
+
+If you update the code while the dashboard is running, close it and start it again (`npm run dashboard`). Until you do, the button doesn't appear and refresh requests fail.
 
 To turn the button off, set `DEPT_USAGE_DIRECT=off` before starting the dashboard. In PowerShell:
 
@@ -287,6 +289,8 @@ $env:DEPT_USAGE_DIRECT = "off"; npm run dashboard
 ```
 
 The button then disappears, and the server and `usage refresh` refuse to read the login.
+
+For tests only, `DEPT_ANTHROPIC_BASE` points the request at a fake Anthropic server. It must be a loopback address such as `http://127.0.0.1:4942`. If your machine uses a proxy, add `127.0.0.1` to `NO_PROXY` as well, so the test's fake login is never sent to the proxy.
 
 ### Why the numbers can be out of date
 
