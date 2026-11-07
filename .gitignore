@@ -1,3 +1,7 @@
 node_modules/
 .netlify/
 department/data/
+.venv/
+foundry/data/
+*.db-wal
+*.db-shm
