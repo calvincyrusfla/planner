@@ -844,6 +844,8 @@ def build_factory(
             on_task_complete=manager.on_task_complete,
             on_approved=manager.on_approved,
             cwd=str(Path(repo_root).resolve()),
+            config=config,
+            limit_cooldown_s=getattr(config, "limit_cooldown_s", None),
         )
         for team in config.teams
     }
