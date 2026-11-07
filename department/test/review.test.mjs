@@ -645,3 +645,114 @@ test('normalize sets the idle reviewer of a team on a task to assigned', () => {
   core.normalize(busy);
   assert.equal(agent(busy, 'alpha-6').status, 'working');
 });
+
+// ---------- alpha-1 (round 3): teamIssues running total ----------
+
+test('alpha-1: task.teamIssues totals issues per team across rounds, latest wins within a round', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Totals', size: 'large' });
+  assert.deepEqual(task.teamIssues, {});
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'changes', { note: 'a', issues: 2 });
+  verdict(s, task.id, 'alpha', 'changes', { note: 'a2', issues: 3 }); // same round: replaces 2
+  verdict(s, task.id, 'bravo', 'changes', { note: 'b', issues: 1 });
+  verdict(s, task.id, 'charlie', 'approved');
+  assert.equal(task.status, 'active');
+  assert.deepEqual(task.teamIssues, { alpha: 3, bravo: 1, charlie: 0 });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'changes', { note: 'again', issues: 4 });
+  verdict(s, task.id, 'bravo', 'approved');
+  verdict(s, task.id, 'charlie', 'approved');
+  assert.deepEqual(task.teamIssues, { alpha: 7, bravo: 1, charlie: 0 });
+  assert.equal(task.issuesFound, 8);
+  assert.equal(team(s, 'alpha').issuesFound, 7);
+});
+
+test('alpha-1: normalize fills teamIssues from reviews where missing and is idempotent', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Old', size: 'large' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'changes', { note: 'x', issues: 2 });
+  const old = json(s);
+  delete old.tasks[0].teamIssues;
+  const n1 = core.normalize(json(old));
+  assert.deepEqual(n1.tasks[0].teamIssues, { alpha: 2 });
+  assert.deepEqual(core.normalize(json(n1)), n1);
+  const kept = json(s);
+  kept.tasks[0].teamIssues = { alpha: 9 };
+  assert.deepEqual(core.normalize(kept).tasks[0].teamIssues, { alpha: 9 }, 'an existing total is not overwritten');
+});
+
+// ---------- alpha-1 (round 3): a team leaving a task in review settles the round ----------
+
+function threeTeamReview() {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Three teams', size: 'large' });
+  assert.deepEqual(teamsOn(s, task.id), ['alpha', 'bravo', 'charlie']);
+  toReview(s, task.id);
+  return { s, task };
+}
+
+test('alpha-1: unassigning the last pending team when the rest approved completes the round', () => {
+  const { s, task } = threeTeamReview();
+  verdict(s, task.id, 'alpha', 'approved');
+  verdict(s, task.id, 'bravo', 'approved');
+  core.unassignTeam(s, task.id, 'charlie');
+  assert.equal(task.status, 'review');
+  assert.equal(task.approvedRound, 1);
+  assert.ok(s.log.some((e) => e.message === `${task.id} approved by all reviewers (round 1)`));
+  assert.equal(core.reviewGate(s, task).ok, true);
+  core.updateTask(s, task.id, { status: 'done' });
+  assert.equal(task.status, 'done');
+});
+
+test('alpha-1: unassigning the last pending team when another asked for changes sends it back to active', () => {
+  const { s, task } = threeTeamReview();
+  verdict(s, task.id, 'alpha', 'changes', { note: 'fix', issues: 1 });
+  verdict(s, task.id, 'bravo', 'approved');
+  assert.equal(task.status, 'review');
+  core.unassignTeam(s, task.id, 'charlie');
+  assert.equal(task.status, 'active');
+  assert.ok(task.activeSince, 'timer keeps running');
+  assert.ok(s.log.some((e) => e.message === `${task.id} back to the builders: changes requested by Team Alpha`));
+});
+
+test('alpha-1: removing a team while others are still pending leaves the round open', () => {
+  const { s, task } = threeTeamReview();
+  verdict(s, task.id, 'alpha', 'approved');
+  core.unassignTeam(s, task.id, 'charlie');
+  assert.equal(task.status, 'review');
+  assert.deepEqual(core.reviewStatus(s, task).pending, ['bravo']);
+  assert.notEqual(task.approvedRound, 1);
+});
+
+test('alpha-1: moving the pending team to another task settles the round it left', () => {
+  const { s, task } = threeTeamReview();
+  verdict(s, task.id, 'alpha', 'approved');
+  verdict(s, task.id, 'bravo', 'approved');
+  const other = core.addTask(s, { title: 'Elsewhere' }).task; // queued, all teams busy
+  assert.equal(other.status, 'queued');
+  core.assignTeam(s, other.id, 'charlie');
+  assert.equal(task.status, 'review');
+  assert.equal(task.approvedRound, 1);
+});
+
+test('alpha-1: removing a team after the round was already approved does not log approval twice', () => {
+  const { s, task } = threeTeamReview();
+  for (const id of ['alpha', 'bravo', 'charlie']) verdict(s, task.id, id, 'approved');
+  core.unassignTeam(s, task.id, 'charlie');
+  const approvals = s.log.filter((e) => e.message === `${task.id} approved by all reviewers (round 1)`);
+  assert.equal(approvals.length, 1);
+});
+
+test('alpha-1: deleting or pausing a task in review does not settle the round on the way out', () => {
+  const { s, task } = threeTeamReview();
+  verdict(s, task.id, 'alpha', 'changes', { note: 'x' });
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.equal(task.status, 'paused');
+  assert.ok(!s.log.some((e) => /back to the builders/.test(e.message)));
+  const b = threeTeamReview();
+  verdict(b.s, b.task.id, 'alpha', 'approved');
+  core.deleteTask(b.s, b.task.id);
+  assert.ok(!b.s.log.some((e) => /approved by all reviewers|back to the builders/.test(e.message)));
+});

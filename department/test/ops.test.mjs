@@ -314,3 +314,34 @@ test('pushing the same board twice adds nothing the second time, even after renu
   assert.equal(second.skipped, 1);
   assert.equal(hubBoard.tasks.length, 2);
 });
+
+// ---------- alpha-1 (round 3): importState credits teamIssues (all rounds) ----------
+
+test('alpha-1: importState credits issues from every round via teamIssues, once', () => {
+  const other = core.createInitialState();
+  const t = core.addTask(other, { title: 'Two rounds elsewhere' }).task;
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'changes', note: 'x', issues: 2 });
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'approved' }); // latest verdict: 0 issues
+  core.updateTask(other, t.id, { status: 'done' });
+  assert.deepEqual(t.teamIssues, { alpha: 2 });
+  const here = core.createInitialState();
+  here.teams[0].issuesFound = 1;
+  op(here, 'importState', { state: json(other) });
+  assert.equal(here.teams[0].issuesFound, 3, 'credits the round-1 issues, not just the latest verdict');
+  op(here, 'importState', { state: json(other) });
+  assert.equal(here.teams[0].issuesFound, 3, 're-push does not double count');
+});
+
+test('alpha-1: importState falls back to reviews for boards without teamIssues', () => {
+  const other = core.createInitialState();
+  const t = core.addTask(other, { title: 'Older board' }).task;
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'changes', note: 'x', issues: 4 });
+  const old = json(other);
+  delete old.tasks[0].teamIssues;
+  const here = core.createInitialState();
+  op(here, 'importState', { state: old });
+  assert.equal(here.teams[0].issuesFound, 4);
+});
