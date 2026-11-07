@@ -26,7 +26,7 @@ const teamsOn = (s, id) => core.teamsOn(s, id).map((t) => t.id);
 const op = (s, type, args) => applyOp(s, { type, args });
 const json = (v) => JSON.parse(JSON.stringify(v));
 const crewError = (e) => e instanceof core.DeptError && e.status === 400 && /builders must be 1.5/.test(e.message);
-const INVALID = [0, 6, 2.5, 'x', -1, null, true];
+const INVALID = [0, 6, 2.5, 'x', -1, true, '0', '6', '2.5', NaN];
 
 const builderIds = (teamId) => [1, 2, 3, 4, 5].map((n) => `${teamId}-${n}`);
 
@@ -69,10 +69,21 @@ test('addTask accepts an explicit crew of 1 to 5 regardless of size', () => {
   }
 });
 
-test('builders undefined means the size default', () => {
+test('builders undefined (or null / empty, "not given") means the size default', () => {
   const s = fresh();
   assert.equal(core.addTask(s, { title: 'A', builders: undefined }).task.builders, 2);
   assert.equal(core.addTask(s, { title: 'B', size: 'large', builders: undefined }).task.builders, 5);
+  assert.equal(core.addTask(s, { title: 'C', builders: null }).task.builders, 2);
+  assert.equal(core.addTask(s, { title: 'D', size: 'large', builders: '' }).task.builders, 5);
+});
+
+test('an integer string crew (from a form or the CLI) is accepted as a number', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'A', builders: '3' });
+  assert.strictEqual(task.builders, 3);
+  core.updateTask(s, task.id, { builders: '4' });
+  assert.strictEqual(task.builders, 4);
+  assertCrew(s, 'alpha', 4);
 });
 
 test('addTask rejects an invalid crew and changes nothing', () => {
@@ -273,6 +284,23 @@ test('updateTask rejects an invalid crew and changes nothing', () => {
   }
 });
 
+test('an invalid crew in a mixed patch leaves the other fields unchanged too', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'A', builders: 3 });
+  const before = json(s);
+  assert.throws(() => core.updateTask(s, task.id, { title: 'Renamed', size: 'large', builders: 9 }), crewError);
+  assert.deepEqual(json(s), before);
+});
+
+test('updateTask with builders null leaves the crew as it is', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'A', builders: 3 });
+  core.updateTask(s, task.id, { builders: null, title: 'Renamed' });
+  assert.equal(task.builders, 3);
+  assert.equal(task.title, 'Renamed');
+  assertCrew(s, 'alpha', 3);
+});
+
 test('changing size alone does not change an existing crew', () => {
   const s = fresh();
   const { task } = core.addTask(s, { title: 'A', builders: 3 });
@@ -414,4 +442,15 @@ test('changing the crew does not touch the review round or sign-off', () => {
   assert.equal(core.reviewGate(s, task).ok, true);
   core.updateTask(s, task.id, { status: 'done' });
   assert.equal(task.status, 'done');
+});
+
+test('importState gives tasks from a pre-crew board the size default', () => {
+  const src = fresh();
+  core.addTask(src, { title: 'Small' });
+  core.addTask(src, { title: 'Big', size: 'large' });
+  const old = json(src);
+  for (const t of old.tasks) delete t.builders;
+  const here = fresh();
+  op(here, 'importState', { state: old });
+  assert.deepEqual(here.tasks.map((t) => [t.title, t.builders]), [['Small', 2], ['Big', 5]]);
 });

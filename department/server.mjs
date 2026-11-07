@@ -169,7 +169,7 @@ async function readBody(req) {
 
 const routes = [
   ['GET', /^\/api\/state$/, () => payload()],
-  ['POST', /^\/api\/tasks$/, (b) => mutate('addTask', { title: b.title, description: b.description, size: b.size })],
+  ['POST', /^\/api\/tasks$/, (b) => mutate('addTask', { title: b.title, description: b.description, size: b.size, builders: b.builders })],
   ['PATCH', /^\/api\/tasks\/([\w-]+)$/, (b, [id]) => mutate('updateTask', { id, patch: b, by: b.by || 'user' })],
   ['DELETE', /^\/api\/tasks\/([\w-]+)$/, (b, [id]) => mutate('deleteTask', { id, by: b.by || 'user' })],
   ['POST', /^\/api\/tasks\/([\w-]+)\/assign$/, (b, [id]) => mutate('assignTeam', { taskId: id, teamId: b.teamId, focus: b.focus, by: b.by })],
