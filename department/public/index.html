@@ -339,8 +339,10 @@ function crewFor(task) {
 }
 const crewText = (n) => `${n} builder${n === 1 ? '' : 's'} + reviewer`;
 const agentNum = (a) => Number((/-(\d+)$/.exec(a.id) || [])[1]) || 0;
-// A builder beyond the task's crew who isn't doing anything: shown dimmed as "Standby".
-const isStandby = (a, task) => !!task && !isReviewer(a) && agentNum(a) > crewFor(task) && a.status === 'idle';
+// A builder beyond the task's crew who isn't working, blocked or done: shown dimmed as "Standby" (same rule as the CLI's
+// status, so tasks registered before crew sizing, whose extra builders are still 'assigned', read as standby too).
+const isStandby = (a, task) => !!task && !isReviewer(a) && agentNum(a) > crewFor(task)
+  && !['working', 'blocked', 'done'].includes(a.status);
 // Mirrors core.reviewStatus: verdicts of the teams currently on the task, current round only.
 function reviewStatus(task) {
   const round = task.reviewRound || 0;
@@ -869,7 +871,7 @@ $('#new-task').addEventListener('submit', async (e) => {
   if (!title) return;
   const size = document.querySelector('input[name=size]:checked').value;
   const builders = Number($('#t-builders').value) || DEFAULT_BUILDERS[size];
-  // Via the generic op so `builders` reaches core.addTask (the POST /api/tasks route only forwards title/description/size).
+  // Via the generic op: args go straight to core.addTask, builders included.
   const r = await api('POST', '/api/op', { type: 'addTask', args: { title, description: $('#t-desc').value, size, builders } });
   $('#t-title').value = ''; $('#t-desc').value = '';
   buildersTouched = false; syncBuilders();
