@@ -901,18 +901,25 @@ class Factory:
             await asyncio.sleep(0.01)
 
     def close(self) -> None:
-        """Flush the bridge, save the manager's state, close the databases and the bridge."""
-        flush = getattr(self.bridge, "flush", None)
-        if callable(flush):
-            flush(5.0)
+        """Drain and stop the bridge, save the manager's state, close the databases.
+
+        The bridge sends ops from a daemon thread, so anything still queued when
+        the process exits is lost (this is how review/verdict/done went missing
+        after a real run against the shared board). ``bridge.close()`` waits
+        while ops keep completing (bounded, see ``BoardBridge.flush``) before
+        the state is saved, so the board ids it resolved are kept.
+        """
+        try:
+            fn = getattr(self.bridge, "close", None) or getattr(self.bridge, "flush", None)
+            if callable(fn):
+                fn()
+        except Exception as exc:  # the board must never break shutdown
+            log.warning("foundry: board bridge did not close cleanly: %s", exc)
         self.manager.save()  # board ids resolved by the bridge thread are kept for the next run
         for obj in (self.cache, self.queue):
             fn = getattr(obj, "close", None)
             if callable(fn):
                 fn()
-        fn = getattr(self.bridge, "close", None)
-        if callable(fn):
-            fn()
 
 
 def build_factory(

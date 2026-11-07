@@ -45,7 +45,10 @@ from foundry.floor_manager import Factory, WorkOrder, build_factory
 from foundry.gemma_client import GemmaReply, GemmaRequest, SimulatedGemmaClient
 from foundry.schemas import ClaudeResult
 
-__all__ = ["VirtualClock", "DEMO_FILES", "DEMO_ORDERS", "demo_claude", "demo_gemma", "run_demo", "main"]
+__all__ = [
+    "VirtualClock", "DEMO_FILES", "DEMO_ORDERS", "demo_claude", "demo_gemma", "run_demo", "run_real",
+    "explain_task", "completion_report", "task_outputs", "main",
+]
 
 #: Claude Code carries a large system prompt into every headless session; the
 #: simulated client reports it so token burn looks like a real session.
@@ -404,13 +407,22 @@ def _same_repo(a: str | None, b: Path) -> bool:
     return norm(a) == norm(b)
 
 
+def _needs_finishing(factory: Factory, tid: str) -> bool:
+    """Approved (``complete``) but the commit message / patch were never written (run cut short)."""
+    return _state(factory.queue.get_task(tid)) == "complete" and tid not in factory.manager.pr_summaries
+
+
 def _find_open_order(factory: Factory, order: WorkOrder, repo: Path) -> str | None:
-    """A not-yet-finished task of *this* repo from an earlier run with the same title and files."""
+    """A not-yet-finished task of *this* repo from an earlier run with the same title and files.
+
+    A task that was approved but whose patch was never written (the earlier run
+    stopped while the Shop Foreman was still drafting) counts as unfinished.
+    """
     for tid, old in factory.manager.orders.items():
         if old.title == order.title and sorted(old.files) == sorted(order.files):
             if not _same_repo(factory.manager.task_repo(tid), repo):
                 continue
-            if _state(factory.queue.get_task(tid)) not in _TERMINAL_STATES:
+            if _state(factory.queue.get_task(tid)) not in _TERMINAL_STATES or _needs_finishing(factory, tid):
                 return tid
     return None
 
@@ -475,6 +487,113 @@ def explain_task(factory: Factory, tid: str) -> tuple[str, list[str]]:
     return state, lines
 
 
+#: Upper bound (seconds) on waiting for the Shop Foreman's commit message and the
+#: patch file after the reviewer approved. Gemma requests time out after 60 s
+#: and the Foreman then falls back to a heuristic draft, so this is generous.
+FINISH_TIMEOUT_S = 600.0
+
+
+def _abs(path: Path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:  # pragma: no cover - defensive
+        return Path(os.path.abspath(str(path)))
+
+
+def task_outputs(factory: Factory, tid: str) -> dict[str, Path | None]:
+    """Absolute paths of a task's output files: ``patch``, ``rejected`` and ``md`` (None when absent).
+
+    Uses what this run wrote; otherwise looks up the file stem the manager
+    recorded (``F-001`` or ``F-001-2``) in the patches folder, so a task
+    finished by an earlier run is reported too.
+    """
+    m = factory.manager
+    patch = m.patch_paths.get(tid)
+    rejected = m.rejected_patches.get(tid)
+    folder = getattr(m, "patches_dir", None)
+    name = (getattr(m, "patch_names", None) or {}).get(tid)
+    md = None
+    if folder is not None and name:
+        if patch is None and rejected is None:
+            good, bad = Path(folder) / f"{name}.patch", Path(folder) / f"{name}.patch.rejected"
+            patch = good if good.is_file() else None
+            rejected = bad if (patch is None and bad.is_file()) else None
+        md_path = Path(folder) / f"{name}.md"
+        md = md_path if md_path.is_file() else None
+    elif patch is not None or rejected is not None:
+        md_path = Path(patch or rejected).with_name(f"{Path(patch or rejected).name.split('.patch')[0]}.md")  # type: ignore[arg-type]
+        md = md_path if md_path.is_file() else None
+    return {
+        "patch": _abs(patch) if patch else None,
+        "rejected": _abs(rejected) if rejected else None,
+        "md": _abs(md) if md else None,
+    }
+
+
+def _first_line(text: str) -> str:
+    for line in str(text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def completion_report(
+    factory: Factory, tid: str, repo: Path, *, windows: bool | None = None
+) -> list[str]:
+    """Lines telling a ``complete`` task's user where the output is and exactly what to run next."""
+    windows = (os.name == "nt") if windows is None else windows
+    view = "type" if windows else "cat"
+    files = task_outputs(factory, tid)
+    summary = factory.manager.pr_summaries.get(tid) or {}
+    subject = _first_line(summary.get("commit_message", ""))
+    patch, rejected, md = files["patch"], files["rejected"], files["md"]
+    lines = [""]
+    if subject:
+        lines.append(f"Commit message: {subject}")
+    if patch is not None:
+        empty = patch.stat().st_size == 0 if patch.is_file() else False
+        lines.append(f"Patch:          {patch}")
+        if md is not None:
+            lines.append(f"Message + PR:   {md}")
+        lines.append("")
+        if empty:
+            lines.append("The approved change is empty, so there is nothing to apply.")
+            return lines
+        lines.append("Your repository has not been changed yet. Open a terminal in the repository folder")
+        lines.append(f"  {repo}")
+        lines.append("and run:")
+        lines.append(f"  1. look at the change:  {view} \"{patch}\"")
+        lines.append(f"  2. apply it:            git apply \"{patch}\"")
+        if md is not None:
+            lines.append("  3. commit it:           git add -A")
+            lines.append(f"                          git commit -F \"{md}\"")
+        return lines
+    if rejected is not None:
+        lines.append("The patch was REJECTED: the approved changes do not apply cleanly to your repository,")
+        lines.append("so there is nothing to apply automatically. It was saved for a manual merge as")
+        lines.append(f"  {rejected}")
+        if md is not None:
+            lines.append(f"Message + PR:   {md}")
+        lines.append(f"Look at it with:  {view} \"{rejected}\"")
+        return lines
+    folder = getattr(factory.manager, "patches_dir", None)
+    lines.append("No patch file was written for this task" + (f" (looked in {_abs(Path(folder))})." if folder else "."))
+    return lines
+
+
+async def _finish_task(factory: Factory, tid: str, timeout: float, out: Any) -> bool:
+    """Wait (bounded) until the commit message is drafted and the patch is written; True when it was."""
+    manager = factory.manager
+    if tid in manager.pr_summaries:
+        return True
+    out(f"{tid}: approved - the Shop Foreman is writing the commit message and the patch...")
+    try:
+        await asyncio.wait_for(manager.on_task_complete(tid), timeout=timeout)
+    except asyncio.TimeoutError:
+        return False
+    return tid in manager.pr_summaries
+
+
 async def run_real(
     args: argparse.Namespace,
     config: FoundryConfig,
@@ -482,6 +601,7 @@ async def run_real(
     gemma: Any = None,
     *,
     out: Any = print,
+    finish_timeout: float = FINISH_TIMEOUT_S,
 ) -> int:
     """Phase 2: one work order with headless Claude Code and Ollama (after the preflight).
 
@@ -489,10 +609,16 @@ async def run_real(
     gates patch scratch copies, and the approved result is written to
     ``config.patches_dir/<task>.patch`` for you to ``git apply``.
 
+    After the reviewer approves, the run waits (up to ``finish_timeout``) for
+    the Shop Foreman's commit message and the patch file before shutting the
+    line down, then prints their absolute paths and the commands to view and
+    apply the patch (see :func:`completion_report`).
+
     Rerunning the same command resumes an unfinished task with the same title
-    and files instead of submitting it again. Returns :data:`EXIT_DONE`,
-    :data:`EXIT_FAILED` (quarantined/failed) or :data:`EXIT_IN_PROGRESS`
-    (timed out or paused at the usage limit). The factory is always closed.
+    and files instead of submitting it again (including an approved task whose
+    patch was not written yet). Returns :data:`EXIT_DONE`, :data:`EXIT_FAILED`
+    (quarantined/failed) or :data:`EXIT_IN_PROGRESS` (timed out, paused at the
+    usage limit, or the patch is not written yet). The factory is always closed.
     """
     if gemma is None:
         from foundry.gemma_client import OllamaGemmaClient
@@ -502,6 +628,7 @@ async def run_real(
     factory = build_factory(
         config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo, dispatch_repo=repo
     )
+    state = "unknown"
     try:
         forget = getattr(factory.queue, "kv_delete", None)
         if callable(forget):
@@ -518,28 +645,28 @@ async def run_real(
             tid = await factory.manager.submit(order)
         d = factory.manager.directives[tid]
         out(f"{tid}: {d.complexity}, {d.allocated_builders} builder(s) on {d.team_id}")
+        finished = True
         async with factory.running():
             try:
                 await factory.wait([tid], timeout=args.timeout)
             except asyncio.TimeoutError:
                 out(f"{tid}: not finished after {args.timeout:g}s")
+            if _state(factory.queue.get_task(tid)) == "complete":
+                # The commit message and the patch are written by a callback that
+                # can outlast the pools' shutdown grace (a real Gemma draft takes
+                # longer than a few seconds); leaving now would cancel it.
+                finished = await _finish_task(factory, tid, finish_timeout, out)
         state, lines = explain_task(factory, tid)
         for line in lines:
             out(line)
-        summary = factory.manager.pr_summaries.get(tid)
-        if summary:
-            out("")
-            out(summary.get("commit_message", ""))
-            out("")
-            out(summary.get("pr_body", ""))
-        patch = factory.manager.patch_paths.get(tid)
-        if patch:
-            out("")
-            out(f"Patch: {patch}")
-            out(f"Apply it from the target repo's root with:  git apply --index \"{patch}\"")
-        rejected = factory.manager.rejected_patches.get(tid)
-        if rejected:
-            out(f"The combined patch does not apply cleanly; saved as {rejected} for a manual merge.")
+        if state == "complete":
+            if finished:
+                for line in completion_report(factory, tid, repo):
+                    out(line)
+            else:
+                out(f"  approved, but the patch was not written within {finish_timeout:g}s "
+                    "(the Shop Foreman is still drafting) - rerun the same command to finish it")
+                state = "finishing"
     finally:
         factory.close()
     if state == "complete":

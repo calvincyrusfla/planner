@@ -25,10 +25,17 @@ by the tests and by ``python -m foundry.main --simulate``); ``mode="off"`` drops
 everything silently.
 
 The bridge must never block or crash the factory. In ``auto`` mode ops are put
-on an in-memory queue and sent by one daemon thread with short timeouts; every
+on an in-memory queue and sent by one daemon thread with bounded timeouts; every
 error is caught and logged. Board task ids (``T-0xx``) are resolved inside that
 thread, so a later op for the same Foundry task waits for its ``addTask``
 without the caller waiting at all.
+
+Because the sender is a daemon thread, ops still queued when the process exits
+are lost. :meth:`BoardBridge.close` (called by ``Factory.close``) therefore
+drains the queue first: it keeps waiting as long as ops keep completing (a slow
+board, e.g. the dashboard forwarding to the shared Netlify board, is waited for)
+and gives up only when nothing completes for :attr:`BoardBridge.stall_timeout`
+seconds or the overall cap is reached, logging what was left unsent.
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ import queue as queue_mod
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -54,6 +62,11 @@ log = logging.getLogger(__name__)
 BridgeMode = Literal["auto", "off", "dry"]
 
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
+#: The dashboard forwards every op to the shared board when one is configured;
+#: a cold Netlify function can take several seconds, so op POSTs get this long.
+DEFAULT_OP_TIMEOUT = 20.0
+#: Upper bound on how long close()/flush() wait for queued ops at exit.
+DEFAULT_FLUSH_TIMEOUT = 120.0
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPT_CLI = REPO_ROOT / "department" / "dept.mjs"
 
@@ -104,7 +117,15 @@ class BoardBridge:
         mode: ``"auto"`` (dashboard, then CLI, then no-op), ``"dry"`` (record
             ops in :attr:`ops`, no I/O) or ``"off"`` (drop everything).
         dashboard_url: base URL of the local dashboard.
-        timeout: per-request timeout in seconds (HTTP and CLI).
+        timeout: timeout in seconds for reading the board state from the
+            dashboard (and the minimum for everything else).
+        op_timeout: timeout in seconds for one op POST to the dashboard (it
+            may forward to the shared board) and for one CLI call. A POST that
+            times out after it was sent is NOT replayed through the CLI (the
+            board may have applied it); an addTask is then looked up on the
+            board by its Foundry tag.
+        stall_timeout: flush()/close() give up when no queued op completes
+            for this long (default: enough for one op through both transports).
         node_bin: Node executable for the CLI fallback.
         cli_path: path to ``department/dept.mjs``.
         dry_autoassign: dry mode only: the teams the simulated board
@@ -120,6 +141,8 @@ class BoardBridge:
         *,
         dashboard_url: str = DEFAULT_DASHBOARD_URL,
         timeout: float = 3.0,
+        op_timeout: float = DEFAULT_OP_TIMEOUT,
+        stall_timeout: float | None = None,
         node_bin: str = "node",
         cli_path: str | Path = DEPT_CLI,
         dry_autoassign: tuple[str, ...] | list[str] = (),
@@ -130,6 +153,11 @@ class BoardBridge:
         self.mode: BridgeMode = mode
         self.dashboard_url = dashboard_url.rstrip("/")
         self.timeout = timeout
+        self.op_timeout = max(float(op_timeout), float(timeout))
+        # one op can take: a state read (dashboard + CLI json) and the op (dashboard + CLI)
+        self.stall_timeout = (
+            float(stall_timeout) if stall_timeout is not None else 2 * self.op_timeout + 2 * self._cli_timeout() + self.timeout
+        )
         self.node_bin = node_bin
         self.cli_path = Path(cli_path)
         #: Every op the bridge produced, resolved (dry mode) or attempted (auto).
@@ -375,26 +403,67 @@ class BoardBridge:
 
     # --------------------------------------------------------------- plumbing
 
-    def flush(self, timeout: float = 5.0) -> bool:
-        """Wait (bounded) until queued ops are sent. Returns True when drained."""
-        if self.mode != "auto" or self._thread is None:
+    def _cli_timeout(self) -> float:
+        return max(self.op_timeout, 10.0)
+
+    @property
+    def pending(self) -> int:
+        """Ops queued (or being sent) that have not finished yet."""
+        return self._q.unfinished_tasks
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """Wait until every queued op was sent (or failed). Returns True when drained.
+
+        Waits as long as ops keep completing, up to ``timeout`` seconds in total
+        (default :data:`DEFAULT_FLUSH_TIMEOUT`); gives up early when no op
+        completes for :attr:`stall_timeout` seconds. Never raises.
+        """
+        if self.mode != "auto":
             return True
-        done = threading.Event()
+        thread = self._thread
+        if self._q.unfinished_tasks == 0:
+            return True
+        if thread is None or not thread.is_alive():
+            if self._q.unfinished_tasks:
+                self._ensure_thread()  # ops queued but nobody sending them
+                thread = self._thread
+        cap = DEFAULT_FLUSH_TIMEOUT if timeout is None else max(0.0, float(timeout))
+        start = time.monotonic()
+        deadline = start + cap
+        last_left = self._q.unfinished_tasks
+        last_change = start
+        announced = False
+        while True:
+            left = self._q.unfinished_tasks
+            if left == 0:
+                return True
+            now = time.monotonic()
+            if left != last_left:
+                last_left, last_change = left, now
+            if now >= deadline or now - last_change >= self.stall_timeout:
+                break
+            if not announced and now - start >= 1.0:
+                announced = True
+                log.info("board bridge: waiting for %d board op(s) to reach the Agent Department board", left)
+            time.sleep(min(0.02, max(0.0, deadline - now)))
+        left = self._q.unfinished_tasks
+        warning = (
+            f"Agent Department board: {left} op(s) not delivered before exit "
+            f"(board too slow or not answering); the board may not show the latest Foundry state."
+        )
+        self.stats.warnings.append(warning)
+        log.warning(warning)
+        return False
 
-        def _waiter() -> None:
-            self._q.join()
-            done.set()
-
-        threading.Thread(target=_waiter, daemon=True).start()
-        return done.wait(timeout)
-
-    def close(self, timeout: float = 5.0) -> None:
-        """Flush and stop the sender thread."""
-        self.flush(timeout)
-        if self._thread is not None:
+    def close(self, timeout: float | None = None) -> bool:
+        """Drain the queue (see :meth:`flush`) and stop the sender thread. Returns True when drained."""
+        drained = self.flush(timeout)
+        thread = self._thread
+        if thread is not None:
             self._q.put(None)
-            self._thread.join(timeout=1.0)
+            thread.join(timeout=1.0 if drained else 0.1)
             self._thread = None
+        return drained
 
     def _emit(self, op: BoardOp) -> None:
         """Never raises."""
@@ -479,8 +548,14 @@ class BoardBridge:
                 self.stats.warnings.append(warning)
                 log.warning(warning)
             return
-        self.stats.sent += 1
-        self.stats.transport = transport
+        if result is _UNKNOWN:
+            self.stats.failed += 1
+            result = None
+            if op.type == "addTask" and op.foundry_task:
+                result = self._find_added_task(op)
+        else:
+            self.stats.sent += 1
+            self.stats.transport = transport
         if op.type == "addTask" and op.foundry_task and isinstance(result, dict):
             task = result.get("task") if isinstance(result.get("task"), dict) else result
             board_id = task.get("id") if isinstance(task, dict) else None
@@ -495,6 +570,34 @@ class BoardBridge:
                     except Exception as exc:  # never let a fix-up stop the sender
                         self.stats.failed += 1
                         log.warning("board bridge: %s failed: %s", fix.type, exc)
+
+    def _find_added_task(self, op: BoardOp) -> dict[str, Any] | None:
+        """After an addTask timed out: the board task it created, if the board has it.
+
+        Matches the newest open board task with the same title and Foundry tag
+        that no other Foundry task already maps to; returns an addTask-shaped
+        result (``assigned`` = the teams on it now) or None.
+        """
+        state = self._fetch_state()
+        tasks = state.get("tasks") if isinstance(state, dict) else None
+        if not isinstance(tasks, list):
+            return None
+        title, desc = op.args.get("title"), str(op.args.get("description", ""))
+        taken = set(self.board_ids.values())
+        found = [
+            t for t in tasks
+            if isinstance(t, dict) and t.get("id") and str(t["id"]) not in taken
+            and t.get("title") == title and str(t.get("description", "")) == desc
+            and t.get("status") not in ("done", "cancelled")
+        ]
+        if not found:
+            log.info("board bridge: %s not found on the board after the addTask timeout", op.foundry_task)
+            return None
+        task = max(found, key=lambda t: _task_number(str(t["id"])))
+        teams = state.get("teams") if isinstance(state.get("teams"), list) else []
+        assigned = [str(t["id"]) for t in teams if isinstance(t, dict) and t.get("id") and t.get("taskId") == task["id"]]
+        log.info("board bridge: %s found on the board as %s after the addTask timeout", op.foundry_task, task["id"])
+        return {"task": {"id": str(task["id"])}, "assigned": assigned}
 
     def _team_state(self, team_id: str | None, board_id: str) -> str:
         """Where the board has ``team_id``: ours / free / busy / unknown (read from the board state)."""
@@ -529,7 +632,7 @@ class BoardBridge:
             proc = subprocess.run(
                 [node, str(self.cli_path), "json"], capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
-                timeout=max(self.timeout, 10.0), cwd=str(self.cli_path.parent.parent),
+                timeout=self._cli_timeout(), cwd=str(self.cli_path.parent.parent),
             )
             return json.loads(proc.stdout) if proc.returncode == 0 else None
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -546,8 +649,14 @@ class BoardBridge:
             method="POST",
         )
         try:
-            with _LOCAL_OPENER.open(req, timeout=self.timeout) as resp:
+            with _LOCAL_OPENER.open(req, timeout=self.op_timeout) as resp:
                 body = json.loads(resp.read() or b"{}")
+        except TimeoutError:
+            # Connected and sent, but no answer in time (the dashboard may still be
+            # forwarding it to the shared board). Replaying it through the CLI could
+            # apply it twice, so the outcome is just unknown.
+            log.warning("board bridge: no answer to %s within %gs; not resent", payload["type"], self.op_timeout)
+            return _UNKNOWN
         except urllib.error.HTTPError as exc:
             # The board answered but refused the op (e.g. a team is busy): not a transport failure.
             try:
@@ -577,9 +686,12 @@ class BoardBridge:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=max(self.timeout, 10.0),
+                timeout=self._cli_timeout(),
                 cwd=str(self.cli_path.parent.parent),
             )
+        except subprocess.TimeoutExpired:
+            log.warning("board bridge: CLI %s did not finish within %gs; not resent", argv[0], self._cli_timeout())
+            return _UNKNOWN
         except (OSError, subprocess.SubprocessError):
             return _UNAVAILABLE
         if proc.returncode != 0:
@@ -591,6 +703,8 @@ class BoardBridge:
 
 
 _UNAVAILABLE = object()
+#: The op was sent but its outcome is unknown (timed out waiting for the answer).
+_UNKNOWN = object()
 
 _CLI_ADD_RE = re.compile(r"^(T-\d+) created → (.*?)(?: · |$)", re.M)
 
@@ -651,6 +765,11 @@ def cli_args(payload: dict[str, Any]) -> list[str] | None:
         if status:
             return ["set", str(a["id"]), "--status", str(status)]
     return None
+
+
+def _task_number(board_id: str) -> int:
+    m = re.search(r"(\d+)$", board_id)
+    return int(m.group(1)) if m else -1
 
 
 def _get(obj: Any, name: str) -> Any:
