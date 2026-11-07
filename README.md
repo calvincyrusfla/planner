@@ -137,3 +137,5 @@ EDIT_KEY=yourpasscode npx netlify dev
 ## Agent Department
 
 `department/` holds a local dashboard for monitoring the 3 agent teams (5 builders and a reviewer each), their task assignments and their progress. Run `npm run dashboard`, then see [department/README.md](department/README.md). To get a desktop shortcut with a network icon that starts the dashboard and opens it in your browser, run `npm run shortcut` once (Windows, macOS and Linux).
+
+The dashboard has a Claude usage meter at the top (5-hour and weekly limits). To connect it, run `npm run usage-meter` once on your PC and restart Claude Code; see "Usage meter" in [department/README.md](department/README.md).

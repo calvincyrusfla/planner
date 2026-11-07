@@ -73,6 +73,8 @@ export function createInitialState() {
     })),
     tasks: [],
     log: [],
+    // Latest Claude usage report (see reportUsage), or null when none yet.
+    usage: null,
   };
 }
 
@@ -566,6 +568,101 @@ export function updateSettings(state, patch = {}) {
   return state.settings;
 }
 
+// ---------- usage meter ----------
+// Claude Code's statusLine reports the plan's rate-limit windows; the board
+// keeps only the latest report. Reports are frequent, so they never touch the
+// activity log, tasks or teams.
+//
+// state.usage = null | {
+//   fiveHour: { usedPct: 0-100 (1 decimal), resetsAt: ISO|null } | null,
+//   sevenDay: { same } | null,
+//   reportedAt: ISO,  // when the reporter took it (never later than receivedAt)
+//   receivedAt: ISO,  // when this board stored it
+//   source: string,   // short label, <= 40 chars
+// }
+
+export const USAGE_SOURCE_MAX = 40;
+// Epoch numbers above this are milliseconds, below it seconds (1e11 s is the
+// year 5138; 1e11 ms is 1973).
+const EPOCH_MS_THRESHOLD = 1e11;
+
+// Epoch seconds, epoch ms, numeric strings of either, ISO strings or Dates ->
+// ISO string; anything unusable -> null.
+export function usageTimeToIso(value) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
+  let ms;
+  if (value instanceof Date) ms = value.getTime();
+  else if (typeof value === 'number' || (typeof value === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(value))) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    ms = n >= EPOCH_MS_THRESHOLD ? n : n * 1000;
+  } else if (typeof value === 'string') ms = Date.parse(value);
+  else return null;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const d = new Date(Math.round(ms));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// One rate-limit window. Accepts our shape ({usedPct, resetsAt}) and Claude
+// Code's ({used_percentage, resets_at}). Returns null for null/undefined,
+// throws (strict) or returns null (lenient) for anything malformed.
+function usageWindow(win, name, strict) {
+  if (win === null || win === undefined) return null;
+  const bad = (why) => {
+    if (strict) throw new DeptError(`Usage ${name}: ${why}`);
+    return null;
+  };
+  if (!isPlainObject(win)) return bad('expected an object with usedPct');
+  const raw = win.usedPct ?? win.used_percentage;
+  const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (typeof n !== 'number' || !Number.isFinite(n)) return bad('usedPct must be a number');
+  const usedPct = Math.round(Math.max(0, Math.min(100, n)) * 10) / 10;
+  return { usedPct, resetsAt: usageTimeToIso(win.resetsAt ?? win.resets_at) };
+}
+
+const cleanSource = (v) =>
+  typeof v === 'string' || typeof v === 'number'
+    ? String(v).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, USAGE_SOURCE_MAX).trim()
+    : '';
+
+// A stored usage object (from disk or another board) -> a clean copy, or null
+// when it isn't one.
+export function normalizeUsage(usage) {
+  if (!isPlainObject(usage)) return null;
+  const fiveHour = usageWindow(usage.fiveHour, 'fiveHour', false);
+  const sevenDay = usageWindow(usage.sevenDay, 'sevenDay', false);
+  if (!fiveHour && !sevenDay) return null;
+  const reportedAt = usageTimeToIso(usage.reportedAt);
+  if (!reportedAt) return null;
+  return {
+    fiveHour,
+    sevenDay,
+    reportedAt,
+    receivedAt: usageTimeToIso(usage.receivedAt) || reportedAt,
+    source: cleanSource(usage.source),
+  };
+}
+
+export function reportUsage(state, { fiveHour, sevenDay, reportedAt, source } = {}) {
+  const five = usageWindow(fiveHour, 'fiveHour', true);
+  const seven = usageWindow(sevenDay, 'sevenDay', true);
+  if (!five && !seven) throw new DeptError('Usage report needs fiveHour or sevenDay');
+  const receivedAt = now();
+  let at = reportedAt === undefined || reportedAt === null || reportedAt === '' ? receivedAt : usageTimeToIso(reportedAt);
+  if (!at) throw new DeptError('Usage reportedAt must be an ISO time or epoch seconds/ms');
+  // A reporter whose clock runs ahead must not lock out every later report.
+  if (Date.parse(at) > Date.parse(receivedAt)) at = receivedAt;
+  const current = normalizeUsage(state.usage);
+  if (current && Date.parse(at) < Date.parse(current.reportedAt)) {
+    state.usage = current;
+    return { stored: false, usage: current };
+  }
+  state.usage = { fiveHour: five, sevenDay: seven, reportedAt: at, receivedAt, source: cleanSource(source) };
+  return { stored: true, usage: state.usage };
+}
+
 // Upgrade/repair a state loaded from disk.
 export function normalize(state) {
   const fresh = createInitialState();
@@ -573,6 +670,7 @@ export function normalize(state) {
   state.settings = { ...fresh.settings, ...(state.settings || {}) };
   state.tasks ||= [];
   state.log ||= [];
+  state.usage = normalizeUsage(state.usage);
   state.nextTaskNumber ||= state.tasks.length + 1;
   for (const task of state.tasks) {
     if (typeof task.activeMs !== 'number' || !Number.isFinite(task.activeMs)) task.activeMs = 0;

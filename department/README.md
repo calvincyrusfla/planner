@@ -148,6 +148,7 @@ node department/dept.mjs review T-002
 node department/dept.mjs verdict T-002 --team bravo approve -m "Looks good" --issues 0
 node department/dept.mjs done T-002 [--force]
 node department/dept.mjs times
+node department/dept.mjs usage
 node department/dept.mjs help
 ```
 
@@ -190,6 +191,65 @@ node department/dept.mjs hub disconnect
 ### When the site can't be reached
 
 The dashboard keeps showing the last copy it got, and the header says **Shared board offline · showing last copy** in yellow (hover over it for the reason). Changes are refused until the site is back, then it catches up on its own within a few seconds.
+
+## Usage meter
+
+The band at the top of the dashboard shows how much of your Claude plan you have used:
+
+- **5-hour limit:** the rolling 5-hour window.
+- **Weekly limit:** the 7-day window.
+
+Each meter shows the percentage used, a bar and a live countdown to when that window resets. The bar is green below 70%, amber from 70% and red from 90%. Below the meters, a line says how old the numbers are and which machine sent them.
+
+### Where the numbers come from
+
+Claude Code can run a small program for its status bar, and it passes that program the current usage. The usage meter installs `department/usage/statusline.mjs` as that program. Each time Claude Code refreshes its status bar, the program shows the numbers there too, and sends them to the board in the background (at most about once a minute unless they change). It goes through the dashboard, the shared board or the local state file, the same way the CLI does.
+
+It only reads what Claude Code hands it. It doesn't read passwords, tokens or credential files, and it doesn't call any Claude account API.
+
+### Set it up
+
+Do this once on your PC. Open PowerShell in the repo folder and run:
+
+```powershell
+npm run usage-meter
+```
+
+Then close and restart Claude Code. The meter fills in the next time a Claude Code session refreshes its status bar.
+
+This adds a `statusLine` entry to your Claude Code user settings, `%USERPROFILE%\.claude\settings.json` (`~/.claude/settings.json` on macOS and Linux, or the folder in `CLAUDE_CONFIG_DIR` if you set it). It saves a backup first, as `settings.json.bak-agent-department`. If you already have a different status line, it leaves it alone and shows you what's there. To replace it anyway:
+
+```powershell
+npm run usage-meter -- --force
+```
+
+To see what it would change without changing anything:
+
+```powershell
+npm run usage-meter -- --dry-run
+```
+
+### Remove it
+
+```powershell
+npm run usage-meter:remove
+```
+
+This removes only the usage meter's status line. Restart Claude Code afterwards.
+
+### Why the numbers can be out of date
+
+The meter only updates while a Claude Code session with the status line is running. When nothing has reported for 15 minutes, the band says that no session is reporting and the numbers may be out of date. When a window's reset time has passed, the band shows when it reset instead of the old percentage, until the next report comes in.
+
+The numbers are only there on Claude subscription plans. With an API key, Claude Code doesn't pass usage to the status line, so the band says the meter isn't connected.
+
+### From the CLI
+
+To see the current meter in the terminal:
+
+```bash
+node department/dept.mjs usage
+```
 
 ## How the agents use it
 

@@ -28,6 +28,8 @@ const OPS = {
       ...(issues !== undefined ? { issues } : {}),
       ...(by ? { by } : {}),
     }),
+  reportUsage: (state, { fiveHour, sevenDay, reportedAt, source } = {}) =>
+    core.reportUsage(state, { fiveHour, sevenDay, reportedAt, source }),
   dispatch: (state) => core.dispatch(state),
   updateSettings: (state, { autoDispatch } = {}) => core.updateSettings(state, { autoDispatch }),
   reset: (state) => {
@@ -61,6 +63,7 @@ export function applyOp(state, op) {
 //   Team issuesFound is not overwritten; like totalMs, it is credited from the
 //   added tasks only (teamIssues[team], all rounds), so a re-push can't double count.
 // - Logs are merged (duplicates dropped), sorted by `at` and capped at 500.
+// - Usage: the newer report (by reportedAt) wins; an older or invalid one is ignored.
 // - Finally dispatch runs so queued work picks up free teams.
 
 const TEAM_IDENTITY = new Set(['id', 'name', 'color', 'taskId', 'totalMs', 'issuesFound', 'agents']);
@@ -152,6 +155,12 @@ export function importState(state, other) {
   }
   merged.sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
   state.log = merged.slice(-LOG_LIMIT);
+
+  const theirUsage = core.normalizeUsage(incoming.usage);
+  const ourUsage = core.normalizeUsage(state.usage);
+  if (theirUsage && (!ourUsage || Date.parse(theirUsage.reportedAt) > Date.parse(ourUsage.reportedAt))) {
+    state.usage = theirUsage;
+  } else state.usage = ourUsage;
 
   core.dispatch(state);
   return { added: addedTasks.length, skipped: skippedIds.size, idMap };

@@ -71,7 +71,7 @@ test('dispatch and updateSettings', () => {
 test('every op type is covered and missing args are tolerated', () => {
   assert.deepEqual(OP_TYPES.sort(), [
     'addTask', 'assignTeam', 'deleteTask', 'dispatch', 'importState', 'reportProgress',
-    'reset', 'reviewTask', 'unassignTeam', 'updateSettings', 'updateTask',
+    'reportUsage', 'reset', 'reviewTask', 'unassignTeam', 'updateSettings', 'updateTask',
   ]);
   const s = fresh();
   assert.deepEqual(applyOp(s, { type: 'dispatch' }), []);

@@ -18,6 +18,7 @@ When the user assigns a task, you are the department head. Don't do the work alo
 **Steps for every task the user gives you:**
 
 1. Decide if it is large (multiple features or areas, a rewrite, or work that would take one team a long time) or small.
+   Before staffing a large task, glance at `node department/dept.mjs usage`. If the 5-hour meter is at 90% or more, tell the user before spawning many agents.
 2. Register it, which also assigns the team(s):
    ```bash
    node department/dept.mjs add "Short title" --desc "What the user asked for" [--large]
