@@ -19,6 +19,8 @@ const URL_BASE = `http://127.0.0.1:${PORT}`;
 const LOG_DIR = process.env.DEPT_DATA ? path.dirname(path.resolve(process.env.DEPT_DATA)) : path.join(here, 'data');
 const LOG_FILE = path.join(LOG_DIR, 'server.log');
 
+// Absolute System32 paths on Windows, since a shortcut's environment may lack a useful PATH.
+const winBin = (rel) => path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', rel);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 'dashboard' if our server answers, 'other' if something else holds the port, 'free' if nothing answers.
@@ -57,7 +59,7 @@ function fail(message) {
     run('osascript', ['-e', `display alert ${JSON.stringify(title)} message ${JSON.stringify(message)} as critical`]);
   } else if (process.platform === 'win32') {
     const ps = (s) => `'${s.replace(/'/g, "''")}'`;
-    run('powershell', [
+    run(winBin('WindowsPowerShell\\v1.0\\powershell.exe'), [
       '-NoProfile',
       '-Command',
       `Add-Type -AssemblyName PresentationFramework;[System.Windows.MessageBox]::Show(${ps(message)},${ps(title)})`,
@@ -87,7 +89,8 @@ function startServer() {
 
 function openBrowser(url) {
   if (process.platform === 'darwin') detach('open', [url]);
-  else if (process.platform === 'win32') detach('cmd', ['/c', 'start', '""', url], { windowsVerbatimArguments: true });
+  // Verbatim args so the empty `start` title stays "" instead of being escaped to \"\".
+  else if (process.platform === 'win32') detach(winBin('cmd.exe'), ['/d', '/s', '/c', 'start', '""', url], { windowsVerbatimArguments: true });
   else detach('xdg-open', [url]);
 }
 
