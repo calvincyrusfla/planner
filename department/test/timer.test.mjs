@@ -108,7 +108,7 @@ test('done freezes the timer and reopening continues from the frozen value', () 
   const s = fresh();
   const { task } = core.addTask(s, { title: 'Finish me' });
   advance(20 * SEC);
-  core.updateTask(s, task.id, { status: 'done' });
+  core.updateTask(s, task.id, { status: 'done', force: true });
   assert.equal(task.status, 'done');
   assert.equal(task.activeMs, 20 * SEC);
   assert.equal(task.activeSince, null);
@@ -211,7 +211,7 @@ test('taskTeamMs and teamTotalMs include open intervals', () => {
   const s = fresh();
   const first = core.addTask(s, { title: 'First' }).task;
   advance(10 * SEC);
-  core.updateTask(s, first.id, { status: 'done' });
+  core.updateTask(s, first.id, { status: 'done', force: true });
   const second = core.addTask(s, { title: 'Second' }).task; // alpha again
   advance(4 * SEC);
   const alpha = team(s, 'alpha');
@@ -229,10 +229,10 @@ test('teamStats reports totals, current task, tasksDone and avgDoneMs', () => {
   const s = fresh();
   const a = core.addTask(s, { title: 'A' }).task;
   advance(10 * SEC);
-  core.updateTask(s, a.id, { status: 'done' });
+  core.updateTask(s, a.id, { status: 'done', force: true });
   const b = core.addTask(s, { title: 'B' }).task;
   advance(30 * SEC);
-  core.updateTask(s, b.id, { status: 'done' });
+  core.updateTask(s, b.id, { status: 'done', force: true });
   const c = core.addTask(s, { title: 'C' }).task;
   advance(5 * SEC);
   core.updateTask(s, c.id, { status: 'cancelled' }); // cancelled work counts toward total, not tasksDone
@@ -324,7 +324,7 @@ test('normalize migrates an old state without time fields', () => {
 
   // And normal operations keep working on the migrated state.
   advance(MIN);
-  core.updateTask(s, running.id, { status: 'done' });
+  core.updateTask(s, running.id, { status: 'done', force: true });
   assert.equal(running.activeMs, 2 * HOUR + MIN);
   assert.equal(running.teamMs.alpha, 2 * HOUR + MIN);
   assert.equal(alpha.totalMs, 2 * HOUR + MIN);

@@ -35,9 +35,14 @@ const HELP = `Agent Department CLI
   node department/dept.mjs progress <task> [--team alpha] [--agent alpha-2]
                        [--pct 40] [--status working|blocked|done] [-m "note"]
                                                        Report progress
-  node department/dept.mjs set <task> [--status queued|paused|done|cancelled] [--pct N]
+  node department/dept.mjs set <task> [--status queued|review|paused|done|cancelled] [--pct N]
                        [--title "..."] [--size small|large]
-  node department/dept.mjs done <task>                 Finish a task and free its teams
+  node department/dept.mjs review <task>               Send a task to its teams' reviewers (In review)
+  node department/dept.mjs verdict <task> --team <id> approve|changes [-m "note"] [--issues N]
+                                                       Record a team reviewer's verdict; changes
+                                                       sends the task back to the builders
+  node department/dept.mjs done <task> [--force]       Finish a task and free its teams; needs every
+                                                       team's reviewer sign-off unless --force
   node department/dept.mjs delete <task>
   node department/dept.mjs dispatch                    Hand free teams to queued tasks
   node department/dept.mjs auto on|off                 Toggle automatic dispatch
@@ -116,7 +121,32 @@ async function currentState() {
   return load();
 }
 
-const countOpen = (s) => s.tasks.filter((t) => ['queued', 'active', 'paused'].includes(t.status)).length;
+const OPEN = core.TASK_STATUSES.filter((st) => st !== 'done' && st !== 'cancelled');
+const countOpen = (s) => s.tasks.filter((t) => OPEN.includes(t.status)).length;
+
+// Per-team review state for the current round. Uses core.reviewStatus when the
+// core has it; otherwise reads task.reviews directly (same contract).
+function reviewState(s, task) {
+  if (typeof core.reviewStatus === 'function') return core.reviewStatus(s, task);
+  const round = task.reviewRound || 0;
+  const out = { round, approved: [], changes: [], pending: [] };
+  for (const team of s.teams.filter((x) => x.taskId === task.id)) {
+    const r = (task.reviews || {})[team.id];
+    if (r && r.round === round && r.verdict === 'approved') out.approved.push(team.id);
+    else if (r && r.round === round && r.verdict === 'changes') out.changes.push(team.id);
+    else out.pending.push(team.id);
+  }
+  return out;
+}
+
+function reviewLine(s, task) {
+  const rs = reviewState(s, task);
+  const mark = (id) => (rs.approved.includes(id) ? `${id} ✓` : rs.changes.includes(id) ? `${id} ✗` : `${id} …`);
+  const ids = s.teams.filter((x) => x.taskId === task.id).map((x) => x.id);
+  return `in review (round ${rs.round}): ${ids.map(mark).join(', ') || '—'}`;
+}
+
+const VERDICTS = { approve: 'approved', approved: 'approved', ok: 'approved', changes: 'changes', change: 'changes', reject: 'changes' };
 
 async function hubCommand(sub, pos, opt) {
   switch (sub) {
@@ -211,13 +241,23 @@ function printStatus(s) {
     const total = `total ${dur(core.teamTotalMs(team, at))}`;
     if (task) console.log(`  ${bar(team.progress)}  on task ${dur(core.taskTeamMs(s, task, at)[team.id])} · ${total}`);
     else console.log(`  ${total}`);
-    for (const a of team.agents) console.log(`  · ${a.id.padEnd(10)} ${a.status.padEnd(8)} ${a.work}`);
+    for (const a of team.agents) {
+      if (a.role === 'reviewer') console.log(`  ★ ${`${a.id} reviewer`.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
+      else console.log(`  · ${a.id.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
+    }
+    if (team.issuesFound) console.log(`  issues caught by review: ${team.issuesFound}`);
   }
-  const open = s.tasks.filter((t) => ['queued', 'active', 'paused'].includes(t.status));
+  const open = s.tasks.filter((t) => OPEN.includes(t.status));
   console.log(`\nOpen tasks (${open.length})`);
   for (const t of open) {
     const teams = s.teams.filter((x) => x.taskId === t.id).map((x) => x.id).join(', ') || '—';
     console.log(`  ${t.id} [${t.status}] ${t.size === 'large' ? '(large) ' : ''}${t.title}\n        ${bar(t.progress)}  teams: ${teams}  active: ${dur(core.taskActiveMs(t, at))}`);
+    if (t.status === 'review') console.log(`        ${reviewLine(s, t)}`);
+    else if (t.reviewRound) {
+      const back = Object.entries(t.reviews || {}).filter(([, r]) => r.round === t.reviewRound && r.verdict === 'changes').map(([id]) => id);
+      console.log(`        review round ${t.reviewRound}${back.length ? `: changes requested by ${back.join(', ')}` : ''}`);
+    }
+    if (t.issuesFound) console.log(`        issues caught: ${t.issuesFound}`);
   }
 }
 
@@ -242,6 +282,12 @@ function printTask(s, task, at) {
   console.log(`  wall time    ${dur(wallMs(task, at))}${task.finishedAt ? '' : ' (so far)'}`);
   console.log(`  created      ${task.createdAt || '—'}`);
   if (task.finishedAt) console.log(`  finished     ${task.finishedAt}`);
+  if (task.reviewRound) {
+    console.log(`  review       round ${task.reviewRound}, ${task.issuesFound || 0} issues caught`);
+    for (const [id, r] of Object.entries(task.reviews || {})) {
+      console.log(`    ${id.padEnd(11)} ${r.verdict === 'approved' ? '✓ approved' : '✗ changes'} (round ${r.round}${r.issues ? `, ${r.issues} issues` : ''})${r.note ? ` — ${r.note}` : ''}`);
+    }
+  }
   const per = core.taskTeamMs(s, task, at);
   const rows = Object.entries(per).filter(([, ms]) => ms > 0).sort((a, b) => b[1] - a[1]);
   console.log('  team time');
@@ -258,12 +304,13 @@ function printTimes(s, taskId) {
   if (taskId) {
     return printTask(s, core.getTask(s, taskId), at);
   }
-  const cols = ['Team', 'Total', 'Done', 'Avg/done', 'Current task'];
+  const cols = ['Team', 'Total', 'Done', 'Avg/done', 'Issues', 'Current task'];
   const rows = core.teamStats(s, at).map((st) => [
     st.name,
     dur(st.totalMs),
     String(st.tasksDone),
     st.tasksDone ? dur(st.avgDoneMs) : '—',
+    String(st.issuesFound ?? s.teams.find((x) => x.id === st.id)?.issuesFound ?? 0),
     st.currentTaskId ? `${st.currentTaskId} (${dur(st.currentMs)})` : '(free)',
   ]);
   const widths = cols.map((c, i) => Math.max(c.length, ...rows.map((r) => r[i].length)));
@@ -342,9 +389,42 @@ async function main() {
       console.log(`${r.id} [${r.status}] ${r.progress}%`);
       return;
     }
+    case 'review': {
+      const id = pos[0];
+      if (!id) throw new core.DeptError('Usage: review <task>');
+      const patch = { status: 'review' };
+      const r = await run('POST', '/api/op', { type: 'updateTask', args: { id, patch, by: 'cli' } }, { type: 'updateTask', args: { id, patch, by: 'cli' } });
+      console.log(`${r.id} in review (round ${r.reviewRound ?? '?'})`);
+      return;
+    }
+    case 'verdict': {
+      const [taskId, word] = pos;
+      const verdict = VERDICTS[String(word || (opt.approve ? 'approve' : opt.changes ? 'changes' : '')).toLowerCase()];
+      if (!taskId || typeof opt.team !== 'string' || !verdict) {
+        throw new core.DeptError('Usage: verdict <task> --team <id> approve|changes [-m "note"] [--issues N]');
+      }
+      let issues = 0;
+      if (opt.issues !== undefined) {
+        issues = Number(opt.issues);
+        if (!Number.isInteger(issues) || issues < 0) throw new core.DeptError('--issues must be a whole number, 0 or more');
+      }
+      const args = { taskId, teamId: opt.team, verdict, note: typeof opt.message === 'string' ? opt.message : '', issues, by: typeof opt.by === 'string' ? opt.by : 'reviewer' };
+      const r = await run('POST', '/api/op', { type: 'reviewTask', args }, { type: 'reviewTask', args });
+      const id = r.task?.id || taskId;
+      const name = r.team?.name || opt.team;
+      if (verdict === 'changes') console.log(`${name} requested changes on ${id}${issues ? ` (${issues} issues)` : ''}; back to the builders (${r.task?.status || 'active'})`);
+      else if (r.approved) console.log(`${name} approved ${id}; all teams signed off, ready for done`);
+      else console.log(`${name} approved ${id}; still waiting on ${(r.pending || []).join(', ') || '—'}`);
+      return;
+    }
     case 'done': {
-      const r = await run('PATCH', `/api/tasks/${pos[0]}`, { status: 'done' }, { type: 'updateTask', args: { id: pos[0], patch: { status: 'done' } } });
-      console.log(`${r.id} done`);
+      // `done --force T-1` would read T-1 as the flag's value; take it back.
+      if (typeof opt.force === 'string') pos.unshift(opt.force);
+      const id = pos[0];
+      if (!id) throw new core.DeptError('Usage: done <task> [--force]');
+      const patch = opt.force ? { status: 'done', force: true } : { status: 'done' };
+      const r = await run('PATCH', `/api/tasks/${id}`, patch, { type: 'updateTask', args: { id, patch } });
+      console.log(`${r.id} done${opt.force ? ' (forced)' : ''}`);
       return;
     }
     case 'delete': {

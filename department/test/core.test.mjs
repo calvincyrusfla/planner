@@ -5,12 +5,13 @@ import * as core from '../lib/core.mjs';
 const fresh = () => core.createInitialState();
 const teamsOn = (s, id) => core.teamsOn(s, id).map((t) => t.id);
 
-test('department has 3 teams of 5 builders', () => {
+test('department has 3 teams of 5 builders and a reviewer', () => {
   const s = fresh();
   assert.equal(s.teams.length, 3);
   for (const t of s.teams) {
-    assert.equal(t.agents.length, 5);
-    assert.ok(t.agents.every((a) => a.role === 'builder'));
+    assert.equal(t.agents.length, 6);
+    assert.equal(t.agents.filter((a) => a.role === 'builder').length, 5);
+    assert.equal(t.agents.filter((a) => a.role === 'reviewer').length, 1);
   }
 });
 
@@ -40,7 +41,7 @@ test('tasks queue when every team is busy and start when one frees up', () => {
   const waiting = core.addTask(s, { title: 'Next' });
   assert.deepEqual(waiting.assigned, []);
   assert.equal(waiting.task.status, 'queued');
-  core.updateTask(s, big.id, { status: 'done' });
+  core.updateTask(s, big.id, { status: 'done', force: true });
   assert.equal(waiting.task.status, 'active');
   assert.equal(teamsOn(s, waiting.task.id).length, 1);
 });

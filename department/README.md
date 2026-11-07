@@ -1,6 +1,6 @@
 # Agent Department
 
-A local dashboard for a department of 3 agent teams (Alpha, Bravo, Charlie), each with 5 builder agents. Use it to see which team is on which task and how far along each task is. You can also reassign teams or take them off a task.
+A local dashboard for a department of 3 agent teams (Alpha, Bravo, Charlie). Each team has 6 agents: 5 builders and a reviewer that checks the team's work before a task can be marked done. Use it to see which team is on which task and how far along each task is. You can also reassign teams or take them off a task.
 
 No dependencies: it needs only Node 18 or newer.
 
@@ -87,18 +87,40 @@ npm run icons
 
 ## What the dashboard does
 
-- **Teams:** one card per team, showing its task, progress, focus area and what each of its 5 builders is doing (idle, assigned, working, blocked or done). Use **Reassign to…** to move the team to another task, or **Remove from task** to free it.
-- **Tasks:** each open task, with its progress bar and the teams on it. Click **×** on a team to remove it, or use **+ Add team…** to add one (a busy team is moved off its old task). You can also pause, queue, mark done, cancel or delete a task.
+- **Teams:** one card per team, showing its task, progress, focus area and what each of its 5 builders and its reviewer are doing (idle, assigned, working, blocked or done). The reviewer is shown below the builders with a **Reviewer** tag. Use **Reassign to…** to move the team to another task, or **Remove from task** to free it.
+- **Tasks:** each open task, with its progress bar and the teams on it. Click **×** on a team to remove it, or use **+ Add team…** to add one (a busy team is moved off its old task). You can also pause, queue, send to review, mark done, cancel or delete a task.
 - **Activity:** a live feed of assignments, moves and progress notes from the agents.
 - Updates stream in live while agents report progress.
-- **Time by team:** one card per team with its total time, tasks done, average time per done task and the task it's on now.
+- **Time by team:** one card per team with its total time, tasks done, average time per done task, issues its reviewer caught and the task it's on now.
 - The dashboard always uses a dark theme.
+
+## Reviews
+
+Each team's 6th agent (`alpha-6`, `bravo-6`, `charlie-6`) is its reviewer. When the builders finish, the task is sent to review and each team on it gets checked by its own reviewer.
+
+- **In review:** a task waiting for its reviewers. It keeps its teams, and its timers keep running.
+- **Sign-off:** each reviewer either approves or requests changes. **Changes requested** sends the task back to active for the builders to fix, and it's sent to review again for the next round. The task card shows the round and each team's verdict (Approved, Changes requested or Waiting); hover over a verdict to read the note.
+- **Done needs sign-off:** a task with teams on it can only be marked done once every team on it has approved in the current round. A team added during review has to approve too.
+- **Issues caught:** each verdict records how many issues the reviewer found. The task card shows the task's total, and **Time by team** shows each team's.
+
+On the dashboard, **Send to review** appears on an active task with a team. On a task in review, each team has **Approve** and **Request changes** (which asks for a note). **Mark done** on a task without full sign-off asks before skipping the review.
+
+From the CLI:
+
+```bash
+node department/dept.mjs review T-002
+node department/dept.mjs verdict T-002 --team bravo approve -m "Looks good" --issues 1
+node department/dept.mjs verdict T-002 --team bravo changes -m "Export drops the last row" --issues 2
+node department/dept.mjs done T-002 --force
+```
+
+`done` refuses a task that hasn't been signed off; `--force` marks it done anyway, and the activity feed notes that the review was skipped.
 
 ## Timers
 
 Every task and team keeps time. The numbers tick live on the dashboard.
 
-- **Active time:** how long a task has been active, meaning at least one team was on it. Time while it's queued or paused doesn't count.
+- **Active time:** how long a task has been active or in review, meaning at least one team was on it. Time while it's queued or paused doesn't count.
 - **Start to finish:** for a finished task, the time from when it was added to when it was done or cancelled, including any waiting.
 - **Team time:** on a task, how long each team has spent on it. A team that was moved off and back again keeps adding to the same number.
 - **Team totals:** in **Time by team**, each team's time across all tasks (deleted tasks too), how many done tasks it worked on, and its average time per done task.
@@ -122,7 +144,9 @@ node department/dept.mjs assign T-002 bravo --focus "API"
 node department/dept.mjs unassign T-002 bravo
 node department/dept.mjs progress T-002 --agent bravo-3 -m "Endpoint done"
 node department/dept.mjs progress T-002 --team bravo --pct 60
-node department/dept.mjs done T-002
+node department/dept.mjs review T-002
+node department/dept.mjs verdict T-002 --team bravo approve -m "Looks good" --issues 0
+node department/dept.mjs done T-002 [--force]
 node department/dept.mjs times
 node department/dept.mjs help
 ```
@@ -169,7 +193,7 @@ The dashboard keeps showing the last copy it got, and the header says **Shared b
 
 ## How the agents use it
 
-`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here, staffed with the assigned team's 5 builders (`.claude/agents/builder.md`), and progress is reported back as the work happens.
+`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here, staffed with the assigned team's 5 builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.
 
 ## Tests
 

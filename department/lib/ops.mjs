@@ -6,18 +6,28 @@
 import * as core from './core.mjs';
 
 const LOG_LIMIT = 500;
-const OPEN = new Set(['queued', 'active', 'paused']);
+const OPEN = new Set(['queued', 'active', 'review', 'paused']);
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const taskNumber = (n) => `T-${String(n).padStart(3, '0')}`;
 
 const OPS = {
   addTask: (state, { title, description, size } = {}) => core.addTask(state, { title, description, size }),
+  // patch is passed whole, so patch.force (done without review sign-off) gets through.
   updateTask: (state, { id, patch, by } = {}) => core.updateTask(state, id, patch || {}, by ? { by } : {}),
   deleteTask: (state, { id, by } = {}) => core.deleteTask(state, id, by ? { by } : {}),
   assignTeam: (state, { taskId, teamId, focus, by } = {}) =>
     core.assignTeam(state, taskId, teamId, { ...(focus ? { focus } : {}), ...(by ? { by } : {}) }),
   unassignTeam: (state, { taskId, teamId, by } = {}) => core.unassignTeam(state, taskId, teamId, by ? { by } : {}),
   reportProgress: (state, args = {}) => core.reportProgress(state, args),
+  reviewTask: (state, { taskId, teamId, verdict, note, issues, by } = {}) =>
+    core.reviewTask(state, {
+      taskId,
+      teamId,
+      verdict,
+      ...(note !== undefined ? { note } : {}),
+      ...(issues !== undefined ? { issues } : {}),
+      ...(by ? { by } : {}),
+    }),
   dispatch: (state) => core.dispatch(state),
   updateSettings: (state, { autoDispatch } = {}) => core.updateSettings(state, { autoDispatch }),
   reset: (state) => {
@@ -44,12 +54,15 @@ export function applyOp(state, op) {
 //   must still recognise it.)
 // - Every other task is appended under a fresh id (T-### from nextTaskNumber);
 //   its log entries (and task ids mentioned in them) are rewritten to match.
-// - Open tasks keep a team only if that team is free here; an active task that
-//   keeps no team goes back to the queue. Done/cancelled tasks have no team.
+// - Open tasks keep a team only if that team is free here; an active (or
+//   in-review) task that keeps no team goes back to the queue. Done/cancelled
+//   tasks have no team. A kept team keeps this board's roster (so an older
+//   5-agent board can't drop the reviewer); saved agent status/work is taken.
+//   Team issuesFound is this board's own count and is not overwritten.
 // - Logs are merged (duplicates dropped), sorted by `at` and capped at 500.
 // - Finally dispatch runs so queued work picks up free teams.
 
-const TEAM_IDENTITY = new Set(['id', 'name', 'color', 'taskId', 'totalMs']);
+const TEAM_IDENTITY = new Set(['id', 'name', 'color', 'taskId', 'totalMs', 'issuesFound', 'agents']);
 const logKey = (e) => JSON.stringify([e.at, e.kind, e.taskId, e.teamId, e.agentId, e.message]);
 
 export function importState(state, other) {
@@ -87,10 +100,16 @@ export function importState(state, other) {
         const ours = state.teams.find((t) => t.id === theirs.id);
         if (!ours || ours.taskId) continue;
         for (const [k, v] of Object.entries(theirs)) if (!TEAM_IDENTITY.has(k)) ours[k] = v;
+        const theirAgents = new Map((Array.isArray(theirs.agents) ? theirs.agents : []).map((a) => [a?.id, a]));
+        for (const agent of ours.agents) {
+          const a = theirAgents.get(agent.id);
+          if (!a) continue;
+          for (const k of ['status', 'work', 'updatedAt']) if (a[k] !== undefined) agent[k] = a[k];
+        }
         ours.taskId = task.id;
         kept++;
       }
-      if (!kept && task.status === 'active') {
+      if (!kept && core.isRunning(task)) {
         task.status = 'queued';
         if ('activeSince' in task) task.activeSince = null;
       }

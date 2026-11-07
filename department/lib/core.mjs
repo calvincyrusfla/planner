@@ -6,11 +6,18 @@ export const TEAM_DEFS = [
   { id: 'bravo', name: 'Team Bravo', color: '#1c7ed6' },
   { id: 'charlie', name: 'Team Charlie', color: '#2f9e44' },
 ];
-export const AGENTS_PER_TEAM = 5;
+// Each team: 5 builders (<team>-1..5) plus 1 reviewer (<team>-6) who checks
+// the team's work before a task is called done.
+export const BUILDERS_PER_TEAM = 5;
+export const AGENTS_PER_TEAM = BUILDERS_PER_TEAM + 1;
 
-export const TASK_STATUSES = ['queued', 'active', 'paused', 'done', 'cancelled'];
+export const TASK_STATUSES = ['queued', 'active', 'review', 'paused', 'done', 'cancelled'];
 export const AGENT_STATUSES = ['idle', 'assigned', 'working', 'blocked', 'done'];
-const OPEN = new Set(['queued', 'active', 'paused']);
+export const REVIEW_VERDICTS = ['approved', 'changes'];
+const OPEN = new Set(['queued', 'active', 'review', 'paused']);
+// Statuses in which a task's clock runs and its teams are at work.
+const RUNNING = new Set(['active', 'review']);
+export const isRunning = (task) => RUNNING.has(task?.status);
 const LOG_LIMIT = 500;
 
 export class DeptError extends Error {
@@ -34,6 +41,21 @@ const since = (iso, at) => {
 };
 const clampPct = (n) => Math.max(0, Math.min(100, Math.round(Number(n))));
 
+function makeAgents(t) {
+  const short = t.name.replace('Team ', '');
+  return Array.from({ length: AGENTS_PER_TEAM }, (_, i) => {
+    const reviewer = i === BUILDERS_PER_TEAM;
+    return {
+      id: `${t.id}-${i + 1}`,
+      name: reviewer ? `${short} Reviewer` : `${short} Builder ${i + 1}`,
+      role: reviewer ? 'reviewer' : 'builder',
+      status: 'idle',
+      work: '',
+      updatedAt: null,
+    };
+  });
+}
+
 export function createInitialState() {
   return {
     version: 1,
@@ -46,14 +68,8 @@ export function createInitialState() {
       progress: 0,
       assignedAt: null,
       totalMs: 0,
-      agents: Array.from({ length: AGENTS_PER_TEAM }, (_, i) => ({
-        id: `${t.id}-${i + 1}`,
-        name: `${t.name.replace('Team ', '')} Builder ${i + 1}`,
-        role: 'builder',
-        status: 'idle',
-        work: '',
-        updatedAt: null,
-      })),
+      issuesFound: 0,
+      agents: makeAgents(t),
     })),
     tasks: [],
     log: [],
@@ -86,7 +102,9 @@ export function getAgent(state, id) {
 
 export const idleTeams = (state) => state.teams.filter((t) => !t.taskId);
 export const teamsOn = (state, taskId) => state.teams.filter((t) => t.taskId === taskId);
-const runningTasks = (state) => state.tasks.filter((t) => t.status === 'active');
+const runningTasks = (state) => state.tasks.filter(isRunning);
+export const reviewerOf = (team) =>
+  team.agents.find((a) => a.role === 'reviewer') || team.agents.find((a) => a.id === `${team.id}-${AGENTS_PER_TEAM}`) || null;
 
 function log(state, entry) {
   state.log.push({ at: now(), ...entry });
@@ -99,9 +117,9 @@ function touch(task) {
 
 // ---------- time tracking ----------
 // Open/close the task's active interval so activeSince is set exactly while
-// status === 'active'. Call after every status change.
+// the task is running (status 'active' or 'review'). Call after every status change.
 function syncActive(task) {
-  if (task.status === 'active') {
+  if (isRunning(task)) {
     if (!task.activeSince) task.activeSince = now();
   } else if (task.activeSince) {
     task.activeMs = (task.activeMs || 0) + since(task.activeSince, clockNow());
@@ -150,6 +168,7 @@ export function teamStats(state, at = clockNow()) {
       currentMs: current ? taskTeamMs(state, current, at)[team.id] || 0 : 0,
       tasksDone: done.length,
       avgDoneMs: done.length ? Math.round(doneMs / done.length) : 0,
+      issuesFound: team.issuesFound || 0,
     };
   });
 }
@@ -167,11 +186,14 @@ export function formatDuration(ms) {
 }
 
 function setAgents(team, status, work = '') {
-  for (const a of team.agents) {
-    a.status = status;
-    a.work = work;
-    a.updatedAt = now();
-  }
+  for (const a of team.agents) setAgent(a, status, work);
+}
+
+function setAgent(agent, status, work = '') {
+  if (!agent) return;
+  agent.status = status;
+  agent.work = work;
+  agent.updatedAt = now();
 }
 
 // ---------- assignment primitives ----------
@@ -185,7 +207,9 @@ function attach(state, task, team, { focus = '', by = 'dispatcher' } = {}) {
   team.progress = task.progress;
   setAgents(team, 'assigned');
   if (!task.teamHistory.includes(team.id)) task.teamHistory.push(team.id);
-  task.status = 'active';
+  // A team joining a task in review joins the review: its reviewer is pending.
+  if (task.status === 'review') setAgent(reviewerOf(team), 'working', `Reviewing round ${task.reviewRound}`);
+  else task.status = 'active';
   syncActive(task);
   task.startedAt ||= now();
   touch(task);
@@ -204,7 +228,7 @@ function detach(state, task, team, { by = 'dispatcher', reason = '' } = {}) {
   // straight back to someone. Requeue it to make it eligible again.
   const remaining = teamsOn(state, task.id);
   if (remaining.length) task.progress = Math.round(remaining.reduce((s, t) => s + t.progress, 0) / remaining.length);
-  else if (task.status === 'active') task.status = 'paused';
+  else if (isRunning(task)) task.status = 'paused';
   syncActive(task);
   touch(task);
   log(state, {
@@ -263,6 +287,9 @@ export function addTask(state, { title, description = '', size = 'small' } = {})
     activeMs: 0,
     activeSince: null,
     teamMs: {},
+    reviewRound: 0,
+    reviews: {},
+    issuesFound: 0,
   };
   state.tasks.push(task);
   log(state, { kind: 'create', taskId: id, message: `${id} created (${size}): ${title}` });
@@ -309,8 +336,27 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
   if (patch.status !== undefined && patch.status !== task.status) {
     const status = patch.status;
     if (!TASK_STATUSES.includes(status)) throw new DeptError(`Unknown status ${status}`);
-    if (status === 'active' && !teamsOn(state, task.id).length) {
+    const onTask = teamsOn(state, task.id);
+    if (status === 'active' && !onTask.length) {
       throw new DeptError('Assign a team to make a task active, or set it to queued');
+    }
+    if (status === 'review' && !onTask.length) throw new DeptError('Assign a team before review');
+    let forced = false;
+    if (status === 'done' && onTask.length) {
+      const { pending, changes } = reviewStatus(state, task);
+      const missing = [...changes, ...pending];
+      if (missing.length) {
+        if (patch.force !== true) {
+          const names = missing.map((id) => getTeam(state, id).name).join(', ');
+          throw new DeptError(`${task.id} needs reviewer sign-off from ${names}. Send it to review, or mark it done with force.`);
+        }
+        forced = true;
+      }
+    }
+    if (status === 'review') {
+      task.reviewRound = (task.reviewRound || 0) + 1;
+      task.reviews ||= {};
+      for (const team of onTask) setAgent(reviewerOf(team), 'working', `Reviewing round ${task.reviewRound}`);
     }
     if (status === 'done' || status === 'cancelled' || status === 'paused' || status === 'queued') {
       for (const team of teamsOn(state, task.id)) detach(state, task, team, { by, reason: `task ${status}` });
@@ -319,11 +365,72 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
     syncActive(task);
     if (status === 'done') task.progress = 100;
     task.finishedAt = status === 'done' || status === 'cancelled' ? now() : null;
-    log(state, { kind: 'status', taskId: task.id, message: `${task.id} marked ${status} by ${by}` });
+    if (status === 'review') {
+      log(state, { kind: 'review', taskId: task.id, message: `${task.id} sent to review (round ${task.reviewRound})` });
+    } else if (forced) {
+      log(state, { kind: 'status', taskId: task.id, message: `${task.id} marked done without review by ${by}` });
+    } else {
+      log(state, { kind: 'status', taskId: task.id, message: `${task.id} marked ${status} by ${by}` });
+    }
   }
   touch(task);
   dispatch(state);
   return task;
+}
+
+// ---------- reviews ----------
+// Each team on a task has a reviewer (<team>-6). Sending a task to review opens
+// a new round; every attached team's reviewer must approve that round before
+// the task can be marked done (unless forced).
+
+export function reviewStatus(state, task) {
+  if (typeof task === 'string') task = getTask(state, task);
+  const round = task.reviewRound || 0;
+  const out = { round, approved: [], changes: [], pending: [] };
+  for (const team of teamsOn(state, task.id)) {
+    const r = task.reviews?.[team.id];
+    if (round > 0 && r && r.round === round && r.verdict === 'approved') out.approved.push(team.id);
+    else if (round > 0 && r && r.round === round && r.verdict === 'changes') out.changes.push(team.id);
+    else out.pending.push(team.id);
+  }
+  return out;
+}
+
+export function reviewTask(state, { taskId, teamId, verdict, note = '', issues = 0, by = 'reviewer' } = {}) {
+  const task = getTask(state, taskId);
+  if (task.status !== 'review') throw new DeptError(`${task.id} is not in review`);
+  if (!teamId) throw new DeptError('Say which team is reviewing');
+  const team = getTeam(state, teamId);
+  if (team.taskId !== task.id) throw new DeptError(`${team.name} is not on ${task.id}`);
+  if (verdict === 'approve') verdict = 'approved';
+  if (!REVIEW_VERDICTS.includes(verdict)) throw new DeptError("verdict must be 'approved' or 'changes'");
+  const count = issues === undefined || issues === null || issues === '' ? 0 : Number(issues);
+  if (!Number.isInteger(count) || count < 0) throw new DeptError('issues must be a non-negative whole number');
+  note = String(note ?? '');
+  const round = task.reviewRound || 0;
+  task.reviews ||= {};
+  task.reviews[team.id] = { verdict, note, issues: count, at: now(), round };
+  task.issuesFound = (task.issuesFound || 0) + count;
+  team.issuesFound = (team.issuesFound || 0) + count;
+  const reviewer = reviewerOf(team);
+  if (verdict === 'approved') {
+    setAgent(reviewer, 'done', `Approved round ${round}`);
+    log(state, { kind: 'review', taskId: task.id, teamId: team.id, agentId: reviewer?.id, message: `${team.name} reviewer approved ${task.id}` });
+  } else {
+    setAgent(reviewer, 'working', note);
+    task.status = 'active'; // back to the builders
+    syncActive(task);
+    log(state, {
+      kind: 'review',
+      taskId: task.id,
+      teamId: team.id,
+      agentId: reviewer?.id,
+      message: `${team.name} reviewer requested changes on ${task.id}: ${note}`,
+    });
+  }
+  touch(task);
+  const status = reviewStatus(state, task);
+  return { task, team, approved: verdict === 'approved' && status.pending.length === 0 && status.changes.length === 0, pending: [...status.changes, ...status.pending] };
 }
 
 export function deleteTask(state, taskId, { by = 'user' } = {}) {
@@ -396,7 +503,10 @@ export function normalize(state) {
   for (const task of state.tasks) {
     if (typeof task.activeMs !== 'number' || !Number.isFinite(task.activeMs)) task.activeMs = 0;
     if (!task.teamMs || typeof task.teamMs !== 'object') task.teamMs = {};
-    if (task.status === 'active') task.activeSince ||= task.startedAt || task.updatedAt || now();
+    if (!Number.isInteger(task.reviewRound) || task.reviewRound < 0) task.reviewRound = 0;
+    if (!task.reviews || typeof task.reviews !== 'object' || Array.isArray(task.reviews)) task.reviews = {};
+    if (typeof task.issuesFound !== 'number' || !Number.isFinite(task.issuesFound)) task.issuesFound = 0;
+    if (isRunning(task)) task.activeSince ||= task.startedAt || task.updatedAt || now();
     else task.activeSince = null;
   }
   const existing = new Map((state.teams || []).map((t) => [t.id, t]));
@@ -404,12 +514,23 @@ export function normalize(state) {
     const old = existing.get(t.id);
     if (!old) return t;
     const agents = new Map((old.agents || []).map((a) => [a.id, a]));
-    return { ...t, ...old, agents: t.agents.map((a) => ({ ...a, ...(agents.get(a.id) || {}) })) };
+    // Agents come from the current roster (adds the reviewer to old states);
+    // saved status/work is kept, identity (role, and the reviewer's name) is not.
+    return {
+      ...t,
+      ...old,
+      agents: t.agents.map((a) => {
+        const saved = agents.get(a.id);
+        if (!saved) return a;
+        return a.role === 'reviewer' ? { ...a, ...saved, role: a.role, name: a.name } : { ...a, ...saved, role: a.role };
+      }),
+    };
   });
   const tasks = new Map(state.tasks.map((t) => [t.id, t]));
   for (const team of state.teams) {
     if (team.taskId && !tasks.has(team.taskId)) team.taskId = null;
     if (typeof team.totalMs !== 'number' || !Number.isFinite(team.totalMs)) team.totalMs = 0;
+    if (typeof team.issuesFound !== 'number' || !Number.isFinite(team.issuesFound)) team.issuesFound = 0;
     if (team.taskId) team.assignedAt ||= tasks.get(team.taskId).startedAt || now();
     else team.assignedAt = null;
   }

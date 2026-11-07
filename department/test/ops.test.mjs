@@ -22,7 +22,7 @@ test('addTask maps onto core.addTask', () => {
 test('updateTask passes patch and by', () => {
   const s = fresh();
   op(s, 'addTask', { title: 'A' });
-  const t = op(s, 'updateTask', { id: 'T-001', patch: { status: 'done' }, by: 'tester' });
+  const t = op(s, 'updateTask', { id: 'T-001', patch: { status: 'done', force: true }, by: 'tester' });
   assert.equal(t.status, 'done');
   assert.match(s.log.at(-1).message, /by tester/);
   assert.deepEqual(teamsOn(s, 'T-001'), []);
@@ -71,7 +71,7 @@ test('dispatch and updateSettings', () => {
 test('every op type is covered and missing args are tolerated', () => {
   assert.deepEqual(OP_TYPES.sort(), [
     'addTask', 'assignTeam', 'deleteTask', 'dispatch', 'importState', 'reportProgress',
-    'reset', 'unassignTeam', 'updateSettings', 'updateTask',
+    'reset', 'reviewTask', 'unassignTeam', 'updateSettings', 'updateTask',
   ]);
   const s = fresh();
   assert.deepEqual(applyOp(s, { type: 'dispatch' }), []);
@@ -201,7 +201,7 @@ test('an imported task with no free team stays queued', () => {
 
 test('done and cancelled tasks import without teams', () => {
   const there = boardWith(['Done', 'Cancelled', 'Open'], (s) => {
-    core.updateTask(s, 'T-001', { status: 'done' });
+    core.updateTask(s, 'T-001', { status: 'done', force: true });
     core.updateTask(s, 'T-002', { status: 'cancelled' });
   });
   // Simulate a stale team pointer on the source board.
@@ -273,7 +273,7 @@ test('importState result is JSON-serialisable', () => {
 test('importState credits team time from added tasks only once', () => {
   const other = core.createInitialState();
   const t = core.addTask(other, { title: 'Done elsewhere' }).task;
-  core.updateTask(other, t.id, { status: 'done' });
+  core.updateTask(other, t.id, { status: 'done', force: true });
   t.teamMs = { alpha: 60_000 };
   const here = core.createInitialState();
   applyOp(here, { type: 'importState', args: { state: other } });
