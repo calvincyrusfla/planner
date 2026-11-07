@@ -6,7 +6,7 @@ import json
 import socket
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -387,3 +387,147 @@ def test_auto_mode_review_falls_back_to_known_teams_when_state_unreadable(tmp_pa
         server.shutdown()
     verdicts = [r["args"]["teamId"] for r in _FakeDashboard.received if r["type"] == "reviewTask"]
     assert verdicts == ["bravo"]
+
+
+# --------------------------------------------------------------- T-012: slow boards
+
+
+class _SlowDashboard(BaseHTTPRequestHandler):
+    """A dashboard whose op POSTs take ``delay`` seconds (it forwards to a slow shared board)."""
+
+    received: list[dict[str, Any]] = []
+    delay: dict[str, float] = {}
+    tasks: list[dict[str, Any]] = []
+    teams: list[dict[str, Any]] = [{"id": "alpha", "taskId": "T-077"}]
+
+    def _send(self, body: Any) -> None:
+        data = json.dumps(body).encode()
+        try:
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except OSError:
+            pass  # the client gave up waiting
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._send({"ok": True, "result": {"teams": type(self).teams, "tasks": type(self).tasks}})
+
+    def do_POST(self) -> None:  # noqa: N802
+        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        type(self).received.append(body)
+        time.sleep(type(self).delay.get(body["type"], 0.0))
+        result: Any = {"task": {"id": "T-077"}, "assigned": ["alpha"]} if body["type"] == "addTask" else {"ok": True}
+        self._send({"ok": True, "result": result})
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+def _serve_slow(delay: dict[str, float], tasks: list[dict[str, Any]] | None = None) -> ThreadingHTTPServer:
+    _SlowDashboard.received = []
+    _SlowDashboard.delay = delay
+    _SlowDashboard.tasks = tasks or []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SlowDashboard)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _recording_cli(tmp_path: Path) -> tuple[Path, Path]:
+    """A stand-in dept.mjs that records its argv (to prove an op was or was not replayed)."""
+    log_file = tmp_path / "cli.log"
+    cli = tmp_path / "department" / "dept.mjs"
+    cli.parent.mkdir(parents=True)
+    cli.write_text(
+        "require('fs').appendFileSync(%s, JSON.stringify(process.argv.slice(2)) + '\\n');\n" % json.dumps(str(log_file))
+    )
+    return cli, log_file
+
+
+def test_close_keeps_waiting_while_a_slow_board_keeps_answering(tmp_path: Path) -> None:
+    """Every op takes 0.15 s: 40 ops need ~6 s, beyond the old fixed 5 s flush; close() still drains."""
+    server = _serve_slow({"reportProgress": 0.15})
+    try:
+        bridge = BoardBridge(mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs")
+        bridge.register_task("F-1", "t", team_id="alpha")
+        for i in range(40):
+            bridge.progress("F-1", f"step {i}")
+        bridge.done("F-1")
+        assert bridge.close() is True
+    finally:
+        server.shutdown()
+    assert bridge.pending == 0
+    last = _SlowDashboard.received[-1]
+    assert last == {"type": "updateTask", "args": {"id": "T-077", "patch": {"status": "done"}, "by": "foundry"}}
+
+
+def test_close_gives_up_when_the_board_stalls_and_says_so(tmp_path: Path) -> None:
+    server = _serve_slow({"reportProgress": 3.0})
+    try:
+        bridge = BoardBridge(
+            mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=tmp_path / "x.mjs",
+            op_timeout=5.0, stall_timeout=0.3,
+        )
+        bridge.register_task("F-1", "t", team_id="alpha")
+        bridge.progress("F-1", "stuck")
+        bridge.done("F-1")
+        t0 = time.monotonic()
+        assert bridge.close() is False
+        assert time.monotonic() - t0 < 2.5
+    finally:
+        server.shutdown()
+    assert any("not delivered before exit" in w for w in bridge.stats.warnings)
+
+
+def test_timed_out_op_is_not_replayed_through_the_cli(tmp_path: Path) -> None:
+    """A POST the dashboard accepted but answered too late may be applied: never send it twice."""
+    cli, cli_log = _recording_cli(tmp_path)
+    server = _serve_slow({"reportProgress": 1.5})
+    try:
+        bridge = BoardBridge(
+            mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=cli, timeout=0.3, op_timeout=0.4
+        )
+        bridge.register_task("F-1", "t", team_id="alpha")
+        bridge.progress("F-1", "slow")
+        bridge.done("F-1")
+        assert bridge.close() is True
+    finally:
+        server.shutdown()
+    assert not cli_log.exists()
+    assert [r["type"] for r in _SlowDashboard.received] == ["addTask", "reportProgress", "updateTask"]
+    assert bridge.stats.failed == 1 and bridge.stats.transport == "dashboard"
+
+
+def test_timed_out_add_task_is_found_on_the_board_by_its_foundry_tag(tmp_path: Path) -> None:
+    cli, cli_log = _recording_cli(tmp_path)
+    tasks = [
+        {"id": "T-070", "title": "Add login", "description": "[Foundry F-1 · S] x", "status": "done"},  # an old run
+        {"id": "T-081", "title": "Add login", "description": "[Foundry F-1 · S] x", "status": "active"},
+        {"id": "T-082", "title": "Other", "description": "[Foundry F-1 · S] x", "status": "active"},
+    ]
+    _SlowDashboard.teams = [{"id": "alpha", "taskId": "T-081"}]
+    server = _serve_slow({"addTask": 1.5}, tasks)
+    try:
+        bridge = BoardBridge(
+            mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=cli, timeout=0.3, op_timeout=0.4
+        )
+        bridge.register_task("F-1", "Add login", "x", team_id="alpha")
+        bridge.done("F-1")
+        assert bridge.close() is True
+    finally:
+        server.shutdown()
+        _SlowDashboard.teams = [{"id": "alpha", "taskId": "T-077"}]
+    assert not cli_log.exists()
+    assert bridge.board_ids == {"F-1": "T-081"}
+    assert bridge.board_teams["F-1"] == ["alpha"]
+    assert _SlowDashboard.received[-1]["args"]["id"] == "T-081"
+
+
+def test_dashboard_url_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FOUNDRY_DASHBOARD_URL", "http://127.0.0.1:4950/")
+    assert BoardBridge("dry").dashboard_url == "http://127.0.0.1:4950"
+    assert BoardBridge("dry", dashboard_url="http://x:1").dashboard_url == "http://x:1"
+    monkeypatch.delenv("FOUNDRY_DASHBOARD_URL")
+    assert BoardBridge("dry").dashboard_url == "http://127.0.0.1:4300"
