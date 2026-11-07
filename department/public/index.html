@@ -289,12 +289,12 @@ function reviewGate(task) {
     const rs = reviewStatus(task);
     const missing = onTask.map((t) => t.id).filter((id) => !rs.approved.includes(id));
     return { ok: !missing.length, missing,
-      message: missing.length ? `${task.id} needs reviewer sign-off from ${missing.map(name).join(', ')}.` : '' };
+      message: missing.length ? `${task.id} needs reviewer sign-off from ${missing.map(name).join(', ')}. Send it to review, or mark it done with force.` : '' };
   }
   const worked = (task.teamHistory || []).length > 0;
   const round = task.reviewRound || 0;
   if (worked && !(round > 0 && task.approvedRound === round)) {
-    return { ok: false, missing: [], message: `${task.id} has no reviewer sign-off${round ? ` for review round ${round}` : ' (it was never reviewed)'}.` };
+    return { ok: false, missing: [], message: `${task.id} was worked on but has no reviewer sign-off. Mark it done with force.` };
   }
   return { ok: true, missing: [], message: '' };
 }
@@ -627,10 +627,12 @@ document.addEventListener('click', async (e) => {
       issues = Math.max(0, Math.floor(Number(count)) || 0);
     }
     const r = await api('POST', '/api/op', { type: 'reviewTask', args: { taskId, teamId, verdict, note, issues, by: 'user' } });
-    const left = (r && r.pending || []).filter((id) => id !== teamId);
-    toast(r && r.task && r.task.status === 'active' ? `Every reviewer has answered: ${taskId} is back with the builders for changes`
-      : r && r.approved ? `${taskId} approved by every reviewer, ready to mark done`
-      : `${teamName} ${verdict === 'changes' ? 'requested changes on' : 'approved'} ${taskId}${left.length ? `; waiting on ${left.map((id) => state.teams.find((t) => t.id === id)?.name || id).join(', ')}` : ''}`);
+    // Based on the reviewTask result: the task leaves review only once every team on it has a verdict.
+    const names = (ids) => (ids || []).map((id) => state.teams.find((t) => t.id === id)?.name || id).join(', ');
+    const waiting = r && r.pending && r.pending.length ? ` — waiting for ${names(r.pending)}` : '';
+    toast(r && r.approved ? `${taskId} approved by every reviewer, ready to mark done`
+      : r && r.complete ? `${taskId} back to the builders: changes requested by ${names(r.changes)}`
+      : `${verdict === 'changes' ? `Changes requested by ${teamName}` : `${teamName} approved ${taskId}`}${waiting}`);
   } else if (el.dataset.done) {
     const task = state.tasks.find((t) => t.id === el.dataset.done);
     const gate = task ? reviewGate(task) : { ok: true };

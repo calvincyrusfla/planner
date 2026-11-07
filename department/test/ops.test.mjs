@@ -270,6 +270,25 @@ test('importState result is JSON-serialisable', () => {
   assert.deepEqual(json(r), r);
 });
 
+test('importState credits team issuesFound from added tasks only once', () => {
+  const other = core.createInitialState();
+  const t = core.addTask(other, { title: 'Reviewed elsewhere', size: 'large' }).task;
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'changes', note: 'x', issues: 2 });
+  core.reviewTask(other, { taskId: t.id, teamId: 'bravo', verdict: 'approved', issues: 1 });
+  core.reviewTask(other, { taskId: t.id, teamId: 'charlie', verdict: 'approved' });
+  core.updateTask(other, t.id, { status: 'done', force: true });
+  const here = core.createInitialState();
+  applyOp(here, { type: 'importState', args: { state: json(other) } });
+  const issues = (id) => here.teams.find((x) => x.id === id).issuesFound;
+  assert.equal(issues('alpha'), 2);
+  assert.equal(issues('bravo'), 1);
+  assert.equal(issues('charlie'), 0);
+  applyOp(here, { type: 'importState', args: { state: json(other) } });
+  assert.equal(issues('alpha'), 2, 'a second import of the same board does not double it');
+  assert.equal(issues('bravo'), 1);
+});
+
 test('importState credits team time from added tasks only once', () => {
   const other = core.createInitialState();
   const t = core.addTask(other, { title: 'Done elsewhere' }).task;

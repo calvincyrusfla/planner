@@ -447,3 +447,201 @@ test('teamStats includes issuesFound', () => {
   assert.equal(stats.find((x) => x.teamId === 'bravo').issuesFound, 0);
   assert.equal(task.issuesFound, 4);
 });
+
+// ---------- round 2 decisions: multi-team rounds ----------
+
+test('a multi-team task stays in review until every team has a verdict', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Big', size: 'large' });
+  toReview(s, task.id);
+
+  let r = verdict(s, task.id, 'alpha', 'changes', { note: 'broken', issues: 2 });
+  assert.equal(task.status, 'review', 'one "changes" does not end the round');
+  assert.equal(r.complete, false);
+  assert.equal(r.approved, false);
+  assert.deepEqual(r.changes, ['alpha']);
+  assert.deepEqual([...r.pending].sort(), ['bravo', 'charlie']);
+  assert.equal(agent(s, 'bravo-6').status, 'working', 'other reviewers keep reviewing');
+
+  r = verdict(s, task.id, 'bravo', 'approved', { issues: 1 });
+  assert.equal(task.status, 'review');
+  assert.equal(r.complete, false);
+  assert.deepEqual(r.pending, ['charlie']);
+
+  const before = s.log.length;
+  r = verdict(s, task.id, 'charlie', 'approved');
+  assert.equal(r.complete, true);
+  assert.equal(r.approved, false);
+  assert.deepEqual(r.pending, []);
+  assert.deepEqual(r.changes, ['alpha']);
+  assert.equal(task.status, 'active', 'back to the builders after the last verdict');
+  assert.deepEqual(teamsOn(s, task.id), ['alpha', 'bravo', 'charlie']);
+
+  assert.deepEqual(Object.keys(task.reviews).sort(), ['alpha', 'bravo', 'charlie']);
+  assert.equal(task.reviews.alpha.verdict, 'changes');
+  assert.equal(task.reviews.bravo.verdict, 'approved');
+  assert.equal(task.reviews.charlie.verdict, 'approved');
+  for (const id of ['alpha', 'bravo', 'charlie']) assert.equal(task.reviews[id].round, 1);
+  assert.equal(task.issuesFound, 3);
+  assert.equal(team(s, 'alpha').issuesFound, 2);
+  assert.equal(team(s, 'bravo').issuesFound, 1);
+  assert.ok(
+    s.log.slice(before).some((e) => e.message.includes('back to the builders: changes requested by Team Alpha')),
+    'log names the teams that asked for changes',
+  );
+  assert.notEqual(task.approvedRound, task.reviewRound);
+});
+
+test('all teams approving keeps the task in review and sets approvedRound', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Big', size: 'large' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  verdict(s, task.id, 'bravo', 'approved');
+  assert.notEqual(task.approvedRound, task.reviewRound, 'not approved until the last team signs off');
+  const r = verdict(s, task.id, 'charlie', 'approved');
+  assert.equal(r.approved, true);
+  assert.equal(r.complete, true);
+  assert.deepEqual(r.pending, []);
+  assert.deepEqual(r.changes, []);
+  assert.equal(task.status, 'review');
+  assert.equal(task.approvedRound, task.reviewRound);
+  assert.equal(task.approvedRound, 1);
+});
+
+test('a team re-giving a verdict in the same round: the latest wins', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Big', size: 'large' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'changes', { note: 'hmm' });
+  verdict(s, task.id, 'alpha', 'approved', { note: 'fine after all' });
+  let st = core.reviewStatus(s, task);
+  assert.deepEqual(st.approved, ['alpha']);
+  assert.deepEqual(st.changes, []);
+  assert.deepEqual([...st.pending].sort(), ['bravo', 'charlie']);
+  assert.equal(task.reviews.alpha.note, 'fine after all');
+
+  verdict(s, task.id, 'bravo', 'approved');
+  verdict(s, task.id, 'bravo', 'changes', { note: 'spotted a bug' });
+  st = core.reviewStatus(s, task);
+  assert.deepEqual(st.approved, ['alpha']);
+  assert.deepEqual(st.changes, ['bravo']);
+  assert.deepEqual(st.pending, ['charlie']);
+  assert.equal(task.status, 'review');
+
+  const r = verdict(s, task.id, 'charlie', 'approved');
+  assert.equal(r.complete, true);
+  assert.deepEqual(r.changes, ['bravo']);
+  assert.equal(task.status, 'active');
+});
+
+// ---------- round 2 decisions: done gate ----------
+
+test('a worked task paused without sign-off needs force to be done', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Worked' });
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.deepEqual(teamsOn(s, task.id), []);
+  assert.throws(
+    () => core.updateTask(s, task.id, { status: 'done' }),
+    isDeptError(/has no reviewer sign-off/),
+  );
+  assert.equal(task.status, 'paused');
+  const gate = core.reviewGate(s, task);
+  assert.equal(gate.ok, false);
+  assert.ok(Array.isArray(gate.missing));
+  assert.match(gate.message, /has no reviewer sign-off/);
+
+  core.updateTask(s, task.id, { status: 'done', force: true });
+  assert.equal(task.status, 'done');
+});
+
+test('a task worked and reviewed but paused before approval still needs force', () => {
+  const { s, task } = inReview();
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), isDeptError(/has no reviewer sign-off/));
+});
+
+test('a task that never had a team passes the gate', () => {
+  const s = fresh();
+  core.updateSettings(s, { autoDispatch: false });
+  const { task } = core.addTask(s, { title: 'Never staffed' });
+  const gate = core.reviewGate(s, task);
+  assert.equal(gate.ok, true);
+  assert.deepEqual(gate.missing, []);
+  core.updateTask(s, task.id, { status: 'done' });
+  assert.equal(task.status, 'done');
+});
+
+test('a task approved by all, then paused, can be done without force', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Big', size: 'large' });
+  toReview(s, task.id);
+  for (const id of ['alpha', 'bravo', 'charlie']) verdict(s, task.id, id, 'approved');
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.deepEqual(teamsOn(s, task.id), []);
+  assert.equal(core.reviewGate(s, task).ok, true);
+  core.updateTask(s, task.id, { status: 'done' });
+  assert.equal(task.status, 'done');
+  assert.ok(!s.log.some((e) => e.message.includes('without review')));
+});
+
+test('reviewGate reports missing teams and the refusal message', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Big', size: 'large' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  const gate = core.reviewGate(s, task);
+  assert.equal(gate.ok, false);
+  assert.equal(gate.missing.length, 2);
+  assert.ok(gate.missing.every((m) => /bravo|charlie/i.test(String(m?.id ?? m?.name ?? m))));
+  assert.match(gate.message, /needs reviewer sign-off from/);
+  assert.match(gate.message, /Team Bravo/);
+  assert.match(gate.message, /Team Charlie/);
+  assert.doesNotMatch(gate.message, /Team Alpha/);
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), (e) => e instanceof core.DeptError && e.message === gate.message);
+
+  verdict(s, task.id, 'bravo', 'approved');
+  verdict(s, task.id, 'charlie', 'approved');
+  const ok = core.reviewGate(s, task);
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.missing, []);
+});
+
+// ---------- round 2 decisions: log attribution ----------
+
+test("verdict log says '(by user)' for the user and nothing for the reviewer", () => {
+  const { s, task } = inReview();
+  verdict(s, task.id, 'alpha', 'changes', { note: 'from the dashboard', by: 'user' });
+  const userLine = s.log.findLast((e) => e.message.includes('reviewer requested changes'));
+  assert.match(userLine.message, /\(by user\)/);
+
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved', { by: 'reviewer' });
+  const revLine = s.log.findLast((e) => e.message.includes(`reviewer approved ${task.id}`));
+  assert.doesNotMatch(revLine.message, /\(by /);
+
+  // Still in review; re-verdict in the same round without `by` defaults to the reviewer.
+  verdict(s, task.id, 'alpha', 'approved');
+  const defLine = s.log.findLast((e) => e.message.includes(`reviewer approved ${task.id}`));
+  assert.doesNotMatch(defLine.message, /\(by /);
+});
+
+// ---------- round 2 decisions: normalize ----------
+
+test('normalize sets the idle reviewer of a team on a task to assigned', () => {
+  const old = fresh();
+  const { task } = core.addTask(old, { title: 'Running' });
+  for (const t of old.teams) t.agents = t.agents.filter((a) => a.role === 'builder');
+  const s = core.normalize(json(old));
+  assert.equal(team(s, 'alpha').taskId, task.id);
+  assert.equal(agent(s, 'alpha-6').status, 'assigned');
+  assert.equal(agent(s, 'bravo-6').status, 'idle', 'a free team keeps an idle reviewer');
+  assert.equal(agent(s, 'alpha-2').status, 'assigned', 'builders are untouched');
+
+  // A reviewer that is already busy is left alone.
+  const busy = core.normalize(json(old));
+  agent(busy, 'alpha-6').status = 'working';
+  core.normalize(busy);
+  assert.equal(agent(busy, 'alpha-6').status, 'working');
+});
