@@ -919,7 +919,7 @@ def test_real_mode_only_dispatches_tasks_of_the_current_repo(tmp_path: Path) -> 
     assert _run(run_real(args_b, cfg, cb, SimulatedGemmaClient(), out=out2.append)) == EXIT_DONE
     text = "\n".join(out2)
     assert re.search(r"F-001 \(repo .*repoA\) is unfinished - rerun with --repo \".*repoA\" to resume it", text), text
-    assert all("Task F-002" in c.prompt or "review task F-002" in c.prompt.lower() for c in cb.history), "B's run touched A's task"
+    assert cb.history and all("task f-002" in c.prompt.lower() for c in cb.history), "B's run touched A's task"
     assert {c.cwd for c in cb.history} == {str(b.resolve())}
     patches = sorted(p.name for p in (tmp_path / "patches").glob("*.patch"))
     assert patches == ["F-002.patch"]

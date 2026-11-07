@@ -154,7 +154,14 @@ Before doing anything, real mode runs two preflight checks. If either fails it p
 
 It then sizes the order and runs the teams with `ClaudeCodeClient` and `OllamaGemmaClient`. Claude Code must be logged in under your subscription.
 
-When the run ends, real mode prints each task's state. As applicable, it also prints the quarantine reason, the last infrastructure error, and `paused until HH:MM (usage limit) - rerun the same command to resume`. The factory is always shut down cleanly, even after `--timeout`.
+When the run ends, real mode prints each task's state. As applicable, it also prints the quarantine reason and the last infrastructure error. For a task that isn't finished it prints the real cause:
+
+- `paused until 15:00 (usage limit) - rerun the same command to resume`. The weekday and date are added when the pause doesn't end today, e.g. `Sun 8 Nov 15:00`;
+- `Claude Code is not logged in - run claude and /login, then rerun the same command`;
+- `Claude Code was not found - install it or set FOUNDRY_CLAUDE_BIN, ...`;
+- otherwise, still in progress.
+
+The factory is always shut down cleanly, even after `--timeout`.
 
 | Exit code | Meaning |
 |---|---|
@@ -163,17 +170,23 @@ When the run ends, real mode prints each task's state. As applicable, it also pr
 | `2` | preflight failed (Claude Code or Gemma not ready) |
 | `3` | still in progress: `--timeout` was reached, or the line is paused at the usage limit |
 
-**Resuming.** Run the same command again. An unfinished task with the same `--title` and `--files` is resumed from the database, not submitted a second time.
+**Resuming.** Run the same command again. An unfinished task with the same `--title`, `--files` and `--repo` is resumed from the database, not submitted a second time.
+
+**Tasks belong to a repository.** Each task records the `--repo` it was submitted for, and `--real` only dispatches tasks of the current `--repo`. At startup it lists every other unfinished task with the command to resume it, for example `F-001 (repo C:\work\A) is unfinished - rerun with --repo "C:\work\A" to resume it`. Repo names match case-insensitively on Windows. Tasks from older databases have no recorded repo; they are listed as `unknown repo` and are never dispatched by `--real`.
 
 **Your working tree is never modified:**
 
 - Claude runs with `cwd` = the target repo, but only as a diff-only builder or reviewer.
-- Gates apply each diff to a scratch copy of the repo (`.git`, `node_modules`, `.venv` and caches are left out).
-- Each approved task ends up as two files in `FOUNDRY_PATCHES_DIR` (default `foundry\data\patches\`):
+- Gates apply each diff to a scratch copy of the repo. `.git`, `node_modules`, `.venv` and caches are left out, and symlinks are copied as links, never followed.
+- Each approved task ends up as two files in the patches folder. By default that is `patches\` **next to the database** (`foundry\data\patches\` with the default `FOUNDRY_DB_PATH`); `FOUNDRY_PATCHES_DIR` overrides it:
   - `<task>.patch`: the combined approved diff, one hunk set per subtask. A subtask approved again after a resume replaces its earlier diff instead of being added twice;
   - `<task>.md`: the commit message and PR body.
 
-  When git is installed, Foundry first runs `git apply --check` on the combined patch against a scratch copy. If the subtasks' diffs conflict, the patch is saved as `<task>.patch.rejected` for a manual merge, and a warning is logged.
+  When git is installed, Foundry first runs `git apply --check` on the combined patch against a scratch copy of the task's repo. If the subtasks' diffs conflict, the patch is saved as `<task>.patch.rejected` for a manual merge, and a warning is logged.
+
+  A task's files never lie:
+  - writing `<task>.patch` deletes a stale `<task>.patch.rejected` from an earlier attempt, and the reverse;
+  - a file of the same name with *different* content (another database, a reset) is never overwritten. Foundry writes `<task>-2.patch` (the next free number) and prints the exact file name it used.
 
 Review the patch, then apply it yourself from the target repo's root:
 
@@ -190,7 +203,17 @@ git commit -F C:\path\to\planner\foundry\data\patches\F-001.md
 - `--strict-mcp-config`;
 - `--append-system-prompt` with `claude_append_prompt`. That prompt says the agent is a Foundry builder or reviewer whose only output is the diff or JSON, and that it must ignore repository instructions (such as this repo's `CLAUDE.md`) to register tasks or spawn agents.
 
-Flags in `FOUNDRY_CLAUDE_ARGS` are **appended** to these defaults. Set `FOUNDRY_CLAUDE_ARGS_REPLACE=1` to use only your flags instead. On Windows the value is split the Windows way, and surrounding quotes are removed. `FOUNDRY_CLAUDE_APPEND_PROMPT` replaces the role prompt; `none` turns it off.
+Flags in `FOUNDRY_CLAUDE_ARGS` are **appended** to these defaults. Set `FOUNDRY_CLAUDE_ARGS_REPLACE=1` to use only your flags instead. `FOUNDRY_CLAUDE_APPEND_PROMPT` replaces the role prompt; `none` turns it off.
+
+The value is split the same way on every platform:
+
+- whitespace separates arguments;
+- single or double quotes group words and are removed;
+- backslashes are always literal, so `--mcp-config "C:\Users\John Smith\mcp.json"` works as written;
+- `#` is not a comment;
+- an unbalanced quote is an error.
+
+A JSON value must be wrapped in single quotes, for example `--settings '{"model": "sonnet"}'`. A literal `"` (or `%`) can never reach Claude through `claude.cmd`, because Windows cmd can't pass it safely. The `--real` preflight refuses such arguments; use `claude.exe` (the native installer) or put the JSON in a file.
 
 ### What happens at the Claude usage limit
 
@@ -224,7 +247,7 @@ Foundry is restart-safe on the same database:
 - On start, `build_factory` calls `queue.resume()`, which reopens tickets a crashed worker left claimed.
 - The Floor Manager reloads its state from the queue's key-value table: directives, orders, allocations, board task ids, PR drafts, reported quarantines and applied alert ids.
 - New work orders continue numbering after the highest `F-###` in the database.
-- `--real` resumes an unfinished task with the same title and files.
+- `--real` resumes an unfinished task with the same title, files and repo, and only dispatches tasks of its own `--repo`.
 - Escalations are idempotent per `alert_id`: an alert that was already applied is not applied or posted again.
 
 ## How it feeds the Agent Department dashboard
@@ -251,7 +274,7 @@ Every board task is registered as `small` with `builders` = the Foundry allocati
 - **The Foundry team is free on the board** (or the board already picked it): the bridge assigns it and unassigns the other teams the board just auto-assigned. Those teams were free a moment earlier.
 - **The Foundry team is busy on another open board task**, for example one of your own (or the board state can't be read): **the bridge never moves it**. The board's own assignment stays as it is. At review time Foundry posts a verdict for *every* team on that board task, so `done` is never refused.
 
-Your own board work is never paused or left without a team by Foundry.
+In that busy case the verdicts Foundry posts are *Foundry's* review result, recorded under each board team's reviewer id (`<team>-6`). They are not a review by those teams. Progress for that task is posted as plain messages: no agent, team or status, so it never changes the busy team's agents. Your own board work is never paused or left without a team by Foundry.
 
 Run `npm run dashboard` to watch Foundry tasks appear live. If a shared board (hub) is configured, the dashboard forwards to it like any other client. In tests use `mode="dry"`: it records ops in `bridge.ops` and makes no I/O.
 
@@ -281,7 +304,7 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_CLAUDE_ARGS_REPLACE` | `1` = `FOUNDRY_CLAUDE_ARGS` replaces the defaults instead |
 | `FOUNDRY_INFRA_FAILURE_CAP` | `3` consecutive infrastructure failures on one ticket before it is quarantined |
 | `FOUNDRY_CLAUDE_APPEND_PROMPT` | the Foundry role prompt; `none` = no `--append-system-prompt` |
-| `FOUNDRY_PATCHES_DIR` | `foundry/data/patches` |
+| `FOUNDRY_PATCHES_DIR` | `patches/` next to the database (`foundry/data/patches` by default) |
 
 ## Escalation actions (Floor Manager)
 
