@@ -19,12 +19,14 @@ When the user assigns a task, you are the department head. Don't do the work alo
 
 1. Decide if it is large (multiple features or areas, a rewrite, or work that would take one team a long time) or small.
    Before staffing a large task, glance at `node department/dept.mjs usage`. If the 5-hour meter is at 90% or more, tell the user before spawning many agents.
+   Also pick the crew: how many builders each team puts on it (1–5). Small ≈ 1–2 (a tiny fix can use 1), medium ≈ 3, large = 5. Without `--builders`, small tasks get 2 and large tasks 5.
 2. Register it, which also assigns the team(s):
    ```bash
-   node department/dept.mjs add "Short title" --desc "What the user asked for" [--large]
+   node department/dept.mjs add "Short title" --desc "What the user asked for" [--large] [--builders N]
    ```
-3. Check who is on it with `node department/dept.mjs status`. If it is queued, tell the user it is waiting and which task is holding the teams.
-4. For each assigned team, split the team's share of the work into 5 slices that don't overlap, then spawn the 5 builders in parallel with the Agent tool (`subagent_type: "builder"`). When several teams share a task, give each team a separate area first (`node department/dept.mjs assign <task> <team> --focus "area"` records it). Each spawn prompt names the agent id, team, task id, the whole task, that agent's slice and what its teammates own.
+   To change the crew later: `node department/dept.mjs set <task> --builders N`.
+3. Check who is on it with `node department/dept.mjs status`. It shows each task's crew. If it is queued, tell the user it is waiting and which task is holding the teams.
+4. For each assigned team, split the team's share of the work into as many slices as the task's crew (shown by `status`), with no overlap, then spawn that many builders (`<team>-1` … `<team>-N`) in parallel with the Agent tool (`subagent_type: "builder"`). The other builders stay on standby. The team's reviewer always reviews, whatever the crew size. When several teams share a task, give each team a separate area first (`node department/dept.mjs assign <task> <team> --focus "area"` records it). Each spawn prompt names the agent id, team, task id, the whole task, that agent's slice and what its teammates own.
 5. As builders finish, report team progress:
    ```bash
    node department/dept.mjs progress <task> --team <team> --pct <N> -m "note"
@@ -35,7 +37,7 @@ When the user assigns a task, you are the department head. Don't do the work alo
    ```
    Then spawn every assigned team's reviewer in parallel with the Agent tool (`subagent_type: "reviewer"`, agent id `<team>-6`). Its spawn prompt names the team, task id, the whole task, each builder's slice and report, and the review round. On a large task shared by several teams, give each team's reviewer a focus area (tests and code / look and behaviour / data safety and end to end), and have every reviewer also check where its team's work meets the other teams' work. If the shared board refuses `review` or `verdict` (older code on the hub), still run the reviewers, and record their verdicts once the hub is updated.
 7. Each reviewer records its verdict with `node department/dept.mjs verdict <task> --team <team> approve|changes -m "..." --issues <N>` (a later verdict in the same round replaces its earlier one). The task stays in review until every team on it has given a verdict. Wait for all of them. If any reviewer asked for changes, the task then goes back to active: send the findings to the builders who own those slices, have them fix it, then run `review` again for the next round. Repeat until every team on the task has approved.
-8. Once all reviewers have approved, do a final check of the whole task yourself (run the checks, try the feature), commit and push. Then `node department/dept.mjs done <task>`; freed teams pick up queued tasks automatically. `done` refuses a task that lacks sign-off, including one whose teams have since been removed; use `done <task> --force` only when the user says so.
+8. Once all reviewers have approved, do a final check of the whole task yourself (run the checks, try the feature), commit and push. Pull requests are squash-merged, so checkpoint commits on the branch are fine: they collapse into one commit on merge. Write the PR description so it reads well as that single squash commit message. Then `node department/dept.mjs done <task>`; freed teams pick up queued tasks automatically. `done` refuses a task that lacks sign-off, including one whose teams have since been removed; use `done <task> --force` only when the user says so.
 9. Before spawning or continuing work on a task, run `status` again. If the user removed a team from the task, stop using that team for it. If they moved a team to another task, staff that task with it.
 
 **Shared board:** before registering a task, run `node department/dept.mjs hub status`. When a shared board is configured (`department/data/hub.json` on the user's PC, or `DEPT_HUB_URL` in cloud sessions, where the network proxy supplies the passcode), every CLI command goes to it automatically, so tasks from Claude sessions and from the PC land on the same board. If the hub is configured but unreachable, tell the user and log the task locally.

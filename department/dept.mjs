@@ -5,6 +5,7 @@
 import * as core from './lib/core.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
@@ -27,9 +28,11 @@ const BASE = process.env.DEPT_URL || `http://127.0.0.1:${process.env.PORT || 430
 const HELP = `Agent Department CLI
 
   node department/dept.mjs status                      Teams, agents and open tasks
-  node department/dept.mjs add "Title" [--large] [--desc "..."]
+  node department/dept.mjs add "Title" [--large] [--builders 1-5] [--desc "..."]
                                                        New task; auto-assigns a team
-                                                       (all teams if large and nothing else runs)
+                                                       (all teams if large and nothing else runs).
+                                                       --builders: builders per team (default 2
+                                                       small, 5 large); the reviewer always reviews
   node department/dept.mjs assign <task> <team> [--focus "..."]
                                                        Put a team on a task (moves it off its old one)
   node department/dept.mjs unassign <task> <team>      Remove a team from a task
@@ -37,7 +40,9 @@ const HELP = `Agent Department CLI
                        [--pct 40] [--status working|blocked|done] [-m "note"]
                                                        Report progress
   node department/dept.mjs set <task> [--status queued|review|paused|done|cancelled] [--pct N]
-                       [--title "..."] [--size small|large]
+                       [--title "..."] [--size small|large] [--builders 1-5]
+                                                       --builders changes the crew per team; the
+                                                       rest of each team stands by
   node department/dept.mjs review <task>               Send a task to its teams' reviewers (In review)
   node department/dept.mjs verdict <task> --team <id> approve|changes [-m "note"] [--issues N]
                                                        Record a team reviewer's verdict; changes
@@ -55,6 +60,10 @@ const HELP = `Agent Department CLI
                        [--week <pct>] [--week-reset <iso|epoch>] [--source X]
                                                        Store a usage report by hand (testing); the
                                                        status line (npm run usage-meter) does this
+  node department/dept.mjs usage refresh               Fetch live usage from Anthropic with Claude
+                                                       Code's saved login on this PC (unofficial
+                                                       endpoint; at most every 30 s via the dashboard;
+                                                       env DEPT_USAGE_DIRECT=off disables it)
   node department/dept.mjs json                        Dump the full state
   node department/dept.mjs reset                       Wipe all tasks and reset the teams
 
@@ -153,6 +162,35 @@ function reviewLine(s, task) {
   return `in review (round ${rs.round}): ${ids.map(mark).join(', ') || '—'}`;
 }
 
+// Builders per team on a task: core.crewFor when the core has it, else the
+// task's own field, else the size default (small 2, large 5).
+const DEFAULT_CREW = core.DEFAULT_BUILDERS || { small: 2, large: 5 };
+function crewOf(task) {
+  if (!task) return null;
+  if (typeof core.crewFor === 'function') return core.crewFor(task);
+  return Number.isInteger(task.builders) ? task.builders : DEFAULT_CREW[task.size] || DEFAULT_CREW.small;
+}
+
+// --builders N → integer 1-5, or a clear error.
+function buildersArg(value) {
+  const max = core.BUILDERS_PER_TEAM || 5;
+  const msg = `--builders must be a whole number from 1 to ${max}`;
+  if (typeof value !== 'string' || !/^\s*\d+\s*$/.test(value)) throw new core.DeptError(msg);
+  const n = Number(value);
+  if (n < 1 || n > max) throw new core.DeptError(msg);
+  return n;
+}
+
+// A builder is on standby when its number is above its team's task crew (or
+// the core already marked it "Standby").
+function isStandby(agent, task) {
+  if (agent.role === 'reviewer') return false;
+  const crew = crewOf(task);
+  const n = Number(String(agent.id).split('-').pop());
+  if (crew && Number.isInteger(n)) return n > crew && !['working', 'blocked', 'done'].includes(agent.status);
+  return agent.status === 'idle' && agent.work === 'Standby';
+}
+
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 // Would marking this task done skip missing reviewer sign-off? Uses
@@ -223,9 +261,84 @@ function printUsage(s) {
   }
 }
 
+// `usage refresh`: through the local dashboard server when it runs (it throttles
+// and stores the result), else read the login and ask Anthropic from here and
+// store the report like any other op. The token stays inside usage-direct.mjs.
+// The direct path has the same 30 s throttle as the server, kept in a small file
+// next to the state file; only attempts that reached Anthropic count.
+const REFRESH_GAP_MS = 30 * 1000;
+const REFRESH_LAST_FILE = path.join(path.dirname(DATA_FILE), 'usage-refresh-last.json');
+const OLD_DASHBOARD =
+  'Your dashboard is running older code — restart it (close it, stop the server, reopen the shortcut) to enable usage refresh.';
+
+function lastRefreshAt() {
+  try {
+    const at = Number(JSON.parse(fs.readFileSync(REFRESH_LAST_FILE, 'utf8')).at);
+    return Number.isFinite(at) ? at : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function markRefresh() {
+  try {
+    fs.mkdirSync(path.dirname(REFRESH_LAST_FILE), { recursive: true });
+    fs.writeFileSync(REFRESH_LAST_FILE, JSON.stringify({ at: Date.now() }) + '\n');
+  } catch {
+    /* throttle is best effort */
+  }
+}
+
+async function usageRefresh() {
+  let res;
+  try {
+    res = await fetch(`${BASE}/api/usage/refresh`, { method: 'POST', signal: AbortSignal.timeout(20000) });
+  } catch {
+    res = null; // dashboard not running
+  }
+  let usage;
+  if (res) {
+    // A dashboard from before usage refresh has no such route. Don't fall back to the
+    // direct path, so the dashboard's throttle can't be sidestepped.
+    if (res.status === 404) throw new core.DeptError(OLD_DASHBOARD, 404);
+    let json;
+    try {
+      json = await res.json();
+    } catch {
+      throw new core.DeptError(`Unexpected answer from the dashboard server at ${BASE} (HTTP ${res.status})`);
+    }
+    if (!json.ok) throw new core.DeptError(json.error || `Usage refresh failed (HTTP ${res.status})`, res.status);
+    usage = json.result?.usage;
+  } else {
+    const direct = await import('./lib/usage-direct.mjs');
+    const wait = lastRefreshAt() + REFRESH_GAP_MS - Date.now();
+    if (wait > 0 && direct.isUsageDirectEnabled(process.env)) {
+      throw new core.DeptError(`Wait ${Math.ceil(wait / 1000)} s before refreshing again`, 429);
+    }
+    // Marks the throttle when a request is actually sent; passed straight through otherwise.
+    const fetchImpl = (...a) => {
+      markRefresh();
+      return globalThis.fetch(...a);
+    };
+    let args;
+    try {
+      // Resolves to {type: 'reportUsage', args}; it refuses itself when DEPT_USAGE_DIRECT=off.
+      args = (await direct.refreshUsageFromAnthropic({ env: process.env, fetchImpl })).args;
+    } catch (err) {
+      // Only usage-direct's own short, token-free messages are shown.
+      throw new core.DeptError(err instanceof direct.UsageDirectError ? err.message : "Couldn't refresh usage from Anthropic.");
+    }
+    const r = await run('POST', '/api/op', { type: 'reportUsage', args }, { type: 'reportUsage', args });
+    usage = r?.usage;
+  }
+  console.log('Usage updated from Anthropic.');
+  if (usage) printUsage({ usage });
+}
+
 async function usageCommand(sub, opt) {
   if (sub === undefined || sub === 'show' || sub === 'status') return printUsage(await currentState());
-  if (sub !== 'report') throw new core.DeptError(`Unknown usage command ${sub}; use \`usage\` or \`usage report ...\``);
+  if (sub === 'refresh' || sub === 'update') return usageRefresh();
+  if (sub !== 'report') throw new core.DeptError(`Unknown usage command ${sub}; use \`usage\`, \`usage refresh\` or \`usage report ...\``);
   const fiveHour = usageWindowArg(opt, 'five', 'five-reset');
   const sevenDay = usageWindowArg(opt, 'week', 'week-reset');
   if (!fiveHour && !sevenDay) throw new core.DeptError(USAGE_HELP);
@@ -333,12 +446,14 @@ function printStatus(s) {
   console.log(`Auto-dispatch: ${s.settings.autoDispatch ? 'on' : 'off'}\n`);
   for (const team of s.teams) {
     const task = team.taskId ? s.tasks.find((t) => t.id === team.taskId) : null;
-    console.log(`${team.name.padEnd(13)} ${task ? `${task.id} ${task.title}` : '(free)'}${team.focus ? ` — focus: ${team.focus}` : ''}`);
+    const crew = task ? ` (${plural(crewOf(task), 'builder')} + reviewer)` : '';
+    console.log(`${team.name.padEnd(13)} ${task ? `${task.id} ${task.title}${crew}` : '(free)'}${team.focus ? ` — focus: ${team.focus}` : ''}`);
     const total = `total ${dur(core.teamTotalMs(team, at))}`;
     if (task) console.log(`  ${bar(team.progress)}  on task ${dur(core.taskTeamMs(s, task, at)[team.id])} · ${total}`);
     else console.log(`  ${total}`);
     for (const a of team.agents) {
       if (a.role === 'reviewer') console.log(`  ★ ${`${a.id} reviewer`.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
+      else if (task && isStandby(a, task)) console.log(`  - ${a.id.padEnd(19)} ${'standby'.padEnd(8)} ${a.work && a.work !== 'Standby' ? a.work : ''}`.trimEnd());
       else console.log(`  · ${a.id.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
     }
     if (team.issuesFound) console.log(`  ${plural(team.issuesFound, 'issue')} caught by review`);
@@ -347,7 +462,7 @@ function printStatus(s) {
   console.log(`\nOpen tasks (${open.length})`);
   for (const t of open) {
     const teams = s.teams.filter((x) => x.taskId === t.id).map((x) => x.id).join(', ') || '—';
-    console.log(`  ${t.id} [${t.status}] ${t.size === 'large' ? '(large) ' : ''}${t.title}\n        ${bar(t.progress)}  teams: ${teams}  active: ${dur(core.taskActiveMs(t, at))}`);
+    console.log(`  ${t.id} [${t.status}] ${t.size === 'large' ? '(large) ' : ''}${t.title}\n        ${bar(t.progress)}  teams: ${teams}  ${plural(crewOf(t), 'builder')} + reviewer  active: ${dur(core.taskActiveMs(t, at))}`);
     if (t.status === 'review') console.log(`        ${reviewLine(s, t)}`);
     else if (t.reviewRound) {
       const back = Object.entries(t.reviews || {}).filter(([, r]) => r.round === t.reviewRound && r.verdict === 'changes').map(([id]) => id);
@@ -445,8 +560,15 @@ async function main() {
       return console.log(JSON.stringify(await currentState(), null, 2));
     case 'add': {
       const body = { title: pos.join(' '), description: opt.desc || '', size: opt.large ? 'large' : opt.size || 'small' };
+      if (opt.builders !== undefined) body.builders = buildersArg(opt.builders);
       const r = await run('POST', '/api/tasks', body, { type: 'addTask', args: body });
-      console.log(`${r.task.id} created → ${r.assigned.length ? r.assigned.join(', ') : 'queued (no free team)'}`);
+      const crew = crewOf(r.task);
+      console.log(`${r.task.id} created → ${r.assigned.length ? r.assigned.join(', ') : 'queued (no free team)'} · ${plural(crew, 'builder')} + reviewer per team`);
+      if (body.builders && r.task.builders !== undefined && r.task.builders !== body.builders) {
+        console.log(`  Note: the board kept ${plural(r.task.builders, 'builder')}; it may run older code without crew sizing.`);
+      } else if (body.builders && r.task.builders === undefined) {
+        console.log('  Note: the board did not store --builders; it may run older code without crew sizing.');
+      }
       return;
     }
     case 'assign': {
@@ -483,8 +605,13 @@ async function main() {
       if (opt.title) body.title = opt.title;
       if (opt.size) body.size = opt.size;
       if (opt.desc) body.description = opt.desc;
+      if (opt.builders !== undefined) body.builders = buildersArg(opt.builders);
+      if (!pos[0]) throw new core.DeptError('Usage: set <task> [--status ...] [--pct N] [--title "..."] [--size small|large] [--builders 1-5]');
       const r = await run('PATCH', `/api/tasks/${pos[0]}`, body, { type: 'updateTask', args: { id: pos[0], patch: body } });
-      console.log(`${r.id} [${r.status}] ${r.progress}%`);
+      console.log(`${r.id} [${r.status}] ${r.progress}%${body.builders !== undefined || r.builders !== undefined ? ` · ${plural(crewOf(r), 'builder')} + reviewer` : ''}`);
+      if (body.builders !== undefined && r.builders !== body.builders) {
+        console.log('  Note: the board did not store --builders; it may run older code without crew sizing.');
+      }
       return;
     }
     case 'review': {

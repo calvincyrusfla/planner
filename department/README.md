@@ -85,6 +85,24 @@ npm run icons
 - When you remove a task's last team, the task is **paused**. A paused task isn't handed out automatically. Click **Queue** to put it back in line, or add a team yourself.
 - Turn off **Auto-dispatch** to stop free teams from picking up queued tasks on their own.
 
+## Crew size
+
+Not every task needs all 5 builders. Each task has a crew: how many builders each team on it puts to work (1–5). The team's reviewer always reviews on top of that.
+
+- **Defaults:** a small task gets 2 builders, a large task 5.
+- **New task form:** the **Builders** picker (1–5) sits next to Small/Large. Choosing Small or Large sets it to 2 or 5 unless you've changed it yourself.
+- **Task cards:** show the crew as "N builders + reviewer", with a picker to change it on an open task. Team cards show the same line.
+- **Standby builders:** builders beyond the crew (for example `alpha-3` to `alpha-5` on a 2-builder task) are shown dimmed with a **Standby** tag on the team card and don't count as busy. When the crew changes, builders still in it keep their status if already working, blocked or done; builders cut from the crew go to standby.
+
+From the CLI:
+
+```bash
+node department/dept.mjs add "Fix typo in footer" --builders 1
+node department/dept.mjs set T-002 --builders 3
+```
+
+`status` shows each task's crew ("2 builders + reviewer") and lists builders beyond it as `standby`.
+
 ## What the dashboard does
 
 - **Teams:** one card per team, showing its task, progress, focus area and what each of its 5 builders and its reviewer are doing (idle, assigned, working, blocked or done). The reviewer is shown below the builders with a **Reviewer** tag. Use **Reassign to…** to move the team to another task, or **Remove from task** to free it.
@@ -139,7 +157,8 @@ Agents report through the CLI, and you can use it too. It goes through the dashb
 
 ```bash
 node department/dept.mjs status
-node department/dept.mjs add "Build CSV export" --desc "Export tasks per tab" [--large]
+node department/dept.mjs add "Build CSV export" --desc "Export tasks per tab" [--large] [--builders N]
+node department/dept.mjs set T-002 --builders 3
 node department/dept.mjs assign T-002 bravo --focus "API"
 node department/dept.mjs unassign T-002 bravo
 node department/dept.mjs progress T-002 --agent bravo-3 -m "Endpoint done"
@@ -205,7 +224,7 @@ Each meter shows the percentage used, a bar and a live countdown to when that wi
 
 Claude Code can run a small program for its status bar, and it passes that program the current usage. The usage meter installs `department/usage/statusline.mjs` as that program. Each time Claude Code refreshes its status bar, the program shows the numbers there too, and sends them to the board in the background: about once a minute, or sooner when the numbers change, but never more often than every 15 seconds. It goes through the dashboard, the shared board or the local state file, the same way the CLI does.
 
-It only reads what Claude Code hands it. It doesn't read passwords, tokens or credential files, and it doesn't call any Claude account API.
+The status line only reads what Claude Code hands it. It doesn't read passwords, tokens or credential files, and it doesn't call any Claude account API. The **Update** button below is the one exception, and only when you press it.
 
 ### Set it up
 
@@ -241,6 +260,38 @@ npm run usage-meter:remove
 
 This removes only the usage meter's status line; any other status line is left alone. If you installed with `--force`, it puts back the status line that was replaced and deletes `statusline.replaced-by-agent-department.json`. Restart Claude Code afterwards.
 
+### Update button
+
+The band has an **Update** button. Press it to get the current numbers straight from Anthropic, without waiting for Claude Code to report. It also works when the band says the meter isn't connected, so you can see your usage without Claude Code running.
+
+What it reads and sends:
+
+- When you press it, the dashboard server on this PC reads the login Claude Code saved here: `%USERPROFILE%\.claude\.credentials.json` on Windows (`~/.claude/.credentials.json` on Linux, the `CLAUDE_CONFIG_DIR` folder if you set it, or the Keychain entry "Claude Code-credentials" on macOS).
+- It sends that login only to Anthropic (`api.anthropic.com`), to ask for your usage. It never saves it, logs it, shows it in the browser or puts it on the board. Only the two percentages and their reset times go on the board, with the source shown as your computer name followed by **Anthropic**.
+- It never renews the login and never changes the credentials file.
+- Only this PC can use it. The server refuses requests from other computers, and the page must be open at `http://127.0.0.1:4300` or `http://localhost:4300`.
+
+Things to know:
+
+- **The address it asks is unofficial.** Anthropic doesn't document it and can change or remove it at any time. If that happens, Update shows an error such as "Anthropic didn't return usage data" and the status line meter keeps working as before.
+- **If your login has expired,** Update says so. Open Claude Code once so it renews the login, then press Update again.
+- **Once every 30 seconds.** After it has asked Anthropic, the button counts down until you can press it again.
+- If Anthropic is limiting how often you can check, it asks you to try again in a minute. If it can't reach Anthropic, it says so.
+
+From the terminal, `node department/dept.mjs usage refresh` does the same thing, with the same 30-second limit.
+
+If you update the code while the dashboard is running, close it and start it again (`npm run dashboard`). Until you do, the button doesn't appear and refresh requests fail.
+
+To turn the button off, set `DEPT_USAGE_DIRECT=off` before starting the dashboard. In PowerShell:
+
+```powershell
+$env:DEPT_USAGE_DIRECT = "off"; npm run dashboard
+```
+
+The button then disappears, and the server and `usage refresh` refuse to read the login.
+
+For tests only, `DEPT_ANTHROPIC_BASE` points the request at a fake Anthropic server. It must be a loopback address such as `http://127.0.0.1:4942`. If your machine uses a proxy, add `127.0.0.1` to `NO_PROXY` as well, so the test's fake login is never sent to the proxy.
+
 ### Why the numbers can be out of date
 
 The meter only updates while a Claude Code session with the status line is running. When nothing has reported for 15 minutes, the band says that no session is reporting and the numbers may be out of date. Claude Code sometimes leaves one of the limits out of a report. The board then keeps the last known number for that limit until its reset time. When a window's reset time has passed, the band shows when it reset instead of the old percentage, until the next report comes in.
@@ -263,7 +314,9 @@ node department/dept.mjs usage report --five 42 --five-reset 2026-11-07T15:10:00
 
 ## How the agents use it
 
-`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here, staffed with the assigned team's 5 builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.
+`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here with a crew size, staffed with that many of the assigned team's builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.
+
+Pull requests are squash-merged, so each feature lands as one commit. Checkpoint commits on the branch are fine because they collapse on merge; write the PR description so it reads well as that single squash commit message.
 
 ## Tests
 
