@@ -48,7 +48,7 @@ from foundry import __version__
 log = logging.getLogger("foundry.serve")
 
 __all__ = [
-    "DEFAULT_HOST", "DEFAULT_PORT", "DEFAULT_MONITOR_S", "OrderError", "Service",
+    "DEFAULT_HOST", "DEFAULT_PORT", "DEFAULT_MONITOR_S", "OrderError", "PortInUse", "Service",
     "serve_port", "monitor_interval", "build_parser", "main",
 ]
 
@@ -66,6 +66,20 @@ _TERMINAL = ("complete", "quarantined", "failed")
 
 class OrderError(ValueError):
     """An invalid work order (the HTTP layer answers 400 with ``str(exc)``)."""
+
+
+class PortInUse(OSError):
+    """The HTTP API could not bind its port (another Foundry is probably running)."""
+
+
+#: Fields a POST /api/orders body may carry.
+ORDER_FIELDS = frozenset({"title", "description", "files", "size"})
+
+
+def _max_question() -> int:
+    from foundry.serve_api import MAX_QUESTION
+
+    return int(MAX_QUESTION)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -219,7 +233,7 @@ class Service:
         """Stop the monitor, finish completion work, stop the pools, flush the bridge, close."""
         if self.factory is None:
             return
-        was_running, self.running = self.running, False
+        self.running = False
         if self._monitor_task is not None:
             self._monitor_task.cancel()
             try:
@@ -229,13 +243,13 @@ class Service:
             self._monitor_task = None
         f = self.factory
         try:
-            if was_running:
-                if self._resume_tasks:
-                    await asyncio.wait(set(self._resume_tasks), timeout=f.manager.finish_timeout)
-                await f.manager.drain()
-                for pool in f.pools.values():
-                    await pool.stop()
-                await f.manager.drain()
+            # also after a start that failed half-way: stopping an unstarted pool is a no-op
+            if self._resume_tasks:
+                await asyncio.wait(set(self._resume_tasks), timeout=f.manager.finish_timeout)
+            await f.manager.drain()
+            for pool in f.pools.values():
+                await pool.stop()
+            await f.manager.drain()
         finally:
             f.close()  # flushes the board bridge, saves the manager, closes the databases
             self.factory = None
@@ -379,6 +393,9 @@ class Service:
         """Check a POST /api/orders body; returns the cleaned fields or raises :class:`OrderError`."""
         if not isinstance(payload, Mapping):
             raise OrderError("the body must be a JSON object")
+        unknown = set(payload) - ORDER_FIELDS
+        if unknown:
+            raise OrderError(f"unknown field(s): {', '.join(sorted(map(str, unknown)))}")
         title = payload.get("title")
         if not isinstance(title, str) or not title.strip():
             raise OrderError("title is required")
@@ -447,7 +464,7 @@ class Service:
             raise OrderError("question is required")
         if self.factory is None:
             raise RuntimeError("Foundry is not running")
-        async for chunk in self.factory.foreman.answer_question(question.strip()[:2000]):
+        async for chunk in self.factory.foreman.answer_question(question.strip()[:_max_question()]):
             if chunk:
                 yield chunk
 
@@ -522,10 +539,14 @@ async def run_service(service: Service, *, host: str = DEFAULT_HOST, port: int |
             loop.add_signal_handler(sig, stop_event.set)
         except (NotImplementedError, RuntimeError, ValueError):
             pass  # Windows: KeyboardInterrupt reaches asyncio.run instead
-    await service.start()
     api = None
     try:
-        api = serve_api.FoundryAPI(service, host, port if port is not None else serve_port()).start()
+        await service.start()  # inside the try: a half-started service is still stopped and closed
+        bind_port = port if port is not None else serve_port()
+        try:
+            api = serve_api.FoundryAPI(service, host, bind_port).start()
+        except OSError as exc:
+            raise PortInUse(f"Foundry could not listen on {host}:{bind_port}: {exc}") from exc
         service.api = api
         out(f"Foundry is running for {service.repo} on http://{host}:{api.port} - press Ctrl+C to stop")
         await stop_event.wait()
@@ -565,8 +586,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     service = Service(config, repo=repo, claude=claude, gemma=gemma, monitor_s=args.monitor, claude_ok=True)
     try:
         return asyncio.run(run_service(service, host=DEFAULT_HOST, port=args.port))
-    except OSError as exc:  # the port is taken (another Foundry is running?)
-        print(f"Foundry could not listen on port {args.port or serve_port()}: {exc}", file=sys.stderr)
+    except PortInUse as exc:  # another Foundry is probably running
+        print(f"{exc} - is Foundry already running?", file=sys.stderr)
         return 2
     except KeyboardInterrupt:  # Windows Ctrl+C; run_service's finally already shut down
         return 0

@@ -40,7 +40,9 @@ import asyncio
 import inspect
 import json
 import logging
+import concurrent.futures
 import socket
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -69,7 +71,8 @@ LOOPBACK = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]", "::1"})
 MAX_BODY_BYTES = 64 * 1024
 CALL_TIMEOUT_S = 30.0
-ASK_CHUNK_TIMEOUT_S = 180.0
+ASK_CHUNK_TIMEOUT_S = 110.0
+"""Longest wait for one answer chunk; below the dashboard proxy's 120 s idle timeout."""
 
 MAX_TITLE = 200
 MAX_DESCRIPTION = 20_000
@@ -207,12 +210,22 @@ def _resolve(service: Any, value: Any, timeout: float = CALL_TIMEOUT_S) -> Any:
         return value
     loop = _service_loop(service)
     if loop is not None:
-        return asyncio.run_coroutine_threadsafe(_as_coro(value), loop).result(timeout)
+        return _on_loop(_as_coro(value), loop, timeout)
     return asyncio.run(asyncio.wait_for(_as_coro(value), timeout))
 
 
 async def _as_coro(awaitable: Any) -> Any:
     return await awaitable
+
+
+def _on_loop(coro: Any, loop: asyncio.AbstractEventLoop, timeout: float) -> Any:
+    """Run ``coro`` on ``loop`` from another thread; on timeout cancel it and raise ``TimeoutError``."""
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return fut.result(timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        raise TimeoutError(f"no result within {timeout:g} s") from None
 
 
 def _call(service: Any, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -225,7 +238,7 @@ def _call(service: Any, fn: Any, *args: Any, **kwargs: Any) -> Any:
         value = fn(*args, **kwargs)
         return await value if inspect.isawaitable(value) else value
 
-    return asyncio.run_coroutine_threadsafe(run(), loop).result(CALL_TIMEOUT_S)
+    return _on_loop(run(), loop, CALL_TIMEOUT_S)
 
 
 def _not_running(service: Any) -> bool:
@@ -252,7 +265,7 @@ class _ChunkPump:
     def _run(self, coro: Any) -> Any:
         loop = _service_loop(self.service)
         if self._own_loop is None and loop is not None:
-            return asyncio.run_coroutine_threadsafe(coro, loop).result(ASK_CHUNK_TIMEOUT_S)
+            return _on_loop(coro, loop, ASK_CHUNK_TIMEOUT_S)
         assert self._own_loop is not None
         return self._own_loop.run_until_complete(asyncio.wait_for(coro, ASK_CHUNK_TIMEOUT_S))
 
@@ -467,6 +480,9 @@ class _Handler(BaseHTTPRequestHandler):
                     self._event(None, {"text": str(chunk)})
             except (BrokenPipeError, ConnectionResetError):
                 raise
+            except TimeoutError:
+                log.warning("Foreman answer timed out after %s s per chunk", ASK_CHUNK_TIMEOUT_S)
+                self._event("error", {"error": "The Foreman took too long to answer."})
             except Exception:  # noqa: BLE001 - report on the stream, keep internals out
                 log.exception("Foreman answer failed")
                 self._event("error", {"error": "The Foreman could not finish the answer."})
@@ -493,8 +509,26 @@ def _short(exc: Exception) -> str:
 
 
 class _Server(ThreadingHTTPServer):
+    """Threaded server that owns its port exclusively (one Foundry per port).
+
+    POSIX: ``SO_REUSEADDR`` (restart without waiting for TIME_WAIT; a second
+    listener still gets ``OSError``).  Windows: ``SO_REUSEADDR`` would let a
+    second process bind the same port, so it is off and
+    ``SO_EXCLUSIVEADDRUSE`` is set instead.
+    """
+
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32":
+            self.allow_reuse_address = False
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if exclusive is not None:
+                self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        else:
+            self.allow_reuse_address = True
+        super().server_bind()
 
 
 class _Server6(_Server):

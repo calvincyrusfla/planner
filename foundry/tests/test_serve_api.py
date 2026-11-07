@@ -299,3 +299,81 @@ def test_status_keeps_service_ok_flag(svc):
     with FoundryAPI(svc, port=0) as server:
         body = json.loads(request(server, "GET", "/api/status")[1])
     assert body["ok"] is False and body["foreman"] == {}
+
+
+def test_second_api_on_same_port_fails(svc):
+    with FoundryAPI(svc, port=0) as first:
+        with pytest.raises(OSError):
+            FoundryAPI(svc, port=first.port).start()
+        assert request(first, "GET", "/api/health")[0].status == 200
+
+
+class _FakeSocket:
+    def __init__(self):
+        self.opts = []
+
+    def setsockopt(self, level, name, value):
+        self.opts.append((level, name, value))
+
+    def bind(self, addr):
+        self.addr = addr
+
+    def getsockname(self):
+        return ("127.0.0.1", 4310)
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_bind_socket_options_per_platform(monkeypatch, platform):
+    import socket as socket_mod
+
+    from foundry import serve_api
+
+    monkeypatch.setattr(serve_api.sys, "platform", platform)
+    monkeypatch.setattr(socket_mod, "SO_EXCLUSIVEADDRUSE", 0x7FFF0004, raising=False)
+    server = serve_api._Server(("127.0.0.1", 4310), serve_api._Handler, bind_and_activate=False)
+    real = server.socket
+    fake = server.socket = _FakeSocket()
+    try:
+        server.server_bind()
+    finally:
+        real.close()
+    names = {name for _, name, _ in fake.opts}
+    if platform == "win32":
+        assert server.allow_reuse_address is False
+        assert 0x7FFF0004 in names and socket_mod.SO_REUSEADDR not in names
+    else:
+        assert server.allow_reuse_address is True
+        assert socket_mod.SO_REUSEADDR in names and 0x7FFF0004 not in names
+
+
+def test_ask_chunk_timeout_sends_error_and_cancels(monkeypatch, svc):
+    from foundry import serve_api
+
+    monkeypatch.setattr(serve_api, "ASK_CHUNK_TIMEOUT_S", 0.3)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    svc.loop = loop
+    cancelled = threading.Event()
+
+    async def ask(question):
+        yield "first "
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        yield "never"
+
+    svc.ask = ask
+    try:
+        with FoundryAPI(svc, port=0) as server:
+            events = parse_sse(request(server, "POST", "/api/ask", {"question": "q"})[1])
+        assert events[0] == ("message", {"text": "first "})
+        assert events[1][0] == "error" and "too long" in events[1][1]["error"]
+        assert events[-1] == ("done", {})
+        assert cancelled.wait(5)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        loop.close()

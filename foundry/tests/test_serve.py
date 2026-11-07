@@ -367,3 +367,76 @@ def test_run_service_serves_http_and_shuts_down(tmp_path: Path) -> None:
         assert svc.factory is None and lines[-1] == "Foundry stopped."
 
     asyncio.run(go())
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+def test_validate_order_rejects_unknown_fields() -> None:
+    with pytest.raises(OrderError, match="unknown field"):
+        Service.validate_order({"title": "t", "repo_root": "/elsewhere"})
+
+
+def test_ask_uses_the_api_question_limit(tmp_path: Path) -> None:
+    from foundry.serve_api import MAX_QUESTION
+
+    async def go() -> None:
+        svc = _service(tmp_path, monitor_s=3600)
+        await svc.start()
+        seen: list[str] = []
+
+        async def answer(text: str) -> Any:
+            seen.append(text)
+            yield "ok"
+
+        svc.factory.foreman.answer_question = answer  # type: ignore[method-assign]
+        try:
+            assert [c async for c in svc.ask("q" * (MAX_QUESTION + 50))] == ["ok"]
+            assert len(seen[0]) == MAX_QUESTION
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
+def test_port_in_use_is_reported_and_the_service_is_closed(tmp_path: Path) -> None:
+    import socket
+
+    from foundry.serve import PortInUse
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    try:
+        async def go() -> None:
+            svc = _service(tmp_path, monitor_s=3600)
+            with pytest.raises(PortInUse):
+                await run_service(svc, port=sock.getsockname()[1], stop_event=asyncio.Event(), out=lambda _l: None)
+            assert svc.factory is None and svc.closed_factory is not None
+
+        asyncio.run(go())
+    finally:
+        sock.close()
+
+
+def test_other_oserrors_are_not_labelled_port_in_use(tmp_path: Path) -> None:
+    from foundry.serve import PortInUse
+
+    async def go() -> None:
+        svc = _service(tmp_path, monitor_s=3600)
+
+        async def broken_start() -> Any:
+            svc.factory = svc._build()
+            for pool in svc.factory.pools.values():
+                pool.start()
+            raise OSError("disk full")
+
+        svc.start = broken_start  # type: ignore[method-assign]
+        with pytest.raises(OSError) as info:
+            await run_service(svc, port=0, stop_event=asyncio.Event(), out=lambda _l: None)
+        assert not isinstance(info.value, PortInUse)
+        # start failed half-way: pools were stopped and the factory closed anyway
+        assert svc.factory is None
+        assert not any(p.running for p in svc.closed_factory.pools.values())
+
+    asyncio.run(go())

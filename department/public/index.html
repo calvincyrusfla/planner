@@ -93,6 +93,8 @@
   .foundry-row input[type=text] { flex: 1 1 260px; }
   .foundry-row small { color: var(--muted); font-size: 12px; }
   .foundry-row[data-on="false"] .fo-files { display: none; }
+  /* The toggle row comes before the submit button in the DOM (and on narrow screens); on wide ones the button stays top-right. */
+  @media (min-width: 721px) { .new-task > button[type=submit] { grid-row: 1; grid-column: 4; } }
   .crew { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
   .crew b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
   .crew select { font-size: 12px; padding: 1px 4px; font-weight: 600; }
@@ -330,7 +332,6 @@
       </select>
       <small>+ reviewer</small>
     </label>
-    <button class="primary" type="submit">Assign task</button>
     <div class="foundry-row" id="foundry-row" data-on="false">
       <label class="switch" title="Hand this task to the Foundry service instead of the board; Foundry registers it on the board itself">
         <input type="checkbox" id="t-foundry"> Send to Foundry
@@ -339,6 +340,7 @@
       <input type="text" class="fo-files" id="t-files" placeholder="Files (optional), comma separated, e.g. src/app.py, README.md" autocomplete="off">
       <small id="foundry-hint"></small>
     </div>
+    <button class="primary" type="submit">Assign task</button>
     <p class="hint">Each task gets one team. A large task gets all three teams when nothing else is running. Tasks wait in the queue when every team is busy. Builders sets how many of each team's five builders work on it (Small 2, Large 5 by default); the rest stand by and the reviewer always reviews.</p>
   </form>
 
@@ -961,11 +963,14 @@ async function pollFoundry() {
   chip.title = tip;
   chip.querySelector('.fc-text').innerHTML = text;
   syncFoundryRow();
+  foremanSetUp(foundryUp, health); // the Ask the Foreman panel shares this poll
 }
 function syncFoundryRow() {
   const on = $('#t-foundry').checked;
   $('#foundry-row').dataset.on = String(on);
   $('#new-task button[type=submit]').textContent = on ? 'Send to Foundry' : 'Assign task';
+  $('#t-builders').disabled = on; // Foundry picks the crew itself
+  $('.crew-pick').title = on ? 'Foundry picks the crew for tasks sent to it' : "Builders per team on this task; each team's reviewer always reviews as well";
   $('#foundry-hint').textContent = on && !foundryUp ? 'Foundry is not running. Start it first (foundry\\start_foundry.bat).'
     : on ? 'Foundry picks the team and registers the task on the board.' : '';
 }
@@ -992,9 +997,6 @@ async function sendToFoundry(title, size) {
   buildersTouched = false; syncBuilders();
   toast(`Sent to Foundry${r.json.task_id ? ` as ${r.json.task_id}` : ''}; it appears on the board shortly`);
 }
-pollFoundry();
-setInterval(pollFoundry, 10000);
-
 // Small/Large set the Builders picker to 2/5 until the user picks a number themselves.
 let buildersTouched = false;
 function syncBuilders() {
@@ -1103,15 +1105,6 @@ function foremanSetUp(up, health) {
   }
   foremanSync();
 }
-async function foremanHealth() {
-  try {
-    const res = await fetch('/api/foundry/health', { cache: 'no-store' });
-    const json = await res.json().catch(() => null);
-    foremanSetUp(res.ok && !!json && json.ok !== false, json);
-  } catch {
-    foremanSetUp(false);
-  }
-}
 function foremanNote(out, text, err) {
   const el = document.createElement('span');
   el.className = err ? 'foreman-note foreman-err' : 'foreman-note';
@@ -1197,8 +1190,9 @@ $('#foreman-form').addEventListener('submit', (e) => {
   foremanAsk(q);
 });
 $('#foreman-stop').addEventListener('click', () => { if (foreman.ctrl) foreman.ctrl.abort(); });
-foremanHealth();
-setInterval(foremanHealth, 10000);
+// One Foundry health poll (on load, then every 10 s) drives the header chip, the new-task toggle and this panel.
+pollFoundry();
+setInterval(pollFoundry, 10000);
 
 // ---- live updates ----
 // on = SSE connection is up; sync = the server's {mode, ok, lastSync, error, url}
