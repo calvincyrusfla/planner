@@ -11,14 +11,18 @@ Phase 1: exact match only
 -------------------------
 The cache key is a SHA-256 over a *normalized* view of the assignment:
 
+* the work order's intent — task title and description (optional keyword
+  arguments, since :class:`TaskAssignment` does not carry them) and the
+  context slice's objective, each whitespace-collapsed and case-folded. Two
+  tasks with the same files and criteria but a different goal must miss;
 * acceptance criteria — whitespace collapsed, case-folded, de-duplicated and
   sorted (so reordering or re-spacing criteria still hits);
 * allowed files — path separators normalized to ``/`` and sorted;
 * context snippets — each snippet's path, start line and a SHA-256 of its
   text, sorted.
 
-Anything that only describes *who* or *when* (task id, builder id, attempt,
-fix hint, objective wording) is deliberately left out of the key.
+Anything that only describes *who* or *when* (task id, team id, builder id,
+attempt, fix hint) is deliberately left out of the key.
 
 Semantic / fuzzy matching (embedding similarity of criteria, tolerant snippet
 matching) is **phase 2**. Exact-only is safe because a hit requires the same
@@ -47,7 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = ["CACHE_KEY_VERSION", "SolutionCache", "RetryPolicy", "cache_key", "normalize_criterion"]
 
 #: Bump when the normalization changes so old rows can never be hit by mistake.
-CACHE_KEY_VERSION = "v1"
+CACHE_KEY_VERSION = "v2"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS solution_cache (
@@ -80,7 +84,14 @@ def _normalize_path(path: str) -> str:
     return p
 
 
-def _key_material(assignment: TaskAssignment) -> dict[str, Any]:
+def _normalize_text(text: str | None) -> str:
+    """Collapse whitespace and case-fold free text (``None`` → ``""``)."""
+    return " ".join((text or "").split()).casefold()
+
+
+def _key_material(
+    assignment: TaskAssignment, *, title: str | None = None, description: str | None = None
+) -> dict[str, Any]:
     """Build the normalized, order-independent view that the key hashes."""
     criteria = sorted({normalize_criterion(c) for c in assignment.acceptance_criteria if c.strip()})
     files = sorted({_normalize_path(f) for f in assignment.allowed_files if f.strip()})
@@ -90,12 +101,24 @@ def _key_material(assignment: TaskAssignment) -> dict[str, Any]:
         digest = hashlib.sha256(snip.text.encode("utf-8")).hexdigest()
         snippets.append([_normalize_path(snip.path), int(snip.start_line), digest])
     snippets.sort()
-    return {"v": CACHE_KEY_VERSION, "criteria": criteria, "files": files, "snippets": snippets}
+    intent = {
+        "title": _normalize_text(title),
+        "description": _normalize_text(description),
+        "objective": _normalize_text(getattr(context, "objective", None)),
+    }
+    return {"v": CACHE_KEY_VERSION, "intent": intent, "criteria": criteria, "files": files, "snippets": snippets}
 
 
-def cache_key(assignment: TaskAssignment) -> str:
-    """Return the deterministic exact-match cache key for ``assignment``."""
-    material = json.dumps(_key_material(assignment), sort_keys=True, separators=(",", ":"))
+def cache_key(
+    assignment: TaskAssignment, *, title: str | None = None, description: str | None = None
+) -> str:
+    """Return the deterministic exact-match cache key for ``assignment``.
+
+    Pass the work order's ``title`` and ``description`` when known; ``None``
+    and ``""`` are equivalent. Callers must pass them consistently to
+    :meth:`SolutionCache.lookup` and :meth:`SolutionCache.store`.
+    """
+    material = json.dumps(_key_material(assignment, title=title, description=description), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -125,17 +148,21 @@ class SolutionCache:
 
     # -- key -----------------------------------------------------------------
     @staticmethod
-    def key_for(assignment: TaskAssignment) -> str:
+    def key_for(
+        assignment: TaskAssignment, *, title: str | None = None, description: str | None = None
+    ) -> str:
         """Return the cache key for ``assignment`` (see :func:`cache_key`)."""
-        return cache_key(assignment)
+        return cache_key(assignment, title=title, description=description)
 
     # -- operations ----------------------------------------------------------
-    def lookup(self, assignment: TaskAssignment) -> str | None:
+    def lookup(
+        self, assignment: TaskAssignment, *, title: str | None = None, description: str | None = None
+    ) -> str | None:
         """Return the approved diff for an identical assignment, or ``None``.
 
         A hit increments the row's ``hits`` counter and ``last_hit_at``.
         """
-        key = cache_key(assignment)
+        key = cache_key(assignment, title=title, description=description)
         with self._lock:
             self._lookups += 1
             self._conn.execute("BEGIN IMMEDIATE")
@@ -155,7 +182,14 @@ class SolutionCache:
             self._hits += 1
             return str(row[0])
 
-    def store(self, assignment: TaskAssignment, diff: str) -> str:
+    def store(
+        self,
+        assignment: TaskAssignment,
+        diff: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> str:
         """Remember ``diff`` for ``assignment``; returns the key.
 
         Call this **only** after the reviewer returned ``APPROVED``. Storing
@@ -164,7 +198,7 @@ class SolutionCache:
         """
         if not diff.strip():
             raise ValueError("refusing to cache an empty diff")
-        key = cache_key(assignment)
+        key = cache_key(assignment, title=title, description=description)
         with self._lock:
             self._conn.execute(
                 """

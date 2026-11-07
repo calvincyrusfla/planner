@@ -510,8 +510,17 @@ class ClaudeResult(FoundryModel):
     """Normalized result of one headless Claude Code call (``claude -p --output-format json``)."""
 
     text: str = ""
-    input_tokens: int = Field(default=0, ge=0)
+    input_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="Uncached input tokens (including cache-creation tokens); charged to the rate limiter.",
+    )
     output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="Input tokens served from the prompt cache; tracked separately, not charged to TPM.",
+    )
     duration_seconds: float = Field(default=0.0, ge=0)
     cost_usd: float | None = None
     is_error: bool = False
@@ -519,5 +528,5 @@ class ClaudeResult(FoundryModel):
 
     @property
     def total_tokens(self) -> int:
-        """Input plus output tokens."""
+        """Uncached input plus output tokens (excludes ``cache_read_tokens``)."""
         return self.input_tokens + self.output_tokens

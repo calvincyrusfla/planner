@@ -149,6 +149,7 @@ class RateLimiter:
         self._throttle_factor = 1.0
         self._throttle_until = -math.inf
         self._cooldown_until = -math.inf
+        self._paused_until = -math.inf
         self._requests: deque[float] = deque()
         self._tokens: deque[tuple[float, int]] = deque()
         self.rate_limit_hits = 0
@@ -170,9 +171,13 @@ class RateLimiter:
 
         Time spent inside a throttle window accrues at the throttled rate even
         when the window ended between two refills, so lifting a throttle never
-        produces a catch-up burst.
+        produces a catch-up burst. Time spent inside a :meth:`pause_until`
+        window accrues nothing at all, so budgets ramp up from empty once the
+        pause ends instead of releasing a burst of queued requests.
         """
         for bucket in (self._req_bucket, self._tok_bucket):
+            if bucket.updated_at < self._paused_until:
+                bucket.updated_at = min(now, self._paused_until)
             if bucket.updated_at < self._throttle_until < now:
                 bucket.refill(self._throttle_until, factor=self._throttle_factor)
             bucket.refill(now, factor=self._factor(bucket.updated_at))
@@ -211,6 +216,7 @@ class RateLimiter:
                     charge = min(float(estimate), self._tok_bucket.capacity * factor)
                     wait = max(
                         self._cooldown_until - now,
+                        self._paused_until - now,
                         self._req_bucket.wait_for(1.0, factor=factor),
                         self._tok_bucket.wait_for(charge, factor=factor),
                     )
@@ -288,6 +294,12 @@ class RateLimiter:
         whole limiter is paused (other callers wait too). When
         ``estimated_tokens`` is given each attempt runs inside :meth:`slot`.
         After ``max_attempts`` failed attempts the last exception is re-raised.
+
+        A ``retry_after`` longer than ``cap`` (typically a subscription usage
+        limit that resets in hours) is not waited out here: the limiter is
+        paused with :meth:`pause_until` for ``retry_after`` seconds and the
+        exception is re-raised at once, so the caller can release its ticket
+        without consuming an attempt (no spinning through ``max_attempts``).
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -302,14 +314,56 @@ class RateLimiter:
             except errors as exc:
                 attempt += 1
                 self.rate_limit_hits += 1
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after is not None and float(retry_after) > cap:
+                    self.pause_until(seconds=float(retry_after))
+                    raise
                 if attempt >= max_attempts:
                     raise
                 delay = full_jitter_delay(attempt - 1, base=base, cap=cap, rng=self._rng)
-                retry_after = getattr(exc, "retry_after", None)
                 if retry_after is not None:
                     delay = max(delay, float(retry_after))
                 self._cooldown_until = max(self._cooldown_until, self._clock() + delay)
                 await self._sleep(delay)
+
+    def pause_until(self, deadline: float | None = None, *, seconds: float | None = None) -> float:
+        """Pause all dispatch until ``deadline`` (limiter clock) or for ``seconds`` from now.
+
+        Used for usage-limit cooldowns: every caller waiting in :meth:`slot`
+        (and every new one) waits until the pause ends; slots already granted
+        are not affected. Both buckets are emptied and accrue nothing while
+        paused, so dispatch resumes at the normal rate rather than in a burst.
+        A pause only ever extends: an earlier deadline than the current one is
+        ignored. Returns the effective deadline (``-inf`` when never paused).
+        """
+        if (deadline is None) == (seconds is None):
+            raise ValueError("pass exactly one of deadline or seconds")
+        now = self._clock()
+        if seconds is not None:
+            if seconds < 0:
+                raise ValueError("pause seconds must be >= 0")
+            deadline = now + float(seconds)
+        assert deadline is not None
+        if deadline > now and deadline > self._paused_until:
+            self._refill(now)
+            self._req_bucket.level = min(self._req_bucket.level, 0.0)
+            self._tok_bucket.level = min(self._tok_bucket.level, 0.0)
+            self._paused_until = float(deadline)
+        return self._paused_until
+
+    def pause_remaining(self) -> float:
+        """Seconds left in the current :meth:`pause_until` window (0 when not paused)."""
+        return max(0.0, self._paused_until - self._clock())
+
+    @property
+    def is_paused(self) -> bool:
+        """True while a :meth:`pause_until` window is active."""
+        return self.pause_remaining() > 0
+
+    @property
+    def paused_until(self) -> float:
+        """Deadline (limiter clock) of the latest pause; ``-inf`` if never paused."""
+        return self._paused_until
 
     def throttle(self, factor: float, seconds: float) -> None:
         """Scale RPM/TPM budgets by ``factor`` (0 < factor <= 1) for ``seconds``.
@@ -372,4 +426,5 @@ class RateLimiter:
             "current_tpm": self.current_tpm(),
             "throttle_factor": self.throttle_factor,
             "rate_limit_hits": self.rate_limit_hits,
+            "paused_for_s": round(self.pause_remaining(), 3),
         }

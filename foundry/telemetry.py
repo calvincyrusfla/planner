@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS telemetry_tokens (
     agent_id TEXT NOT NULL,
     role TEXT NOT NULL,
     input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL
+    output_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_telemetry_tokens_ts ON telemetry_tokens(ts);
 CREATE TABLE IF NOT EXISTS telemetry_saved (
@@ -99,12 +100,18 @@ CREATE TABLE IF NOT EXISTS telemetry_idle (
     ts REAL NOT NULL,
     ts_iso TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS telemetry_dwell (
-    task_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS telemetry_review_wait (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    item TEXT,
     enqueued_at REAL NOT NULL,
     started_at REAL
 );
+CREATE INDEX IF NOT EXISTS idx_telemetry_review_wait_open
+    ON telemetry_review_wait(task_id, started_at);
 """
+# telemetry_review_wait replaces the phase-1 round-0 table ``telemetry_dwell``
+# (one row per task), which could not represent several pending submissions.
 
 
 def estimate_tokens(text: str) -> int:
@@ -155,19 +162,36 @@ class Telemetry:
             self._lock = getattr(queue, "lock", None) or getattr(queue, "_lock", None) or threading.RLock()
         self.clock = clock
         with self._tx() as cur:
-            cur.executescript(_SCHEMA)
+            # One statement at a time: ``executescript`` would COMMIT a
+            # transaction the caller already has open.
+            for stmt in _SCHEMA.split(";"):
+                if stmt.strip():
+                    cur.execute(stmt)
+            cols = {row[1] for row in cur.execute("PRAGMA table_info(telemetry_tokens)")}
+            if "cache_read_tokens" not in cols:  # databases created before D11
+                cur.execute(
+                    "ALTER TABLE telemetry_tokens ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0"
+                )
 
     # ------------------------------------------------------------------ infra
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Cursor]:
-        """Run statements under the shared lock and commit."""
+        """Run statements under the shared lock and commit.
+
+        If the connection is already inside a transaction on entry (e.g. the
+        caller holds ``queue.transaction()``), the statements join it and the
+        owner of that transaction decides whether to commit or roll back.
+        """
         with self._lock:
+            owns = not self.conn.in_transaction
             cur = self.conn.cursor()
             try:
                 yield cur
-                self.conn.commit()
+                if owns:
+                    self.conn.commit()
             except BaseException:
-                self.conn.rollback()
+                if owns and self.conn.in_transaction:
+                    self.conn.rollback()
                 raise
             finally:
                 cur.close()
@@ -187,17 +211,25 @@ class Telemetry:
         role: Role,
         input_tokens: int,
         output_tokens: int,
+        cache_read_tokens: int = 0,
     ) -> None:
-        """Record one Claude call's token usage (also counts as one request for RPM)."""
+        """Record one Claude call's token usage (also counts as one request for RPM).
+
+        ``input_tokens`` are the uncached input tokens (including cache
+        creation); ``cache_read_tokens`` are stored separately and are NOT part
+        of burn rates or TPM, matching what the rate limiter is charged (D11).
+        """
         _check_choice(role, ROLES, "role")
         _check_count(input_tokens, "input_tokens")
         _check_count(output_tokens, "output_tokens")
+        _check_count(cache_read_tokens, "cache_read_tokens")
         now = self._now()
         with self._tx() as cur:
             cur.execute(
-                "INSERT INTO telemetry_tokens(ts, ts_iso, task_id, agent_id, role, input_tokens, output_tokens)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (now, _iso(now), task_id, agent_id, role, int(input_tokens), int(output_tokens)),
+                "INSERT INTO telemetry_tokens(ts, ts_iso, task_id, agent_id, role, input_tokens, output_tokens,"
+                " cache_read_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (now, _iso(now), task_id, agent_id, role, int(input_tokens), int(output_tokens),
+                 int(cache_read_tokens)),
             )
 
     def record_tokens_saved(self, task_id: str, source: SavedSource, tokens: int) -> None:
@@ -250,47 +282,96 @@ class Telemetry:
                 (team_id, int(count), now, _iso(now)),
             )
 
-    def mark_review_wait(self, task_id: str) -> None:
-        """Mark that a task passed its gates and now waits for a reviewer.
+    def mark_review_wait(self, task_id: str, item: str | None = None) -> None:
+        """Mark that a submission passed its gates and now waits for a reviewer.
 
-        Calling it again (e.g. after a REVISE round) restarts the wait.
+        Dwell is tracked per submission (D7). ``item`` identifies it (the
+        ticket id); with ``item=None`` every call adds a new anonymous
+        submission. Marking an item that is already waiting keeps its original
+        enqueue time, so re-enqueueing never hides how long it has waited.
+        After it was picked up, marking it again (a REVISE round) starts a new wait.
         """
         now = self._now()
         with self._tx() as cur:
+            if item is not None:
+                row = cur.execute(
+                    "SELECT 1 FROM telemetry_review_wait WHERE task_id=? AND item=? AND started_at IS NULL",
+                    (task_id, item),
+                ).fetchone()
+                if row is not None:
+                    return
             cur.execute(
-                "INSERT INTO telemetry_dwell(task_id, enqueued_at, started_at) VALUES (?, ?, NULL)"
-                " ON CONFLICT(task_id) DO UPDATE SET enqueued_at=excluded.enqueued_at, started_at=NULL",
-                (task_id, now),
+                "INSERT INTO telemetry_review_wait(task_id, item, enqueued_at, started_at) VALUES (?, ?, ?, NULL)",
+                (task_id, item, now),
             )
 
-    def mark_review_start(self, task_id: str) -> None:
-        """Mark that a reviewer picked the task up, freezing its dwell time."""
+    def mark_review_start(self, task_id: str, item: str | None = None) -> None:
+        """Mark that a reviewer picked a submission up, freezing its dwell time.
+
+        With ``item`` the oldest waiting row of that item is started; with
+        ``item=None`` the task's oldest waiting submission (FIFO). No-op when
+        nothing matching is waiting.
+        """
         now = self._now()
         with self._tx() as cur:
-            cur.execute(
-                "UPDATE telemetry_dwell SET started_at=? WHERE task_id=? AND started_at IS NULL",
-                (now, task_id),
-            )
+            if item is None:
+                row = cur.execute(
+                    "SELECT id FROM telemetry_review_wait WHERE task_id=? AND started_at IS NULL"
+                    " ORDER BY enqueued_at, id LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT id FROM telemetry_review_wait WHERE task_id=? AND item=? AND started_at IS NULL"
+                    " ORDER BY enqueued_at, id LIMIT 1",
+                    (task_id, item),
+                ).fetchone()
+            if row is not None:
+                cur.execute("UPDATE telemetry_review_wait SET started_at=? WHERE id=?", (now, row[0]))
 
     # ----------------------------------------------------------------- readers
     def queue_dwell(self, task_id: str) -> float:
-        """Seconds the task has waited (or waited) for a reviewer.
+        """Review dwell of a task, in seconds.
 
-        While waiting: ``now - enqueued``; once picked up: ``started - enqueued``.
-        Returns 0.0 for tasks that never entered the review wait.
+        If any submission is still waiting: ``now - enqueued`` of the OLDEST
+        waiting one. Otherwise the frozen dwell (``started - enqueued``) of the
+        most recently started submission. 0.0 if it never waited for review.
         """
-        rows = self._query("SELECT enqueued_at, started_at FROM telemetry_dwell WHERE task_id=?", (task_id,))
+        rows = self._query(
+            "SELECT MIN(enqueued_at) FROM telemetry_review_wait WHERE task_id=? AND started_at IS NULL",
+            (task_id,),
+        )
+        if rows and rows[0][0] is not None:
+            return max(0.0, self._now() - float(rows[0][0]))
+        rows = self._query(
+            "SELECT enqueued_at, started_at FROM telemetry_review_wait WHERE task_id=? AND started_at IS NOT NULL"
+            " ORDER BY started_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        )
         if not rows:
             return 0.0
         enqueued, started = rows[0]
-        end = started if started is not None else self._now()
-        return max(0.0, float(end) - float(enqueued))
+        return max(0.0, float(started) - float(enqueued))
 
     def waiting_for_review(self) -> dict[str, float]:
-        """Current dwell for every task still waiting for a reviewer."""
+        """``{task_id: dwell of its oldest waiting submission}`` for tasks with any waiting."""
         now = self._now()
-        rows = self._query("SELECT task_id, enqueued_at FROM telemetry_dwell WHERE started_at IS NULL")
+        rows = self._query(
+            "SELECT task_id, MIN(enqueued_at) FROM telemetry_review_wait WHERE started_at IS NULL"
+            " GROUP BY task_id ORDER BY task_id"
+        )
         return {task_id: max(0.0, now - float(enq)) for task_id, enq in rows}
+
+    def waiting_submissions(self) -> list[dict[str, Any]]:
+        """Every submission still waiting for review, oldest first."""
+        now = self._now()
+        rows = self._query(
+            "SELECT task_id, item, enqueued_at FROM telemetry_review_wait WHERE started_at IS NULL"
+            " ORDER BY enqueued_at, id"
+        )
+        return [
+            {"task_id": t, "item": i, "dwell_seconds": max(0.0, now - float(e))} for t, i, e in rows
+        ]
 
     def gate_failures(self, task_id: str | None = None) -> int:
         """Gate failure count for one task (or all tasks)."""

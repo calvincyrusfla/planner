@@ -21,6 +21,7 @@ from foundry.gemma_client import (
     GemmaUnavailable,
     OllamaGemmaClient,
     SimulatedGemmaClient,
+    is_loopback_url,
     parse_chat_completion,
 )
 
@@ -239,7 +240,8 @@ def test_connection_refused_gives_clear_message(free_port: int) -> None:
     with pytest.raises(GemmaUnavailable) as info:
         asyncio.run(client.chat([{"role": "user", "content": "x"}]))
     msg = str(info.value)
-    assert "not reachable" in msg and str(free_port) in msg and "setup_foreman" in msg
+    assert "not reachable" in msg and str(free_port) in msg
+    assert "./foundry/setup_foreman.sh" in msg and "foundry\\setup_foreman.bat" in msg
     assert info.value.status is None
 
 
@@ -344,3 +346,40 @@ def test_parse_json_strips_fence_and_rejects_garbage() -> None:
     assert GemmaReply(text='```json\n{"a": 1}\n```').parse_json() == {"a": 1}
     with pytest.raises(GemmaUnavailable):
         GemmaReply(text="not json").parse_json()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_loopback_bypasses_env_proxy(monkeypatch: pytest.MonkeyPatch, free_port: int, host: str) -> None:
+    """A dead HTTP(S)_PROXY must not break calls to a local Ollama."""
+    dead_proxy = f"http://127.0.0.1:{free_port}"
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(var, dead_proxy)
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    with FakeOllama(lambda b: (200, completion("direct"))) as srv:
+        client = OllamaGemmaClient(base_url=f"http://{host}:{srv.port}/v1", timeout=5)
+        reply = asyncio.run(client.chat([{"role": "user", "content": "x"}]))
+    assert reply.text == "direct"
+    assert len(srv.requests) == 1
+
+
+def test_non_loopback_still_uses_env_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remote hosts keep the normal proxy behaviour (a recording fake proxy sees the request)."""
+    with FakeOllama(lambda b: (200, completion("via proxy"))) as proxy:
+        for var in ("HTTP_PROXY", "http_proxy"):
+            monkeypatch.setenv(var, f"http://127.0.0.1:{proxy.port}")
+        for var in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(var, raising=False)
+        client = OllamaGemmaClient(base_url="http://gemma.example.invalid:11434/v1", timeout=5)
+        reply = asyncio.run(client.chat([{"role": "user", "content": "x"}]))
+    assert reply.text == "via proxy"
+    assert proxy.paths == ["http://gemma.example.invalid:11434/v1/chat/completions"]
+
+
+def test_is_loopback_url() -> None:
+    assert is_loopback_url("http://localhost:11434/v1")
+    assert is_loopback_url("http://127.0.0.1:11434/v1")
+    assert is_loopback_url("http://127.5.0.1/v1")
+    assert is_loopback_url("http://[::1]:11434/v1")
+    assert not is_loopback_url("http://192.168.1.20:11434/v1")
+    assert not is_loopback_url("http://gemma.example.com/v1")

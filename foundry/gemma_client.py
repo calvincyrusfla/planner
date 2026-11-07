@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import ipaddress
 import json
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, runtime_checkable
@@ -36,6 +38,7 @@ __all__ = [
     "GemmaUsage",
     "OllamaGemmaClient",
     "SimulatedGemmaClient",
+    "is_loopback_url",
     "parse_chat_completion",
 ]
 
@@ -130,6 +133,17 @@ class GemmaClient(Protocol):
             temperature: sampling temperature.
         """
         ...
+
+
+def is_loopback_url(url: str) -> bool:
+    """True when ``url`` points at this machine, so HTTP(S)_PROXY must be bypassed."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def decode_json_text(text: str) -> Any:
@@ -232,6 +246,12 @@ class OllamaGemmaClient:
         self.timeout = timeout
         self.api_key = api_key
         self._json_schema_supported = True
+        # A local Ollama must never be reached through a system/env proxy
+        # (foreman_probe does the same, so probe and chat agree).
+        handlers: list[urllib.request.BaseHandler] = []
+        if is_loopback_url(self.base_url):
+            handlers.append(urllib.request.ProxyHandler({}))
+        self._opener = urllib.request.build_opener(*handlers)
 
     @property
     def endpoint(self) -> str:
@@ -284,7 +304,7 @@ class OllamaGemmaClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self._opener.open(req, timeout=self.timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as exc:
             try:
@@ -307,7 +327,8 @@ class OllamaGemmaClient:
                 ) from exc
             raise GemmaUnavailable(
                 f"Gemma Shop Foreman is not reachable at {self.base_url} ({reason}). "
-                "Run ./setup_foreman.sh (macOS/Linux) or setup_foreman.bat (Windows) to start it."
+                "Run ./foundry/setup_foreman.sh (macOS/Linux) or foundry\\setup_foreman.bat (Windows) "
+                "from the repo root to start it."
             ) from exc
         except (ConnectionError, OSError) as exc:
             raise GemmaUnavailable(f"Gemma Shop Foreman connection to {self.base_url} failed: {exc}") from exc

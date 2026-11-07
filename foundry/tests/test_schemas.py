@@ -218,12 +218,18 @@ def test_json_round_trip(model: type[BaseModel], factory: Any) -> None:
     assert again2 == obj
 
 
-@pytest.mark.parametrize(("model", "factory"), ALL_VALID, ids=IDS)
+# ClaudeResult is the only contract whose fields all have defaults; it is
+# covered by test_claude_result_defaults instead.
+WITH_REQUIRED = [(m, fac) for m, fac in ALL_VALID if m is not ClaudeResult]
+
+
+@pytest.mark.parametrize(
+    ("model", "factory"), WITH_REQUIRED, ids=[m.__name__ for m, _ in WITH_REQUIRED]
+)
 def test_missing_required_field_rejected(model: type[BaseModel], factory: Any) -> None:
     data = factory()
     required = [n for n, f in model.model_fields.items() if f.is_required()]
-    if not required:  # e.g. ClaudeResult: every field has a sensible default
-        pytest.skip(f"{model.__name__} has no required fields")
+    assert required, f"{model.__name__} unexpectedly has no required fields"
     for name in required:
         partial = dict(data)
         partial.pop(name)
@@ -643,3 +649,28 @@ def test_claude_result_tokens_int() -> None:
 def test_module_exports_complexity() -> None:
     assert hasattr(schemas, "Complexity")
     assert hasattr(schemas, "GateCheck")
+
+
+def test_claude_result_defaults() -> None:
+    r = ClaudeResult()
+    assert r.text == ""
+    assert (r.input_tokens, r.output_tokens, r.cache_read_tokens) == (0, 0, 0)
+    assert r.duration_seconds == 0.0
+    assert r.cost_usd is None
+    assert r.is_error is False and r.error is None
+
+
+def test_claude_result_cache_read_tokens() -> None:
+    r = ClaudeResult.model_validate(_claude_result(cache_read_tokens=1200))
+    assert r.cache_read_tokens == 1200
+    # Tracked separately: not folded into input_tokens.
+    assert r.input_tokens == 10
+    assert r.total_tokens == 15  # uncached input + output only
+    again = ClaudeResult.model_validate_json(r.model_dump_json())
+    assert again.cache_read_tokens == 1200
+
+
+@pytest.mark.parametrize("bad", [-1, "lots", 1.5])
+def test_claude_result_cache_read_tokens_invalid(bad: Any) -> None:
+    with pytest.raises(ValidationError):
+        ClaudeResult.model_validate(_claude_result(cache_read_tokens=bad))

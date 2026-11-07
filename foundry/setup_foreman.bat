@@ -93,7 +93,9 @@ call :api_up
 if not errorlevel 1 goto :api_ready
 if "%DRY%"=="1" goto :serve_dry
 echo [foreman] Ollama API not answering at %OLLAMA_URL%; starting "ollama serve" in the background.
-echo [foreman] Log: %SERVE_LOG% - keep this window open, or start the Ollama app instead.
+echo [foreman] Log: %SERVE_LOG%
+echo [foreman] NOTE: closing this window stops the "ollama serve" started here.
+echo [foreman]       For a server that stays up, start the Ollama app instead - it runs in the system tray.
 start "" /B ollama serve > "%SERVE_LOG%" 2>&1
 set /a "WAITED=0"
 :wait_loop
@@ -113,6 +115,7 @@ goto :finish
 :serve_dry
 echo [foreman] Ollama API not answering at %OLLAMA_URL%; would start it:
 echo [dry-run] start "" /B ollama serve ^> "%SERVE_LOG%" 2^>^&1
+echo [foreman] NOTE: closing this window would stop that "ollama serve"; the Ollama tray app keeps it running.
 goto :pull
 
 :api_started
@@ -142,18 +145,22 @@ goto :finish
 
 rem ---- 6. probe -------------------------------------------------------------
 :probe
+rem First of .venv / py -3 / python that really runs Python 3.11 or newer
+rem (running it, not "where python", also skips the Microsoft Store alias stub).
 set "PY="
-if exist "%REPO_ROOT%\.venv\Scripts\python.exe" set PY="%REPO_ROOT%\.venv\Scripts\python.exe"
+if not exist "%REPO_ROOT%\.venv\Scripts\python.exe" goto :try_py_launcher
+"%REPO_ROOT%\.venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+if not errorlevel 1 set PY="%REPO_ROOT%\.venv\Scripts\python.exe"
 if defined PY goto :run_probe
-py -3 --version >nul 2>&1
+:try_py_launcher
+py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if not errorlevel 1 set "PY=py -3"
 if defined PY goto :run_probe
-rem "python --version" (not "where python") skips the Microsoft Store alias stub.
-python --version >nul 2>&1
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if not errorlevel 1 set "PY=python"
 if defined PY goto :run_probe
-echo [foreman] Python 3.11+ not found. Install it from https://www.python.org/downloads/ then run:
-echo [foreman]   python -m foundry.foreman_probe
+echo [foreman] Python 3.11 or newer not found. Install it from https://www.python.org/downloads/ then run:
+echo [foreman]   py -3 -m foundry.foreman_probe
 set "RC=1"
 goto :finish
 
@@ -161,11 +168,15 @@ goto :finish
 cd /d "%REPO_ROOT%"
 if not "%DRY%"=="1" goto :run_probe_real
 echo [dry-run] %PY% -m foundry.foreman_probe --base-url "%OLLAMA_URL%/v1" --model "%MODEL%"
-goto :finish
+goto :next_step
 :run_probe_real
 %PY% -m foundry.foreman_probe --base-url "%OLLAMA_URL%/v1" --model "%MODEL%"
 set "RC=%ERRORLEVEL%"
-if "%RC%"=="0" echo [foreman] Shop Foreman ready. Launch the orchestrator: %PY% -m foundry.main
+if not "%RC%"=="0" goto :finish
+echo [foreman] Shop Foreman ready.
+:next_step
+echo [foreman] Next, from %REPO_ROOT%:
+echo   .venv\Scripts\python -m foundry.main --real --repo ^<path^> --title "..."
 goto :finish
 
 :no_ollama

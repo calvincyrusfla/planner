@@ -7,7 +7,6 @@ and the shell script runs in dry-run mode with a fake ``ollama`` on PATH.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import socket
@@ -144,8 +143,8 @@ def test_probe_nothing_listening_is_graceful_and_fast() -> None:
     assert result.ok is False
     assert result.models == []
     assert result.message == (
-        f"Gemma Shop Foreman is not reachable at {url}. Run ./setup_foreman.sh (macOS/Linux) "
-        "or setup_foreman.bat (Windows) to start Gemma 4 before launching the orchestrator."
+        f"Gemma Shop Foreman is not reachable at {url}. Run ./foundry/setup_foreman.sh (macOS/Linux) "
+        "or foundry\\setup_foreman.bat (Windows) to start Gemma 4 before launching the orchestrator."
     )
     assert result.message == offline_message(url)
 
@@ -199,7 +198,7 @@ def test_cli_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
         assert main(["--base-url", root, "--model", "gemma4:e2b"]) == 2
         assert "ollama pull gemma4:e2b" in capsys.readouterr().err
     assert main(["--base-url", f"http://127.0.0.1:{free_port()}", "--timeout", "1"]) == 2
-    assert "setup_foreman.bat (Windows)" in capsys.readouterr().err
+    assert "foundry\\setup_foreman.bat (Windows)" in capsys.readouterr().err
 
 
 def test_cli_json_and_env_defaults(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

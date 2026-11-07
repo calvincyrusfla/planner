@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from foundry.config import DEFAULT_DB_PATH, AnomalyThresholds, FoundryConfig
+from foundry.config import (
+    DEFAULT_CLAUDE_APPEND_PROMPT,
+    DEFAULT_CLAUDE_EXTRA_ARGS,
+    DEFAULT_DB_PATH,
+    DEFAULT_PATCHES_DIR,
+    AnomalyThresholds,
+    FoundryConfig,
+)
 
 
 def test_defaults() -> None:
@@ -141,3 +148,77 @@ def test_conftest_helpers(fake_clock, db_path: Path) -> None:  # type: ignore[no
     assert (fake_clock.now() - start_now).total_seconds() == 2.5
     assert fake_clock.sleeps == [2.5]
     assert db_path.name == "foundry.db" and not db_path.exists()
+
+
+def test_round1_defaults() -> None:
+    cfg = FoundryConfig()
+    assert cfg.trust_cache is False
+    assert cfg.limit_cooldown_s == 1200
+    assert cfg.claude_extra_args == [
+        "--max-turns",
+        "3",
+        "--disallowedTools",
+        "Bash Edit Write NotebookEdit Task WebFetch WebSearch",
+    ]
+    assert tuple(cfg.claude_extra_args) == DEFAULT_CLAUDE_EXTRA_ARGS
+    assert cfg.claude_append_prompt == DEFAULT_CLAUDE_APPEND_PROMPT
+    assert "spawn agents" in DEFAULT_CLAUDE_APPEND_PROMPT
+    assert cfg.patches_dir == DEFAULT_PATCHES_DIR
+    assert cfg.patches_dir.parts[-3:] == ("foundry", "data", "patches")
+    # default list is not shared between instances
+    cfg.claude_extra_args.append("--x")
+    assert FoundryConfig().claude_extra_args == list(DEFAULT_CLAUDE_EXTRA_ARGS)
+
+
+def test_claude_cli_args() -> None:
+    cfg = FoundryConfig()
+    args = cfg.claude_cli_args()
+    assert args[:4] == list(DEFAULT_CLAUDE_EXTRA_ARGS)
+    assert args[4:] == ["--append-system-prompt", DEFAULT_CLAUDE_APPEND_PROMPT]
+    bare = FoundryConfig(claude_extra_args=[], claude_append_prompt="  ")
+    assert bare.claude_append_prompt is None
+    assert bare.claude_cli_args() == []
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("1", True), ("true", True), ("yes", True),
+                                               ("on", True), ("0", False), ("off", False)])
+def test_trust_cache_env(raw: str, expected: bool) -> None:
+    assert FoundryConfig.from_env({"FOUNDRY_TRUST_CACHE": raw}).trust_cache is expected
+
+
+def test_round1_env_vars(tmp_path: Path) -> None:
+    env = {
+        "FOUNDRY_LIMIT_COOLDOWN_S": "90",
+        "FOUNDRY_CLAUDE_ARGS": '--max-turns 5 --disallowedTools "Bash Edit"',
+        "FOUNDRY_CLAUDE_APPEND_PROMPT": "Only output a diff.",
+        "FOUNDRY_PATCHES_DIR": str(tmp_path / "p"),
+    }
+    cfg = FoundryConfig.from_env(env)
+    assert cfg.limit_cooldown_s == 90
+    assert cfg.claude_extra_args == ["--max-turns", "5", "--disallowedTools", "Bash Edit"]
+    assert cfg.claude_append_prompt == "Only output a diff."
+    assert cfg.patches_dir == tmp_path / "p"
+    assert cfg.ensure_patches_dir().is_dir()
+
+
+def test_none_word_clears_claude_flags() -> None:
+    cfg = FoundryConfig.from_env(
+        {"FOUNDRY_CLAUDE_ARGS": "none", "FOUNDRY_CLAUDE_APPEND_PROMPT": "NONE"}
+    )
+    assert cfg.claude_extra_args == []
+    assert cfg.claude_append_prompt is None
+    assert cfg.claude_cli_args() == []
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("FOUNDRY_TRUST_CACHE", "maybe"),
+        ("FOUNDRY_LIMIT_COOLDOWN_S", "0"),
+        ("FOUNDRY_LIMIT_COOLDOWN_S", "soon"),
+        ("FOUNDRY_CLAUDE_ARGS", '--x "unbalanced'),
+    ],
+)
+def test_round1_bad_values(var: str, value: str) -> None:
+    with pytest.raises(ValueError):
+        FoundryConfig.from_env({var: value})

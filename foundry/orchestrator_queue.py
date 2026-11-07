@@ -106,6 +106,7 @@ class Ticket(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     allowed_files: list[str] = Field(default_factory=list)
     fix_hint: str | None = None
+    in_review: bool = False
     claimed_by: str | None = None
     claimed_at: str | None = None
     created_at: str
@@ -194,9 +195,28 @@ CREATE TABLE IF NOT EXISTS escalations (
     prescribed_action TEXT NOT NULL,
     task_id           TEXT,
     payload           TEXT NOT NULL DEFAULT '{}',
-    applied_at        TEXT
+    applied_at        TEXT,
+    result            TEXT,
+    UNIQUE (alert_id)
+);
+
+CREATE TABLE IF NOT EXISTS alert_ids (
+    alert_id     TEXT PRIMARY KEY,
+    reserved_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 """
+
+#: Columns added after the first release; ``_migrate`` adds them to old dbs.
+_MIGRATIONS: dict[str, dict[str, str]] = {
+    "tickets": {"in_review": "INTEGER NOT NULL DEFAULT 0"},
+    "escalations": {"result": "TEXT"},
+}
 
 
 def _state(value: TaskState | str) -> TaskState:
@@ -270,7 +290,29 @@ class FoundryQueue:
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.executescript(_SCHEMA)
+            self._migrate()
         self._closed = False
+
+    def _migrate(self) -> None:
+        """Bring a database created by an older version up to the current schema."""
+        with self.transaction() as conn:
+            for table, columns in _MIGRATIONS.items():
+                have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                for name, ddl in columns.items():
+                    if name not in have:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+            # Old escalations tables lack UNIQUE(alert_id): drop duplicates
+            # (keep the first) and enforce uniqueness with an index.
+            conn.execute(
+                "DELETE FROM escalations WHERE id NOT IN"
+                " (SELECT MIN(id) FROM escalations GROUP BY alert_id)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_escalations_alert ON escalations(alert_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tickets_review ON tickets(in_review, status)"
+            )
 
     # ------------------------------------------------------------------ infra
 
@@ -907,7 +949,8 @@ class FoundryQueue:
             attempt=row["attempt"], title=row["title"],
             acceptance_criteria=json.loads(row["acceptance_criteria"] or "[]"),
             allowed_files=json.loads(row["allowed_files"] or "[]"),
-            fix_hint=row["fix_hint"], claimed_by=row["claimed_by"],
+            fix_hint=row["fix_hint"], in_review=bool(row["in_review"]),
+            claimed_by=row["claimed_by"],
             claimed_at=row["claimed_at"], created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

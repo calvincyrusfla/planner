@@ -50,7 +50,7 @@ EXIT_OK = 0
 EXIT_NOT_READY = 2
 
 _SETUP_HINT = (
-    "Run ./setup_foreman.sh (macOS/Linux) or setup_foreman.bat (Windows) "
+    "Run ./foundry/setup_foreman.sh (macOS/Linux) or foundry\\setup_foreman.bat (Windows) "
     "to start Gemma 4 before launching the orchestrator."
 )
 

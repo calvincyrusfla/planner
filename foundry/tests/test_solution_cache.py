@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from foundry.schemas import CodeSnippet, ContextSlice, TaskAssignment
-from foundry.solution_cache import RetryPolicy, SolutionCache, cache_key
+from foundry.solution_cache import CACHE_KEY_VERSION, RetryPolicy, SolutionCache, cache_key
 
 DIFF = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
 
@@ -18,6 +18,7 @@ def make_assignment(
     criteria: list[str] | None = None,
     files: list[str] | None = None,
     snippet_text: str = "def f():\n    ...\n",
+    objective: str = "Make f return 2.",
     **overrides: object,
 ) -> TaskAssignment:
     crit = criteria if criteria is not None else ["Return 2 from f", "Keep the public API"]
@@ -29,7 +30,7 @@ def make_assignment(
         acceptance_criteria=crit,
         allowed_files=files if files is not None else ["app.py", "lib/util.py"],
         context=ContextSlice(
-            objective="Make f return 2.",
+            objective=objective,
             acceptance_criteria=crit,
             snippets=[CodeSnippet(path="app.py", start_line=1, end_line=2, text=snippet_text)],
         ),
@@ -84,6 +85,40 @@ def test_reordering_and_whitespace_case_still_hit(cache: SolutionCache) -> None:
         criteria=["  keep the   PUBLIC api ", "return 2 FROM f"], files=["lib\\util.py", "./app.py"]
     )
     assert cache.lookup(reordered) == DIFF
+
+
+def test_reviewer_repro_different_objective_misses(cache: SolutionCache) -> None:
+    """charlie-6 round 1: task B must not be closed with task A's approved diff."""
+    crit = ["Tests pass", "No new dependencies"]
+    files = ["foundry/util.py"]
+    task_a = make_assignment(criteria=crit, files=files, objective="Add a slug helper.", task_id="F-001")
+    task_b = make_assignment(
+        criteria=crit, files=files, objective="Rename the module docstring.", task_id="F-002"
+    )
+    cache.store(task_a, DIFF, title="Add a slug helper", description="slugify(text) -> str")
+    assert cache.lookup(task_b, title="Rename the module docstring", description="Docs only") is None
+    assert cache.lookup(task_b) is None
+    assert cache.lookup(task_a, title="Add a slug helper", description="slugify(text) -> str") == DIFF
+
+
+def test_title_and_description_are_part_of_key(cache: SolutionCache) -> None:
+    a = make_assignment()
+    cache.store(a, DIFF, title="Add slug helper", description="Adds slugify")
+    assert cache.lookup(a, title="Add slug helper", description="Something else") is None
+    assert cache.lookup(a, title="Other title", description="Adds slugify") is None
+    assert cache.lookup(a) is None
+    # whitespace/case-insensitive, and None == ""
+    assert cache.lookup(a, title="  add SLUG   helper", description="adds slugify ") == DIFF
+    assert cache_key(a, title=None, description=None) == cache_key(a, title="", description="")
+
+
+def test_objective_whitespace_case_still_hits(cache: SolutionCache) -> None:
+    cache.store(make_assignment(), DIFF)
+    assert cache.lookup(make_assignment(objective="  make F   return 2. ")) == DIFF
+
+
+def test_key_version_bumped() -> None:
+    assert CACHE_KEY_VERSION == "v2"
 
 
 def test_persistence_across_reopen(tmp_path: Path) -> None:

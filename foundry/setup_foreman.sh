@@ -52,8 +52,12 @@ api_up() {
 
 # --- python ---------------------------------------------------------------
 PYTHON=""
+# First of .venv / python3 / python that is Python 3.11 or newer.
 for candidate in "$REPO_ROOT/.venv/bin/python" python3 python; do
-  if command -v "$candidate" >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
+  if command -v "$candidate" >/dev/null 2>&1 \
+     && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+    PYTHON="$candidate"; break
+  fi
 done
 
 # --- 1. ollama on PATH ------------------------------------------------------
@@ -135,13 +139,14 @@ fi
 
 # --- 6. probe -----------------------------------------------------------------
 if [ -z "$PYTHON" ]; then
-  say "Python 3.11+ not found; install it, then run: python -m foundry.foreman_probe"
+  say "Python 3.11 or newer not found; install it, then run: python3 -m foundry.foreman_probe"
   exit 1
 fi
 cd "$REPO_ROOT" || exit 1
 run "$PYTHON" -m foundry.foreman_probe --base-url "$OLLAMA_URL/v1" --model "$MODEL"
 status=$?
-if [ "$status" -eq 0 ] && [ "$DRY_RUN" != "1" ]; then
-  say "Shop Foreman ready. Launch the orchestrator: $PYTHON -m foundry.main"
+if [ "$status" -eq 0 ]; then
+  [ "$DRY_RUN" = "1" ] || say "Shop Foreman ready."
+  say "Next (from $REPO_ROOT): $PYTHON -m foundry.main --real --repo <path> --title \"...\""
 fi
 exit "$status"
