@@ -25,7 +25,7 @@ import re
 import socket
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -1041,4 +1041,162 @@ def test_explanations_name_the_real_cause(tmp_path: Path) -> None:
     f.limiter.pause_until(seconds=3600)
     _, lines = explain_task(f, tid)
     assert any(re.search(r"paused until .*\(usage limit\) - rerun", ln) for ln in lines)
+    f.close()
+
+
+# --------------------------------------------------------------------------- T-012: board ops survive the exit
+
+
+class _SlowBoard(BaseHTTPRequestHandler):
+    """A dashboard in front of a slow shared board: every updateTask takes 3.5 s."""
+
+    received: list[dict[str, Any]] = []
+
+    def _send(self, body: Any) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._send({"ok": True, "result": {"teams": [{"id": "alpha", "taskId": "T-077"}], "tasks": []}})
+
+    def do_POST(self) -> None:  # noqa: N802
+        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        type(self).received.append(body)
+        if body["type"] == "updateTask":
+            time.sleep(3.5)
+        result = {"task": {"id": "T-077", "builders": body["args"].get("builders")}, "assigned": ["alpha"]} if body["type"] == "addTask" else {}
+        self._send({"ok": True, "result": result})
+
+    def log_message(self, *a: Any) -> None:
+        pass
+
+
+_SHORT_LIVED_RUN = r"""
+import argparse, asyncio, sys
+from pathlib import Path
+from foundry.config import FoundryConfig
+from foundry.gemma_client import SimulatedGemmaClient
+from foundry.main import demo_claude, run_real, write_demo_repo
+
+tmp = Path(sys.argv[1])
+repo = write_demo_repo(tmp / "repo")
+args = argparse.Namespace(repo=str(repo), title="Add clamp helper", desc="Add clamp.", files=["shop/mathx.py"], timeout=30)
+config = FoundryConfig(db_path=tmp / "foundry.db", patches_dir=tmp / "patches", rpm=1000, tpm=10_000_000,
+                       teams=["alpha"], board_bridge_mode="auto")
+code = asyncio.run(run_real(args, config, demo_claude(repo, fail_first=None), SimulatedGemmaClient(), out=lambda _l: None))
+print("EXIT", code, flush=True)
+"""
+
+
+def test_real_run_delivers_review_verdict_and_done_before_the_process_exits(tmp_path: Path) -> None:
+    """Regression (T-012): the last board ops were lost when a real run exited behind a slow board.
+
+    A separate process runs the whole --real flow (simulated Claude/Gemma, the
+    bridge in auto mode) against a fake dashboard whose updateTask takes 3.5 s,
+    and exits right after, like ``python -m foundry.main --real``. The review,
+    the verdict and the done must all have arrived by then (the old 5 s flush
+    let the daemon sender die with done still queued).
+    """
+    import os
+    import subprocess
+    import sys
+
+    _SlowBoard.received = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SlowBoard)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FOUNDRY_", "DEPT_"))}
+    env.update(
+        FOUNDRY_DASHBOARD_URL=f"http://127.0.0.1:{server.server_port}",
+        # if anything ever fell back to the CLI, it must only see a throwaway local board
+        DEPT_HUB="off", DEPT_HUB_URL="", DEPT_DATA=str(tmp_path / "dept-state.json"), PORT=str(_free_port()),
+        PYTHONPATH=str(Path(__file__).resolve().parents[2]),
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _SHORT_LIVED_RUN, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120,
+        )
+        received = list(_SlowBoard.received)  # what had arrived when the process was gone
+    finally:
+        server.shutdown()
+    assert "EXIT 0" in proc.stdout, proc.stdout + proc.stderr
+    ops = [(r["type"], (r["args"].get("patch") or {}).get("status"), r["args"].get("teamId")) for r in received]
+    assert ops[0][0] == "addTask" and received[0]["args"]["builders"] == 1  # the Foundry allocation (S = 1)
+    assert ops[-3:] == [("reviewTask", None, "alpha"), ("reportProgress", None, None), ("updateTask", "done", None)], ops
+    assert ("updateTask", "review", None) in ops
+    assert received[-1]["args"]["id"] == "T-077"
+    assert not (tmp_path / "dept-state.json").exists()  # nothing went through the CLI
+
+
+def _slow_draft_gemma(delay: float) -> SimulatedGemmaClient:
+    """The demo Gemma, but the commit message / PR draft takes ``delay`` seconds (a real draft is slow)."""
+    from foundry.main import demo_gemma
+
+    inner = demo_gemma().responder
+
+    async def responder(req: GemmaRequest) -> Any:
+        if "commit" in json.dumps(req.messages).lower():
+            await asyncio.sleep(delay)
+        return inner(req)  # type: ignore[misc]
+
+    return SimulatedGemmaClient(responder)
+
+
+def test_shutdown_waits_for_a_slow_pr_draft_and_its_board_ops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leaving ``running()`` while the Foreman still drafts must not cancel the draft (or the board's done)."""
+    from foundry import builder_worker
+
+    stop = builder_worker.TeamPool.stop
+
+    async def fast_stop(self: Any, timeout: float = 5.0) -> None:
+        await stop(self, 0.01)  # a stop grace far shorter than the draft
+
+    monkeypatch.setattr(builder_worker.TeamPool, "stop", fast_stop)
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, demo_claude(repo, fail_first=None), gemma=_slow_draft_gemma(0.6), repo=repo, teams=["alpha"])
+
+    async def go() -> str:
+        tid = await f.manager.submit(WorkOrder(**S_ORDER))
+        async with f.running():
+            while f.queue.get_task(tid)["state"] != "complete":
+                await asyncio.sleep(0.01)
+            # leave at once: the draft is still in flight
+        return tid
+
+    tid = _run(go())
+    assert tid in f.manager.pr_summaries
+    assert (tmp_path / "patches" / f"{tid}.patch").is_file()
+    assert [op["args"]["patch"]["status"] for op in f.bridge.ops if op["type"] == "updateTask"] == ["review", "done"]
+    f.close()
+
+
+def test_cancelled_caller_does_not_cancel_completion_and_a_missing_patch_is_rewritten(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, demo_claude(repo, fail_first=None), gemma=_slow_draft_gemma(0.3), repo=repo, teams=["alpha"])
+    m = f.manager
+
+    async def go() -> str:
+        tid = await m.submit(WorkOrder(**S_ORDER))
+        m.diffs[tid] = {f"{tid}.1": append_diff("shop/mathx.py", (repo / "shop/mathx.py").read_text(), ["X = 1"])}
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(m.on_task_complete(tid), timeout=0.05)  # the caller gives up ...
+        assert tid not in m.pr_summaries  # ... nothing is recorded before the patch exists
+        assert await m.drain(5.0) is True  # ... but the work went on
+        assert tid in m.pr_summaries
+        patch = tmp_path / "patches" / f"{tid}.patch"
+        assert patch.is_file()
+        dones = sum(1 for op in f.bridge.ops if op["type"] == "updateTask" and op["args"]["patch"] == {"status": "done"})
+        patch.unlink()
+        calls = f.gemma.calls
+        again = await m.on_task_complete(tid)  # repair: same summary, patch rewritten, no new board ops
+        assert again == m.pr_summaries[tid] and patch.is_file()
+        assert f.gemma.calls == calls
+        assert sum(1 for op in f.bridge.ops if op["type"] == "updateTask" and op["args"]["patch"] == {"status": "done"}) == dones
+        return tid
+
+    _run(go())
     f.close()

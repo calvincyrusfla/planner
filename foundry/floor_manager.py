@@ -119,6 +119,11 @@ def _val(x: Any) -> Any:
 
 
 _KV_KEY = "floor_manager.state"
+#: How long :meth:`FloorManager.drain` waits by default for in-flight completion
+#: work (the Shop Foreman's PR draft, the patch file, the board's review/done).
+#: A real Gemma draft can take a minute; the Foreman falls back to a heuristic
+#: draft when Gemma times out, so this is an upper bound, not a typical wait.
+DEFAULT_FINISH_TIMEOUT_S = 600.0
 _TASK_ID_RE = re.compile(r"^F-(\d+)$")
 _TERMINAL = {"complete", "quarantined", "failed"}
 
@@ -139,6 +144,8 @@ class FloorManager:
         patches_dir: where :meth:`on_task_complete` writes ``<task_id>.patch``
             (the combined approved diff) and ``<task_id>.md`` (the PR draft).
             ``None`` writes nothing.
+        finish_timeout: default bound (seconds) for :meth:`drain`, i.e. how
+            long shutdown waits for in-flight :meth:`on_task_complete` work.
 
     Restart safety: the manager's own state (directives, orders, allocations,
     board ids, PR drafts, reported quarantines, applied alerts) is kept in the
@@ -159,8 +166,10 @@ class FloorManager:
         builders_per_team: int = 5,
         patches_dir: str | Path | None = None,
         repo_root: str | Path | None = None,
+        finish_timeout: float = DEFAULT_FINISH_TIMEOUT_S,
     ) -> None:
         self.queue = queue
+        self.finish_timeout = float(finish_timeout)
         self.foreman = foreman
         self.teams = dict(teams)
         self.telemetry = telemetry
@@ -179,7 +188,8 @@ class FloorManager:
         self.rejected_patches: dict[str, Path] = {}
         self._seq = 0
         self._completed: set[str] = set()
-        self._finishing: set[str] = set()
+        #: task id -> the one task doing its completion work (shared by every caller).
+        self._finish_tasks: dict[str, asyncio.Task[dict[str, str]]] = {}
         self._reported_quarantine: set[str] = set()
         self._pending: set[asyncio.Task[Any]] = set()
         #: Current builder allocation per task (updated on RESIZE_ALLOCATION).
@@ -612,10 +622,30 @@ class FloorManager:
         self._pending.add(t)
         t.add_done_callback(self._pending.discard)
 
-    async def drain(self, timeout: float = 5.0) -> None:
-        """Wait for scheduled completion work (PR drafts) to finish."""
-        if self._pending:
-            await asyncio.wait(set(self._pending), timeout=timeout)
+    async def drain(self, timeout: float | None = None) -> bool:
+        """Wait for in-flight completion work (PR drafts, patch files, board review/done).
+
+        Waits up to ``timeout`` seconds (default :attr:`finish_timeout`) for
+        every scheduled :meth:`on_task_complete` / completion watcher, including
+        ones started while waiting. Never cancels them. Returns True when
+        nothing is left in flight.
+        """
+        limit = self.finish_timeout if timeout is None else float(timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, limit)
+        while True:
+            pending = {t for t in self._pending if not t.done()}
+            if not pending:
+                return True
+            left = deadline - loop.time()
+            if left <= 0:
+                busy = sorted(t for t, task in self._finish_tasks.items() if not task.done())
+                log.warning(
+                    "floor manager: completion work still running after %gs%s",
+                    limit, f" ({', '.join(busy)})" if busy else "",
+                )
+                return False
+            await asyncio.wait(pending, timeout=left)
 
     def report_quarantines(self) -> list[str]:
         """Report tasks the workers quarantined (retry limit, REJECTED) to the board once."""
@@ -630,38 +660,63 @@ class FloorManager:
         return out
 
     async def on_task_complete(self, task_id: str, diff: str | None = None) -> dict[str, str]:
-        """Draft the commit message / PR body with the Foreman, store it, mark the board task done.
+        """Draft the commit message / PR body with the Foreman, write the patch, mark the board task done.
 
-        Idempotent: the pool callback and :meth:`on_approved` may both trigger it.
+        Idempotent: the pool callback, :meth:`on_approved` and ``run_real`` may
+        all call it; they share one manager-owned task, so cancelling a caller
+        (a pool being stopped, a caller's own timeout) never cancels the work.
+        A task whose summary was recorded but whose patch file is missing (the
+        write failed, or the file was removed) gets the patch rewritten from the
+        stored summary, without asking the Foreman again.
         """
-        if task_id in self.pr_summaries:
+        if task_id in self.pr_summaries and not self._patch_missing(task_id):
             return self.pr_summaries[task_id]
-        if task_id in self._finishing:
-            while task_id not in self.pr_summaries and task_id in self._finishing:
-                await asyncio.sleep(0.005)
-            return self.pr_summaries.get(task_id, {})
-        self._finishing.add(task_id)
-        try:
-            return await self._finish(task_id, diff)
-        finally:
-            self._finishing.discard(task_id)
+        task = self._finish_tasks.get(task_id)
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(self._finish(task_id, diff))
+            self._finish_tasks[task_id] = task
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
+        return await asyncio.shield(task)
+
+    def _patch_missing(self, task_id: str) -> bool:
+        """True when patches are written but neither this task's .patch nor .patch.rejected exists."""
+        if self.patches_dir is None:
+            return False
+        name = self.patch_names.get(task_id)
+        if not name:
+            return True
+        return not any((self.patches_dir / f"{name}{ext}").is_file() for ext in (".patch", ".patch.rejected"))
+
+    def _approved_diff(self, task_id: str) -> str:
+        parts = self.diffs.get(task_id, {})
+        return "".join(_with_newline(parts[k]) for k in sorted(parts, key=_subtask_order)) or self._task_diff(task_id)
 
     async def _finish(self, task_id: str, diff: str | None) -> dict[str, str]:
         if diff is None:
-            parts = self.diffs.get(task_id, {})
-            diff = "".join(_with_newline(parts[k]) for k in sorted(parts, key=_subtask_order)) or self._task_diff(task_id)
+            diff = self._approved_diff(task_id)
+        known = self.pr_summaries.get(task_id)
+        if known is not None:
+            # repair: the summary (and the board's review/done) are already recorded
+            await self._write_patch(task_id, diff, known)
+            self.save()
+            return known
         order = self.orders.get(task_id)
         summary = await _maybe_await(
             self.foreman.draft_pr_summary(diff, task_id=task_id, title=order.title if order else None)
         )
         summary = {k: str(v) for k, v in dict(summary).items()}
+        await self._write_patch(task_id, diff, summary)
+        # Recorded only once the patch is written: a run cut short before this
+        # point leaves the task unfinished, and the next call finishes it.
+        # Nothing below awaits, so the summary, the board ops and the save
+        # happen together or not at all.
         self.pr_summaries[task_id] = summary
         self._completed.add(task_id)
         try:
             self.queue.store_pr_summary(task_id, summary)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
             log.debug("store_pr_summary failed: %s", exc)
-        await self._write_patch(task_id, diff, summary)
         d = self.directives.get(task_id)
         if d is not None:
             self.bridge.review(task_id, d.team_id, "APPROVED", note="Foundry reviewer approved")
@@ -875,12 +930,15 @@ class Factory:
 
     @asynccontextmanager
     async def running(self) -> AsyncIterator[Factory]:
-        """Start every team pool; stop them (and flush the bridge) on exit."""
+        """Start every team pool; on exit wait for completion work, then stop the pools."""
         for pool in self.pools.values():
             pool.start()
         try:
             yield self
         finally:
+            # Completion work first (the PR draft, the patch, the board's
+            # review/done): a pool's stop grace would otherwise cancel it.
+            await self.manager.drain()
             for pool in self.pools.values():
                 await pool.stop()
             await self.manager.drain()
@@ -937,6 +995,7 @@ def build_factory(
     poll: float = 0.01,
     trust_cache: bool | None = None,
     patches_dir: str | Path | None = None,
+    finish_timeout: float | None = None,
     dispatch_repo: str | Path | None = None,
 ) -> Factory:
     """Build queue, telemetry, limiter, context engine, Foreman, cache, gates, pools and manager.
@@ -956,6 +1015,9 @@ def build_factory(
         patches_dir: overrides ``config.patches_dir`` for the approved patches
             (default: ``config.resolved_patches_dir()``, i.e. ``patches/`` next
             to the database unless FOUNDRY_PATCHES_DIR says otherwise).
+        finish_timeout: how long shutdown (``Factory.running`` / ``wait``)
+            waits for in-flight completion work (default
+            :data:`DEFAULT_FINISH_TIMEOUT_S`).
         dispatch_repo: when given, the pools only claim tickets of tasks that
             belong to this repository (real mode); None dispatches everything.
 
@@ -1005,6 +1067,7 @@ def build_factory(
         builders_per_team=config.builders_per_team,
         patches_dir=patches_dir,
         repo_root=repo_root,
+        finish_timeout=DEFAULT_FINISH_TIMEOUT_S if finish_timeout is None else finish_timeout,
     )
     pool_extra: dict[str, Any] = {}
     if dispatch_repo is not None:
