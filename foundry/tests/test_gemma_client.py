@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -55,7 +55,7 @@ class FakeOllama:
         fake = self
 
         class _H(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802 - http.server API
+            def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length)
                 body = json.loads(raw.decode("utf-8"))
@@ -87,11 +87,11 @@ class FakeOllama:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}/v1"
 
-    def __enter__(self) -> FakeOllama:
+    def __enter__(self) -> Self:
         self.thread.start()
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.server.shutdown()
         self.server.server_close()
 

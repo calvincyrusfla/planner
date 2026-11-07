@@ -22,7 +22,8 @@ import json
 import socket
 import urllib.error
 import urllib.request
-from typing import Any, Awaitable, Callable, Protocol, Union, runtime_checkable
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -294,7 +295,7 @@ class OllamaGemmaClient:
                 f"Gemma Shop Foreman at {self.base_url} returned HTTP {exc.code}: {detail}".rstrip(": "),
                 status=exc.code,
             ) from exc
-        except (TimeoutError, socket.timeout) as exc:
+        except TimeoutError as exc:
             raise GemmaUnavailable(
                 f"Gemma Shop Foreman at {self.base_url} timed out after {self.timeout:g}s"
             ) from exc
@@ -348,8 +349,8 @@ class OllamaGemmaClient:
         return parse_chat_completion(raw)
 
 
-ResponderResult = Union[GemmaReply, str, dict, list, None]
-Responder = Callable[[GemmaRequest], Union[ResponderResult, Awaitable[ResponderResult]]]
+ResponderResult = GemmaReply | str | dict | list | None
+Responder = Callable[[GemmaRequest], ResponderResult | Awaitable[ResponderResult]]
 
 
 class SimulatedGemmaClient:

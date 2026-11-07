@@ -116,7 +116,7 @@ class ClaudeClient(Protocol):
 
 _RATE_LIMIT_RE = re.compile(
     r"rate[\s_-]?limit|usage[\s_-]?limit|too many requests|overloaded|\b429\b|\b529\b"
-    r"|limit reached",
+    r"|\d+[\s-]?hour limit|weekly limit|session limit|hit your (?:usage )?limit",
     re.IGNORECASE,
 )
 _RETRY_SECONDS_RE = re.compile(

@@ -263,8 +263,10 @@ class RateLimiter:
         if delta == 0:
             return
         now = self._clock()
-        self._refill(now)
-        self._tok_bucket.level = min(self._tok_bucket.capacity, self._tok_bucket.level - delta)
+        factor = self._refill(now)
+        self._tok_bucket.level = min(
+            self._tok_bucket.capacity * factor, self._tok_bucket.level - delta
+        )
         self._prune(now)
         self._tokens.append((now, delta))
 
