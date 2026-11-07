@@ -1002,3 +1002,87 @@ def test_migrates_old_database(db: Path) -> None:
         assert q.kv_get("k") == 1
     finally:
         close(q)
+
+
+# --------------------------------------------------------------------------
+# Round 2: per-ticket infrastructure failure counter (E1)
+# --------------------------------------------------------------------------
+
+
+def test_infra_counter_counts_consecutive_and_resets(q: FoundryQueue, db: Path) -> None:
+    sized(q, complexity="S")
+    t = q.claim_ticket("alpha", 1)
+    assert t.infra_failures == 0 and t.infra_last_error is None
+    assert q.record_infra_failure(t.ticket_id, "timeout after 600s") == 1
+    assert q.release_ticket(t.ticket_id) is True
+    t = q.claim_ticket("alpha", 1)
+    assert t.infra_failures == 1  # survives release and re-claim
+    assert t.infra_last_error == "timeout after 600s"
+    assert t.attempt == 0  # infra failures never spend an attempt
+    assert q.record_infra_failure(t.ticket_id, "exit without JSON") == 2
+    q.reset_infra_failures(t.ticket_id)
+    t = q.get_ticket(t.ticket_id)
+    assert t.infra_failures == 0
+    assert t.infra_last_error == "exit without JSON"  # kept as history
+    assert q.record_infra_failure(t.ticket_id, "again") == 1
+    assert tickets_of(db, "T-1")[0]["infra_failures"] == 1
+    assert state_of(q, "T-1") == "building"  # the queue never quarantines on its own
+    kinds = [e["kind"] for e in q.events(task_id="T-1")]
+    assert kinds.count("infra_failure") == 3 and "infra_failures_reset" in kinds
+
+
+def test_infra_counter_is_per_ticket(q: FoundryQueue) -> None:
+    sized(q, complexity="M")
+    a = q.claim_ticket("alpha", 1)
+    b = q.claim_ticket("alpha", 2)
+    q.record_infra_failure(a.ticket_id, "x")
+    q.record_infra_failure(a.ticket_id, "x")
+    assert q.record_infra_failure(b.ticket_id, "y") == 1
+    assert q.get_ticket(a.ticket_id).infra_failures == 2
+
+
+def test_infra_error_excerpt_truncated_and_single_line(q: FoundryQueue) -> None:
+    from foundry.orchestrator_queue import INFRA_ERROR_MAX
+
+    sized(q, complexity="S")
+    t = q.claim_ticket("alpha", 1)
+    q.record_infra_failure(t.ticket_id, "line1\nline2\t" + "z" * 2000)
+    err = q.get_ticket(t.ticket_id).infra_last_error
+    assert err is not None and len(err) <= INFRA_ERROR_MAX
+    assert err.startswith("line1 line2 z") and "\n" not in err
+
+
+def test_infra_counter_unknown_ticket(q: FoundryQueue) -> None:
+    with pytest.raises(KeyError):
+        q.record_infra_failure("T-1:nope", "x")
+    with pytest.raises(KeyError):
+        q.reset_infra_failures("T-1:nope")
+
+
+def test_infra_counter_persists_and_migrates(db: Path) -> None:
+    with raw(db) as c:  # tickets table from before round 2 (no infra columns)
+        c.executescript(
+            """
+            CREATE TABLE tickets (ticket_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+              team_id TEXT NOT NULL, subtask_id TEXT NOT NULL, slot INTEGER NOT NULL,
+              status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+              title TEXT NOT NULL DEFAULT '', acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+              allowed_files TEXT NOT NULL DEFAULT '[]', fix_hint TEXT,
+              in_review INTEGER NOT NULL DEFAULT 0, claimed_by TEXT,
+              claimed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE (task_id, subtask_id));
+            """
+        )
+    q1 = FoundryQueue(db)
+    sized(q1, complexity="S")
+    t = q1.claim_ticket("alpha", 1)
+    assert t.infra_failures == 0
+    q1.record_infra_failure(t.ticket_id, "launch failed")
+    close(q1)
+    q2 = FoundryQueue(db)
+    try:
+        assert q2.resume() == 1
+        t = q2.get_ticket(t.ticket_id)
+        assert t.infra_failures == 1 and t.infra_last_error == "launch failed"
+    finally:
+        close(q2)

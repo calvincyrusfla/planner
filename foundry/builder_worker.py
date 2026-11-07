@@ -155,6 +155,29 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
+_KW_CACHE: dict[tuple[Any, str], bool] = {}
+
+
+def _accepts_kw(fn: Callable[..., Any], name: str) -> bool:
+    """Whether ``fn`` accepts keyword ``name`` (inspected once per function, then cached)."""
+    key = (getattr(fn, "__func__", fn), name)
+    cached = _KW_CACHE.get(key)
+    if cached is None:
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):  # builtins without a signature
+            cached = False
+        else:
+            cached = name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        _KW_CACHE[key] = cached
+    return cached
+
+
+def _supported_kwargs(fn: Callable[..., Any], kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """The subset of ``kwargs`` that ``fn`` accepts (older collaborators lack newer keywords)."""
+    return {k: v for k, v in kwargs.items() if _accepts_kw(fn, k)}
+
+
 async def _maybe_await(value: Any) -> Any:
     """Await ``value`` when it is awaitable, else return it."""
     if inspect.isawaitable(value):
@@ -594,6 +617,7 @@ class _WorkerBase:
         backoff_attempts: int = 5,
         limit_cooldown_s: float = 1200.0,
         infra_backoff_s: float = 5.0,
+        infra_failure_cap: int = 3,
     ) -> None:
         self.team_id = team_id
         self.queue = queue
@@ -611,6 +635,9 @@ class _WorkerBase:
         self.infra_failures = 0
         #: Infrastructure failures seen in total (usage limits, timeouts, CLI missing ...).
         self.infra_errors: list[str] = []
+        #: Consecutive counted failures before a ticket's task is quarantined (E1).
+        self.infra_failure_cap = int(infra_failure_cap)
+        self._local_infra: dict[str, int] = {}
 
     # -- telemetry (never lets a metrics error break the line) ---------------
     def _tm(self, method: str, *args: Any, **kwargs: Any) -> None:
@@ -618,12 +645,7 @@ class _WorkerBase:
         if fn is None:
             return
         try:
-            try:
-                fn(*args, **kwargs)
-            except TypeError:
-                if not kwargs:
-                    raise
-                fn(*args)  # older telemetry without the keyword
+            fn(*args, **_supported_kwargs(fn, kwargs))
         except Exception:  # pragma: no cover - defensive
             log.exception("telemetry.%s failed", method)
 
@@ -745,28 +767,35 @@ class _WorkerBase:
             "record_tokens", task_id, self.agent_id, self.role, result.input_tokens, result.output_tokens,
             cache_read_tokens=int(getattr(result, "cache_read_tokens", 0) or 0),
         )
-        self.infra_failures = 0
         return result
 
-    # -- infrastructure failures (D1): never consume an attempt -------------
-    async def _handle_infra_error(self, exc: BaseException) -> float:
-        """Record an infrastructure failure and pause; returns this worker's own extra wait.
-
-        Usage/rate limits, logged-out or missing CLI pause the whole limiter
-        (``pause_until``) for ``retry_after`` or ``limit_cooldown_s``.  Other
-        failures (timeouts, crashes of the CLI) back off this worker only,
-        exponentially up to ``limit_cooldown_s``.
-        """
-        self.infra_failures += 1
-        self.infra_errors.append(_one_line(f"{type(exc).__name__}: {exc}", 200))
-        account_wide = tuple(
+    # -- infrastructure failures (D1/E1) --------------------------------------
+    @staticmethod
+    def _is_account_wide(exc: BaseException) -> bool:
+        """Usage/rate limit, logged out, CLI missing: clears by itself or needs the user."""
+        kinds = tuple(
             c for c in (
                 getattr(_claude_client, "ClaudeRateLimited", None),
                 getattr(_claude_client, "ClaudeAuthError", None),
                 getattr(_claude_client, "ClaudeNotFound", None),
             ) if c is not None
         )
-        if account_wide and isinstance(exc, account_wide):
+        return bool(kinds) and isinstance(exc, kinds)
+
+    async def _handle_infra_error(self, exc: BaseException) -> float:
+        """Log, pause and compute backoff for an infrastructure failure.
+
+        Account-wide errors pause the whole limiter (``pause_until``) for
+        ``retry_after`` or ``limit_cooldown_s`` and return 0.  Other failures
+        (timeouts, CLI crashes, scratch-copy errors) back off this worker only,
+        exponentially up to ``limit_cooldown_s``; the returned seconds are that
+        backoff.  Counting toward the per-ticket cap is :meth:`_count_infra`.
+        """
+        self.infra_failures += 1
+        excerpt = _one_line(str(exc) or type(exc).__name__, 160)
+        self.infra_errors.append(f"{type(exc).__name__}: {excerpt}")
+        log.warning("%s infrastructure error %s: %s", self.agent_id, type(exc).__name__, excerpt)
+        if self._is_account_wide(exc):
             retry_after = getattr(exc, "retry_after", None)
             seconds = float(retry_after) if retry_after else self.limit_cooldown_s
             pause = getattr(self.limiter, "pause_until", None)
@@ -775,6 +804,57 @@ class _WorkerBase:
                 return 0.0
             return seconds
         return min(self.limit_cooldown_s, self.infra_backoff_s * 2 ** (self.infra_failures - 1))
+
+    def _count_infra(self, ticket: Any, exc: BaseException) -> bool:
+        """Count a non-account-wide failure on ``ticket``; quarantine at the cap.
+
+        Returns True when the task was quarantined (reason ``"infrastructure: ..."``,
+        no attempt spent).  Uses ``queue.record_infra_failure`` (consecutive
+        count per ticket, shared by builder and reviewer); a worker-local
+        counter stands in for queues without it.
+        """
+        ticket_id = _get(ticket, "ticket_id")
+        task_id = _get(ticket, "task_id")
+        short = _one_line(str(exc) or type(exc).__name__, 120)
+        fn = getattr(self.queue, "record_infra_failure", None)
+        if fn is not None:
+            try:
+                count = int(fn(ticket_id, short))
+            except (KeyError, ValueError) as err:
+                log.debug("record_infra_failure refused: %s", err)
+                return False
+        else:
+            count = self._local_infra.get(str(ticket_id), 0) + 1
+            self._local_infra[str(ticket_id)] = count
+        if count < self.infra_failure_cap:
+            return False
+        log.warning("%s: %d consecutive infrastructure failures on %s; quarantining %s",
+                    self.agent_id, count, ticket_id, task_id)
+        self._quarantine(task_id, f"infrastructure: {short}")
+        self._event("quarantined", task_id, {"ticket_id": ticket_id, "reason": "infrastructure", "error": short,
+                                             "infra_failures": count})
+        return True
+
+    def _reset_infra(self, ticket: Any) -> None:
+        """A parsed reply arrived: the ticket's consecutive infrastructure count starts over."""
+        self.infra_failures = 0
+        ticket_id = _get(ticket, "ticket_id")
+        self._local_infra.pop(str(ticket_id), None)
+        fn = getattr(self.queue, "reset_infra_failures", None)
+        if fn is not None:
+            try:
+                fn(ticket_id)
+            except (KeyError, ValueError):
+                pass
+
+    async def _infra_failure(self, ticket: Any, exc: BaseException) -> tuple[str, float]:
+        """Shared E1 policy; returns ``("paused"|"counted"|"quarantined", backoff_seconds)``."""
+        backoff = await self._handle_infra_error(exc)
+        if self._is_account_wide(exc):
+            return "paused", backoff
+        if self._count_infra(ticket, exc):
+            return "quarantined", 0.0
+        return "counted", backoff
 
     def _release(self, ticket: Any, reason: str) -> bool:
         """Give the ticket back without spending an attempt (``queue.release_ticket``)."""
@@ -829,10 +909,7 @@ class _WorkerBase:
         fn = getattr(self.foreman, "condense_error_trace", None) if self.foreman is not None else None
         if fn is not None and trace.strip():
             try:
-                try:
-                    raw = fn(trace, task_id=task_id)
-                except TypeError:  # condensers without the task_id keyword
-                    raw = fn(trace)
+                raw = fn(trace, **_supported_kwargs(fn, {"task_id": task_id}))
                 hint = await _maybe_await(raw)
                 if isinstance(hint, str) and hint.strip():
                     return _one_line(hint, MAX_FIX_HINT_CHARS)
@@ -905,6 +982,7 @@ class BuilderWorker(_WorkerBase):
         backoff_attempts: int = 5,
         limit_cooldown_s: float = 1200.0,
         infra_backoff_s: float = 5.0,
+        infra_failure_cap: int = 3,
     ) -> None:
         super().__init__(
             team_id,
@@ -918,6 +996,7 @@ class BuilderWorker(_WorkerBase):
             backoff_attempts=backoff_attempts,
             limit_cooldown_s=limit_cooldown_s,
             infra_backoff_s=infra_backoff_s,
+            infra_failure_cap=infra_failure_cap,
         )
         self.workspace: Path | None = Path(workspace) if workspace is not None else None
         if self.workspace is None and (hasattr(gates, "validate_async") or hasattr(gates, "validate")):
@@ -1278,10 +1357,7 @@ _SHORT_CONTRACT = "Reply with exactly one ```diff block holding a unified diff o
 def _cache_call(cache: Any, method: str, assignment: TaskAssignment, meta: dict[str, str], *args: Any) -> Any:
     """``cache.lookup/store(assignment, *args, title=, description=)``; older caches lack the keywords."""
     fn = getattr(cache, method)
-    try:
-        return fn(assignment, *args, **meta)
-    except TypeError:
-        return fn(assignment, *args)
+    return fn(assignment, *args, **_supported_kwargs(fn, meta))
 
 
 async def _complete_ticket(
@@ -1371,6 +1447,7 @@ class ReviewerWorker(_WorkerBase):
         backoff_attempts: int = 5,
         limit_cooldown_s: float = 1200.0,
         infra_backoff_s: float = 5.0,
+        infra_failure_cap: int = 3,
     ) -> None:
         super().__init__(
             team_id,
@@ -1384,6 +1461,7 @@ class ReviewerWorker(_WorkerBase):
             backoff_attempts=backoff_attempts,
             limit_cooldown_s=limit_cooldown_s,
             infra_backoff_s=infra_backoff_s,
+            infra_failure_cap=infra_failure_cap,
         )
         self.agent_id = reviewer_id or f"{team_id}-6"
         #: Builder id whose work this reviewer must not review (a promoted peer's own slot, D13).

@@ -45,6 +45,7 @@ from foundry.schemas import MAX_RETRIES, TaskSizingDirective, TaskState
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "BUSY_TIMEOUT_MS",
+    "INFRA_ERROR_MAX",
     "FoundryQueue",
     "MAX_RETRIES",
     "TERMINAL_STATES",
@@ -53,6 +54,9 @@ __all__ = [
     "utc_now_iso",
 ]
 
+
+#: Longest infrastructure error excerpt stored on a ticket.
+INFRA_ERROR_MAX: int = 500
 
 #: SQLite busy timeout in milliseconds.
 BUSY_TIMEOUT_MS: int = 5000
@@ -107,6 +111,8 @@ class Ticket(BaseModel):
     allowed_files: list[str] = Field(default_factory=list)
     fix_hint: str | None = None
     in_review: bool = False
+    infra_failures: int = Field(default=0, ge=0)
+    infra_last_error: str | None = None
     claimed_by: str | None = None
     claimed_at: str | None = None
     created_at: str
@@ -143,6 +149,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     acceptance_criteria  TEXT NOT NULL DEFAULT '[]',
     allowed_files        TEXT NOT NULL DEFAULT '[]',
     fix_hint             TEXT,
+    in_review            INTEGER NOT NULL DEFAULT 0,
+    infra_failures       INTEGER NOT NULL DEFAULT 0,
+    infra_last_error     TEXT,
     claimed_by           TEXT,
     claimed_at           TEXT,
     created_at           TEXT NOT NULL,
@@ -214,7 +223,11 @@ CREATE TABLE IF NOT EXISTS kv (
 
 #: Columns added after the first release; ``_migrate`` adds them to old dbs.
 _MIGRATIONS: dict[str, dict[str, str]] = {
-    "tickets": {"in_review": "INTEGER NOT NULL DEFAULT 0"},
+    "tickets": {
+        "in_review": "INTEGER NOT NULL DEFAULT 0",
+        "infra_failures": "INTEGER NOT NULL DEFAULT 0",
+        "infra_last_error": "TEXT",
+    },
     "escalations": {"result": "TEXT"},
 }
 
@@ -793,6 +806,46 @@ class FoundryQueue:
             self._event(conn, "ticket_in_review" if in_review else "ticket_review_cleared",
                         t["task_id"], {"ticket_id": ticket_id})
 
+    def record_infra_failure(self, ticket_id: str, error: str) -> int:
+        """Count one infrastructure failure on a ticket; return the consecutive count.
+
+        Infrastructure failures (timeout, exit without JSON, launch error,
+        scratch-copy failure, reviewer ``is_error``) never spend an attempt;
+        the worker releases the ticket and calls this. The caller compares the
+        returned count with ``FoundryConfig.infra_failure_cap`` and
+        quarantines the task when it is reached. ``error`` is stored
+        (truncated to :data:`INFRA_ERROR_MAX`) as ``infra_last_error``.
+        Usage/rate limits must not be counted. KeyError for an unknown ticket.
+        """
+        excerpt = " ".join(str(error).split())[:INFRA_ERROR_MAX]
+        now = self.now()
+        with self.transaction() as conn:
+            t = self._require_ticket(conn, ticket_id)
+            count = int(t["infra_failures"] or 0) + 1
+            conn.execute(
+                "UPDATE tickets SET infra_failures=?, infra_last_error=?, updated_at=?"
+                " WHERE ticket_id=?",
+                (count, excerpt, now, ticket_id),
+            )
+            self._event(conn, "infra_failure", t["task_id"],
+                        {"ticket_id": ticket_id, "count": count, "error": excerpt})
+            return count
+
+    def reset_infra_failures(self, ticket_id: str) -> None:
+        """Reset a ticket's consecutive infrastructure failure count to 0.
+
+        Call after a successful Claude call (a reply that was parsed).
+        ``infra_last_error`` is kept as history for exit reports.
+        KeyError for an unknown ticket.
+        """
+        with self.transaction() as conn:
+            t = self._require_ticket(conn, ticket_id)
+            if int(t["infra_failures"] or 0) == 0:
+                return
+            conn.execute("UPDATE tickets SET infra_failures=0, updated_at=? WHERE ticket_id=?",
+                         (self.now(), ticket_id))
+            self._event(conn, "infra_failures_reset", t["task_id"], {"ticket_id": ticket_id})
+
     def resume(self) -> int:
         """Recover after a crash: reopen every ticket left ``claimed``.
 
@@ -1161,6 +1214,8 @@ class FoundryQueue:
             acceptance_criteria=json.loads(row["acceptance_criteria"] or "[]"),
             allowed_files=json.loads(row["allowed_files"] or "[]"),
             fix_hint=row["fix_hint"], in_review=bool(row["in_review"]),
+            infra_failures=int(row["infra_failures"] or 0),
+            infra_last_error=row["infra_last_error"],
             claimed_by=row["claimed_by"],
             claimed_at=row["claimed_at"], created_at=row["created_at"],
             updated_at=row["updated_at"],

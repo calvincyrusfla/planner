@@ -148,9 +148,11 @@ rem ---- 6. probe -------------------------------------------------------------
 rem First of .venv / py -3 / python that really runs Python 3.11 or newer
 rem (running it, not "where python", also skips the Microsoft Store alias stub).
 set "PY="
+set "PY_IS_VENV=0"
 if not exist "%REPO_ROOT%\.venv\Scripts\python.exe" goto :try_py_launcher
 "%REPO_ROOT%\.venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if not errorlevel 1 set PY="%REPO_ROOT%\.venv\Scripts\python.exe"
+if defined PY set "PY_IS_VENV=1"
 if defined PY goto :run_probe
 :try_py_launcher
 py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
@@ -175,8 +177,18 @@ set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :finish
 echo [foreman] Shop Foreman ready.
 :next_step
-echo [foreman] Next, from %REPO_ROOT%:
+if "%PY_IS_VENV%"=="1" goto :next_step_venv
+rem The probe ran on %PY% (no usable .venv); the orchestrator needs pydantic, so set up the venv first.
+echo [foreman] No .venv yet - the probe ran with %PY%. Create the venv first, from %REPO_ROOT%
+echo [foreman] - see "Install" in foundry\README.md:
+echo   py -3.11 -m venv .venv
+echo   .venv\Scripts\python -m pip install -r foundry\requirements.txt
+echo [foreman] Then launch the orchestrator:
 echo   .venv\Scripts\python -m foundry.main --real --repo ^<path^> --title "..."
+goto :finish
+:next_step_venv
+echo [foreman] Next, from %REPO_ROOT%:
+echo   %PY% -m foundry.main --real --repo ^<path^> --title "..."
 goto :finish
 
 :no_ollama

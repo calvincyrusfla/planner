@@ -101,6 +101,21 @@ def test_reviewer_repro_different_objective_misses(cache: SolutionCache) -> None
     assert cache.lookup(task_a, title="Add a slug helper", description="slugify(text) -> str") == DIFF
 
 
+def test_same_title_description_different_objective_misses(cache: SolutionCache) -> None:
+    """alpha-6 round 2: sibling subtasks share title/description; only the objective differs."""
+    crit = ["Tests pass"]
+    files = ["foundry/util.py"]
+    meta = {"title": "Text utilities", "description": "Add slug and docstring helpers"}
+    first = make_assignment(criteria=crit, files=files, objective="Add a slug helper.", subtask_id="F-1.1")
+    second = make_assignment(
+        criteria=crit, files=files, objective="Rename the module docstring.", subtask_id="F-1.2"
+    )
+    assert cache_key(first, **meta) != cache_key(second, **meta)
+    cache.store(first, DIFF, **meta)
+    assert cache.lookup(second, **meta) is None
+    assert cache.lookup(first, **meta) == DIFF
+
+
 def test_title_and_description_are_part_of_key(cache: SolutionCache) -> None:
     a = make_assignment()
     cache.store(a, DIFF, title="Add slug helper", description="Adds slugify")

@@ -296,6 +296,39 @@ def test_setup_sh_dry_run_custom_model_server_up(tmp_path: Path) -> None:
 
 
 @needs_bash
+def test_setup_sh_without_venv_says_to_create_it(tmp_path: Path) -> None:
+    """A checkout with no .venv: the next-step line must not pretend one exists."""
+    if not any(
+        shutil.which(p, path="/usr/bin:/bin")
+        and subprocess.run([p, "-c", "import sys; sys.exit(sys.version_info < (3, 11))"]).returncode == 0
+        for p in ("python3", "python")
+    ):
+        pytest.skip("no system Python 3.11+ outside the venv")
+    repo = tmp_path / "repo"
+    (repo / "foundry").mkdir(parents=True)
+    shutil.copy(SH_SCRIPT, repo / "foundry" / "setup_foreman.sh")
+    bin_dir, marker = _fake_bin(tmp_path)
+    full_env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "FOREMAN_DRY_RUN": "1",
+        "FOREMAN_OLLAMA_URL": f"http://127.0.0.1:{free_port()}",
+    }
+    proc = subprocess.run(
+        ["bash", str(repo / "foundry" / "setup_foreman.sh")], env=full_env, capture_output=True, text=True, timeout=60
+    )
+    out = proc.stdout
+    assert proc.returncode == 0, out + proc.stderr
+    assert not marker.exists()
+    assert "No .venv yet - the probe ran with python" in out
+    assert "python3 -m venv .venv" in out and '"Install" in foundry/README.md' in out
+    assert out.strip().splitlines()[-1].endswith(
+        '.venv/bin/python -m foundry.main --real --repo <path> --title "..."'
+    )
+
+
+@needs_bash
 def test_setup_sh_without_ollama_prints_download_link(tmp_path: Path) -> None:
     bin_dir, _ = _fake_bin(tmp_path, ollama=False)
     proc = _run_sh(tmp_path, bin_dir)
@@ -332,7 +365,17 @@ def test_setup_bat_structure() -> None:
         "closing this window stops",
         "Ollama app",
         '.venv\\Scripts\\python -m foundry.main --real --repo ^<path^> --title "..."',
+        'set "PY_IS_VENV=1"',
+        "%PY% -m foundry.main --real --repo ^<path^> --title",
+        "No .venv yet - the probe ran with %PY%",
+        "py -3.11 -m venv .venv",
+        ".venv\\Scripts\\python -m pip install -r foundry\\requirements.txt",
+        'see "Install" in foundry\\README.md',
     ):
         assert needle in text, needle
+    # The venv branch is only taken when .venv\Scripts\python.exe passed the version check.
+    venv_set = text.index('set PY="%REPO_ROOT%\\.venv\\Scripts\\python.exe"')
+    assert venv_set < text.index('if defined PY set "PY_IS_VENV=1"') < text.index(":try_py_launcher")
+    assert 'if "%PY_IS_VENV%"=="1" goto :next_step_venv' in text
     assert (REPO_ROOT / ".gitattributes").read_text().split() == ["*.bat", "text", "eol=crlf", "*.sh", "text", "eol=lf"]
     assert "wmic" not in text.lower().replace("wmic is deprecated", "")

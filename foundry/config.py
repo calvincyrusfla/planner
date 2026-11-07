@@ -30,15 +30,24 @@ Environment variable               Field (default)
 ``FOUNDRY_TRUST_CACHE``            ``trust_cache`` (``false``; ``1/true/yes/on``
                                    or ``0/false/no/off``)
 ``FOUNDRY_LIMIT_COOLDOWN_S``       ``limit_cooldown_s`` (``1200``)
-``FOUNDRY_CLAUDE_ARGS``            ``claude_extra_args`` (see
-                                   ``DEFAULT_CLAUDE_EXTRA_ARGS``); split with
-                                   ``shlex``, e.g. ``--max-turns 5
-                                   --disallowedTools "Bash Edit"``; the
-                                   value ``none`` means no extra flags
+``FOUNDRY_CLAUDE_ARGS``            extra flags APPENDED to
+                                   ``claude_extra_args`` (default
+                                   ``DEFAULT_CLAUDE_EXTRA_ARGS``), e.g.
+                                   ``--mcp-config C:\\Users\\me\\mcp.json``;
+                                   split by ``split_claude_args`` (quotes
+                                   group words, backslashes stay literal, so
+                                   Windows paths are safe); ``none`` = nothing
+``FOUNDRY_CLAUDE_ARGS_REPLACE``    ``1/true/yes/on``: ``FOUNDRY_CLAUDE_ARGS``
+                                   REPLACES the safe defaults instead (unset
+                                   or ``none`` then means no extra flags)
 ``FOUNDRY_CLAUDE_APPEND_PROMPT``   ``claude_append_prompt`` (see
                                    ``DEFAULT_CLAUDE_APPEND_PROMPT``); ``none``
                                    disables ``--append-system-prompt``
 ``FOUNDRY_PATCHES_DIR``            ``patches_dir`` (``foundry/data/patches``)
+``FOUNDRY_INFRA_FAILURE_CAP``      ``infra_failure_cap`` (``3``): consecutive
+                                   infrastructure failures on one ticket
+                                   (timeouts, crashes; not usage limits)
+                                   before its task is quarantined
 =================================  ==========================================
 
 Empty environment values are treated as unset.  The rate-limit defaults are
@@ -54,7 +63,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 __all__ = [
     "AnomalyThresholds",
@@ -66,6 +75,7 @@ __all__ = [
     "DEFAULT_PATCHES_DIR",
     "ENV_PREFIX",
     "FoundryConfig",
+    "split_claude_args",
 ]
 
 #: Prefix shared by every Foundry environment variable.
@@ -81,13 +91,16 @@ DEFAULT_DB_PATH: Path = DEFAULT_DATA_DIR / "foundry.db"
 DEFAULT_PATCHES_DIR: Path = DEFAULT_DATA_DIR / "patches"
 
 #: Safe default flags for diff-only headless Claude Code roles (builder,
-#: reviewer): few turns, and no tools that could touch the working tree,
-#: run commands, spawn agents or reach the network.
+#: reviewer): few turns, no tools that could touch the working tree, run
+#: commands, spawn agents (``Agent``/``Task``) or reach the network, and
+#: ``--strict-mcp-config`` so only MCP servers passed explicitly (via
+#: ``--mcp-config`` in ``FOUNDRY_CLAUDE_ARGS``) are loaded.
 DEFAULT_CLAUDE_EXTRA_ARGS: tuple[str, ...] = (
     "--max-turns",
     "3",
     "--disallowedTools",
-    "Bash Edit Write NotebookEdit Task WebFetch WebSearch",
+    "Agent Bash Edit Write NotebookEdit Task WebFetch WebSearch",
+    "--strict-mcp-config",
 )
 
 #: Appended to Claude Code's system prompt (``--append-system-prompt``).
@@ -100,10 +113,31 @@ DEFAULT_CLAUDE_APPEND_PROMPT: str = (
     "head; they do not apply to you."
 )
 
-#: Env value that clears ``claude_extra_args`` / ``claude_append_prompt``.
+#: Env value meaning "nothing" for ``FOUNDRY_CLAUDE_ARGS`` /
+#: ``FOUNDRY_CLAUDE_APPEND_PROMPT``.
 _NONE_WORD = "none"
 
 BoardBridgeMode = Literal["auto", "off", "dry"]
+
+_BOOL = TypeAdapter(bool)
+
+
+def split_claude_args(text: str) -> list[str]:
+    """Split a command-line string into argv items, safely on every platform.
+
+    Whitespace separates items; single or double quotes group words and are
+    removed; backslashes are always literal (no escape character), so
+    Windows paths such as ``C:\\Users\\John Smith\\mcp.json`` survive
+    unchanged on Windows and POSIX alike.  ``#`` is not a comment.
+
+    Raises:
+        ValueError: on an unbalanced quote.
+    """
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    lexer.commenters = ""
+    return list(lexer)
 
 
 class AnomalyThresholds(BaseModel):
@@ -170,6 +204,15 @@ class FoundryConfig(BaseModel):
         description="Text for --append-system-prompt (None/empty: flag omitted).",
     )
     patches_dir: Path = Field(default=DEFAULT_PATCHES_DIR)
+    infra_failure_cap: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Consecutive counted infrastructure failures (timeouts, crashes, bad "
+            "replies; not usage limits/auth/missing claude) on one ticket before "
+            "its task is quarantined."
+        ),
+    )
 
     @field_validator("gemma_base_url")
     @classmethod
@@ -245,7 +288,8 @@ class FoundryConfig(BaseModel):
         Raises:
             pydantic.ValidationError: if a variable holds an invalid value
                 (the error names the field).
-            ValueError: if ``FOUNDRY_CLAUDE_ARGS`` cannot be shlex-split.
+            ValueError: if ``FOUNDRY_CLAUDE_ARGS`` has an unbalanced quote or
+                ``FOUNDRY_CLAUDE_ARGS_REPLACE`` is not a boolean.
         """
         env = os.environ if environ is None else environ
 
@@ -269,6 +313,7 @@ class FoundryConfig(BaseModel):
             "TRUST_CACHE": "trust_cache",
             "LIMIT_COOLDOWN_S": "limit_cooldown_s",
             "PATCHES_DIR": "patches_dir",
+            "INFRA_FAILURE_CAP": "infra_failure_cap",
         }
         for var, field in simple.items():
             value = get(var)
@@ -284,15 +329,26 @@ class FoundryConfig(BaseModel):
         if teams is not None:
             data["teams"] = [t for t in (p.strip() for p in teams.split(",")) if t]
 
+        replace_raw = get("CLAUDE_ARGS_REPLACE")
+        replace = False
+        if replace_raw is not None:
+            try:
+                replace = _BOOL.validate_python(replace_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{ENV_PREFIX}CLAUDE_ARGS_REPLACE: not a boolean: {replace_raw!r}"
+                ) from exc
         claude_args = get("CLAUDE_ARGS")
-        if claude_args is not None:
-            if claude_args.lower() == _NONE_WORD:
-                data["claude_extra_args"] = []
-            else:
-                try:
-                    data["claude_extra_args"] = shlex.split(claude_args)
-                except ValueError as exc:  # e.g. unbalanced quotes
-                    raise ValueError(f"{ENV_PREFIX}CLAUDE_ARGS: {exc}") from exc
+        user_args: list[str] = []
+        if claude_args is not None and claude_args.lower() != _NONE_WORD:
+            try:
+                user_args = split_claude_args(claude_args)
+            except ValueError as exc:  # e.g. unbalanced quotes
+                raise ValueError(f"{ENV_PREFIX}CLAUDE_ARGS: {exc}") from exc
+        if replace:
+            data["claude_extra_args"] = user_args
+        elif user_args:
+            data["claude_extra_args"] = [*DEFAULT_CLAUDE_EXTRA_ARGS, *user_args]
 
         append_prompt = get("CLAUDE_APPEND_PROMPT")
         if append_prompt is not None:

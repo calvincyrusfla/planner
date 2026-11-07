@@ -147,6 +147,13 @@ run "$PYTHON" -m foundry.foreman_probe --base-url "$OLLAMA_URL/v1" --model "$MOD
 status=$?
 if [ "$status" -eq 0 ]; then
   [ "$DRY_RUN" = "1" ] || say "Shop Foreman ready."
-  say "Next (from $REPO_ROOT): $PYTHON -m foundry.main --real --repo <path> --title \"...\""
+  if [ "$PYTHON" = "$REPO_ROOT/.venv/bin/python" ]; then
+    say "Next (from $REPO_ROOT): $PYTHON -m foundry.main --real --repo <path> --title \"...\""
+  else
+    # The probe ran on a system python; the orchestrator needs pydantic, so set up the venv first.
+    say "No .venv yet - the probe ran with $PYTHON. Create the venv first (see \"Install\" in foundry/README.md):"
+    say "  python3 -m venv .venv && .venv/bin/python -m pip install -r foundry/requirements.txt"
+    say "Then (from $REPO_ROOT): .venv/bin/python -m foundry.main --real --repo <path> --title \"...\""
+  fi
 fi
 exit "$status"
