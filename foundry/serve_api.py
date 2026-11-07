@@ -480,7 +480,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._event(None, {"text": str(chunk)})
             except (BrokenPipeError, ConnectionResetError):
                 raise
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 log.warning("Foreman answer timed out after %s s per chunk", ASK_CHUNK_TIMEOUT_S)
                 self._event("error", {"error": "The Foreman took too long to answer."})
             except Exception:  # noqa: BLE001 - report on the stream, keep internals out
