@@ -145,6 +145,7 @@ class BoardBridge:
         self.dry_busy = frozenset(dry_busy)
         #: Foundry task id -> the board teams left on its board task (who must sign off).
         self.board_teams: dict[str, list[str]] = {}
+        self._dry_live: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------ events
 
@@ -254,12 +255,42 @@ class BoardBridge:
             return [op]
         if not op.fanout:
             return [op]
-        teams = self.board_teams.get(op.foundry_task or "") or [op.args.get("teamId")]
-        out = []
+        # Review: sign-off teams come from the LIVE board (the dispatcher may have
+        # given a queued board task a freed team since it was added).
+        ftask = op.foundry_task or ""
+        teams = self._sign_off_teams(ftask)
+        if teams is None:  # board state unreadable: what we knew at add time
+            known = self.board_teams.get(ftask)
+            teams = list(known) if known is not None else [op.args.get("teamId")]
+        else:
+            self.board_teams[ftask] = list(teams)
+        if not teams:
+            # still queued with no team: there is nobody to sign off; done() goes straight through
+            log.info("board bridge: %s has no team on the board; skipping review, sending done directly", ftask)
+            return []
+        out = [BoardOp("updateTask", {"id": None, "patch": {"status": "review"}, "by": "foundry"}, foundry_task=ftask, task_key="id")]
         for t in teams:
             args = dict(op.args, teamId=t, by=f"{t}-6" if op.args.get("by") == f"{op.team_id}-6" else op.args.get("by"))
-            out.append(BoardOp(op.type, args, foundry_task=op.foundry_task, task_key=op.task_key))
+            out.append(BoardOp(op.type, args, foundry_task=ftask, task_key=op.task_key))
         return out
+
+    def dry_dispatch(self, task_id: str, teams: list[str]) -> None:
+        """Dry mode: simulate the board's dispatcher putting ``teams`` on a Foundry task's board task."""
+        self._dry_live[task_id] = list(teams)
+
+    def _sign_off_teams(self, task_id: str) -> list[str] | None:
+        """Teams on the task's board task right now (None when the board state can't be read)."""
+        if self.mode == "dry":
+            live = self._dry_live.get(task_id)
+            return list(live) if live is not None else self.board_teams.get(task_id)
+        board_id = self.board_ids.get(task_id)
+        if not board_id:
+            return None
+        state = self._fetch_state()
+        teams = state.get("teams") if isinstance(state, dict) else None
+        if not isinstance(teams, list):
+            return None
+        return [str(t["id"]) for t in teams if isinstance(t, dict) and t.get("id") and t.get("taskId") == board_id]
 
     def progress(
         self,
@@ -302,10 +333,12 @@ class BoardBridge:
         self.progress(task_id, msg, team_id=team_id)
 
     def review(self, task_id: str, team_id: str, verdict: str, *, note: str = "", issues: int = 0, by: str | None = None) -> None:
-        """Send the task to review and record the team reviewer's verdict."""
-        self._emit(
-            BoardOp("updateTask", {"id": None, "patch": {"status": "review"}, "by": "foundry"}, foundry_task=task_id, task_key="id")
-        )
+        """Send the task to review and record a verdict for every team on its board task.
+
+        The teams are read from the live board when the op is sent (see
+        :meth:`_expand`); a board task that is still queued without a team gets
+        no review at all, and :meth:`done` closes it directly.
+        """
         self._emit(
             BoardOp(
                 "reviewTask",
