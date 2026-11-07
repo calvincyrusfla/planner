@@ -400,6 +400,17 @@ def _signature_end(lines: list[str], start: int) -> int:
     return start
 
 
+def _bracket_end(lines: list[str], start: int) -> int:
+    """Index of the line where all brackets opened from ``start`` are closed again."""
+    depth = 0
+    for i in range(start, len(lines)):
+        text = re.sub(r"(['\"`])(?:\\.|(?!\1).)*\1", "", lines[i]).split("//", 1)[0]
+        depth += sum(text.count(c) for c in "([{") - sum(text.count(c) for c in ")]}")
+        if depth <= 0:
+            return i
+    return len(lines) - 1
+
+
 def _block_end(lines: list[str], start: int) -> int:
     """Index of the line closing the ``{`` block opened at or after ``start``."""
     depth = 0
@@ -496,7 +507,7 @@ def skeletonize_script(path: str, source: str) -> list[SourceSymbol]:
             end = _block_end(lines, sig_end) if "{" in lines[sig_end] else sig_end
             sym_kind = "function"
         else:  # exported value
-            end = _block_end(lines, i) if _brace_delta(text) > 0 or text.rstrip().endswith(("[", "(")) else i
+            end = _bracket_end(lines, i)
             first = _clip(text)
             kept = [(i + 1, first)] if end == i else [(i + 1, first), (None, "  // ...")]
             sym_kind = "constant"
