@@ -255,7 +255,10 @@ class Service:
                 self.last_monitor_error = None
                 return None
             action = await f.manager.apply_escalation(alert)
-            self.last_alert = alert.model_dump(mode="json") if hasattr(alert, "model_dump") else dict(alert)
+            if hasattr(alert, "model_dump"):
+                self.last_alert = alert.model_dump(mode="json")
+            else:
+                self.last_alert = dict(alert) if isinstance(alert, Mapping) else {"alert": str(alert)}
             self.last_action = dict(getattr(action, "__dict__", {}) or {})
             self.last_monitor_error = None
             log.info("foundry serve: %s -> %s (%s)", self.last_alert.get("alert_id"), self.last_action.get("action"),
