@@ -268,7 +268,7 @@ class FloorManager:
         pool = self.teams.get(team_id)
         hook = getattr(pool, "promote_peer_reviewer", None)
         if callable(hook):
-            started = await _maybe_await(hook(slot, minutes * 60))
+            started = await _maybe_await(hook(slot, minutes))
             if started:
                 grant.agent_id = str(started)
         return True, f"{grant.agent_id} reviews for {team_id} for {minutes:g} min", {"slot": slot, "minutes": minutes}

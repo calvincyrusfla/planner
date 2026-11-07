@@ -1,0 +1,437 @@
+"""Foundry entry point: ``python -m foundry.main --simulate`` runs the end-to-end demo.
+
+The simulated demo (phase 1) needs no Claude, no Ollama and no network. It:
+
+1. builds a small throwaway Python repo and three work orders (S, M, L);
+2. lets the Shop Foreman size them (S=1, M=2, L=5 builders) and the Floor
+   Manager queue one ticket per allocated builder slot;
+3. runs all three teams (5 builder slots + 1 reviewer each) against a
+   ``SimulatedClaudeClient`` and prints how many Claude calls each builder made
+   (idle slots: 0);
+4. forces one deterministic gate failure (a syntax error), prints the Foreman's
+   one-line fix hint, the retry and the reviewer verdicts;
+5. has the Foreman evaluate the line, raises an escalation and lets the Floor
+   Manager execute its action;
+6. prints the drafted commit message / PR summary and the board ops that would
+   go to the Agent Department dashboard (``--board dry``, the default).
+
+Time is simulated: rate-limiter waits advance a virtual clock instead of
+sleeping, so the demo finishes in a couple of seconds.
+
+``--real`` (phase 2) probes the Gemma Shop Foreman first (exit code 2 when it is
+not ready), then runs one work order with headless Claude Code
+(``claude -p --output-format json``) and Ollama. It has not been exercised
+against the real services in phase 1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Sequence
+
+from foundry.board_bridge import BoardBridge
+from foundry.claude_client import SimulatedClaudeClient
+from foundry.config import FoundryConfig
+from foundry.floor_manager import Factory, WorkOrder, build_factory
+from foundry.gemma_client import GemmaReply, GemmaRequest, SimulatedGemmaClient
+from foundry.schemas import ClaudeResult
+
+__all__ = ["VirtualClock", "DEMO_FILES", "DEMO_ORDERS", "demo_claude", "demo_gemma", "run_demo", "main"]
+
+#: Claude Code carries a large system prompt into every headless session; the
+#: simulated client reports it so token burn looks like a real session.
+SESSION_OVERHEAD_TOKENS = 1500
+
+
+class VirtualClock:
+    """Real time plus a virtual offset; ``sleep`` advances the offset instantly.
+
+    The queue (datetime), telemetry (epoch) and rate limiter (monotonic) share
+    it, so simulated waits are consistent everywhere and cost no wall time.
+    """
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+        self._t0 = time.time()
+        self._m0 = time.monotonic()
+
+    def epoch(self) -> float:
+        """Seconds since the epoch, virtual."""
+        return self._t0 + (time.monotonic() - self._m0) + self.offset
+
+    def monotonic(self) -> float:
+        """Monotonic seconds, virtual."""
+        return time.monotonic() + self.offset
+
+    def utc(self) -> datetime:
+        """Aware UTC datetime, virtual."""
+        return datetime.fromtimestamp(self.epoch(), timezone.utc)
+
+    def advance(self, seconds: float) -> None:
+        """Move virtual time forward."""
+        self.offset += max(0.0, float(seconds))
+
+    async def sleep(self, seconds: float) -> None:
+        """Advance virtual time and yield once."""
+        self.advance(seconds)
+        await asyncio.sleep(0)
+
+
+# --------------------------------------------------------------------------- demo repo
+
+def _module(name: str, funcs: Sequence[str]) -> str:
+    lines = [f'"""{name} module of the demo shop."""', ""]
+    for f in funcs:
+        lines += ["", f"def {f}(value):", f'    """Return {f} of value."""', "    result = value", "    return result", ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+DEMO_FILES: dict[str, str] = {
+    "shop/mathx.py": _module("mathx", ["double", "halve", "square"]),
+    "shop/strings.py": _module("strings", ["shout", "whisper"]),
+    "shop/slug.py": _module("slug", ["slugify_basic"]),
+    "shop/inventory.py": _module("inventory", ["count_items", "restock", "reserve", "release"]),
+    "shop/pricing.py": _module("pricing", ["net_price", "gross_price"]),
+    "shop/orders.py": _module("orders", ["open_order", "close_order"]),
+    "shop/report.py": _module("report", ["daily_report"]),
+    "shop/cli.py": _module("cli", ["parse_args"]),
+}
+
+DEMO_ORDERS: list[dict[str, Any]] = [
+    {
+        "title": "Add clamp helper",
+        "description": "Add clamp(x, lo, hi) to the math helpers.",
+        "files": ["shop/mathx.py"],
+        "acceptance_criteria": ["clamp returns x limited to the range lo..hi"],
+    },
+    {
+        "title": "Add string casing helpers",
+        "description": "Add title-case and kebab-case helpers next to the existing string utilities.",
+        "files": ["shop/strings.py", "shop/slug.py"],
+        "acceptance_criteria": ["title_case capitalises each word", "kebab_case joins words with dashes"],
+    },
+    {
+        "title": "Rewrite inventory pipeline end-to-end",
+        "description": "Rewrite the inventory, pricing, orders, report and CLI modules so stock flows end-to-end.",
+        "files": ["shop/inventory.py", "shop/pricing.py", "shop/orders.py", "shop/report.py", "shop/cli.py"],
+        "acceptance_criteria": ["each module gains a pipeline_step function"],
+    },
+]
+
+#: The builder whose first attempt is broken on purpose (M task, team bravo).
+FAILING_BUILDER = "bravo-1"
+
+
+def write_demo_repo(root: Path) -> Path:
+    """Write the demo repo under ``root`` and return it."""
+    for rel, text in DEMO_FILES.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def append_diff(path: str, original: str, new_lines: Sequence[str]) -> str:
+    """Unified diff that appends ``new_lines`` to ``original`` (last line as context)."""
+    lines = original.splitlines()
+    n = len(lines)
+    body = [f"--- a/{path}", f"+++ b/{path}", f"@@ -{n},1 +{n},{1 + len(new_lines)} @@", f" {lines[-1]}"]
+    body += [f"+{ln}" for ln in new_lines]
+    return "\n".join(body) + "\n"
+
+
+_FILES_RE = re.compile(r"## Files you may modify\n((?:- .+\n)+)")
+_BUILDER_RE = re.compile(r"You are builder (\S+) on team")
+
+
+def demo_claude(repo: Path, *, fail_first: str | None = FAILING_BUILDER) -> SimulatedClaudeClient:
+    """A scripted Claude: builders append a function per allowed file, reviewers approve.
+
+    ``fail_first``'s first attempt contains a syntax error so the gates fail.
+    """
+    failed: set[str] = set()
+
+    def script(prompt: str, agent_id: str) -> ClaudeResult:
+        if prompt.startswith("You are reviewer") or "## Unified diff" in prompt:
+            text = json.dumps({"verdict": "APPROVED", "directives": []})
+        else:
+            m = _FILES_RE.search(prompt)
+            files = [ln[2:].strip() for ln in m.group(1).splitlines()] if m else []
+            diffs = []
+            for rel in files:
+                src = (repo / rel).read_text(encoding="utf-8")
+                fn = re.sub(r"\W", "_", Path(rel).stem)
+                if agent_id == fail_first and agent_id not in failed:
+                    new = ["", "", f"def {fn}_helper(value:", "    return value"]
+                else:
+                    new = ["", "", f"def {fn}_helper(value):", f'    """Helper added by {agent_id}."""', "    return value"]
+                diffs.append(append_diff(rel, src, new))
+            if agent_id == fail_first:
+                failed.add(agent_id)
+            text = "Here is the change.\n\n```diff\n" + "".join(diffs) + "```\n"
+        return ClaudeResult(
+            text=text,
+            input_tokens=-(-len(prompt) // 4) + SESSION_OVERHEAD_TOKENS,
+            output_tokens=-(-len(text) // 4),
+            duration_seconds=0.0,
+        )
+
+    return SimulatedClaudeClient(script)
+
+
+def demo_gemma() -> SimulatedGemmaClient:
+    """A scripted Gemma that writes PR drafts and diagnoses; other hooks fall back."""
+
+    def responder(req: GemmaRequest) -> Any:
+        system = str(req.messages[0].get("content", "")) if req.messages else ""
+        if "Conventional Commit" in system:
+            user = str(req.messages[-1].get("content", ""))
+            title = user.split("\n", 1)[0].removeprefix("Task: ").strip() or "update"
+            subject = re.sub(r"\s+", " ", title.lower())[:50]
+            return {
+                "commit_message": f"feat(shop): {subject}",
+                "pr_body": f"## Summary\n{title}.\n\nDrafted by the Gemma Shop Foreman from the approved diffs.",
+            }
+        if "diagnosis" in system:
+            return GemmaReply(text="Claude token burn is above the safe share of the budget. Slow dispatch briefly.")
+        return "{}" if req.json_schema is not None else ""
+
+    return SimulatedGemmaClient(responder)
+
+
+# --------------------------------------------------------------------------- demo run
+
+def _p(out: list[str], line: str = "") -> None:
+    out.append(line)
+    print(line, flush=True)
+
+
+async def run_demo(
+    *,
+    workdir: Path | None = None,
+    board: str = "dry",
+    quiet: bool = False,
+) -> dict[str, Any]:
+    """Run the simulated end-to-end demo; returns a summary dict (used by tests)."""
+    out: list[str] = []
+    say = (lambda line="": out.append(line)) if quiet else (lambda line="": _p(out, line))
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="foundry-demo-") if workdir is None else None
+    root = Path(tmp_ctx.name) if tmp_ctx else Path(workdir)  # type: ignore[union-attr]
+    started = time.monotonic()
+    try:
+        repo = write_demo_repo(root / "repo")
+        clock = VirtualClock()
+        config = FoundryConfig(
+            db_path=root / "foundry.db",
+            rpm=60,
+            tpm=20_000,
+            max_concurrent=3,
+            board_bridge_mode=board,  # type: ignore[arg-type]
+        )
+        from foundry.rate_limiter import RateLimiter
+
+        limiter = RateLimiter(config.rpm, config.tpm, config.max_concurrent, clock=clock.monotonic, sleep=clock.sleep)
+        claude = demo_claude(repo)
+        gemma = demo_gemma()
+        bridge = BoardBridge(board)  # type: ignore[arg-type]
+        factory = build_factory(
+            config,
+            claude=claude,
+            gemma=gemma,
+            repo_root=repo,
+            workspace=repo,
+            bridge=bridge,
+            limiter=limiter,
+            queue_clock=clock.utc,
+            telemetry_clock=clock.epoch,
+        )
+        say("Foundry phase 1 demo: simulated Claude builders/reviewers, simulated Gemma Shop Foreman")
+        say(f"  teams {', '.join(config.teams)} x {config.builders_per_team} builder slots + 1 reviewer; "
+            f"budget {config.rpm} rpm / {config.tpm} tpm, {config.max_concurrent} Claude calls at once")
+        say()
+        result = await _run_line(factory, clock, say)
+        result["elapsed_s"] = round(time.monotonic() - started, 2)
+        say()
+        say(f"Done in {result['elapsed_s']}s wall time ({clock.offset:.0f}s of simulated waiting).")
+        result["output"] = "\n".join(out)
+        factory.close()
+        return result
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
+
+
+async def _run_line(f: Factory, clock: VirtualClock, say: Any) -> dict[str, Any]:
+    manager, queue, claude = f.manager, f.queue, f.claude
+    say("1. Sizing (Shop Foreman) and dispatch (Floor Manager)")
+    task_ids: list[str] = []
+    for order in DEMO_ORDERS:
+        tid = await manager.submit(WorkOrder(**order))
+        d = manager.directives[tid]
+        task_ids.append(tid)
+        say(f"   {tid} '{order['title']}' -> {d.complexity}: {d.allocated_builders} builder(s) on team {d.team_id} "
+            f"[{f.foreman.last_source.get('size_task_scope', '?')}]")
+
+    async with f.running():
+        states = await f.wait(task_ids, timeout=30)
+    say()
+    say("2. Selective dispatch: Claude calls per builder slot (idle slots never call Claude)")
+    for team in f.config.teams:
+        row = "  ".join(f"{a}={claude.calls.get(a, 0)}" for a in f.config.builder_ids(team))
+        say(f"   {team:<8} {row}  | reviewer {f.config.reviewer_id(team)}={claude.calls.get(f.config.reviewer_id(team), 0)}")
+
+    say()
+    say("3. Deterministic gates, fix hint and retry")
+    retries = [e for e in queue.events() if e["kind"] == "retry"]
+    for e in retries:
+        p = e["payload"]
+        say(f"   {e['task_id']} {p.get('ticket_id')}: gate failed -> hint: {p.get('fix_hint')}")
+        say(f"   {e['task_id']}: ticket reopened for attempt {p.get('attempt', 0) + 1} (max 3)")
+    if not retries:
+        say("   (no gate failures)")
+    failing_prompts = claude.prompts_for(FAILING_BUILDER)
+    if len(failing_prompts) > 1:
+        say(f"   {FAILING_BUILDER} retry prompt carries the hint: "
+            f"{'## Fix required' in failing_prompts[1]}")
+
+    say()
+    say("4. Review (diff-only payloads)")
+    for tid in task_ids:
+        verdicts = queue.verdicts(tid)
+        summary = ", ".join(f"{v.get('reviewer_id')}:{v.get('verdict')}" for v in verdicts)
+        say(f"   {tid} [{states[tid]}] {summary}")
+
+    say()
+    say("5. Shop Foreman line check -> escalation -> Floor Manager action")
+    alert = await f.foreman.evaluate_line_anomaly()
+    action = None
+    if alert is None:
+        say("   line healthy, no escalation")
+    else:
+        say(f"   {alert.alert_id} {alert.severity.value} {alert.category.value}: {alert.diagnosis}")
+        say(f"   metrics: tpm={alert.metrics_snapshot.current_tpm:.0f} queue_depth={alert.metrics_snapshot.queue_depth}")
+        action = await manager.apply_escalation(alert)
+        say(f"   Floor Manager -> {action.action}: {action.detail} (applied={action.applied})")
+
+    say()
+    say("6. PR summaries (drafted by the Shop Foreman)")
+    for tid in task_ids:
+        s = manager.pr_summaries.get(tid)
+        if s:
+            say(f"   {tid}: {s.get('commit_message')}")
+    last = manager.pr_summaries.get(task_ids[-1], {})
+    body = " / ".join(ln.strip() for ln in last.get("pr_body", "").splitlines() if ln.strip())
+    say(f"   {task_ids[-1]} PR body ({f.foreman.last_source.get('draft_pr_summary', '?')}): {body[:160]}")
+
+    snap = f.telemetry.snapshot()
+    saved = f.telemetry.tokens_saved_by_source()
+    say()
+    say("7. Telemetry and board")
+    say(f"   Claude calls: {claude.total_calls} (builders {claude.role_calls.get('builder', 0)}, "
+        f"reviewers {claude.role_calls.get('reviewer', 0)}, manager {claude.role_calls.get('manager', 0)})")
+    say(f"   tokens saved: {json.dumps(saved)}; peak in flight {f.limiter.peak_in_flight}/{f.config.max_concurrent}")
+    ops = getattr(f.bridge, "ops", [])
+    counts: dict[str, int] = {}
+    for op in ops:
+        counts[op["type"]] = counts.get(op["type"], 0) + 1
+    say(f"   board ops ({f.bridge.mode}): {json.dumps(counts)}")
+    escal = [op["args"]["message"] for op in ops if op["type"] == "reportProgress" and op["args"]["message"].startswith("[Foreman]")]
+    for m in escal:
+        say(f"   board <- {m}")
+
+    return {
+        "task_ids": task_ids,
+        "states": states,
+        "directives": {t: manager.directives[t].model_dump() for t in task_ids},
+        "calls": dict(claude.calls),
+        "retries": len(retries),
+        "alert": alert.model_dump(mode="json") if alert else None,
+        "action": action.__dict__ if action else None,
+        "pr_summaries": dict(manager.pr_summaries),
+        "board_ops": list(ops),
+        "telemetry": snap,
+    }
+
+
+# --------------------------------------------------------------------------- real mode (phase 2)
+
+async def run_real(args: argparse.Namespace, config: FoundryConfig) -> int:
+    """Phase 2: one work order with headless Claude Code and Ollama (after the probe)."""
+    from foundry.claude_client import ClaudeCodeClient
+    from foundry.gemma_client import OllamaGemmaClient
+
+    repo = Path(args.repo).resolve()
+    claude = ClaudeCodeClient(config.claude_bin)
+    gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model)
+    factory = build_factory(config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo)
+    order = WorkOrder(title=args.title, description=args.desc or "", files=list(args.files or []))
+    tid = await factory.manager.submit(order)
+    d = factory.manager.directives[tid]
+    print(f"{tid}: {d.complexity}, {d.allocated_builders} builder(s) on {d.team_id}")
+    async with factory.running():
+        states = await factory.wait([tid], timeout=args.timeout)
+    print(f"{tid}: {states[tid]}")
+    summary = factory.manager.pr_summaries.get(tid)
+    if summary:
+        print(summary.get("commit_message", ""))
+        print()
+        print(summary.get("pr_body", ""))
+    factory.close()
+    return 0 if states[tid] == "complete" else 1
+
+
+# --------------------------------------------------------------------------- CLI
+
+def build_parser() -> argparse.ArgumentParser:
+    """Command-line interface."""
+    p = argparse.ArgumentParser(prog="python -m foundry.main", description="Foundry factory orchestrator.")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--simulate", action="store_true", help="run the simulated end-to-end demo (default)")
+    mode.add_argument("--real", action="store_true", help="phase 2: headless Claude Code + Ollama Gemma")
+    p.add_argument("--board", choices=["dry", "auto", "off"], default=None,
+                   help="board bridge mode (simulate default: dry; real default: FOUNDRY_BOARD_BRIDGE_MODE or auto)")
+    p.add_argument("--workdir", help="keep demo files (repo, foundry.db) here instead of a temp dir")
+    p.add_argument("--json", action="store_true", help="simulate: print the result summary as JSON at the end")
+    p.add_argument("--repo", default=".", help="real: repository the builders work in")
+    p.add_argument("--title", default="", help="real: work order title")
+    p.add_argument("--desc", default="", help="real: work order description")
+    p.add_argument("--files", nargs="*", help="real: files the work order may touch")
+    p.add_argument("--timeout", type=float, default=3600.0, help="real: seconds to wait for the task")
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point; returns the process exit code."""
+    args = build_parser().parse_args(argv)
+    if not args.real:
+        workdir = Path(args.workdir) if args.workdir else None
+        if workdir:
+            workdir.mkdir(parents=True, exist_ok=True)
+        result = asyncio.run(run_demo(workdir=workdir, board=args.board or "dry"))
+        if args.json:
+            print(json.dumps({k: v for k, v in result.items() if k != "output"}, indent=2, default=str))
+        return 0 if all(s in ("complete", "quarantined") for s in result["states"].values()) else 1
+
+    from foundry.foreman_probe import EXIT_NOT_READY, probe
+
+    config = FoundryConfig.from_env(**({"board_bridge_mode": args.board} if args.board else {}))
+    r = probe(config.gemma_base_url, config.gemma_model)
+    if not r.ok:
+        print(r.message, file=sys.stderr)
+        return EXIT_NOT_READY
+    if not args.title:
+        print("--real needs --title (and usually --files)", file=sys.stderr)
+        return 2
+    return asyncio.run(run_real(args, config))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
