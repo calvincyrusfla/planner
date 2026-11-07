@@ -130,7 +130,7 @@ class Rig:
         self.client = SimulatedClaudeClient(script)
         self.completed: list[str] = []
 
-    def pool(self, builders: int = 5) -> TeamPool:
+    def pool(self, builders: int = 5, **kwargs: Any) -> TeamPool:
         return TeamPool(
             TEAM,
             builders,
@@ -145,12 +145,13 @@ class Rig:
             poll=0.01,
             workspace=self.ws if self.gates is not None and hasattr(self.gates, "validate") else None,
             on_task_complete=self.completed.append,
+            **kwargs,
         )
 
     def submit(self, task_id: str, complexity: str = "S", files: list[str] | None = None,
-               criteria: list[str] | None = None) -> None:
+               criteria: list[str] | None = None, title: str | None = None) -> None:
         n = BUILDERS_FOR[complexity]
-        self.queue.add_task(task_id, f"Task {task_id}", "add mul", TEAM)
+        self.queue.add_task(task_id, title or f"Task {task_id}", "add mul", TEAM)
         self.queue.apply_sizing(
             TaskSizingDirective(
                 task_id=task_id,
@@ -474,27 +475,54 @@ def test_rejected_quarantines_and_rolls_back(tmp_path: Path) -> None:
     assert "wrong module" in (rig.queue.get_task("T-J")["quarantine_reason"] or "")
 
 
-def test_cache_hit_skips_claude(tmp_path: Path) -> None:
-    # Fake gates keep the workspace untouched so the second identical task hits the cache.
-    def fake_gates(sub: BuilderSubmission, a: TaskAssignment) -> list[DeterministicGateResult]:
-        return [DeterministicGateResult(task_id=a.task_id, subtask_id=a.subtask_id, passed=True, check_type="syntax")]
+def _fake_gates(sub: BuilderSubmission, a: TaskAssignment) -> list[DeterministicGateResult]:
+    """Pass-through gates that leave the workspace untouched (so identical tasks stay identical)."""
+    return [DeterministicGateResult(task_id=a.task_id, subtask_id=a.subtask_id, passed=True, check_type="syntax")]
 
-    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=fake_gates)
 
+def _two_tasks(rig: Rig, titles: tuple[str, str], **pool_kwargs: Any) -> None:
     async def scenario() -> None:
-        pool = rig.pool()
+        pool = rig.pool(**pool_kwargs)
         async with pool:
-            rig.submit("T-C1", "S")
+            rig.submit("T-C1", "S", title=titles[0])
             await pool.wait_for_tasks(["T-C1"], timeout=10)
-            rig.submit("T-C2", "S")
+            rig.submit("T-C2", "S", title=titles[1])
             await pool.wait_for_tasks(["T-C2"], timeout=10)
 
     asyncio.run(scenario())
+
+
+def test_cache_hit_skips_builder_claude_but_still_reviewed_by_default(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=_fake_gates)
+    _two_tasks(rig, ("Add mul", "Add mul"))
     assert rig.state("T-C1") == TaskState.COMPLETE and rig.state("T-C2") == TaskState.COMPLETE
     assert rig.client.calls[f"{TEAM}-1"] == 1  # second task served from the cache
-    assert rig.client.calls[REVIEWER] == 1
+    assert rig.client.calls[REVIEWER] == 2  # trust_cache defaults to False: still reviewed
     assert rig.telemetry.tokens_saved_by_source()["cache"] > 0
     assert rig.completed == ["T-C1", "T-C2"]
+
+
+def test_trusted_cache_hit_skips_reviewer_too(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=_fake_gates)
+    _two_tasks(rig, ("Add mul", "Add mul"), trust_cache=True)
+    assert rig.client.calls[f"{TEAM}-1"] == 1 and rig.client.calls[REVIEWER] == 1
+
+
+def test_trust_cache_comes_from_config(tmp_path: Path) -> None:
+    from foundry.config import FoundryConfig
+
+    rig = Rig(tmp_path, lambda p, agent: APPROVE)
+    assert rig.pool().trust_cache is False
+    cfg = FoundryConfig(trust_cache=True, limit_cooldown_s=77)
+    pool = rig.pool(config=cfg)
+    assert pool.trust_cache is True and pool.builder(1).trust_cache is True
+    assert pool.builder(1).limit_cooldown_s == 77 and pool.reviewer.limit_cooldown_s == 77
+
+
+def test_different_work_order_title_misses_the_cache(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=_fake_gates)
+    _two_tasks(rig, ("Add mul", "Add a multiply helper for invoices"))
+    assert rig.client.calls[f"{TEAM}-1"] == 2
 
 
 def test_rate_limited_call_is_retried_without_burning_an_attempt(tmp_path: Path) -> None:
@@ -607,3 +635,185 @@ def test_async_foreman_condenser_with_task_id(tmp_path: Path) -> None:
     prompts = rig.client.prompts_for(f"{TEAM}-1")
     assert "[syntax] pkg/mathx.py:6 SyntaxError: expected ':'" in prompts[1]
     assert "[syntax]" in prompts[2]  # fallback hint (GateOutcome.summary) after the foreman failed
+
+
+# ---------------------------------------------------------------------------
+# round 1 fixes: infrastructure failures (D1), in-review (D6), dwell (D7),
+# token accounting (D11), peer reviewers (D13)
+# ---------------------------------------------------------------------------
+
+
+async def _run_for(rig: Rig, seconds: float, **pool_kwargs: Any) -> TeamPool:
+    pool = rig.pool(**pool_kwargs)
+    async with pool:
+        await asyncio.sleep(seconds)
+    return pool
+
+
+class _StepClock:
+    """Monotonic fake clock whose async sleep advances time and yields once."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, seconds)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("retry_after", [3600.0, None])
+def test_permanent_usage_limit_never_quarantines(tmp_path: Path, retry_after: float | None) -> None:
+    """bravo-6 repro: a usage limit that never lifts must not burn attempts or quarantine."""
+    rig = Rig(tmp_path, lambda p, agent: fenced(GOOD_DIFF))
+    clock = _StepClock()  # backoff sleeps advance a fake clock instantly
+    rig.limiter = RateLimiter(rpm=600, tpm=10_000_000, max_concurrent=3, clock=clock, sleep=clock.sleep)
+    rig.client.inject_rate_limit(times=10_000, retry_after=retry_after)
+    rig.submit("T-U", "S")
+    asyncio.run(_run_for(rig, 0.4))
+    assert rig.state("T-U") == TaskState.BUILDING
+    ticket = rig.queue.tickets_for_task("T-U")[0]
+    assert ticket.status == "open" and ticket.attempt == 0 and ticket.fix_hint is None
+    assert rig.telemetry.retries("T-U") == 0
+    assert rig.limiter.is_paused
+    expected = 3600.0 if retry_after else 1200.0
+    assert rig.limiter.pause_remaining() == pytest.approx(expected, abs=5)
+    # paused: the builder stopped instead of spinning (1 call for a long reset; the backoff
+    # attempts of call_with_backoff when no reset time was given)
+    assert rig.client.calls[f"{TEAM}-1"] == (1 if retry_after else 5)
+    assert rig.queue.claim_ticket(TEAM, 1) is not None  # still claimable
+
+
+def test_timeout_releases_ticket_and_retries_without_attempt(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF))
+    rig.client.inject_exception(asyncio.TimeoutError(), agent_id=f"{TEAM}-1", times=2)
+    rig.submit("T-T", "S")
+
+    async def scenario() -> TeamPool:
+        pool = rig.pool(infra_backoff_s=0.01)
+        async with pool:
+            await pool.wait_for_tasks(["T-T"], timeout=10)
+        return pool
+
+    pool = asyncio.run(scenario())
+    assert rig.state("T-T") == TaskState.COMPLETE
+    assert rig.client.calls[f"{TEAM}-1"] == 3
+    assert rig.telemetry.retries("T-T") == 0
+    assert "Fix required" not in rig.client.prompts_for(f"{TEAM}-1")[-1]
+    assert pool.builder(1).outcomes[:2] == ["released", "released"]
+    assert not rig.limiter.is_paused  # a timeout backs off this worker only
+
+
+def test_auth_error_pauses_dispatch(tmp_path: Path) -> None:
+    from foundry import claude_client
+
+    exc_type = getattr(claude_client, "ClaudeAuthError", claude_client.ClaudeNotFound)
+    rig = Rig(tmp_path, lambda p, agent: fenced(GOOD_DIFF))
+    rig.client.inject_exception(exc_type("please run /login"), times=10)
+    rig.submit("T-A", "S")
+    asyncio.run(_run_for(rig, 0.3, limit_cooldown_s=900))
+    assert rig.limiter.pause_remaining() == pytest.approx(900, abs=5)
+    assert rig.queue.tickets_for_task("T-A")[0].attempt == 0
+    assert rig.client.calls[f"{TEAM}-1"] == 1
+
+
+def test_reviewer_infra_error_requeues_without_builder_retry(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF))
+    rig.client.inject_exception(asyncio.TimeoutError(), agent_id=REVIEWER, times=1)
+    rig.client.inject_failure(agent_id=REVIEWER, times=1, error="overloaded")
+    rig.submit("T-RV", "S")
+
+    async def scenario() -> None:
+        pool = rig.pool(infra_backoff_s=0.01)
+        async with pool:
+            await pool.wait_for_tasks(["T-RV"], timeout=10)
+
+    asyncio.run(scenario())
+    assert rig.state("T-RV") == TaskState.COMPLETE
+    assert rig.client.calls[f"{TEAM}-1"] == 1  # builder never asked again
+    assert rig.client.calls[REVIEWER] == 3
+    assert rig.telemetry.retries("T-RV") == 0
+    assert [v["verdict"] for v in rig.queue.verdicts("T-RV")] == ["APPROVED"]
+
+
+def test_in_review_flag_and_ownership_recheck_after_review_call(tmp_path: Path) -> None:
+    """Stall repro: a ticket reset while the reviewer's Claude call runs is not approved stale."""
+    seen: dict[str, Any] = {}
+
+    def script(prompt: str, agent: str) -> str:
+        if not is_reviewer(agent):
+            return fenced(GOOD_DIFF)
+        ticket = rig.queue.tickets_for_task("T-ST")[0]
+        if "first" not in seen:
+            seen["first"] = ticket.in_review
+            rig.queue.release_ticket(ticket.ticket_id, "manager reset")  # e.g. RESET_BUILDER_CONTEXT
+        return APPROVE
+
+    rig = Rig(tmp_path, script)
+    rig.submit("T-ST", "S")
+    asyncio.run(run_pool(rig, ["T-ST"]))
+    assert seen["first"] is True  # in_review set while waiting for / in review
+    assert rig.state("T-ST") == TaskState.COMPLETE
+    assert rig.client.calls[f"{TEAM}-1"] == 2  # rebuilt after the reset
+    assert [v["verdict"] for v in rig.queue.verdicts("T-ST")] == ["APPROVED"]  # stale verdict discarded
+    t = rig.queue.tickets_for_task("T-ST")[0]
+    assert t.attempt == 0 and t.in_review is False
+    assert (rig.ws / "pkg" / "mathx.py").read_text() == GOOD_NEW
+
+
+def test_review_dwell_is_tracked_per_ticket(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF))
+    rig.submit("T-D", "S")
+    asyncio.run(run_pool(rig, ["T-D"]))
+    ticket_id = rig.queue.tickets_for_task("T-D")[0].ticket_id
+    rows = rig.queue.conn.execute(
+        "SELECT item, started_at FROM telemetry_review_wait WHERE task_id='T-D'").fetchall()
+    assert [r[0] for r in rows] == [ticket_id]
+    assert rows[0][1] is not None
+
+
+def test_limiter_charged_without_cache_reads(tmp_path: Path) -> None:
+    from foundry.schemas import ClaudeResult
+
+    def script(prompt: str, agent: str) -> ClaudeResult:
+        text = APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF)
+        return ClaudeResult(text=text, input_tokens=10, output_tokens=5, cache_read_tokens=5000)
+
+    rig = Rig(tmp_path, script)
+    rig.submit("T-K", "S")
+    asyncio.run(run_pool(rig, ["T-K"]))
+    assert rig.limiter.current_tpm() == 30  # 2 calls x (10 + 5); cache reads not charged
+    roles = rig.telemetry.tokens_by_role()
+    assert roles["builder"]["cache_read"] == 5000 and roles["builder"]["total"] == 15
+
+
+def test_peer_reviewer_never_reviews_its_own_slot(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) or "Review task" in p else fenced(GOOD_DIFF))
+
+    async def scenario() -> int:
+        pool = rig.pool()
+        async with pool:
+            assert pool.promote_peer_reviewer(1, minutes=1) == f"{TEAM}-1"
+            peer = pool.peer_reviewers[f"{TEAM}-1"]
+            rig.submit("T-O", "S")  # built by bravo-1
+            await pool.wait_for_tasks(["T-O"], timeout=10)
+            return peer.claude_calls
+
+    peer_calls = asyncio.run(scenario())
+    assert peer_calls == 0
+    assert rig.client.calls[REVIEWER] == 1
+    assert rig.state("T-O") == TaskState.COMPLETE
+
+
+def test_busy_slot_cannot_be_promoted(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: APPROVE)
+
+    async def scenario() -> str | None:
+        pool = rig.pool()
+        async with pool:
+            pool.builder(3).busy = True
+            return pool.promote_peer_reviewer(3, minutes=1)
+
+    assert asyncio.run(scenario()) is None

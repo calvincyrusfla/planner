@@ -48,6 +48,7 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
+from foundry import claude_client as _claude_client
 from foundry.schemas import (
     MAX_RETRIES,
     SubtaskAllocation,
@@ -536,6 +537,8 @@ class ReviewItem:
     #: Pre-diff contents of the touched files (restored on REVISE/REJECTED).
     snapshot: dict[str, str | None] | None = None
     workspace: Path | None = None
+    #: Work-order title/description used in the solution-cache key (same for lookup and store).
+    cache_meta: dict[str, str] = field(default_factory=dict)
 
     @property
     def ticket_id(self) -> Any:
@@ -566,6 +569,8 @@ class _WorkerBase:
         claude_timeout: float = 600,
         cwd: str | None = None,
         backoff_attempts: int = 5,
+        limit_cooldown_s: float = 1200.0,
+        infra_backoff_s: float = 5.0,
     ) -> None:
         self.team_id = team_id
         self.queue = queue
@@ -576,15 +581,26 @@ class _WorkerBase:
         self.claude_timeout = claude_timeout
         self.cwd = cwd
         self.backoff_attempts = backoff_attempts
+        self.limit_cooldown_s = float(limit_cooldown_s)
+        self.infra_backoff_s = float(infra_backoff_s)
         self.claude_calls = 0
+        #: Consecutive infrastructure failures (reset by a successful Claude call).
+        self.infra_failures = 0
+        #: Infrastructure failures seen in total (usage limits, timeouts, CLI missing ...).
+        self.infra_errors: list[str] = []
 
     # -- telemetry (never lets a metrics error break the line) ---------------
-    def _tm(self, method: str, *args: Any) -> None:
+    def _tm(self, method: str, *args: Any, **kwargs: Any) -> None:
         fn = getattr(self.telemetry, method, None) if self.telemetry is not None else None
         if fn is None:
             return
         try:
-            fn(*args)
+            try:
+                fn(*args, **kwargs)
+            except TypeError:
+                if not kwargs:
+                    raise
+                fn(*args)  # older telemetry without the keyword
         except Exception:  # pragma: no cover - defensive
             log.exception("telemetry.%s failed", method)
 
@@ -691,6 +707,7 @@ class _WorkerBase:
                 result = await self.client.run(
                     prompt, agent_id=self.agent_id, role=self.role, cwd=self.cwd, timeout=self.claude_timeout
                 )
+                # D11: charge uncached input + output only; cache reads are free for TPM.
                 actual = result.input_tokens + result.output_tokens
                 recorder = getattr(handle, "record_actual", None) or getattr(self.limiter, "record_actual", None)
                 if recorder is not None and actual:
@@ -701,8 +718,83 @@ class _WorkerBase:
             result = await once()
         else:
             result = await self.limiter.call_with_backoff(once, max_attempts=self.backoff_attempts)
-        self._tm("record_tokens", task_id, self.agent_id, self.role, result.input_tokens, result.output_tokens)
+        self._tm(
+            "record_tokens", task_id, self.agent_id, self.role, result.input_tokens, result.output_tokens,
+            cache_read_tokens=int(getattr(result, "cache_read_tokens", 0) or 0),
+        )
+        self.infra_failures = 0
         return result
+
+    # -- infrastructure failures (D1): never consume an attempt -------------
+    async def _handle_infra_error(self, exc: BaseException) -> float:
+        """Record an infrastructure failure and pause; returns this worker's own extra wait.
+
+        Usage/rate limits, logged-out or missing CLI pause the whole limiter
+        (``pause_until``) for ``retry_after`` or ``limit_cooldown_s``.  Other
+        failures (timeouts, crashes of the CLI) back off this worker only,
+        exponentially up to ``limit_cooldown_s``.
+        """
+        self.infra_failures += 1
+        self.infra_errors.append(_one_line(f"{type(exc).__name__}: {exc}", 200))
+        account_wide = tuple(
+            c for c in (
+                getattr(_claude_client, "ClaudeRateLimited", None),
+                getattr(_claude_client, "ClaudeAuthError", None),
+                getattr(_claude_client, "ClaudeNotFound", None),
+            ) if c is not None
+        )
+        if account_wide and isinstance(exc, account_wide):
+            retry_after = getattr(exc, "retry_after", None)
+            seconds = float(retry_after) if retry_after else self.limit_cooldown_s
+            pause = getattr(self.limiter, "pause_until", None)
+            if pause is not None:
+                pause(seconds=seconds)
+                return 0.0
+            return seconds
+        return min(self.limit_cooldown_s, self.infra_backoff_s * 2 ** (self.infra_failures - 1))
+
+    def _release(self, ticket: Any, reason: str) -> bool:
+        """Give the ticket back without spending an attempt (``queue.release_ticket``)."""
+        fn = getattr(self.queue, "release_ticket", None)
+        if fn is None:
+            return False
+        try:
+            ok = bool(fn(_get(ticket, "ticket_id"), reason))
+        except (KeyError, ValueError) as exc:
+            log.debug("release_ticket refused: %s", exc)
+            ok = False
+        self._event("ticket_released", _get(ticket, "task_id"),
+                    {"ticket_id": _get(ticket, "ticket_id"), "agent_id": self.agent_id, "reason": reason})
+        return ok
+
+    def _pause_remaining(self) -> float:
+        fn = getattr(self.limiter, "pause_remaining", None)
+        try:
+            return float(fn()) if fn is not None else 0.0
+        except Exception:  # pragma: no cover - defensive
+            return 0.0
+
+    async def _wait(self, seconds: float, stop: asyncio.Event | None) -> None:
+        """Sleep ``seconds`` (also any limiter pause), returning early when ``stop`` is set."""
+        seconds = max(seconds, self._pause_remaining())
+        if seconds <= 0:
+            return
+        if stop is None:
+            await asyncio.sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    def _set_in_review(self, ticket: Any, flag: bool) -> None:
+        fn = getattr(self.queue, "set_in_review", None)
+        if fn is None:
+            return
+        try:
+            fn(_get(ticket, "ticket_id"), flag)
+        except (KeyError, ValueError) as exc:
+            log.debug("set_in_review skipped: %s", exc)
 
     async def _condense(self, trace: str, fallback: str | None = None, *, task_id: str | None = None) -> str:
         """1-line hint via ``foreman.condense_error_trace`` (sync or async).
@@ -753,9 +845,14 @@ class BuilderWorker(_WorkerBase):
             deterministic local condenser.
         review_inbox: the team's review queue (``TeamPool`` shares one).
         poll: ticket polling interval passed to ``wait_for_ticket``.
-        trust_cache: when True (default) an exact cache hit that passes the
-            gates completes the ticket without a reviewer call; when False the
-            cached diff is still sent to the reviewer (but never to a builder).
+        trust_cache: when True an exact cache hit that passes the gates
+            completes the ticket without a reviewer call; when False (default,
+            ``FoundryConfig.trust_cache``) the cached diff skips the builder's
+            Claude call but still goes through the gates and the reviewer.
+        limit_cooldown_s: pause used for a usage limit with no parseable reset
+            time (``FoundryConfig.limit_cooldown_s``).
+        infra_backoff_s: first per-worker backoff after a non-limit
+            infrastructure failure (doubles each time, capped at the cooldown).
         on_state: callback ``(worker)`` fired when the worker goes busy/idle.
     """
 
@@ -776,13 +873,15 @@ class BuilderWorker(_WorkerBase):
         *,
         review_inbox: asyncio.Queue[ReviewItem] | None = None,
         poll: float = 0.05,
-        trust_cache: bool = True,
+        trust_cache: bool = False,
         on_state: Callable[[BuilderWorker], None] | None = None,
         on_task_complete: Callable[[str], Any] | None = None,
         workspace: str | Path | None = None,
         claude_timeout: float = 600,
         cwd: str | None = None,
         backoff_attempts: int = 5,
+        limit_cooldown_s: float = 1200.0,
+        infra_backoff_s: float = 5.0,
     ) -> None:
         super().__init__(
             team_id,
@@ -794,6 +893,8 @@ class BuilderWorker(_WorkerBase):
             claude_timeout=claude_timeout,
             cwd=cwd,
             backoff_attempts=backoff_attempts,
+            limit_cooldown_s=limit_cooldown_s,
+            infra_backoff_s=infra_backoff_s,
         )
         self.workspace: Path | None = Path(workspace) if workspace is not None else None
         if self.workspace is None and (hasattr(gates, "validate_async") or hasattr(gates, "validate")):
@@ -816,6 +917,7 @@ class BuilderWorker(_WorkerBase):
         self.scratch: dict[str, Any] = {}
         #: Outcomes of processed tickets, in order ("review", "retry", "quarantined", "cached", ...).
         self.outcomes: list[str] = []
+        self._backoff_s = 0.0
 
     # -- lifecycle ------------------------------------------------------------
     def _set_busy(self, busy: bool) -> None:
@@ -833,10 +935,17 @@ class BuilderWorker(_WorkerBase):
     async def run(self, stop: asyncio.Event) -> None:
         """Loop until ``stop`` is set: wait for a ticket (no Claude call), process it."""
         while not stop.is_set():
+            # A usage-limit pause holds every slot before it claims anything (no stalled claims).
+            await self._wait(0.0, stop)
+            if stop.is_set():
+                break
             ticket = await self.queue.wait_for_ticket(self.team_id, self.slot, poll=self.poll, stop=stop)
             if ticket is None:
                 if stop.is_set():
                     break
+                continue
+            if self._pause_remaining() > 0:
+                self._release(ticket, "dispatch paused")
                 continue
             self.current_ticket = ticket
             self._set_busy(True)
@@ -850,6 +959,9 @@ class BuilderWorker(_WorkerBase):
             finally:
                 self.current_ticket = None
                 self._set_busy(False)
+            if self._backoff_s > 0:
+                wait, self._backoff_s = self._backoff_s, 0.0
+                await self._wait(wait, stop)
 
     # -- assignment -------------------------------------------------------------
     def _subtask_info(self, ticket: Any) -> dict[str, Any]:
@@ -1010,9 +1122,10 @@ class BuilderWorker(_WorkerBase):
         started = time.monotonic()
 
         # 1. exact-match solution cache: a hit never calls Claude.
-        cached = self.cache.lookup(assignment) if self.cache is not None else None
+        meta = self._work_order(task_id)
+        cached = _cache_call(self.cache, "lookup", assignment, meta) if self.cache is not None else None
         if cached:
-            outcome = await self._try_cached(ticket, assignment, cached, started)
+            outcome = await self._try_cached(ticket, assignment, cached, started, meta)
             if outcome is not None:
                 return outcome
             # A stale cached diff no longer passes its gates: build normally, no retry burned.
@@ -1025,8 +1138,12 @@ class BuilderWorker(_WorkerBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # D1: usage limits / timeouts / missing or logged-out CLI are not the
+            # builder's fault: release the ticket (attempt unchanged) and pause.
             self._tm("record_duration", task_id, "build", time.monotonic() - started)
-            return self._send_back(ticket, _one_line(f"Claude call failed: {exc}"), reason="claude_error")
+            self._backoff_s = await self._handle_infra_error(exc)
+            self._release(ticket, _one_line(f"Claude unavailable: {type(exc).__name__}: {exc}", 200))
+            return "released"
         self._tm("record_duration", task_id, "build", time.monotonic() - started)
         self.scratch["last_reply"] = result.text
         if result.is_error:
@@ -1061,10 +1178,12 @@ class BuilderWorker(_WorkerBase):
             check = getattr(failure, "check_type", "gate")
             return self._send_back(ticket, f"[{check}] {hint}", reason=f"gate_{check}")
 
-        await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot)
+        await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta)
         return "review"
 
-    async def _try_cached(self, ticket: Any, assignment: TaskAssignment, cached: str, started: float) -> str | None:
+    async def _try_cached(
+        self, ticket: Any, assignment: TaskAssignment, cached: str, started: float, meta: dict[str, str]
+    ) -> str | None:
         """Use an approved cached diff; returns the outcome, or None if it no longer passes."""
         task_id = assignment.task_id
         submission = BuilderSubmission(
@@ -1091,8 +1210,19 @@ class BuilderWorker(_WorkerBase):
         if self.trust_cache:
             await _complete_ticket(self, _get(ticket, "ticket_id"), task_id, self.on_task_complete)
             return "cached"
-        await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot)
+        await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta)
         return "review"
+
+    def _work_order(self, task_id: str) -> dict[str, str]:
+        """The task's title and description (part of the solution-cache key, D5)."""
+        task = None
+        getter = getattr(self.queue, "get_task", None)
+        if getter is not None:
+            try:
+                task = getter(task_id)
+            except Exception:
+                task = None
+        return {"title": str(_get(task, "title", "") or ""), "description": str(_get(task, "description", "") or "")}
 
     async def _enqueue_review(
         self,
@@ -1101,15 +1231,27 @@ class BuilderWorker(_WorkerBase):
         submission: BuilderSubmission,
         results: list[DeterministicGateResult],
         snapshot: dict[str, str | None] | None = None,
+        meta: dict[str, str] | None = None,
     ) -> None:
         self._set_state(assignment.task_id, TaskState.REVIEWING)
-        self._tm("mark_review_wait", assignment.task_id)
+        self._set_in_review(ticket, True)  # D6: the stall detector ignores in-review tickets
+        self._tm("mark_review_wait", assignment.task_id, item=str(_get(ticket, "ticket_id")))
         await self.review_inbox.put(
-            ReviewItem(ticket, assignment, submission, list(results), snapshot=snapshot, workspace=self.workspace)
+            ReviewItem(ticket, assignment, submission, list(results), snapshot=snapshot,
+                       workspace=self.workspace, cache_meta=dict(meta or {}))
         )
 
 
 _SHORT_CONTRACT = "Reply with exactly one ```diff block holding a unified diff of the allowed files."
+
+
+def _cache_call(cache: Any, method: str, assignment: TaskAssignment, meta: dict[str, str], *args: Any) -> Any:
+    """``cache.lookup/store(assignment, *args, title=, description=)``; older caches lack the keywords."""
+    fn = getattr(cache, method)
+    try:
+        return fn(assignment, *args, **meta)
+    except TypeError:
+        return fn(assignment, *args)
 
 
 async def _complete_ticket(
@@ -1192,9 +1334,13 @@ class ReviewerWorker(_WorkerBase):
         foreman: Any = None,
         on_task_complete: Callable[[str], Any] | None = None,
         on_approved: Callable[[ReviewItem, ReviewerVerdict], Any] | None = None,
+        exclude_builder: str | None = None,
+        poll: float = 0.05,
         claude_timeout: float = 600,
         cwd: str | None = None,
         backoff_attempts: int = 5,
+        limit_cooldown_s: float = 1200.0,
+        infra_backoff_s: float = 5.0,
     ) -> None:
         super().__init__(
             team_id,
@@ -1206,8 +1352,14 @@ class ReviewerWorker(_WorkerBase):
             claude_timeout=claude_timeout,
             cwd=cwd,
             backoff_attempts=backoff_attempts,
+            limit_cooldown_s=limit_cooldown_s,
+            infra_backoff_s=infra_backoff_s,
         )
         self.agent_id = reviewer_id or f"{team_id}-6"
+        #: Builder id whose work this reviewer must not review (a promoted peer's own slot, D13).
+        self.exclude_builder: str | None = exclude_builder
+        self.poll = poll
+        self._backoff_s = 0.0
         self.cache = cache
         self.inbox = inbox
         self.on_task_complete = on_task_complete
@@ -1231,6 +1383,12 @@ class ReviewerWorker(_WorkerBase):
                 break
             stopper.cancel()
             item = getter.result()
+            if self.exclude_builder is not None and item.submission.builder_id == self.exclude_builder:
+                # D13: never review your own slot's work; leave it for the team reviewer.
+                self.inbox.put_nowait(item)
+                self.inbox.task_done()
+                await self._wait(self.poll, stop)
+                continue
             self.busy = True
             try:
                 await self.review(item)
@@ -1243,6 +1401,9 @@ class ReviewerWorker(_WorkerBase):
             finally:
                 self.busy = False
                 self.inbox.task_done()
+            if self._backoff_s > 0 or self._pause_remaining() > 0:
+                wait, self._backoff_s = self._backoff_s, 0.0
+                await self._wait(wait, stop)
 
     async def review(self, item: ReviewItem) -> ReviewerVerdict | None:
         """Review one submission and act on the verdict; ``None`` if the task is already terminal."""
@@ -1251,7 +1412,8 @@ class ReviewerWorker(_WorkerBase):
             # Quarantined/superseded meanwhile: no Claude call, undo the applied diff.
             _restore_files(item.workspace, item.snapshot)
             return None
-        self._tm("mark_review_start", task_id)
+        item_key = str(item.ticket_id)
+        self._tm("mark_review_start", task_id, item=item_key)
         retry = item.assignment.attempt
         prompt = build_reviewer_prompt(
             item.submission,
@@ -1261,26 +1423,43 @@ class ReviewerWorker(_WorkerBase):
             retry_count=retry,
         )
         started = time.monotonic()
+        error: BaseException | None = None
+        result: ClaudeResult | None = None
         try:
             result = await self._call_claude(prompt, task_id=task_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = exc
         finally:
             self._tm("record_duration", task_id, "review", time.monotonic() - started)
-        if result.is_error:
-            verdict = parse_reviewer_reply(
-                "", task_id=task_id, reviewer_id=self.agent_id, retry_count=retry,
-                default_path=(item.submission.modified_files or ["(review)"])[0],
-            )
-        else:
-            verdict = parse_reviewer_reply(
-                result.text, task_id=task_id, reviewer_id=self.agent_id, retry_count=retry,
-                default_path=(item.submission.modified_files or ["(review)"])[0],
-            )
+        if error is None and result is not None and result.is_error:
+            error = _claude_client.ClaudeError(result.error or "reviewer call returned an error")
+        if error is not None:
+            # D1: reviewer infrastructure failure -> back into the inbox, no builder retry.
+            self._backoff_s = await self._handle_infra_error(error)
+            self._tm("mark_review_wait", task_id, item=item_key)
+            self.inbox.put_nowait(item)
+            self._event("review_requeued", task_id, {"ticket_id": item.ticket_id, "reviewer_id": self.agent_id,
+                                                     "error": _one_line(str(error), 200)})
+            return None
+        assert result is not None
+        # D6: the ticket may have been reset/reopened/quarantined while Claude was thinking.
+        if self._task_state(task_id) in _TERMINAL_STATES or not self._still_owned(item.ticket):
+            _restore_files(item.workspace, item.snapshot)
+            self._event("review_discarded", task_id, {"ticket_id": item.ticket_id, "reviewer_id": self.agent_id})
+            return None
+        verdict = parse_reviewer_reply(
+            result.text, task_id=task_id, reviewer_id=self.agent_id, retry_count=retry,
+            default_path=(item.submission.modified_files or ["(review)"])[0],
+        )
+        self._set_in_review(item.ticket, False)
         self.verdicts.append(verdict)
         self._record_verdict(verdict, item)
 
         if verdict.verdict == "APPROVED":
             if self.cache is not None and item.submission.diff.strip() and not item.submission.self_check.get("cache_hit"):
-                self.cache.store(item.assignment, item.submission.diff)
+                _cache_call(self.cache, "store", item.assignment, item.cache_meta, item.submission.diff)
             if self.on_approved is not None:
                 await _maybe_await(self.on_approved(item, verdict))
             await _complete_ticket(self, item.ticket_id, task_id, self.on_task_complete)
@@ -1336,15 +1515,26 @@ class TeamPool:
         foreman: Any = None,
         reviewer_id: str | None = None,
         poll: float = 0.05,
-        trust_cache: bool = True,
+        trust_cache: bool | None = None,
         on_task_complete: Callable[[str], Any] | None = None,
         on_approved: Callable[[ReviewItem, ReviewerVerdict], Any] | None = None,
         workspace: str | Path | None = None,
         claude_timeout: float = 600,
         cwd: str | None = None,
+        config: Any = None,
+        limit_cooldown_s: float | None = None,
+        infra_backoff_s: float = 5.0,
     ) -> None:
         if not 1 <= builders <= 5:
             raise ValueError("a team has 1..5 builder slots")
+        if trust_cache is None:
+            trust_cache = bool(getattr(config, "trust_cache", False))
+        if limit_cooldown_s is None:
+            limit_cooldown_s = float(getattr(config, "limit_cooldown_s", 1200.0))
+        self.trust_cache = trust_cache
+        self._poll = poll
+        self._limit_cooldown_s = limit_cooldown_s
+        self._infra_backoff_s = infra_backoff_s
         self.team_id = team_id
         self.queue = queue
         self.client = client
@@ -1377,6 +1567,8 @@ class TeamPool:
                 workspace=workspace,
                 claude_timeout=claude_timeout,
                 cwd=cwd,
+                limit_cooldown_s=limit_cooldown_s,
+                infra_backoff_s=infra_backoff_s,
             )
             for slot in range(1, builders + 1)
         ]
@@ -1386,7 +1578,7 @@ class TeamPool:
         self._stop: asyncio.Event | None = None
         self._tasks: list[asyncio.Task[None]] = []
 
-    def _make_reviewer(self, reviewer_id: str) -> ReviewerWorker:
+    def _make_reviewer(self, reviewer_id: str, exclude_builder: str | None = None) -> ReviewerWorker:
         return ReviewerWorker(
             self.team_id,
             self.queue,
@@ -1399,8 +1591,12 @@ class TeamPool:
             foreman=self.foreman,
             on_task_complete=self._task_completed,
             on_approved=self.on_approved,
+            exclude_builder=exclude_builder,
+            poll=self._poll,
             claude_timeout=self._claude_timeout,
             cwd=self._cwd,
+            limit_cooldown_s=self._limit_cooldown_s,
+            infra_backoff_s=self._infra_backoff_s,
         )
 
     # -- callbacks --------------------------------------------------------------
@@ -1515,10 +1711,12 @@ class TeamPool:
             if not idle:
                 return None
             slot = max(idle)
+        if not 1 <= slot <= len(self.builders) or self.builder(slot).busy:
+            return None  # D13: only an idle slot can be promoted
         agent_id = f"{self.team_id}-{slot}"
         if agent_id in self.peer_reviewers:
             return agent_id
-        peer = self._make_reviewer(agent_id)
+        peer = self._make_reviewer(agent_id, exclude_builder=agent_id)
         self.peer_reviewers[agent_id] = peer
         peer_stop = asyncio.Event()
         pool_stop = self._stop

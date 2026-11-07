@@ -58,11 +58,11 @@ def test_tokens_per_role_task_and_agent(tel: Telemetry) -> None:
     tel.record_tokens("T1", "alpha-6", "reviewer", 30, 5)
     tel.record_tokens("T2", "manager", "manager", 7, 3)
     assert tel.tokens_by_role() == {
-        "builder": {"input": 150, "output": 30, "total": 180, "calls": 2},
-        "manager": {"input": 7, "output": 3, "total": 10, "calls": 1},
-        "reviewer": {"input": 30, "output": 5, "total": 35, "calls": 1},
+        "builder": {"input": 150, "output": 30, "total": 180, "cache_read": 0, "calls": 2},
+        "manager": {"input": 7, "output": 3, "total": 10, "cache_read": 0, "calls": 1},
+        "reviewer": {"input": 30, "output": 5, "total": 35, "cache_read": 0, "calls": 1},
     }
-    assert tel.tokens_by_task()["T1"] == {"input": 180, "output": 35, "total": 215, "calls": 3}
+    assert tel.tokens_by_task()["T1"] == {"input": 180, "output": 35, "total": 215, "cache_read": 0, "calls": 3}
     assert tel.tokens_by_task()["T2"]["total"] == 10
     assert tel.tokens_by_agent()["alpha-1"]["calls"] == 2
 
@@ -149,7 +149,8 @@ def test_burn_rate_windows(tel: Telemetry, clock: FakeClock) -> None:
     clock.advance(30)
 
     one = tel.burn_rate(1)
-    assert one == {"input_per_min": 1000.0, "output_per_min": 100.0, "tokens_per_min": 1100.0, "rpm": 2.0}
+    assert one == {"input_per_min": 1000.0, "output_per_min": 100.0, "tokens_per_min": 1100.0, "rpm": 2.0,
+                   "cache_read_per_min": 0.0}
     fifteen = tel.burn_rate(15)
     assert fifteen["input_per_min"] == pytest.approx(2500 / 15)
     assert fifteen["output_per_min"] == pytest.approx(400 / 15)
@@ -196,7 +197,7 @@ def test_snapshot_shape_and_json(tel: Telemetry, clock: FakeClock) -> None:
 def test_empty_snapshot(tel: Telemetry) -> None:
     snap = tel.snapshot()
     assert snap["tokens"]["total"] == 0
-    assert snap["queue_dwell"] == {"waiting": {}, "max_seconds": 0.0}
+    assert snap["queue_dwell"] == {"waiting": {}, "waiting_submissions": 0, "max_seconds": 0.0}
     assert snap["current_tpm"] == 0.0
 
 
@@ -222,7 +223,7 @@ def test_with_real_foundry_queue(tmp_path: Path, clock: FakeClock) -> None:
     assert tel.snapshot()["tokens"]["total"] == 12
     tables = {r[0] for r in queue.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"telemetry_tokens", "telemetry_saved", "telemetry_durations", "telemetry_gates",
-            "telemetry_idle", "telemetry_dwell"} <= tables
+            "telemetry_idle", "telemetry_review_wait"} <= tables
 
 
 def test_concurrent_writers_threadsafe(tel: Telemetry) -> None:
@@ -236,3 +237,171 @@ def test_concurrent_writers_threadsafe(tel: Telemetry) -> None:
     for t in threads:
         t.join()
     assert sum(v["calls"] for v in tel.tokens_by_task().values()) == 200
+
+
+# --------------------------------------------------------------- round 1 fixes
+def test_dwell_per_submission_oldest_unstarted_still_shows(tel: Telemetry, clock: FakeClock) -> None:
+    """alpha-6's repro (D7): 5 waits then one start must not hide the other 4."""
+    for n in range(1, 6):
+        tel.mark_review_wait("T1", f"tk-{n}")
+        clock.advance(10)
+    # now: tk-1 waited 50 s, tk-5 waited 10 s
+    tel.mark_review_start("T1", "tk-1")
+    assert tel.waiting_for_review() == {"T1": pytest.approx(40)}  # tk-2 is now the oldest
+    assert tel.queue_dwell("T1") == pytest.approx(40)
+    assert [w["item"] for w in tel.waiting_submissions()] == ["tk-2", "tk-3", "tk-4", "tk-5"]
+    # starting a later one leaves tk-2 as the oldest
+    tel.mark_review_start("T1", "tk-4")
+    clock.advance(5)
+    assert tel.queue_dwell("T1") == pytest.approx(45)
+    for n in (2, 3, 5):
+        tel.mark_review_start("T1", f"tk-{n}")
+    assert tel.waiting_for_review() == {}
+    assert tel.queue_dwell("T1") > 0  # frozen dwell of the last started one
+    assert tel.snapshot()["queue_dwell"]["waiting_submissions"] == 0
+
+
+def test_dwell_anonymous_submissions_fifo(tel: Telemetry, clock: FakeClock) -> None:
+    for _ in range(5):
+        tel.mark_review_wait("T1")
+        clock.advance(10)
+    tel.mark_review_start("T1")  # starts the oldest (50 s)
+    assert tel.queue_dwell("T1") == pytest.approx(40)
+    assert len(tel.waiting_submissions()) == 4
+
+
+def test_dwell_rewait_same_item_keeps_original_time(tel: Telemetry, clock: FakeClock) -> None:
+    tel.mark_review_wait("T1", "tk-1")
+    clock.advance(30)
+    tel.mark_review_wait("T1", "tk-1")  # duplicate enqueue does not reset the clock
+    clock.advance(10)
+    assert tel.queue_dwell("T1") == pytest.approx(40)
+    assert len(tel.waiting_submissions()) == 1
+    tel.mark_review_start("T1", "tk-1")
+    tel.mark_review_wait("T1", "tk-1")  # REVISE round: a fresh wait
+    clock.advance(3)
+    assert tel.queue_dwell("T1") == pytest.approx(3)
+
+
+def test_dwell_separate_tasks(tel: Telemetry, clock: FakeClock) -> None:
+    tel.mark_review_wait("T1", "a")
+    clock.advance(20)
+    tel.mark_review_wait("T2", "b")
+    clock.advance(5)
+    tel.mark_review_start("T2", "unknown")  # no-op
+    assert tel.waiting_for_review() == {"T1": pytest.approx(25), "T2": pytest.approx(5)}
+
+
+def test_cache_read_tokens_excluded_from_burn(tel: Telemetry, clock: FakeClock) -> None:
+    """D11: cache reads are stored, but burn rates / TPM count uncached input + output only."""
+    tel.record_tokens("T1", "alpha-1", "builder", 200, 100, cache_read_tokens=50_000)
+    tel.record_tokens("T1", "alpha-6", "reviewer", 100, 0)
+    one = tel.burn_rate(1)
+    assert one["tokens_per_min"] == 400.0
+    assert one["input_per_min"] == 300.0
+    assert one["cache_read_per_min"] == 50_000.0
+    assert tel.current_tpm() == 400.0
+    assert tel.tokens_by_role()["builder"] == {
+        "input": 200, "output": 100, "total": 300, "cache_read": 50_000, "calls": 1,
+    }
+    snap = tel.snapshot()
+    assert snap["tokens"]["total"] == 400
+    assert snap["tokens"]["cache_read"] == 50_000
+    assert snap["current_tpm"] == 400.0
+    with pytest.raises(ValueError):
+        tel.record_tokens("T1", "a", "builder", 1, 1, cache_read_tokens=-1)
+
+
+def test_cache_read_column_added_to_old_db(tmp_path: Path, clock: FakeClock) -> None:
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE telemetry_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,"
+        " ts_iso TEXT NOT NULL, task_id TEXT NOT NULL, agent_id TEXT NOT NULL, role TEXT NOT NULL,"
+        " input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO telemetry_tokens(ts, ts_iso, task_id, agent_id, role, input_tokens, output_tokens)"
+        " VALUES (?, 'x', 'T0', 'a', 'builder', 5, 5)", (clock.now,)
+    )
+    conn.commit()
+    conn.close()
+    tel = Telemetry(StubQueue(db), clock=clock)
+    tel.record_tokens("T1", "a", "builder", 1, 1, cache_read_tokens=9)
+    assert tel.tokens_by_task()["T0"]["cache_read"] == 0
+    assert tel.tokens_by_task()["T1"]["cache_read"] == 9
+
+
+def test_tx_joins_open_transaction_without_committing(tmp_path: Path, clock: FakeClock) -> None:
+    """A9: inside a caller's transaction, Telemetry must neither commit nor roll back."""
+    db = tmp_path / "tx.db"
+    q = StubQueue(db)
+    tel = Telemetry(q, clock=clock)
+    q.conn.execute("CREATE TABLE other (x INTEGER)")
+    q.conn.commit()
+
+    q.conn.execute("BEGIN")
+    q.conn.execute("INSERT INTO other VALUES (1)")
+    tel.record_tokens("T1", "alpha-1", "builder", 10, 10)
+    assert q.conn.in_transaction  # still the caller's transaction
+    q.conn.rollback()
+    assert q.conn.execute("SELECT COUNT(*) FROM other").fetchone()[0] == 0
+    assert tel.tokens_by_task() == {}  # rolled back with the caller's work
+
+    q.conn.execute("BEGIN")
+    q.conn.execute("INSERT INTO other VALUES (2)")
+    tel.mark_review_wait("T1", "tk")
+    q.conn.commit()
+    assert q.conn.execute("SELECT COUNT(*) FROM other").fetchone()[0] == 1
+    assert len(tel.waiting_submissions()) == 1
+
+
+def test_tx_error_inside_caller_transaction_keeps_it_open(tmp_path: Path, clock: FakeClock) -> None:
+    q = StubQueue(tmp_path / "tx2.db")
+    tel = Telemetry(q, clock=clock)
+    q.conn.execute("CREATE TABLE other (x INTEGER)")
+    q.conn.commit()
+    q.conn.execute("BEGIN")
+    q.conn.execute("INSERT INTO other VALUES (1)")
+    with pytest.raises(sqlite3.Error):
+        with tel._tx() as cur:
+            cur.execute("INSERT INTO no_such_table VALUES (1)")
+    assert q.conn.in_transaction
+    q.conn.commit()
+    assert q.conn.execute("SELECT COUNT(*) FROM other").fetchone()[0] == 1
+
+
+def test_init_inside_caller_transaction_does_not_commit(tmp_path: Path, clock: FakeClock) -> None:
+    q = StubQueue(tmp_path / "tx3.db")
+    q.conn.execute("CREATE TABLE other (x INTEGER)")
+    q.conn.commit()
+    q.conn.execute("BEGIN")
+    q.conn.execute("INSERT INTO other VALUES (1)")
+    Telemetry(q, clock=clock)
+    assert q.conn.in_transaction
+    q.conn.rollback()
+    assert q.conn.execute("SELECT COUNT(*) FROM other").fetchone()[0] == 0
+
+
+def test_tx_with_real_queue_transaction(tmp_path: Path, clock: FakeClock) -> None:
+    oq = pytest.importorskip("foundry.orchestrator_queue")
+    queue = oq.FoundryQueue(tmp_path / "rq.db")
+    tel = Telemetry(queue, clock=clock)
+    if not hasattr(queue, "transaction"):
+        pytest.skip("FoundryQueue.transaction() not available")
+    with pytest.raises(RuntimeError):
+        with queue.transaction():
+            tel.record_tokens("T1", "alpha-1", "builder", 10, 10)
+            raise RuntimeError("caller aborts")
+    assert tel.tokens_by_task() == {}
+    with queue.transaction():
+        tel.record_tokens("T2", "alpha-1", "builder", 1, 1)
+    assert tel.tokens_by_task()["T2"]["total"] == 2
+
+
+def test_start_with_item_falls_back_to_anonymous_wait(tel: Telemetry, clock: FakeClock) -> None:
+    tel.mark_review_wait("T1")
+    clock.advance(10)
+    tel.mark_review_wait("T1", "tk-9")
+    tel.mark_review_start("T1", "tk-1")  # tk-1 never waited by name: starts the anonymous one
+    assert [w["item"] for w in tel.waiting_submissions()] == ["tk-9"]

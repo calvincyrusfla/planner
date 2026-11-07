@@ -738,3 +738,267 @@ def test_resume_moves_validating_task_back_to_building(db: Path) -> None:
         assert state_of(q2, "T-1") == "building"
     finally:
         close(q2)
+
+
+# --------------------------------------------------------------------------
+# Round 1 additions: release_ticket (D1), in_review (D6), reopen status check,
+# idempotent escalations + alert id reservation (D12), kv store (D9)
+# --------------------------------------------------------------------------
+
+
+def test_release_ticket_keeps_attempt_and_reopens(q: FoundryQueue, db: Path) -> None:
+    sized(q, complexity="S")
+    t = q.claim_ticket("alpha", 1)
+    assert q.reopen_ticket(t.ticket_id, "real failure") is True  # attempt 1
+    t = q.claim_ticket("alpha", 1)
+    q.set_in_review(t.ticket_id, True)
+    assert q.release_ticket(t.ticket_id, "usage limit") is True
+    row = tickets_of(db, "T-1")[0]
+    assert row["status"] == "open"
+    assert row["attempt"] == 1  # unchanged by the release
+    assert row["fix_hint"] == "real failure"
+    assert row["in_review"] == 0
+    assert row["claimed_by"] is None
+    again = q.claim_ticket("alpha", 1)
+    assert again is not None and again.attempt == 1
+    kinds = [e["kind"] for e in q.events(task_id="T-1")]
+    assert "ticket_released" in kinds
+
+
+def test_release_many_times_never_quarantines(q: FoundryQueue) -> None:
+    sized(q, complexity="S")
+    for _ in range(MAX_RETRIES + 3):
+        t = q.claim_ticket("alpha", 1)
+        assert t is not None and t.attempt == 0
+        assert q.release_ticket(t.ticket_id) is True
+    assert state_of(q, "T-1") == "building"
+
+
+def test_release_non_claimed_is_noop(q: FoundryQueue) -> None:
+    sized(q, complexity="M")
+    t1 = q.claim_ticket("alpha", 1)
+    t2 = q.tickets(task_id="T-1", status="open")[0]
+    assert q.release_ticket(t2.ticket_id) is False  # open: nothing to release
+    q.complete_ticket(t1.ticket_id)
+    assert q.release_ticket(t1.ticket_id) is False  # done stays done
+    assert q.get_ticket(t1.ticket_id).status == "done"
+    with pytest.raises(KeyError):
+        q.release_ticket("T-1:nope")
+
+
+def test_release_after_quarantine_is_noop(q: FoundryQueue) -> None:
+    sized(q, complexity="S")
+    t = q.claim_ticket("alpha", 1)
+    q.quarantine("T-1", "manual")
+    assert q.release_ticket(t.ticket_id) is False
+    assert q.claim_ticket("alpha", 1) is None
+
+
+def test_release_moves_ticket_within_allocation(q: FoundryQueue) -> None:
+    sized(q, complexity="L")
+    t5 = q.claim_ticket("alpha", 5)
+    q.resize("T-1", 2)
+    assert q.release_ticket(t5.ticket_id) is True
+    assert q.get_ticket(t5.ticket_id).slot <= 2
+    assert q.claim_ticket("alpha", 5) is None
+
+
+@pytest.mark.parametrize("status", ["done", "blocked"])
+def test_reopen_refuses_done_or_blocked(q: FoundryQueue, status: str) -> None:
+    sized(q, complexity="M")
+    t = q.claim_ticket("alpha", 1)
+    if status == "done":
+        q.complete_ticket(t.ticket_id)
+    else:
+        q.block_ticket(t.ticket_id, "cannot proceed")
+    with pytest.raises(ValueError):
+        q.reopen_ticket(t.ticket_id, "hint")
+    assert q.get_ticket(t.ticket_id).status == status
+    assert q.get_ticket(t.ticket_id).attempt == 0
+
+
+def test_reopen_open_ticket_allowed(q: FoundryQueue) -> None:
+    sized(q, complexity="S")
+    t = q.tickets(task_id="T-1")[0]
+    assert t.status == "open"
+    assert q.reopen_ticket(t.ticket_id, "hint") is True
+    assert q.get_ticket(t.ticket_id).attempt == 1
+
+
+def test_in_review_flag_and_filter(q: FoundryQueue) -> None:
+    sized(q, complexity="M")
+    a = q.claim_ticket("alpha", 1)
+    b = q.claim_ticket("alpha", 2)
+    assert a.in_review is False
+    q.set_in_review(a.ticket_id, True)
+    q.set_in_review(a.ticket_id, True)  # idempotent
+    assert q.get_ticket(a.ticket_id).in_review is True
+    assert [t.ticket_id for t in q.tickets(in_review=True)] == [a.ticket_id]
+    assert [t.ticket_id for t in q.tickets(status="claimed", in_review=False)] == [b.ticket_id]
+    q.set_in_review(a.ticket_id, False)
+    assert q.tickets(in_review=True) == []
+    with pytest.raises(KeyError):
+        q.set_in_review("T-1:nope", True)
+
+
+def test_in_review_cleared_by_reopen_complete_and_resume(db: Path) -> None:
+    q1 = FoundryQueue(db)
+    sized(q1, complexity="L")
+    t1, t2, t3 = (q1.claim_ticket("alpha", s) for s in (1, 2, 3))
+    for t in (t1, t2, t3):
+        q1.set_in_review(t.ticket_id, True)
+    q1.reopen_ticket(t1.ticket_id, "REVISE")
+    q1.complete_ticket(t2.ticket_id)
+    assert q1.get_ticket(t1.ticket_id).in_review is False
+    assert q1.get_ticket(t2.ticket_id).in_review is False
+    close(q1)
+    q2 = FoundryQueue(db)  # crash with t3 waiting for review
+    try:
+        assert q2.resume() == 1
+        t = q2.get_ticket(t3.ticket_id)
+        assert t.status == "open" and t.in_review is False
+    finally:
+        close(q2)
+
+
+def test_in_review_cleared_by_quarantine(q: FoundryQueue) -> None:
+    sized(q, complexity="S")
+    t = q.claim_ticket("alpha", 1)
+    q.set_in_review(t.ticket_id, True)
+    q.quarantine("T-1", "manual")
+    assert q.get_ticket(t.ticket_id).in_review is False
+
+
+def _alert(alert_id: str = "ALT-20261107-001", task_id: str = "T-1") -> dict[str, Any]:
+    return {
+        "alert_id": alert_id,
+        "timestamp": "2026-11-07T10:00:00+00:00",
+        "severity": "HIGH",
+        "category": "LINE_JAM",
+        "target_entity": {"team_id": "alpha", "task_id": task_id},
+        "metrics_snapshot": {"queue_depth": 1, "dwell_seconds": 0.0,
+                             "gate_failure_count": 2, "current_tpm": 0},
+        "diagnosis": "Gate failures repeat.",
+        "prescribed_action": "QUARANTINE_TASK",
+        "action_parameters": {},
+    }
+
+
+def test_escalation_alert_id_unique_in_db(q: FoundryQueue) -> None:
+    q.record_escalation(_alert())
+    with pytest.raises(sqlite3.IntegrityError):
+        q.conn.execute(
+            "INSERT INTO escalations (ts, alert_id, severity, category, prescribed_action,"
+            " payload) VALUES ('t', 'ALT-20261107-001', 'LOW', 'LINE_JAM', 'NONE', '{}')")
+
+
+def test_record_escalation_idempotent(q: FoundryQueue) -> None:
+    first = q.record_escalation(_alert(), applied=True, result={"ok": True, "n": 1})
+    assert first["created"] is True
+    assert first["result"] == {"ok": True, "n": 1}
+    assert first["applied_at"] is not None
+    again = q.record_escalation(_alert(), applied=True, result={"ok": False})
+    assert again["created"] is False
+    assert again["result"] == {"ok": True, "n": 1}  # earlier result wins
+    assert again["applied_at"] == first["applied_at"]
+    assert len(q.escalations()) == 1
+    assert len(q.events(kind="escalation")) == 1
+
+
+def test_record_then_apply_escalation(q: FoundryQueue) -> None:
+    stored = q.record_escalation(_alert())
+    assert stored["applied_at"] is None and stored["result"] is None
+    later = q.record_escalation(_alert(), applied=True, result={"applied": True})
+    assert later["created"] is False and later["result"] == {"applied": True}
+    assert q.mark_escalation_applied("ALT-20261107-001", {"applied": "twice"})["result"] == {
+        "applied": True}
+    assert q.get_escalation("ALT-20261107-001")["result"] == {"applied": True}
+    assert q.get_escalation("ALT-20261107-999") is None
+    with pytest.raises(KeyError):
+        q.mark_escalation_applied("ALT-20261107-999")
+
+
+def test_record_escalation_accepts_model(q: FoundryQueue) -> None:
+    from foundry.schemas import ForemanEscalation
+
+    alert = ForemanEscalation.model_validate(_alert("ALT-20261107-007"))
+    assert q.record_escalation(alert)["created"] is True
+    assert q.has_escalation("ALT-20261107-007")
+    assert q.escalations()[0]["category"] == "LINE_JAM"
+
+
+def test_has_escalation_and_reserve_alert_id(db: Path) -> None:
+    q1 = FoundryQueue(db)
+    assert q1.has_escalation("ALT-20261107-001") is False
+    assert q1.reserve_alert_id("ALT-20261107-001") is True
+    assert q1.reserve_alert_id("ALT-20261107-001") is False  # already issued
+    assert q1.has_escalation("ALT-20261107-001") is False  # reserved, not recorded
+    q1.record_escalation(_alert("ALT-20261107-002"))
+    assert q1.reserve_alert_id("ALT-20261107-002") is False  # recorded counts as taken
+    close(q1)
+    q2 = FoundryQueue(db)  # survives a restart
+    try:
+        assert q2.reserve_alert_id("ALT-20261107-001") is False
+        assert q2.has_escalation("ALT-20261107-002") is True
+        assert q2.alert_ids() == ["ALT-20261107-001", "ALT-20261107-002"]
+        assert q2.alert_ids("ALT-20261108-") == []
+    finally:
+        close(q2)
+
+
+def test_kv_round_trip_and_persistence(db: Path) -> None:
+    q1 = FoundryQueue(db)
+    assert q1.kv_get("missing") is None
+    assert q1.kv_get("missing", {"d": 1}) == {"d": 1}
+    q1.kv_set("manager.next_order", 7)
+    q1.kv_set("manager.orders", {"F-001": {"task_id": "T-1", "title": "x"}})
+    q1.kv_set("manager.orders", {"F-001": {"task_id": "T-1", "title": "y"}})  # overwrite
+    q1.kv_set("raw", '{"already": "json"}')  # a JSON string round-trips as a string
+    q1.kv_set("other", [1, 2])
+    close(q1)
+    q2 = FoundryQueue(db)
+    try:
+        assert q2.kv_get("manager.next_order") == 7
+        assert q2.kv_get("manager.orders") == {"F-001": {"task_id": "T-1", "title": "y"}}
+        assert q2.kv_get("raw") == '{"already": "json"}'
+        assert set(q2.kv_items("manager.")) == {"manager.next_order", "manager.orders"}
+        assert q2.kv_delete("other") is True
+        assert q2.kv_delete("other") is False
+        assert q2.kv_get("other") is None
+    finally:
+        close(q2)
+
+
+def test_migrates_old_database(db: Path) -> None:
+    """A db created before in_review / UNIQUE(alert_id) / kv gets upgraded in place."""
+    with raw(db) as c:
+        c.executescript(
+            """
+            CREATE TABLE tickets (ticket_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+              team_id TEXT NOT NULL, subtask_id TEXT NOT NULL, slot INTEGER NOT NULL,
+              status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+              title TEXT NOT NULL DEFAULT '', acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+              allowed_files TEXT NOT NULL DEFAULT '[]', fix_hint TEXT, claimed_by TEXT,
+              claimed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE (task_id, subtask_id));
+            CREATE TABLE escalations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+              alert_id TEXT NOT NULL, severity TEXT NOT NULL, category TEXT NOT NULL,
+              prescribed_action TEXT NOT NULL, task_id TEXT,
+              payload TEXT NOT NULL DEFAULT '{}', applied_at TEXT);
+            INSERT INTO escalations (ts, alert_id, severity, category, prescribed_action, payload)
+              VALUES ('a', 'ALT-20261107-001', 'LOW', 'LINE_JAM', 'NONE', '{"alert_id": "ALT-20261107-001"}'),
+                     ('b', 'ALT-20261107-001', 'LOW', 'LINE_JAM', 'NONE', '{"alert_id": "ALT-20261107-001"}');
+            """
+        )
+    q = FoundryQueue(db)
+    try:
+        assert len(q.escalations()) == 1  # duplicate dropped, uniqueness enforced
+        assert q.record_escalation(_alert())["created"] is False
+        sized(q, complexity="S")
+        t = q.claim_ticket("alpha", 1)
+        q.set_in_review(t.ticket_id, True)
+        assert q.get_ticket(t.ticket_id).in_review is True
+        q.kv_set("k", 1)
+        assert q.kv_get("k") == 1
+    finally:
+        close(q)

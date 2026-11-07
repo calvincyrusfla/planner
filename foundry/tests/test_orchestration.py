@@ -33,14 +33,14 @@ import pytest
 from pydantic import ValidationError
 
 from foundry.board_bridge import BoardBridge
-from foundry.claude_client import ClaudeRateLimited, SimulatedClaudeClient
+from foundry.claude_client import SimulatedClaudeClient
 from foundry.config import FoundryConfig
 from foundry.floor_manager import Factory, WorkOrder, build_factory
 from foundry.foreman_probe import probe
-from foundry.gemma_client import GemmaReply, GemmaRequest, SimulatedGemmaClient
+from foundry.gemma_client import GemmaRequest, SimulatedGemmaClient
 from foundry.main import append_diff, demo_claude, run_demo, write_demo_repo
 from foundry.rate_limiter import RateLimiter
-from foundry.schemas import ClaudeResult, ForemanEscalation, TaskState
+from foundry.schemas import ClaudeResult, DeterministicGateResult, ForemanEscalation, TaskState
 
 
 # --------------------------------------------------------------------------- helpers
@@ -68,7 +68,7 @@ def _factory(
     )
     return build_factory(
         config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo,
-        bridge=BoardBridge("dry"), limiter=limiter,
+        bridge=BoardBridge("dry"), limiter=limiter, patches_dir=tmp_path / "patches",
     )
 
 
@@ -84,9 +84,14 @@ async def _submit_and_run(f: Factory, *orders: dict[str, Any], timeout: float = 
     return ids, states
 
 
-def _alert(action: str, *, category: str = "LINE_JAM", params: dict[str, Any] | None = None, **target: str) -> ForemanEscalation:
+_ALERT_SEQ = iter(range(1, 1000))
+
+
+def _alert(
+    action: str, *, category: str = "LINE_JAM", params: dict[str, Any] | None = None, alert_id: str | None = None, **target: str
+) -> ForemanEscalation:
     return ForemanEscalation(
-        alert_id="ALT-20261107-001",
+        alert_id=alert_id or f"ALT-20261107-{next(_ALERT_SEQ):03d}",
         timestamp="2026-11-07T12:00:00Z",
         severity="HIGH",
         category=category,
@@ -455,10 +460,16 @@ def test_floor_manager_executes_each_action(tmp_path: Path) -> None:
         assert out.applied and pool.builder(1).scratch == {}
         reopened = q.get_ticket(ticket.ticket_id)
         assert reopened.status == "open" and reopened.fix_hint is None
+        assert reopened.attempt == ticket.attempt  # a stall costs no retry (queue.release_ticket)
 
         # PROMOTE_PEER_REVIEWER (needs the pool running)
         q.quarantine(t2, "test cleanup")
         q.quarantine(t3, "test cleanup")
+        # not running -> the pool cannot promote: applied=False
+        out = await m.apply_escalation(
+            _alert("PROMOTE_PEER_REVIEWER", category="REVIEW_BOTTLENECK", team_id="alpha", params={"minutes": 1})
+        )
+        assert not out.applied and m.peer_reviewer_for("alpha") is None
         async with f.running():
             out = await m.apply_escalation(
                 _alert("PROMOTE_PEER_REVIEWER", category="REVIEW_BOTTLENECK", team_id="alpha", params={"minutes": 1, "slot": 5})
@@ -474,12 +485,14 @@ def test_floor_manager_executes_each_action(tmp_path: Path) -> None:
 
     _run(go())
     assert [a.action for a in m.actions] == [
-        "QUARANTINE_TASK", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "RESET_BUILDER_CONTEXT", "PROMOTE_PEER_REVIEWER", "NONE",
+        "QUARANTINE_TASK", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "RESET_BUILDER_CONTEXT",
+        "PROMOTE_PEER_REVIEWER", "PROMOTE_PEER_REVIEWER", "NONE",
     ]
+    assert [a.applied for a in m.actions] == [True, True, True, True, False, True, True]
     # every escalation is stored and posted to the board in the agreed format
-    assert len(f.queue.escalations()) == 6
+    assert len(f.queue.escalations()) == 7
     posted = [op["args"]["message"] for op in f.bridge.ops if op["type"] == "reportProgress" and op["args"]["message"].startswith("[Foreman]")]
-    assert len(posted) == 6 and posted[0].startswith("[Foreman] HIGH LINE_JAM: Test alert.")
+    assert len(posted) == 7 and posted[0].startswith("[Foreman] HIGH LINE_JAM: Test alert.")
     assert claude.total_calls == 0  # none of the actions called Claude
     f.close()
 
@@ -491,8 +504,12 @@ def test_real_foreman_line_jam_drives_quarantine(tmp_path: Path) -> None:
 
     async def go() -> None:
         tid = await f.manager.submit(WorkOrder(**S_ORDER))
-        f.telemetry.record_gate_failure(tid)
-        f.telemetry.record_gate_failure(tid)
+        sub = f.manager.directives[tid].subtasks[0].subtask_id
+        for _ in range(2):  # the ticket failed its gates twice (D8: counted per ticket)
+            f.queue.record_gate_result(
+                DeterministicGateResult(task_id=tid, subtask_id=sub, passed=False, check_type="syntax", stderr="SyntaxError")
+            )
+            f.telemetry.record_gate_failure(tid)
         alert = await f.foreman.evaluate_line_anomaly()
         assert alert is not None and alert.category.value == "LINE_JAM"
         assert alert.prescribed_action.value == "QUARANTINE_TASK"
@@ -565,10 +582,150 @@ def test_simulated_demo_runs_end_to_end_quickly(tmp_path: Path) -> None:
     assert calls.get("alpha-6", 0) == 1 and "manager" not in json.dumps(calls)
 
 
-def test_main_real_exits_2_when_foreman_is_offline(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_main_real_exits_2_when_foreman_is_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry import claude_client
     from foundry import main as main_mod
 
+    fake = tmp_path / "claude"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(claude_client, "resolve_claude_bin", lambda name="claude", **kw: str(fake))
     monkeypatch.setenv("FOUNDRY_GEMMA_BASE_URL", f"http://127.0.0.1:{_free_port()}/v1")
     code = main_mod.main(["--real", "--title", "x"])
     assert code == 2
     assert "not reachable" in capsys.readouterr().err
+
+
+def test_main_real_exits_2_when_claude_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry import main as main_mod
+
+    monkeypatch.setenv("FOUNDRY_CLAUDE_BIN", str(tmp_path / "no-such-claude"))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    code = main_mod.main(["--real", "--title", "x"])
+    assert code == 2
+    assert "Claude Code is not ready" in capsys.readouterr().err
+
+
+def test_claude_args_come_from_config() -> None:
+    from foundry.main import claude_args
+
+    args = claude_args(FoundryConfig())
+    assert "--append-system-prompt" in args
+    joined = " ".join(args)
+    for tool in ("Bash", "Edit", "Write"):
+        assert tool in joined  # write/exec tools are disallowed for diff-only roles
+
+
+# --------------------------------------------------------------------------- restart safety, patches, idempotency
+
+
+def test_two_runs_on_one_db_continue_where_the_first_stopped(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    claude = demo_claude(repo, fail_first=None)
+    f1 = _factory(tmp_path, claude, repo=repo, teams=["alpha"])
+    ids1, states1 = _run(_submit_and_run(f1, S_ORDER))
+    board_id = f1.bridge.board_ids[ids1[0]]
+    f1.close()
+
+    f2 = _factory(tmp_path, claude, repo=repo, teams=["alpha"])  # same db, fresh process state
+    assert ids1[0] in f2.manager.directives  # manager state reloaded from the queue's kv table
+    assert f2.manager.pr_summaries[ids1[0]] == f1.manager.pr_summaries[ids1[0]]
+    assert f2.bridge.board_ids[ids1[0]] == board_id
+    ids2, states2 = _run(_submit_and_run(f2, {**S_ORDER, "title": "Add wrap helper"}))
+    assert ids1 == ["F-001"] and ids2 == ["F-002"]  # no id collision on restart
+    assert states1 == {"F-001": "complete"} and states2 == {"F-002": "complete"}
+    assert [op["type"] for op in f2.bridge.ops].count("addTask") == 1  # F-001 is not re-registered
+    f2.close()
+
+
+def test_restart_resumes_tickets_a_crashed_run_left_claimed(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    claude = demo_claude(repo, fail_first=None)
+    f1 = _factory(tmp_path, claude, repo=repo, teams=["alpha"])
+    tid = _run(f1.manager.submit(WorkOrder(**S_ORDER)))
+    claimed = f1.queue.claim_ticket("alpha", 1)  # a worker claimed it, then the process died
+    assert claimed is not None
+    f1.queue.close()
+
+    f2 = _factory(tmp_path, claude, repo=repo, teams=["alpha"])
+    assert f2.queue.get_ticket(claimed.ticket_id).status == "open"  # build_factory ran queue.resume()
+
+    async def go() -> dict[str, str]:
+        async with f2.running():
+            return await f2.wait([tid], timeout=15)
+
+    assert _run(go()) == {tid: "complete"}
+    assert claude.calls["alpha-1"] == 1
+    f2.close()
+
+
+def test_approved_task_writes_patch_and_pr_draft_and_never_touches_the_repo(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    before = {p: p.read_text(encoding="utf-8") for p in repo.rglob("*.py")}
+    claude = demo_claude(repo, fail_first=None)
+    f = _factory(tmp_path, claude, repo=repo, teams=["alpha"])
+    ids, states = _run(_submit_and_run(f, S_ORDER))
+    assert states[ids[0]] == "complete"
+    assert {p: p.read_text(encoding="utf-8") for p in repo.rglob("*.py")} == before  # working tree untouched
+    patch = tmp_path / "patches" / f"{ids[0]}.patch"
+    md = tmp_path / "patches" / f"{ids[0]}.md"
+    assert patch.is_file() and md.is_file()
+    text = patch.read_text(encoding="utf-8")
+    assert "+++ b/shop/mathx.py" in text and "def mathx_helper(value):" in text
+    assert md.read_text(encoding="utf-8").startswith(f.manager.pr_summaries[ids[0]]["commit_message"])
+    # the patch applies cleanly to a copy of the repo
+    from foundry.validation_gates import apply_diff
+    import shutil
+
+    copy = tmp_path / "copy"
+    shutil.copytree(repo, copy)
+    apply_diff(text, copy, allowed_files=["shop/mathx.py"])
+    assert "def mathx_helper(value):" in (copy / "shop/mathx.py").read_text(encoding="utf-8")
+    # claude ran in the target repo (read-only role, diff-only output)
+    assert {c.cwd for c in claude.history} == {str(repo.resolve())}
+    f.close()
+
+
+def test_apply_escalation_is_idempotent_per_alert_id(tmp_path: Path) -> None:
+    f = _factory(tmp_path, SimulatedClaudeClient(), teams=["alpha"])
+
+    async def go() -> None:
+        tid = await f.manager.submit(WorkOrder(**S_ORDER))
+        alert = _alert("RESIZE_ALLOCATION", category="CAPACITY_REBALANCE", task_id=tid, team_id="alpha", params={"builders": 3})
+        first = await f.manager.apply_escalation(alert)
+        f.queue.resize(tid, 1)  # someone changed it since
+        again = await f.manager.apply_escalation(alert)
+        assert again == first and f.queue.get_task(tid)["allocated_builders"] == 1  # not re-applied
+        assert len(f.queue.escalations()) == 1
+        posted = [op for op in f.bridge.ops if op["args"].get("message", "").startswith("[Foreman]")]
+        assert len(posted) == 1
+
+    _run(go())
+    f.close()
+    # after a restart the stored outcome is still honoured
+    f2 = _factory(tmp_path, SimulatedClaudeClient(), teams=["alpha"])
+    out = _run(f2.manager.apply_escalation(_alert("NONE", alert_id="ALT-20261107-900", team_id="alpha")))
+    assert out.applied
+    f2.manager.applied_alerts.clear()  # even with the manager's cache gone, the queue row wins
+    again = _run(f2.manager.apply_escalation(_alert("QUARANTINE_TASK", alert_id="ALT-20261107-900", task_id="F-001")))
+    assert again.action == "NONE" and f2.queue.get_task("F-001")["state"] != "quarantined"
+    f2.close()
+
+
+def test_quarantine_is_reported_to_the_board_once(tmp_path: Path) -> None:
+    f = _factory(tmp_path, SimulatedClaudeClient(), teams=["alpha"])
+
+    async def go() -> None:
+        tid = await f.manager.submit(WorkOrder(**S_ORDER))
+        await f.manager.apply_escalation(_alert("QUARANTINE_TASK", task_id=tid, params={"reason": "jam"}))
+        out = await f.manager.apply_escalation(_alert("QUARANTINE_TASK", task_id=tid, params={"reason": "jam"}))
+        assert not out.applied  # already quarantined
+        assert f.manager.report_quarantines() == []
+
+    _run(go())
+    paused = [op for op in f.bridge.ops if op["type"] == "updateTask" and op["args"]["patch"] == {"status": "paused"}]
+    assert len(paused) == 1
+    f.close()

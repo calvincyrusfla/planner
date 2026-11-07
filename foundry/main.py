@@ -252,6 +252,7 @@ async def run_demo(
             limiter=limiter,
             queue_clock=clock.utc,
             telemetry_clock=clock.epoch,
+            patches_dir=root / "patches",
         )
         say("Foundry phase 1 demo: simulated Claude builders/reviewers, simulated Gemma Shop Foreman")
         say(f"  teams {', '.join(config.teams)} x {config.builders_per_team} builder slots + 1 reviewer; "
@@ -330,6 +331,10 @@ async def _run_line(f: Factory, clock: VirtualClock, say: Any) -> dict[str, Any]
     last = manager.pr_summaries.get(task_ids[-1], {})
     body = " / ".join(ln.strip() for ln in last.get("pr_body", "").splitlines() if ln.strip())
     say(f"   {task_ids[-1]} PR body ({f.foreman.last_source.get('draft_pr_summary', '?')}): {body[:160]}")
+    for tid in task_ids:
+        patch = manager.patch_paths.get(tid)
+        if patch:
+            say(f"   {tid} patch: {patch.name} ({len(patch.read_text(encoding='utf-8').splitlines())} lines; apply with git apply)")
 
     snap = f.telemetry.snapshot()
     saved = f.telemetry.tokens_saved_by_source()
@@ -356,6 +361,7 @@ async def _run_line(f: Factory, clock: VirtualClock, say: Any) -> dict[str, Any]
         "alert": alert.model_dump(mode="json") if alert else None,
         "action": action.__dict__ if action else None,
         "pr_summaries": dict(manager.pr_summaries),
+        "patches": {t: str(p) for t, p in manager.patch_paths.items()},
         "board_ops": list(ops),
         "telemetry": snap,
     }
@@ -363,13 +369,32 @@ async def _run_line(f: Factory, clock: VirtualClock, say: Any) -> dict[str, Any]
 
 # --------------------------------------------------------------------------- real mode (phase 2)
 
-async def run_real(args: argparse.Namespace, config: FoundryConfig) -> int:
-    """Phase 2: one work order with headless Claude Code and Ollama (after the probe)."""
+def claude_args(config: FoundryConfig) -> list[str]:
+    """Extra ``claude -p`` flags for diff-only Foundry roles (from the config).
+
+    ``config.claude_extra_args`` holds the safe defaults (few turns, no
+    Bash/Edit/Write/agent tools); ``config.claude_append_prompt`` is passed as
+    ``--append-system-prompt`` unless the args already carry one.
+    """
+    args = [str(a) for a in (getattr(config, "claude_extra_args", None) or [])]
+    prompt = getattr(config, "claude_append_prompt", None)
+    if prompt and "--append-system-prompt" not in args:
+        args += ["--append-system-prompt", str(prompt)]
+    return args
+
+
+async def run_real(args: argparse.Namespace, config: FoundryConfig, claude_bin: str) -> int:
+    """Phase 2: one work order with headless Claude Code and Ollama (after the preflight).
+
+    The target repo is only read: Claude runs in it (cwd) with diff-only output,
+    gates patch scratch copies, and the approved result is written to
+    ``config.patches_dir/<task>.patch`` for you to ``git apply``.
+    """
     from foundry.claude_client import ClaudeCodeClient
     from foundry.gemma_client import OllamaGemmaClient
 
     repo = Path(args.repo).resolve()
-    claude = ClaudeCodeClient(config.claude_bin)
+    claude = ClaudeCodeClient(claude_bin, extra_args=claude_args(config))
     gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model)
     factory = build_factory(config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo)
     order = WorkOrder(title=args.title, description=args.desc or "", files=list(args.files or []))
@@ -384,6 +409,11 @@ async def run_real(args: argparse.Namespace, config: FoundryConfig) -> int:
         print(summary.get("commit_message", ""))
         print()
         print(summary.get("pr_body", ""))
+    patch = factory.manager.patch_paths.get(tid)
+    if patch:
+        print()
+        print(f"Patch: {patch}")
+        print(f"Apply it from the repo root with:  git apply --index \"{patch}\"")
     factory.close()
     return 0 if states[tid] == "complete" else 1
 
@@ -423,14 +453,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     from foundry.foreman_probe import EXIT_NOT_READY, probe
 
     config = FoundryConfig.from_env(**({"board_bridge_mode": args.board} if args.board else {}))
+    if not args.title:
+        print("--real needs --title (and usually --files)", file=sys.stderr)
+        return EXIT_NOT_READY
+    from foundry.claude_client import ClaudeError, resolve_claude_bin
+
+    try:
+        claude_bin = resolve_claude_bin(config.claude_bin)
+    except ClaudeError as exc:
+        print(f"Claude Code is not ready: {exc}", file=sys.stderr)
+        return EXIT_NOT_READY
     r = probe(config.gemma_base_url, config.gemma_model)
     if not r.ok:
         print(r.message, file=sys.stderr)
         return EXIT_NOT_READY
-    if not args.title:
-        print("--real needs --title (and usually --files)", file=sys.stderr)
-        return 2
-    return asyncio.run(run_real(args, config))
+    return asyncio.run(run_real(args, config, claude_bin))
 
 
 if __name__ == "__main__":

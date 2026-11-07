@@ -310,7 +310,8 @@ class Telemetry:
     def mark_review_start(self, task_id: str, item: str | None = None) -> None:
         """Mark that a reviewer picked a submission up, freezing its dwell time.
 
-        With ``item`` the oldest waiting row of that item is started; with
+        With ``item`` the oldest waiting row of that item is started (or, if
+        that item never waited, the task's oldest anonymous wait); with
         ``item=None`` the task's oldest waiting submission (FIFO). No-op when
         nothing matching is waiting.
         """
@@ -328,6 +329,12 @@ class Telemetry:
                     " ORDER BY enqueued_at, id LIMIT 1",
                     (task_id, item),
                 ).fetchone()
+                if row is None:  # the wait was marked without an item: start the oldest anonymous one
+                    row = cur.execute(
+                        "SELECT id FROM telemetry_review_wait WHERE task_id=? AND item IS NULL"
+                        " AND started_at IS NULL ORDER BY enqueued_at, id LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
             if row is not None:
                 cur.execute("UPDATE telemetry_review_wait SET started_at=? WHERE id=?", (now, row[0]))
 

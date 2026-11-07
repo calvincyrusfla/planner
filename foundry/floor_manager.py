@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
+import re
 import shutil
 import tempfile
 import time
@@ -93,6 +95,11 @@ def _val(x: Any) -> Any:
     return getattr(x, "value", x)
 
 
+_KV_KEY = "floor_manager.state"
+_TASK_ID_RE = re.compile(r"^F-(\d+)$")
+_TERMINAL = {"complete", "quarantined", "failed"}
+
+
 class FloorManager:
     """Planning tier: sizes and registers work orders, executes Foreman escalations.
 
@@ -106,6 +113,14 @@ class FloorManager:
         limiter: the shared :class:`~foundry.rate_limiter.RateLimiter`
             (needed for THROTTLE_DISPATCH).
         builders_per_team: slots per team (for PROMOTE_PEER_REVIEWER).
+        patches_dir: where :meth:`on_task_complete` writes ``<task_id>.patch``
+            (the combined approved diff) and ``<task_id>.md`` (the PR draft).
+            ``None`` writes nothing.
+
+    Restart safety: the manager's own state (directives, orders, allocations,
+    board ids, PR drafts, reported quarantines, applied alerts) is kept in the
+    queue's key-value table and reloaded on construction, and new task ids
+    continue after the highest ``F-###`` already in the database.
     """
 
     def __init__(
@@ -119,6 +134,7 @@ class FloorManager:
         *,
         limiter: Any = None,
         builders_per_team: int = 5,
+        patches_dir: str | Path | None = None,
     ) -> None:
         self.queue = queue
         self.foreman = foreman
@@ -140,12 +156,93 @@ class FloorManager:
         self._finishing: set[str] = set()
         self._reported_quarantine: set[str] = set()
         self._pending: set[asyncio.Task[Any]] = set()
+        #: Current builder allocation per task (updated on RESIZE_ALLOCATION).
+        self.allocations: dict[str, int] = {}
+        #: alert_id -> outcome of every escalation already applied (idempotency).
+        self.applied_alerts: dict[str, ActionOutcome] = {}
+        self.patches_dir = Path(patches_dir) if patches_dir else None
+        self.patch_paths: dict[str, Path] = {}
+        self._load()
+
+    # ------------------------------------------------------------ persistence
+
+    def _kv_get(self) -> dict[str, Any] | None:
+        fn = getattr(self.queue, "kv_get", None)
+        if not callable(fn):
+            return None
+        try:
+            raw = fn(_KV_KEY)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("floor manager: could not load state: %s", exc)
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, (str, bytes)):
+            raw = json.loads(raw)
+        return raw if isinstance(raw, dict) else None
+
+    def save(self) -> None:
+        """Persist the manager's state in the queue's key-value table (best effort)."""
+        fn = getattr(self.queue, "kv_set", None)
+        if not callable(fn):
+            return
+        state = {
+            "version": 1,
+            "seq": self._seq,
+            "orders": {t: o.model_dump(mode="json") for t, o in self.orders.items()},
+            "directives": {t: d.model_dump(mode="json") for t, d in self.directives.items()},
+            "allocations": dict(self.allocations),
+            "board_ids": dict(getattr(self.bridge, "board_ids", {}) or {}),
+            "completed": sorted(self._completed),
+            "reported_quarantine": sorted(self._reported_quarantine),
+            "pr_summaries": dict(self.pr_summaries),
+            "applied_alerts": {k: v.__dict__ for k, v in self.applied_alerts.items()},
+            "diffs": {t: v for t, v in self.diffs.items() if t not in self._completed},
+        }
+        try:
+            fn(_KV_KEY, state)
+        except Exception as exc:  # pragma: no cover - persistence must not stop the line
+            log.warning("floor manager: could not save state: %s", exc)
+
+    def _load(self) -> None:
+        state = self._kv_get() or {}
+        try:
+            self.orders = {t: WorkOrder.model_validate(o) for t, o in (state.get("orders") or {}).items()}
+            self.directives = {
+                t: TaskSizingDirective.model_validate(d) for t, d in (state.get("directives") or {}).items()
+            }
+            self.allocations = {t: int(n) for t, n in (state.get("allocations") or {}).items()}
+            self._completed = set(state.get("completed") or [])
+            self._reported_quarantine = set(state.get("reported_quarantine") or [])
+            self.pr_summaries = {t: dict(v) for t, v in (state.get("pr_summaries") or {}).items()}
+            self.applied_alerts = {k: ActionOutcome(**v) for k, v in (state.get("applied_alerts") or {}).items()}
+            self.diffs = {t: list(v) for t, v in (state.get("diffs") or {}).items()}
+        except Exception as exc:  # a corrupt blob must not stop a restart
+            log.warning("floor manager: ignoring unreadable saved state: %s", exc)
+        board_ids = state.get("board_ids") or {}
+        restore = getattr(self.bridge, "restore", None)
+        if board_ids and callable(restore):
+            restore(board_ids)
+        # Continue numbering after anything already in the queue (or the saved counter).
+        highest = int(state.get("seq") or 0)
+        try:
+            tasks = self.queue.all_tasks()
+        except Exception:  # pragma: no cover - defensive
+            tasks = []
+        for t in tasks:
+            m = _TASK_ID_RE.match(str(t.get("task_id", "")))
+            if m:
+                highest = max(highest, int(m.group(1)))
+        self._seq = highest
 
     # ------------------------------------------------------------- work orders
 
     def _next_task_id(self) -> str:
-        self._seq += 1
-        return f"F-{self._seq:03d}"
+        while True:
+            self._seq += 1
+            task_id = f"F-{self._seq:03d}"
+            if self.queue.get_task(task_id) is None:
+                return task_id
 
     def _pick_team(self, order: WorkOrder) -> str:
         if order.team_id:
@@ -169,6 +266,7 @@ class FloorManager:
         self.queue.add_task(task_id, order.title, order.description, order.team_id)
         directive = await self._size(order)
         self.directives[task_id] = directive
+        self.allocations[task_id] = directive.allocated_builders
         self.queue.apply_sizing(directive)
         self.queue.record_event(
             "sized",
@@ -188,6 +286,7 @@ class FloorManager:
             f"[Foundry] sized {directive.complexity}: {directive.allocated_builders} builder(s) on {directive.team_id}. {directive.rationale}"[:300],
             team_id=directive.team_id,
         )
+        self.save()
         return task_id
 
     async def _size(self, order: WorkOrder) -> TaskSizingDirective:
@@ -207,9 +306,18 @@ class FloorManager:
     # ------------------------------------------------------------ escalations
 
     async def apply_escalation(self, alert: ForemanEscalation | Mapping[str, Any]) -> ActionOutcome:
-        """Execute the escalation's prescribed action (validated first) and report it."""
+        """Execute the escalation's prescribed action (validated first) and report it.
+
+        Idempotent per ``alert_id``: an alert that was already applied (in this
+        run or before a restart) returns the earlier outcome without acting,
+        storing or posting it again.
+        """
         if not isinstance(alert, ForemanEscalation):
             alert = ForemanEscalation.model_validate(dict(alert))
+        earlier = self.applied_alerts.get(alert.alert_id) or self._stored_outcome(alert.alert_id)
+        if earlier is not None:
+            self.applied_alerts[alert.alert_id] = earlier
+            return earlier
         action = PrescribedAction(_val(alert.prescribed_action))
         handler = {
             PrescribedAction.PROMOTE_PEER_REVIEWER: self._promote_peer_reviewer,
@@ -226,12 +334,31 @@ class FloorManager:
             applied, detail, params = False, f"failed: {exc}", {}
         outcome = ActionOutcome(alert.alert_id, action.value, applied, detail, params)
         self.actions.append(outcome)
+        self.applied_alerts[alert.alert_id] = outcome
         try:
-            self.queue.record_escalation(alert, applied=applied)
+            self.queue.record_escalation(alert, applied=True, result=outcome.__dict__)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
             log.debug("record_escalation failed: %s", exc)
         self.bridge.escalation(alert)
+        self.save()
         return outcome
+
+    def _stored_outcome(self, alert_id: str) -> ActionOutcome | None:
+        """The outcome the queue stored for an alert already handled (survives lost manager state)."""
+        fn = getattr(self.queue, "get_escalation", None)
+        if not callable(fn):
+            return None
+        try:
+            row = fn(alert_id)
+        except Exception:  # pragma: no cover - defensive
+            return None
+        result = (row or {}).get("result")
+        if not row or not row.get("applied_at") or not isinstance(result, dict):
+            return None
+        try:
+            return ActionOutcome(**result)
+        except TypeError:
+            return None
 
     def _team_for(self, alert: ForemanEscalation) -> str | None:
         t = alert.target_entity
@@ -244,33 +371,53 @@ class FloorManager:
         return None
 
     def _allocated(self, team_id: str) -> int:
-        """Highest builder slot in use by the team's open tasks."""
+        """Highest builder slot in use by the team's open tasks (current allocation, after resizes)."""
         n = 0
         for d in self.directives.values():
-            if d.team_id == team_id and d.task_id not in self._completed:
-                n = max(n, d.allocated_builders)
+            if d.team_id != team_id or d.task_id in self._completed:
+                continue
+            task = self.queue.get_task(d.task_id)
+            if task and _val(task.get("state")) in _TERMINAL:
+                continue
+            n = max(n, self.allocations.get(d.task_id, d.allocated_builders))
         return n
+
+    def _slot_idle(self, team_id: str, slot: int) -> bool:
+        """A slot is idle when the pool says it is not busy and it holds no claimed ticket."""
+        pool = self.teams.get(team_id)
+        builder = getattr(pool, "builder", None)
+        if callable(builder):
+            try:
+                if getattr(builder(slot), "busy", False):
+                    return False
+            except (IndexError, KeyError):
+                return False
+        agent = f"{team_id}-{slot}"
+        return not any(t.claimed_by == agent for t in self.queue.tickets(team_id=team_id, status="claimed"))
 
     async def _promote_peer_reviewer(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         team_id = self._team_for(alert)
         if not team_id:
             return False, "no team to promote a reviewer in", {}
         minutes = float(alert.action_parameters.get("minutes", alert.action_parameters.get("duration_minutes", 15)))
-        slot = alert.action_parameters.get("slot")
-        if slot is None:
-            idle = [s for s in range(self._allocated(team_id) + 1, self.builders_per_team + 1)]
-            if not idle:
-                return False, f"{team_id} has no idle builder slot", {}
+        alloc = self._allocated(team_id)
+        idle = [s for s in range(alloc + 1, self.builders_per_team + 1) if self._slot_idle(team_id, s)]
+        wanted = alert.action_parameters.get("slot")
+        if wanted is not None and int(wanted) in idle:
+            slot = int(wanted)
+        elif idle:
             slot = idle[-1]
-        slot = int(slot)
-        grant = PeerReviewerGrant(team_id, slot, f"{team_id}-{slot}", time.monotonic() + minutes * 60)
-        self.peer_reviewers[team_id] = grant
+        else:
+            return False, f"{team_id} has no idle builder slot above its allocation ({alloc})", {}
         pool = self.teams.get(team_id)
         hook = getattr(pool, "promote_peer_reviewer", None)
-        if callable(hook):
-            started = await _maybe_await(hook(slot, minutes))
-            if started:
-                grant.agent_id = str(started)
+        if not callable(hook):
+            return False, f"team {team_id} has no pool to promote a reviewer in", {}
+        started = await _maybe_await(hook(slot, minutes))
+        if not started:
+            return False, f"{team_id}-{slot} was not promoted (pool not running or slot busy)", {"slot": slot}
+        grant = PeerReviewerGrant(team_id, slot, str(started), time.monotonic() + minutes * 60)
+        self.peer_reviewers[team_id] = grant
         return True, f"{grant.agent_id} reviews for {team_id} for {minutes:g} min", {"slot": slot, "minutes": minutes}
 
     async def _quarantine_task(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
@@ -278,9 +425,21 @@ class FloorManager:
         if not task_id:
             return False, "no task to quarantine", {}
         reason = str(alert.action_parameters.get("reason") or alert.diagnosis)
+        task = self.queue.get_task(task_id)
+        if task is None:
+            return False, f"unknown task {task_id}", {}
+        if _val(task.get("state")) in _TERMINAL:
+            return False, f"{task_id} is already {_val(task.get('state'))}", {}
         self.queue.quarantine(task_id, reason)
-        self.bridge.quarantined(task_id, reason)
+        self._report_quarantine(task_id, reason)
         return True, f"{task_id} quarantined", {"reason": reason}
+
+    def _report_quarantine(self, task_id: str, reason: str) -> None:
+        """Post a quarantine to the board once per task."""
+        if task_id in self._reported_quarantine:
+            return
+        self._reported_quarantine.add(task_id)
+        self.bridge.quarantined(task_id, reason)
 
     async def _reset_builder_context(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         agent_id = alert.target_entity.agent_id or alert.action_parameters.get("agent_id")
@@ -293,22 +452,27 @@ class FloorManager:
         hook = getattr(pool, "reset_builder_context", None) or getattr(pool, "reset_builder", None)
         if callable(hook):
             await _maybe_await(hook(slot))
-        # Reopen the stalled ticket with a fresh prompt (no fix hint carried over).
-        reopened = await self._reopen_claimed(
+        # Put the stalled ticket back with a fresh prompt (attempt unchanged, no fix hint).
+        released = self._release_claimed(
             team_id, slot, alert.target_entity.task_id, alert.action_parameters.get("ticket_id")
         )
-        if reopened:
-            detail.append(f"ticket {reopened} reopened")
-        return True, "; ".join(detail), {"agent_id": agent_id, "ticket": reopened}
+        if released:
+            detail.append(f"ticket {released} released for a fresh start")
+        try:  # every reset counts as a stall, even a repeat for the same ticket
+            self.queue.record_event(
+                "builder_reset", alert.target_entity.task_id, {"agent_id": agent_id, "ticket_id": released, "alert_id": alert.alert_id}
+            )
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.debug("record_event failed: %s", exc)
+        return True, "; ".join(detail), {"agent_id": agent_id, "ticket": released}
 
-    async def _reopen_claimed(
+    def _release_claimed(
         self, team_id: str, slot: int, task_id: str | None, ticket_id: str | None = None
     ) -> str | None:
-        """Reopen the ticket the stalled builder holds, with no fix hint (a fresh prompt).
+        """Release the ticket the stalled builder holds (``queue.release_ticket``: attempt unchanged).
 
-        The queue has no attempt-neutral single-ticket release, so the reopen
-        counts as an attempt (a stall that needs a reset is treated like a failed
-        try); after the retry limit the queue quarantines the task instead.
+        A stall is not the builder's fault, so it costs no retry; the ticket is
+        open again for the same slot and the next claim builds a fresh prompt.
         """
         agent_id = f"{team_id}-{slot}"
         for t in self.queue.tickets(team_id=team_id, status="claimed"):
@@ -317,7 +481,7 @@ class FloorManager:
             if task_id and t.task_id != task_id:
                 continue
             if t.claimed_by == agent_id or (t.claimed_by is None and t.slot == slot):
-                self.queue.reopen_ticket(t.ticket_id, None)
+                self.queue.release_ticket(t.ticket_id)
                 return t.ticket_id
         return None
 
@@ -328,6 +492,7 @@ class FloorManager:
             return False, "resize needs a task and a builder count", {}
         n = max(1, min(self.builders_per_team, int(n)))
         self.queue.resize(task_id, n)
+        self.allocations[task_id] = n
         if task_id in self.directives:
             d = self.directives[task_id]
             self.bridge.progress(task_id, f"[Foundry] resized to {n} builder(s)", team_id=d.team_id)
@@ -364,6 +529,7 @@ class FloorManager:
         """
         task_id = item.assignment.task_id
         self.diffs.setdefault(task_id, []).append(item.submission.diff)
+        self.save()
         d = self.directives.get(task_id)
         team_id = d.team_id if d else item.assignment.team_id
         self.bridge.progress(
@@ -402,9 +568,10 @@ class FloorManager:
         for task_id in self.directives:
             task = self.queue.get_task(task_id)
             if task and _val(task.get("state")) == "quarantined" and task_id not in self._reported_quarantine:
-                self._reported_quarantine.add(task_id)
-                self.bridge.quarantined(task_id, str(task.get("quarantine_reason") or "quarantined"))
+                self._report_quarantine(task_id, str(task.get("quarantine_reason") or "quarantined"))
                 out.append(task_id)
+        if out:
+            self.save()
         return out
 
     async def on_task_complete(self, task_id: str, diff: str | None = None) -> dict[str, str]:
@@ -438,11 +605,30 @@ class FloorManager:
             self.queue.store_pr_summary(task_id, summary)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
             log.debug("store_pr_summary failed: %s", exc)
+        self._write_patch(task_id, diff, summary)
         d = self.directives.get(task_id)
         if d is not None:
             self.bridge.review(task_id, d.team_id, "APPROVED", note="Foundry reviewer approved")
         self.bridge.done(task_id, summary.get("commit_message", ""))
+        self.save()
         return summary
+
+    def _write_patch(self, task_id: str, diff: str, summary: Mapping[str, str]) -> None:
+        """Write ``<task_id>.patch`` (apply with ``git apply``) and ``<task_id>.md`` into patches_dir.
+
+        Foundry never edits the target repository itself; these files are the output.
+        """
+        if self.patches_dir is None:
+            return
+        try:
+            self.patches_dir.mkdir(parents=True, exist_ok=True)
+            text = diff if diff.endswith("\n") or not diff else diff + "\n"
+            (self.patches_dir / f"{task_id}.patch").write_text(text, encoding="utf-8", newline="\n")
+            md = f"{summary.get('commit_message', '').strip()}\n\n{summary.get('pr_body', '').strip()}\n"
+            (self.patches_dir / f"{task_id}.md").write_text(md, encoding="utf-8")
+            self.patch_paths[task_id] = self.patches_dir / f"{task_id}.patch"
+        except OSError as exc:
+            log.warning("floor manager: could not write the patch for %s: %s", task_id, exc)
 
     def _task_diff(self, task_id: str) -> str:
         fn = getattr(self.queue, "task_diff", None) or getattr(self.queue, "approved_diffs", None)
@@ -466,13 +652,21 @@ def _get(obj: Any, name: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
+#: Never copied into gate scratch workspaces (VCS data, environments, caches).
+SCRATCH_IGNORE: tuple[str, ...] = (
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "*.db", "*.db-wal", "*.db-shm",
+)
+
+
 class WorkspaceGates:
     """Adapts :class:`~foundry.validation_gates.ValidationGates` to the worker's gate interface.
 
     The builder worker calls ``gates.run(submission, assignment)``. Each call
-    copies ``base_workspace`` into a fresh temporary directory, applies the diff
-    there (refusing files outside ``assignment.allowed_files``) and runs the
-    gates, so a retry never sees the previous attempt's half-applied patch.
+    copies ``base_workspace`` (minus :data:`SCRATCH_IGNORE`) into a fresh
+    temporary directory, applies the diff there (refusing files outside
+    ``assignment.allowed_files``) and runs the gates, so a retry never sees the
+    previous attempt's patch and the real working tree is never modified.
     """
 
     def __init__(self, gates: Any, base_workspace: str | Path) -> None:
@@ -487,7 +681,7 @@ class WorkspaceGates:
         try:
             ws = tmp / "ws"
             if self.base_workspace.is_dir():
-                shutil.copytree(self.base_workspace, ws)
+                shutil.copytree(self.base_workspace, ws, ignore=shutil.ignore_patterns(*SCRATCH_IGNORE))
             else:
                 ws.mkdir()
             return await self.gates.validate_async(
@@ -543,7 +737,11 @@ class Factory:
             await asyncio.sleep(0.01)
 
     def close(self) -> None:
-        """Close the databases and the bridge."""
+        """Flush the bridge, save the manager's state, close the databases and the bridge."""
+        flush = getattr(self.bridge, "flush", None)
+        if callable(flush):
+            flush(5.0)
+        self.manager.save()  # board ids resolved by the bridge thread are kept for the next run
         for obj in (self.cache, self.queue):
             fn = getattr(obj, "close", None)
             if callable(fn):
@@ -566,7 +764,8 @@ def build_factory(
     queue_clock: Any = None,
     telemetry_clock: Any = None,
     poll: float = 0.01,
-    trust_cache: bool = True,
+    trust_cache: bool | None = None,
+    patches_dir: str | Path | None = None,
 ) -> Factory:
     """Build queue, telemetry, limiter, context engine, Foreman, cache, gates, pools and manager.
 
@@ -580,6 +779,15 @@ def build_factory(
         gates: the gate runner the workers use; default
             ``WorkspaceGates(ValidationGates(checks=("syntax", "linter")), workspace)``.
         queue_clock / telemetry_clock: fake clocks for tests (datetime / epoch).
+        trust_cache: overrides ``config.trust_cache`` (default False: a cache
+            hit still goes through the gates and the reviewer).
+        patches_dir: overrides ``config.patches_dir`` for the approved patches.
+
+    The target repository is never modified: gates patch scratch copies only,
+    Claude runs with ``cwd=repo_root`` (it reads, it does not write: diff-only
+    output), and approved work lands in ``patches_dir`` as ``<task>.patch``.
+    The queue is resumed (tickets a crashed worker left claimed are reopened)
+    before anything runs.
     """
     from foundry.board_bridge import BoardBridge
     from foundry.builder_worker import TeamPool
@@ -593,6 +801,9 @@ def build_factory(
 
     db = str(config.db_path)
     queue = FoundryQueue(db, clock=queue_clock)
+    resumed = queue.resume()
+    if resumed:
+        log.info("foundry: resumed %d ticket(s) left claimed by a previous run", resumed)
     telemetry = Telemetry(queue, clock=telemetry_clock) if telemetry_clock else Telemetry(queue)
     limiter = limiter or RateLimiter(config.rpm, config.tpm, config.max_concurrent)
     context = ContextEngine(repo_root, gemma)
@@ -601,8 +812,20 @@ def build_factory(
     if gates is None:
         gates = WorkspaceGates(ValidationGates(checks=("syntax", "linter")), workspace or repo_root)
     bridge = bridge if bridge is not None else BoardBridge(config.board_bridge_mode)
+    if trust_cache is None:
+        trust_cache = bool(getattr(config, "trust_cache", False))
+    if patches_dir is None:
+        patches_dir = getattr(config, "patches_dir", None) or Path(config.db_path).parent / "patches"
     manager = FloorManager(
-        queue, foreman, {}, telemetry, bridge, claude, limiter=limiter, builders_per_team=config.builders_per_team
+        queue,
+        foreman,
+        {},
+        telemetry,
+        bridge,
+        claude,
+        limiter=limiter,
+        builders_per_team=config.builders_per_team,
+        patches_dir=patches_dir,
     )
     pools = {
         team: TeamPool(
@@ -620,6 +843,7 @@ def build_factory(
             trust_cache=trust_cache,
             on_task_complete=manager.on_task_complete,
             on_approved=manager.on_approved,
+            cwd=str(Path(repo_root).resolve()),
         )
         for team in config.teams
     }

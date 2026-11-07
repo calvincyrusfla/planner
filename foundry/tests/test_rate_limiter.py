@@ -483,3 +483,23 @@ def test_default_retry_on_long_usage_limit_with_real_exception() -> None:
     with pytest.raises(claude_client.ClaudeRateLimited):
         asyncio.run(limiter.call_with_backoff(fn))
     assert limiter.pause_remaining() == pytest.approx(1200.0)
+
+
+def test_no_float_livelock_at_large_clock_values() -> None:
+    """Regression: a residual wait smaller than the clock's float resolution must not spin."""
+    ft = FakeTime()
+    ft.now = 1_000_000_000.0  # time.monotonic() can be this large on long-running hosts
+    limiter = make(ft, max_concurrent=5)
+    started: list[float] = []
+
+    async def request() -> None:
+        async with limiter.slot(estimated_tokens=3):
+            started.append(ft.now)
+
+    async def main() -> None:
+        limiter.pause_until(seconds=1200.0)
+        await asyncio.gather(*(request() for _ in range(5)))
+
+    asyncio.run(asyncio.wait_for(main(), timeout=5.0))
+    assert len(started) == 5
+    assert min(started) >= 1_000_001_200.0

@@ -124,6 +124,15 @@ def sized_task(queue: FoundryQueue, task_id: str = "F-001", team: str = "alpha",
     return directive
 
 
+def fail_gate(line: dict[str, Any], task_id: str, subtask: int = 1) -> None:
+    """Record one failed (short-circuited) gate run for a ticket, as the builder worker does."""
+    line["queue"].record_gate_result(
+        {"task_id": task_id, "subtask_id": f"{task_id}.{subtask}", "passed": False, "check_type": "tests",
+         "stdout": "", "stderr": PYTEST_TRACE}
+    )
+    line["telemetry"].record_gate_failure(task_id)
+
+
 # --------------------------------------------------------------------------- tools
 
 
@@ -469,10 +478,10 @@ def test_healthy_line_has_no_escalation(line: dict[str, Any]) -> None:
 
 def test_line_jam_quarantines_task(line: dict[str, Any]) -> None:
     sized_task(line["queue"], "F-021", "alpha", 1)
-    line["telemetry"].record_gate_failure("F-021")
+    fail_gate(line, "F-021")
     foreman = make_foreman(line)
     assert run(foreman.evaluate_line_anomaly()) is None  # 1 < threshold 2
-    line["telemetry"].record_gate_failure("F-021")
+    fail_gate(line, "F-021")
     alert = run(foreman.evaluate_line_anomaly())
     assert isinstance(alert, ForemanEscalation)
     assert alert.category == EscalationCategory.LINE_JAM
@@ -528,7 +537,7 @@ def test_review_bottleneck_promotes_peer_reviewer(line: dict[str, Any]) -> None:
     assert alert is not None and alert.category == EscalationCategory.REVIEW_BOTTLENECK
     assert alert.prescribed_action == PrescribedAction.PROMOTE_PEER_REVIEWER
     assert alert.target_entity.team_id == "charlie"
-    assert alert.action_parameters == {"minutes": 15.0, "slot": 5}
+    assert alert.action_parameters == {"minutes": 15.0, "slot": 5}  # no ticket id: task-level mark
     assert alert.metrics_snapshot.dwell_seconds == pytest.approx(601, abs=1)
 
 
@@ -547,7 +556,7 @@ def test_capacity_rebalance_resizes_allocation(line: dict[str, Any]) -> None:
 
 def test_thresholds_come_from_config(line: dict[str, Any]) -> None:
     sized_task(line["queue"], "F-027", "alpha", 1)
-    line["telemetry"].record_gate_failure("F-027")
+    fail_gate(line, "F-027")
     config = FoundryConfig(db_path=line["config"].db_path, thresholds=AnomalyThresholds(gate_fail_quarantine=1))
     foreman = ShopForeman(None, line["queue"], line["telemetry"], line["engine"], config)
     alert = run(foreman.evaluate_line_anomaly())
@@ -558,7 +567,7 @@ def test_alert_ids_are_sequential_and_cooldown_skips_repeats(line: dict[str, Any
     sized_task(line["queue"], "F-028", "alpha", 1)
     sized_task(line["queue"], "F-029", "bravo", 1)
     for tid in ("F-028", "F-028", "F-029", "F-029"):
-        line["telemetry"].record_gate_failure(tid)
+        fail_gate(line, tid)
     foreman = make_foreman(line, cooldown_s=300)
     first = run(foreman.evaluate_line_anomaly())
     second = run(foreman.evaluate_line_anomaly())
@@ -573,7 +582,7 @@ def test_alert_ids_are_sequential_and_cooldown_skips_repeats(line: dict[str, Any
 def test_alert_sequence_continues_after_stored_escalations(line: dict[str, Any]) -> None:
     sized_task(line["queue"], "F-030", "alpha", 1)
     for _ in range(2):
-        line["telemetry"].record_gate_failure("F-030")
+        fail_gate(line, "F-030")
     first = run(make_foreman(line).evaluate_line_anomaly())
     line["queue"].record_escalation(first)
     restarted = make_foreman(line)  # e.g. after a crash
@@ -583,7 +592,7 @@ def test_alert_sequence_continues_after_stored_escalations(line: dict[str, Any])
 def test_gemma_writes_only_the_diagnosis(line: dict[str, Any]) -> None:
     sized_task(line["queue"], "F-031", "alpha", 1)
     for _ in range(2):
-        line["telemetry"].record_gate_failure("F-031")
+        fail_gate(line, "F-031")
     gemma = SimulatedGemmaClient(lambda req: "The task keeps failing its tests. Quarantine it now.")
     foreman = make_foreman(line, gemma)
     alert = run(foreman.evaluate_line_anomaly())
@@ -597,10 +606,10 @@ def test_gemma_writes_only_the_diagnosis(line: dict[str, Any]) -> None:
 def test_invalid_gemma_diagnosis_falls_back(line: dict[str, Any], bad: str) -> None:
     sized_task(line["queue"], "F-032", "alpha", 1)
     for _ in range(2):
-        line["telemetry"].record_gate_failure("F-032")
+        fail_gate(line, "F-032")
     foreman = make_foreman(line, SimulatedGemmaClient(lambda req: bad))
     alert = run(foreman.evaluate_line_anomaly())
-    assert alert.diagnosis.startswith("Task F-032 failed its deterministic gates 2 times.")
+    assert alert.diagnosis.startswith("Ticket F-032:F-032.1 failed its deterministic gates 2 times")
     assert foreman.last_source["evaluate_line_anomaly"] == "heuristic"
 
 
@@ -610,7 +619,7 @@ def test_detect_anomalies_orders_by_urgency(line: dict[str, Any]) -> None:
     line["telemetry"].mark_review_wait("F-033")
     line["clock"].advance(1000)
     for _ in range(2):
-        line["telemetry"].record_gate_failure("F-033")
+        fail_gate(line, "F-033", subtask=2)  # the other ticket; gate events on ticket 1 would count as activity
     line["telemetry"].record_tokens("F-033", "alpha-1", "builder", 99000, 0)
     categories = [a.category for a in make_foreman(line).detect_anomalies()]
     assert categories[:4] == [
@@ -624,6 +633,125 @@ def test_detect_anomalies_orders_by_urgency(line: dict[str, Any]) -> None:
 def test_terminal_tasks_raise_nothing(line: dict[str, Any]) -> None:
     sized_task(line["queue"], "F-034", "alpha", 1)
     for _ in range(3):
-        line["telemetry"].record_gate_failure("F-034")
+        fail_gate(line, "F-034")
     line["queue"].quarantine("F-034", "test")
     assert run(make_foreman(line).evaluate_line_anomaly()) is None
+
+
+# --------------------------------------------------------------------------- round 1 fixes (D6, D7, D8, D12)
+
+
+def submit_for_review(line: dict[str, Any], task_id: str, team: str, slot: int = 1, *,
+                      flag: bool = True, mark: bool = True) -> Any:
+    """Claim a ticket, submit it, pass gates and hand it to the review inbox (as builder_worker does)."""
+    queue = line["queue"]
+    ticket = queue.claim_ticket(team, slot)
+    queue.record_event("submission", task_id, {"ticket_id": ticket.ticket_id, "builder_id": f"{team}-{slot}"})
+    if queue.get_task(task_id)["state"].value == "building":
+        queue.set_state(task_id, "validating")
+        queue.set_state(task_id, "reviewing")
+    if flag:
+        queue.set_in_review(ticket.ticket_id, True)
+    if mark:
+        line["telemetry"].mark_review_wait(task_id, item=ticket.ticket_id)
+    return ticket
+
+
+def test_repro_alpha6_ticket_waiting_for_review_is_not_a_stall(line: dict[str, Any]) -> None:
+    """alpha-6: at +16 min a submission waiting for review raised AGENT_STALLED/RESET."""
+    sized_task(line["queue"], "F-040", "alpha", 1)
+    ticket = submit_for_review(line, "F-040", "alpha")
+    line["clock"].advance(16 * 60)
+    foreman = make_foreman(line)
+    categories = [a.category for a in foreman.detect_anomalies()]
+    assert EscalationCategory.AGENT_STALLED not in categories
+    alert = run(foreman.evaluate_line_anomaly())
+    assert alert.category == EscalationCategory.REVIEW_BOTTLENECK
+    assert alert.prescribed_action == PrescribedAction.PROMOTE_PEER_REVIEWER
+    assert alert.action_parameters["ticket_id"] == ticket.ticket_id
+    assert alert.action_parameters["slot"] == 5
+    assert alert.metrics_snapshot.dwell_seconds == pytest.approx(960, abs=1)
+    assert run(foreman.evaluate_line_anomaly()) is None  # no RESET follow-up either
+
+
+def test_repro_charlie6_in_review_flag_alone_suppresses_stall(line: dict[str, Any]) -> None:
+    """charlie-6: same scenario with only the queue's in_review flag (no telemetry wait mark)."""
+    sized_task(line["queue"], "F-041", "charlie", 1)
+    submit_for_review(line, "F-041", "charlie", mark=False)
+    line["clock"].advance(16 * 60)
+    alert = run(make_foreman(line).evaluate_line_anomaly())
+    assert alert.category == EscalationCategory.REVIEW_BOTTLENECK  # falls back to time in 'reviewing'
+    assert alert.target_entity.task_id == "F-041"
+
+
+def test_review_wait_mark_alone_also_suppresses_stall(line: dict[str, Any]) -> None:
+    sized_task(line["queue"], "F-042", "bravo", 1)
+    submit_for_review(line, "F-042", "bravo", flag=False)
+    line["clock"].advance(16 * 60)
+    categories = [a.category for a in make_foreman(line).detect_anomalies()]
+    assert categories == [EscalationCategory.REVIEW_BOTTLENECK]
+
+
+def test_stall_detection_resumes_when_review_cleared(line: dict[str, Any]) -> None:
+    sized_task(line["queue"], "F-043", "alpha", 1)
+    ticket = submit_for_review(line, "F-043", "alpha", mark=False)
+    line["queue"].set_in_review(ticket.ticket_id, False)  # reviewer finished, builder owns it again
+    line["queue"].set_state("F-043", "building")
+    line["clock"].advance(901)
+    alert = run(make_foreman(line).evaluate_line_anomaly())
+    assert alert.category == EscalationCategory.AGENT_STALLED
+    assert alert.action_parameters["ticket_id"] == ticket.ticket_id
+
+
+def test_review_bottleneck_uses_per_submission_dwell(line: dict[str, Any]) -> None:
+    sized_task(line["queue"], "F-044", "alpha", 2)
+    first = submit_for_review(line, "F-044", "alpha", 1)
+    line["clock"].advance(500)
+    second = submit_for_review(line, "F-044", "alpha", 2)
+    line["telemetry"].mark_review_start("F-044", item=first.ticket_id)  # reviewer took the old one
+    line["clock"].advance(200)
+    foreman = make_foreman(line)
+    assert run(foreman.evaluate_line_anomaly()) is None  # remaining submission waited only 200 s
+    line["clock"].advance(401)
+    alert = run(foreman.evaluate_line_anomaly())
+    assert alert.category == EscalationCategory.REVIEW_BOTTLENECK
+    assert alert.action_parameters["ticket_id"] == second.ticket_id
+    assert alert.metrics_snapshot.dwell_seconds == pytest.approx(601, abs=1)
+
+
+def test_line_jam_counts_gate_failures_per_ticket(line: dict[str, Any]) -> None:
+    sized_task(line["queue"], "F-045", "alpha", 2)
+    fail_gate(line, "F-045", subtask=1)
+    fail_gate(line, "F-045", subtask=2)
+    foreman = make_foreman(line)
+    assert run(foreman.evaluate_line_anomaly()) is None  # 2 failures on the task, but 1 per ticket
+    fail_gate(line, "F-045", subtask=2)
+    alert = run(foreman.evaluate_line_anomaly())
+    assert alert.category == EscalationCategory.LINE_JAM
+    assert alert.action_parameters["ticket_id"] == "F-045:F-045.2"
+    assert alert.metrics_snapshot.gate_failure_count == 2
+    assert foreman.inspect_task_failure("F-045")["gate_failures_by_ticket"] == {"F-045.1": 1, "F-045.2": 2}
+
+
+def test_line_jam_ignores_failures_of_done_tickets(line: dict[str, Any]) -> None:
+    queue = line["queue"]
+    sized_task(queue, "F-046", "alpha", 2)
+    for _ in range(2):
+        fail_gate(line, "F-046", subtask=1)
+    ticket = queue.claim_ticket("alpha", 1)
+    queue.complete_ticket(ticket.ticket_id)  # it eventually passed and was approved
+    assert run(make_foreman(line).evaluate_line_anomaly()) is None
+
+
+def test_alert_ids_are_reserved_in_the_db_when_issued(line: dict[str, Any]) -> None:
+    queue = line["queue"]
+    sized_task(queue, "F-047", "alpha", 1)
+    for _ in range(2):
+        fail_gate(line, "F-047")
+    first = run(make_foreman(line).evaluate_line_anomaly())
+    assert first.alert_id == "ALT-20260115-001"
+    assert queue.alert_ids("ALT-20260115-") == ["ALT-20260115-001"]  # persisted without record_escalation
+    queue.reserve_alert_id("ALT-20260115-002")  # e.g. taken by another Foreman process
+    restarted = make_foreman(line)
+    assert run(restarted.evaluate_line_anomaly()).alert_id == "ALT-20260115-003"
+    assert queue.alert_ids("ALT-20260115-")[-1] == "ALT-20260115-003"

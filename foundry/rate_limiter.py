@@ -44,6 +44,13 @@ T = TypeVar("T")
 WINDOW_SECONDS = 60.0
 """Length of the sliding window used by :meth:`RateLimiter.current_rpm`/`current_tpm`."""
 
+WAIT_EPSILON = 1e-6
+"""Waits at or below this many seconds count as "available now".
+
+Without it, float rounding at large clock values can leave a residual wait so
+small that ``clock + wait == clock``, and the slot loop would spin forever.
+"""
+
 
 def _rate_limited_exception() -> type[BaseException]:
     """Return ``ClaudeRateLimited`` from :mod:`foundry.claude_client`, imported lazily."""
@@ -83,7 +90,7 @@ class TokenBucket:
 
     def wait_for(self, amount: float, *, factor: float = 1.0) -> float:
         """Seconds until ``amount`` tokens are available (0 when available now)."""
-        if self.level >= amount:
+        if self.level >= amount - 1e-9 * max(1.0, amount):
             return 0.0
         rate = self.rate_per_s * factor
         if rate <= 0:
@@ -220,10 +227,10 @@ class RateLimiter:
                         self._req_bucket.wait_for(1.0, factor=factor),
                         self._tok_bucket.wait_for(charge, factor=factor),
                     )
-                    if self._throttle_until > now:
+                    if self._throttle_until - now > WAIT_EPSILON:
                         # Re-evaluate when the throttle lifts (budgets grow back).
                         wait = min(wait, self._throttle_until - now) if wait > 0 else wait
-                    if wait <= 0:
+                    if wait <= WAIT_EPSILON:
                         self._req_bucket.level -= 1.0
                         self._tok_bucket.level -= charge
                         self._prune(now)

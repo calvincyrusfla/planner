@@ -38,10 +38,11 @@ PR drafting as ``"release_draft"``, context slices as ``"pruning"``).
 ==========================  ================================================
 Action                      Parameters
 ==========================  ================================================
-QUARANTINE_TASK             ``reason``, ``gate_failure_count``
+QUARANTINE_TASK             ``reason``, ``gate_failure_count``, ``ticket_id``
 THROTTLE_DISPATCH           ``factor`` (0..1), ``seconds``
 RESET_BUILDER_CONTEXT       ``agent_id``, ``ticket_id``, ``slot``
-PROMOTE_PEER_REVIEWER       ``minutes`` and, when one is free, ``slot``
+PROMOTE_PEER_REVIEWER       ``minutes``; ``slot`` when one is free; ``ticket_id``
+                            of the waiting submission when known
 RESIZE_ALLOCATION           ``builders`` (new allocation), ``from``
 ==========================  ================================================
 
@@ -575,6 +576,7 @@ class ShopForeman:
             "state": _jsonable(task["state"]),
             "quarantine_reason": task.get("quarantine_reason"),
             "gate_failure_count": self._gate_failures(task_id),
+            "gate_failures_by_ticket": self._ticket_gate_failures(task_id),
             "recent_gate_failures": failures,
             "tickets": tickets,
             "verdicts": verdicts,
@@ -652,18 +654,57 @@ class ShopForeman:
                 log.debug("queue gate_failure_count failed: %s", exc)
         return max(counts)
 
-    def _review_waits(self) -> dict[str, float]:
-        """Seconds each non-terminal task has waited for review.
+    def _ticket_gate_failures(self, task_id: str) -> dict[str, int]:
+        """Failed gate results per ticket (subtask) of a task, for tickets not yet done.
 
-        Uses telemetry's review-wait marks; a task in ``reviewing`` without a
-        mark falls back to the time since it entered that state.
+        Gates short-circuit on the first failure, so one failed row is one
+        failed submission: the same unit the retry policy counts (D8).
         """
-        waits: dict[str, float] = {}
-        if self.telemetry is not None:
+        rows = self._sql(
+            "SELECT subtask_id, COUNT(*) FROM gate_results WHERE task_id=? AND passed=0 GROUP BY subtask_id",
+            (task_id,),
+        )
+        done = {t.subtask_id for t in self.queue.tickets_for_task(task_id) if t.status == "done"}
+        return {str(sub): int(n) for sub, n in rows if sub not in done}
+
+    def _pending_review_items(self) -> list[dict[str, Any]]:
+        """Submissions still waiting for a reviewer: ``{task_id, item, dwell_seconds}``, oldest first."""
+        if self.telemetry is None:
+            return []
+        fn = getattr(self.telemetry, "waiting_submissions", None)
+        if callable(fn):
             try:
-                waits.update(self.telemetry.waiting_for_review())
+                return [dict(r) for r in fn()]
             except Exception as exc:  # noqa: BLE001
-                log.debug("telemetry waiting_for_review failed: %s", exc)
+                log.debug("telemetry waiting_submissions failed: %s", exc)
+        try:  # older telemetry: one anonymous wait per task
+            return [{"task_id": t, "item": None, "dwell_seconds": s}
+                    for t, s in self.telemetry.waiting_for_review().items()]
+        except Exception as exc:  # noqa: BLE001
+            log.debug("telemetry waiting_for_review failed: %s", exc)
+            return []
+
+    def _review_wait_items(self) -> dict[str, dict[str, Any]]:
+        """Per non-terminal task: its oldest submission waiting for review.
+
+        Returns ``{task_id: {"dwell_seconds", "ticket_id"}}``. Dwell is per
+        submission (D7); a submission whose ticket is no longer awaiting review
+        (done, or reopened to ``open``) is ignored. A task in ``reviewing``
+        with no wait mark at all falls back to the time since it entered that
+        state.
+        """
+        waits: dict[str, dict[str, Any]] = {}
+        for row in self._pending_review_items():
+            tid, item = row.get("task_id"), row.get("item")
+            if not tid:
+                continue
+            if item:
+                ticket = self.queue.get_ticket(str(item))
+                if ticket is not None and ticket.status in ("done", "open"):
+                    continue
+            secs = float(row.get("dwell_seconds") or 0.0)
+            if tid not in waits or secs > waits[tid]["dwell_seconds"]:
+                waits[tid] = {"dwell_seconds": secs, "ticket_id": item}
         now = self._now()
         for task in self.queue.tasks_in_state(TaskState.REVIEWING):
             tid = task["task_id"]
@@ -679,18 +720,30 @@ class ShopForeman:
                 continue  # a reviewer already picked it up
             since = _parse_ts(task.get("state_changed_at"))
             if since is not None:
-                waits[tid] = max(0.0, (now - since).total_seconds())
+                waits[tid] = {"dwell_seconds": max(0.0, (now - since).total_seconds()), "ticket_id": None}
         live = {}
-        for tid, secs in waits.items():
+        for tid, info in waits.items():
             task = self.queue.get_task(tid)
             if task is not None and _jsonable(task["state"]) not in _TERMINAL:
-                live[tid] = float(secs)
+                live[tid] = info
         return live
 
+    def _review_waits(self) -> dict[str, float]:
+        """Seconds each non-terminal task's oldest submission has waited for review."""
+        return {tid: float(info["dwell_seconds"]) for tid, info in self._review_wait_items().items()}
+
     def _claimed_ages(self, team_id: str | None, now: datetime) -> list[tuple[Any, float]]:
-        """Claimed tickets with seconds since their builder's last activity."""
+        """Claimed tickets still being built, with seconds since their builder's last activity.
+
+        Tickets waiting for review are skipped (D6): the ``in_review`` flag, or
+        a pending review-wait submission for the ticket in telemetry. Their
+        builder is finished; a slow reviewer is a REVIEW_BOTTLENECK, not a stall.
+        """
+        awaiting = {str(r.get("item")) for r in self._pending_review_items() if r.get("item")}
         out = []
         for ticket in self.queue.tickets(team_id=team_id, status="claimed"):
+            if getattr(ticket, "in_review", False) or ticket.ticket_id in awaiting:
+                continue
             last = _parse_ts(ticket.claimed_at) or _parse_ts(ticket.updated_at)
             for ev in self.queue.events(task_id=ticket.task_id):
                 payload = ev.get("payload") or {}
@@ -1193,25 +1246,33 @@ class ShopForeman:
         found: list[Anomaly] = []
         tasks = {t["task_id"]: t for t in self.queue.all_tasks() if _jsonable(t["state"]) not in _TERMINAL}
 
-        # LINE_JAM: repeated gate failures on one task -> quarantine it.
+        # LINE_JAM: one ticket failed its gates repeatedly (per ticket, like the retry policy) -> quarantine.
         for tid, task in tasks.items():
-            n = self._gate_failures(tid)
-            if n >= th.gate_fail_quarantine:
-                found.append(
-                    Anomaly(
-                        EscalationCategory.LINE_JAM,
-                        Severity.CRITICAL if n >= th.gate_fail_quarantine + 2 else Severity.HIGH,
-                        PrescribedAction.QUARANTINE_TASK,
-                        team_id=task["team_id"],
-                        task_id=tid,
-                        gate_failure_count=n,
-                        action_parameters={"reason": f"{n} gate failures (limit {th.gate_fail_quarantine})",
-                                           "gate_failure_count": n},
-                        extra_metrics={"threshold": th.gate_fail_quarantine},
-                        fallback_diagnosis=f"Task {tid} failed its deterministic gates {n} times. "
-                                           "Quarantine it before more builder calls are spent.",
-                    )
+            per_ticket = self._ticket_gate_failures(tid)
+            if not per_ticket:
+                continue
+            subtask_id, n = max(per_ticket.items(), key=lambda kv: (kv[1], kv[0]))
+            if n < th.gate_fail_quarantine:
+                continue
+            ticket = next((t for t in self.queue.tickets_for_task(tid) if t.subtask_id == subtask_id), None)
+            ticket_id = ticket.ticket_id if ticket is not None else f"{tid}:{subtask_id}"
+            found.append(
+                Anomaly(
+                    EscalationCategory.LINE_JAM,
+                    Severity.CRITICAL if n > th.gate_fail_quarantine else Severity.HIGH,
+                    PrescribedAction.QUARANTINE_TASK,
+                    team_id=task["team_id"],
+                    task_id=tid,
+                    agent_id=ticket.claimed_by if ticket is not None else None,
+                    gate_failure_count=n,
+                    action_parameters={"reason": f"ticket {ticket_id} failed its gates {n} times "
+                                                 f"(limit {th.gate_fail_quarantine})",
+                                       "gate_failure_count": n, "ticket_id": ticket_id},
+                    extra_metrics={"threshold": th.gate_fail_quarantine, "ticket_id": ticket_id},
+                    fallback_diagnosis=f"Ticket {ticket_id} failed its deterministic gates {n} times and is on its "
+                                       "last attempt. Quarantine the task before more builder calls are spent.",
                 )
+            )
 
         # TOKEN_VELOCITY_SPIKE: burn above the configured share of the TPM cap.
         if self.telemetry is not None:
@@ -1248,7 +1309,7 @@ class ShopForeman:
                         task_id=ticket.task_id,
                         agent_id=agent,
                         dwell_seconds=secs,
-                        gate_failure_count=self._gate_failures(ticket.task_id),
+                        gate_failure_count=self._ticket_gate_failures(ticket.task_id).get(ticket.subtask_id, 0),
                         action_parameters={"agent_id": agent, "ticket_id": ticket.ticket_id, "slot": ticket.slot},
                         extra_metrics={"threshold_s": th.stall_s},
                         fallback_diagnosis=f"Builder {agent} has shown no activity on {ticket.ticket_id} for {secs:.0f}s. "
@@ -1256,14 +1317,18 @@ class ShopForeman:
                     )
                 )
 
-        # REVIEW_BOTTLENECK: a task waiting too long for its reviewer.
-        for tid, secs in sorted(self._review_waits().items(), key=lambda kv: -kv[1]):
+        # REVIEW_BOTTLENECK: a submission waiting too long for its reviewer (per-submission dwell).
+        waits = self._review_wait_items()
+        for tid, info in sorted(waits.items(), key=lambda kv: -kv[1]["dwell_seconds"]):
+            secs = float(info["dwell_seconds"])
             if secs > th.review_dwell_s and tid in tasks:
                 team = tasks[tid]["team_id"]
                 free = self._free_slots(team)
                 params: dict[str, Any] = {"minutes": self.peer_review_minutes}
                 if free:
                     params["slot"] = free[-1]
+                if info.get("ticket_id"):
+                    params["ticket_id"] = info["ticket_id"]
                 found.append(
                     Anomaly(
                         EscalationCategory.REVIEW_BOTTLENECK,
@@ -1272,10 +1337,10 @@ class ShopForeman:
                         team_id=team,
                         task_id=tid,
                         dwell_seconds=secs,
-                        gate_failure_count=self._gate_failures(tid),
+                        gate_failure_count=max(self._ticket_gate_failures(tid).values(), default=0),
                         action_parameters=params,
                         extra_metrics={"threshold_s": th.review_dwell_s},
-                        fallback_diagnosis=f"Task {tid} has waited {secs:.0f}s for review on team {team}. "
+                        fallback_diagnosis=f"A submission of {tid} has waited {secs:.0f}s for review on team {team}. "
                                            "Promote an idle builder to peer reviewer for a while.",
                     )
                 )
@@ -1311,22 +1376,37 @@ class ShopForeman:
         return found
 
     def _next_alert_id(self, now: datetime) -> str:
-        """Sequential per-day alert id, continuing after ids already stored in the queue."""
+        """Issue the next per-day ``ALT-YYYYMMDD-NNN`` id and reserve it in the queue db (D12).
+
+        The sequence is seeded from every id already reserved or recorded, and
+        each candidate is persisted with ``queue.reserve_alert_id`` when it is
+        issued; a taken id (another Foreman, a restart) moves on to the next
+        number, so ids are never reused even if the alert is never applied.
+        """
         day = now.strftime("%Y%m%d")
+        prefix = f"ALT-{day}-"
         if self._alert_day != day:
             self._alert_day, self._alert_seq = day, 0
+            stored: list[str] = []
             try:
-                stored = [str(e.get("alert_id", "")) for e in self.queue.escalations()]
-            except Exception:  # noqa: BLE001
-                stored = []
-            prefix = f"ALT-{day}-"
+                lister = getattr(self.queue, "alert_ids", None)
+                if callable(lister):
+                    stored = [str(a) for a in lister(prefix)]
+                else:
+                    stored = [str(e.get("alert_id", "")) for e in self.queue.escalations()]
+            except Exception as exc:  # noqa: BLE001
+                log.debug("reading stored alert ids failed: %s", exc)
             for aid in stored:
                 if aid.startswith(prefix) and aid[len(prefix):].isdigit():
                     self._alert_seq = max(self._alert_seq, int(aid[len(prefix):]))
-        self._alert_seq += 1
-        if self._alert_seq > 999:
-            raise RuntimeError("more than 999 escalations today")
-        return new_alert_id(self._alert_seq, now)
+        reserve = getattr(self.queue, "reserve_alert_id", None)
+        while True:
+            self._alert_seq += 1
+            if self._alert_seq > 999:
+                raise RuntimeError("more than 999 escalations today")
+            alert_id = new_alert_id(self._alert_seq, now)
+            if not callable(reserve) or reserve(alert_id):
+                return alert_id
 
     def _valid_diagnosis(self, text: str) -> str | None:
         candidate = " ".join((text or "").split()).strip().strip('"')

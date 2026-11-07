@@ -31,12 +31,15 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from foundry.schemas import ClaudeResult
 
 __all__ = [
+    "ClaudeAuthError",
     "ClaudeClient",
     "ClaudeCodeClient",
     "ClaudeError",
@@ -45,10 +48,12 @@ __all__ = [
     "ClaudeRole",
     "SimulatedCall",
     "SimulatedClaudeClient",
+    "detect_auth_error",
     "detect_rate_limit",
     "parse_claude_json",
     "parse_retry_after",
     "resolve_claude_bin",
+    "windows_shim_command_line",
 ]
 
 log = logging.getLogger(__name__)
@@ -67,7 +72,15 @@ class ClaudeError(RuntimeError):
 
 
 class ClaudeNotFound(ClaudeError):
-    """The ``claude`` executable could not be found on PATH."""
+    """The ``claude`` executable could not be found on PATH (or could not be started)."""
+
+
+class ClaudeAuthError(ClaudeError):
+    """Claude Code is not logged in / its credentials expired ("Please run /login").
+
+    This is an infrastructure failure: the user must run ``claude`` once
+    interactively and ``/login``. Workers must not spend a ticket attempt on it.
+    """
 
 
 class ClaudeRateLimited(ClaudeError):
@@ -108,6 +121,8 @@ class ClaudeClient(Protocol):
 
         Raises:
             ClaudeRateLimited: on a rate limit / usage limit (callers back off).
+            ClaudeAuthError: when Claude Code needs ``/login``.
+            ClaudeNotFound: when the executable is missing or cannot be started.
         """
         ...
 
@@ -129,6 +144,18 @@ _TRY_AGAIN_RE = re.compile(
 )
 #: Claude Code's usage-limit message has the form "Claude AI usage limit reached|1700000000".
 _EPOCH_RE = re.compile(r"\|\s*(\d{10})(?:\d{3})?\b")
+#: "resets 3pm (Europe/Berlin)", "resets 10:30pm", "resets at 15:00". A bare number
+#: without am/pm or minutes is not accepted (too ambiguous).
+_RESET_CLOCK_RE = re.compile(
+    r"\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?(?=[\s(.,;·∙|]|$)"
+    r"(?:\s*\(([^)]+)\))?",
+    re.IGNORECASE,
+)
+_AUTH_RE = re.compile(
+    r"/login\b|not logged in|invalid api key|authentication[_\s-]?error|oauth token (?:has )?expired"
+    r"|credentials? (?:are |is )?(?:missing|invalid|expired)|\b401\b|unauthori[sz]ed",
+    re.IGNORECASE,
+)
 
 
 def _unit_factor(unit: str | None) -> float:
@@ -144,23 +171,82 @@ def _unit_factor(unit: str | None) -> float:
     return 1.0
 
 
-def parse_retry_after(text: str, *, now: float | None = None) -> float | None:
-    """Pull a retry delay (seconds) out of a rate-limit message, or ``None``.
+def _zone(name: str | None, local_tz: tzinfo | None) -> tzinfo:
+    """``ZoneInfo(name)`` when it resolves, else ``local_tz`` / the machine's local zone.
 
-    Understands ``retry after 30`` / ``retry-after: 2.5s`` / ``try again in 5 minutes``
-    and Claude Code's ``usage limit reached|<unix epoch>`` form (converted to the
-    seconds remaining from ``now``, never negative).
+    Windows has no system tz database; without the ``tzdata`` package an IANA name
+    cannot be resolved and local time is used instead (usually the same zone).
+    """
+    if name:
+        try:
+            return ZoneInfo(name.strip())
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            log.debug("unknown time zone %r in reset message; using local time", name)
+    if local_tz is not None:
+        return local_tz
+    return datetime.now().astimezone().tzinfo or ZoneInfo("UTC")
+
+
+def _seconds_until_clock(
+    hour: int, minute: int, meridiem: str | None, tz: tzinfo, now: float
+) -> float | None:
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        pm = meridiem.lower().startswith("p")
+        hour = (hour % 12) + (12 if pm else 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    now_dt = datetime.fromtimestamp(now, tz)
+    target = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now_dt:
+        # next occurrence; wall-clock arithmetic in the zone (DST-safe with zoneinfo)
+        target = (target.replace(tzinfo=None) + timedelta(days=1)).replace(tzinfo=tz)
+    return max(0.0, target.timestamp() - now)
+
+
+def parse_retry_after(
+    text: str, *, now: float | None = None, local_tz: tzinfo | None = None
+) -> float | None:
+    """Pull a retry delay (seconds) out of a rate-limit / usage-limit message, or ``None``.
+
+    Understands, in this order:
+
+    * ``retry after 30`` / ``retry-after: 2.5s`` / ``try again in 5 minutes``;
+    * Claude Code's ``usage limit reached|<unix epoch>`` form;
+    * a reset clock time: ``resets 3pm (Europe/Berlin)``, ``resets 10:30pm``,
+      ``resets at 15:00``. The IANA zone in parentheses is honoured via zoneinfo;
+      without one (or when it can't be resolved) local time is used. The next
+      occurrence of that time is taken.
+
+    ``now`` is a Unix timestamp (defaults to ``time.time()``); ``local_tz`` overrides
+    the machine's zone (tests). Results are never negative. ``None`` means "no
+    usable time": the caller falls back to its configured cooldown
+    (``FOUNDRY_LIMIT_COOLDOWN_S``).
     """
     if not text:
         return None
+    current = time.time() if now is None else now
     m = _RETRY_SECONDS_RE.search(text) or _TRY_AGAIN_RE.search(text)
     if m:
         return float(m.group(1)) * _unit_factor(m.group(2))
     m = _EPOCH_RE.search(text)
     if m:
-        current = time.time() if now is None else now
         return max(0.0, float(m.group(1)) - current)
+    for m in _RESET_CLOCK_RE.finditer(text):
+        hour_s, minute_s, meridiem, zone_name = m.groups()
+        if minute_s is None and meridiem is None:
+            continue
+        tz = _zone(zone_name, local_tz)
+        secs = _seconds_until_clock(int(hour_s), int(minute_s or 0), meridiem, tz, current)
+        if secs is not None:
+            return secs
     return None
+
+
+def detect_auth_error(text: str) -> bool:
+    """True when ``text`` says Claude Code is not logged in ("Please run /login")."""
+    return bool(text) and _AUTH_RE.search(text) is not None
 
 
 def detect_rate_limit(text: str) -> bool:
@@ -172,9 +258,10 @@ def resolve_claude_bin(claude_bin: str = "claude", *, platform: str | None = Non
     """Return the full path of the Claude Code executable.
 
     ``claude_bin`` may be a bare name (looked up on PATH) or a path. On Windows the
-    npm install creates ``claude.cmd`` (and sometimes ``claude.exe``/``claude.ps1``),
-    which a bare ``claude`` lookup through ``CreateProcess`` does not find, so the
-    ``.cmd``/``.exe``/``.bat`` variants are tried explicitly.
+    npm install creates an extensionless ``claude`` sh script (not runnable by
+    ``CreateProcess``) next to ``claude.cmd``; the native installer creates
+    ``claude.exe``. So for a name without a suffix ``.exe``, ``.cmd`` and ``.bat``
+    are tried first and the bare name last.
 
     Raises:
         ClaudeNotFound: when nothing matches.
@@ -182,7 +269,7 @@ def resolve_claude_bin(claude_bin: str = "claude", *, platform: str | None = Non
     plat = sys.platform if platform is None else platform
     candidates = [claude_bin]
     if plat.startswith("win") and not Path(claude_bin).suffix:
-        candidates += [claude_bin + ext for ext in (".cmd", ".exe", ".bat")]
+        candidates = [claude_bin + ext for ext in (".exe", ".cmd", ".bat")] + [claude_bin]
     for cand in candidates:
         found = shutil.which(cand)
         if found:
@@ -239,16 +326,61 @@ def parse_claude_json(stdout: str) -> dict:
     return (results or objects)[-1]
 
 
+def _make_result(**fields: object) -> ClaudeResult:
+    """Build a ClaudeResult, dropping ``cache_read_tokens`` if the schema predates it."""
+    if "cache_read_tokens" not in ClaudeResult.model_fields:
+        fields.pop("cache_read_tokens", None)
+    return ClaudeResult(**fields)  # type: ignore[arg-type]
+
+
+#: Characters that cannot be passed safely through a ``.cmd`` shim even when quoted:
+#: ``"`` ends cmd's quoting, ``%`` triggers variable expansion, newlines end the line.
+_CMD_UNSAFE = frozenset('"%\r\n\x00')
+
+
+def _auth_message(blob: str) -> str:
+    excerpt = " ".join(blob.split())[:200]
+    return (
+        "Claude Code is not logged in (run `claude` once in a terminal and use /login): " + excerpt
+    )
+
+
+def windows_shim_command_line(exe: str, args: Sequence[str]) -> str:
+    """The command string handed to ``cmd.exe /c`` for a ``.cmd``/``.bat`` shim.
+
+    Every token (the shim path too) is wrapped in double quotes, so spaces
+    (``C:\\Users\\John Smith\\...``) and cmd metacharacters (``& | < > ^``) are
+    inert. ``subprocess`` (``shell=True``) runs it as ``cmd.exe /c "<this string>"``;
+    since the string contains more than two quotes, cmd strips exactly the outer
+    pair and runs this string unchanged. A trailing backslash is doubled so it
+    does not escape the closing quote for the CRT argument parser in node.
+
+    Raises:
+        ClaudeError: when a token contains ``"``, ``%`` or a newline, which cannot
+            survive cmd.exe; use ``claude.exe`` or remove those characters.
+    """
+    parts: list[str] = []
+    for tok in (exe, *args):
+        bad = _CMD_UNSAFE.intersection(tok)
+        if bad:
+            raise ClaudeError(
+                f"argument {tok[:40]!r} contains {''.join(sorted(bad))!r}, which cannot be passed "
+                "through claude.cmd; install the native claude.exe or drop those characters"
+            )
+        if tok.endswith("\\"):
+            tok += "\\" * (len(tok) - len(tok.rstrip("\\")))
+        parts.append(f'"{tok}"')
+    return " ".join(parts)
+
+
 def _result_from_payload(payload: dict, wall_seconds: float) -> ClaudeResult:
     usage = payload.get("usage") or {}
     if not isinstance(usage, dict):
         usage = {}
-    # Cached prompt tokens are still input the model read; count them for burn-rate.
-    input_tokens = (
-        _int(usage.get("input_tokens"))
-        + _int(usage.get("cache_creation_input_tokens"))
-        + _int(usage.get("cache_read_input_tokens"))
-    )
+    # D11: input_tokens = uncached input + cache creation (what the rate limiter is
+    # charged); cache reads are reported separately as cache_read_tokens.
+    input_tokens = _int(usage.get("input_tokens")) + _int(usage.get("cache_creation_input_tokens"))
+    cache_read_tokens = _int(usage.get("cache_read_input_tokens"))
     duration_ms = payload.get("duration_ms")
     duration = _int(duration_ms) / 1000.0 if duration_ms is not None else wall_seconds
     cost = payload.get("total_cost_usd", payload.get("cost_usd"))
@@ -262,9 +394,10 @@ def _result_from_payload(payload: dict, wall_seconds: float) -> ClaudeResult:
     error: str | None = None
     if is_error:
         error = (text or str(payload.get("subtype") or "claude reported an error"))[:_ERROR_EXCERPT]
-    return ClaudeResult(
+    return _make_result(
         text=text,
         input_tokens=input_tokens,
+        cache_read_tokens=cache_read_tokens,
         output_tokens=_int(usage.get("output_tokens")),
         duration_seconds=duration,
         cost_usd=cost_usd,
@@ -287,8 +420,13 @@ class ClaudeCodeClient:
 
     Behaviour:
         * the prompt is written to stdin, never put on the command line or logged;
-        * on timeout the whole process tree is killed and an error result returned;
-        * a rate-limit / usage-limit error raises :class:`ClaudeRateLimited`;
+        * on timeout the whole process tree is killed and an error result returned
+          (``error`` starts with ``"timeout"``);
+        * a rate-limit / usage-limit error raises :class:`ClaudeRateLimited`
+          (``retry_after`` from the message, or ``None`` → caller's cooldown);
+        * "Please run /login"-type failures raise :class:`ClaudeAuthError`;
+        * a missing / unstartable executable raises :class:`ClaudeNotFound`
+          (any other spawn ``OSError`` → :class:`ClaudeError`);
         * other failures (non-zero exit, unparseable output) return a
           ``ClaudeResult`` with ``is_error=True`` so workers can retry or block.
     """
@@ -306,16 +444,52 @@ class ClaudeCodeClient:
         self._resolved: str | None = None
 
     def command(self) -> list[str]:
-        """The argv used for each call (without the prompt, which goes to stdin)."""
+        """The logical argv used for each call (the prompt goes to stdin, not here)."""
         if self._resolved is None:
             self._resolved = resolve_claude_bin(self.claude_bin)
-        exe = self._resolved
-        argv = [exe, "-p", "--output-format", "json", *self.extra_args]
-        if sys.platform.startswith("win") and Path(exe).suffix.lower() in (".cmd", ".bat"):
-            # Batch shims must go through cmd.exe; arguments are fixed flags only
-            # (the prompt is on stdin), so there is no injection surface here.
-            argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", *argv]
-        return argv
+        return [self._resolved, "-p", "--output-format", "json", *self.extra_args]
+
+    def launch_spec(self, *, platform: str | None = None) -> tuple[Literal["exec", "shell"], list[str] | str]:
+        """How the child is started: ``("exec", argv)`` or ``("shell", command_line)``.
+
+        On Windows a ``.cmd``/``.bat`` shim (the npm install) cannot be exec'd
+        directly, and ``cmd.exe /s /c`` with list2cmdline quoting breaks on paths with
+        spaces. Such shims are run through the shell (``cmd.exe /c "<line>"``) with the
+        line built by :func:`windows_shim_command_line`. Everything else is exec'd.
+        """
+        plat = sys.platform if platform is None else platform
+        argv = self.command()
+        if plat.startswith("win") and Path(argv[0]).suffix.lower() in (".cmd", ".bat"):
+            return "shell", windows_shim_command_line(argv[0], argv[1:])
+        return "exec", argv
+
+    async def _spawn(self, cwd: str | None, env: dict[str, str] | None) -> asyncio.subprocess.Process:
+        mode, spec = self.launch_spec()
+        kwargs: dict = {
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "cwd": cwd,
+            "env": env,
+        }
+        if sys.platform.startswith("win"):
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            if mode == "shell":
+                assert isinstance(spec, str)
+                return await asyncio.create_subprocess_shell(spec, **kwargs)
+            assert isinstance(spec, list)
+            return await asyncio.create_subprocess_exec(*spec, **kwargs)
+        except (FileNotFoundError, PermissionError) as exc:
+            if cwd is not None and not Path(cwd).is_dir():
+                raise ClaudeError(f"working directory {cwd!r} does not exist") from exc
+            raise ClaudeNotFound(
+                f"could not start Claude Code ({self._resolved or self.claude_bin!r}): {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ClaudeError(f"could not start Claude Code: {exc}") from exc
 
     async def run(
         self,
@@ -327,25 +501,11 @@ class ClaudeCodeClient:
         timeout: float = 600,
     ) -> ClaudeResult:
         """Run one headless Claude Code turn. See the class docstring."""
-        argv = self.command()
         log.info("claude call agent=%s role=%s cwd=%s", agent_id, role, cwd or ".")
         log.debug("claude prompt length=%d chars", len(prompt))
         env = {**os.environ, **self.env} if self.env else None
-        kwargs: dict = {}
-        if sys.platform.startswith("win"):
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        else:
-            kwargs["start_new_session"] = True
         started = time.monotonic()
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=env,
-            **kwargs,
-        )
+        proc = await self._spawn(cwd, env)
         try:
             out_b, err_b = await asyncio.wait_for(
                 proc.communicate(prompt.encode("utf-8")), timeout=timeout
@@ -353,7 +513,7 @@ class ClaudeCodeClient:
         except asyncio.TimeoutError:
             await self._kill(proc)
             log.warning("claude call agent=%s timed out after %.0fs; killed", agent_id, timeout)
-            return ClaudeResult(
+            return _make_result(
                 text="",
                 input_tokens=0,
                 output_tokens=0,
@@ -378,6 +538,8 @@ class ClaudeCodeClient:
             result = _result_from_payload(payload, wall)
             if result.is_error:
                 blob = " ".join(filter(None, [result.error, result.text, stderr]))
+                if detect_auth_error(blob):
+                    raise ClaudeAuthError(_auth_message(blob))
                 if detect_rate_limit(blob):
                     raise ClaudeRateLimited(parse_retry_after(blob), (result.error or "rate limited")[:_ERROR_EXCERPT])
             elif proc.returncode not in (0, None):
@@ -391,10 +553,12 @@ class ClaudeCodeClient:
             return result
 
         blob = f"{stderr}\n{stdout}"
+        if detect_auth_error(blob):
+            raise ClaudeAuthError(_auth_message(blob))
         if detect_rate_limit(blob):
             raise ClaudeRateLimited(parse_retry_after(blob), blob.strip()[:_ERROR_EXCERPT])
         excerpt = (stderr.strip() or stdout.strip())[:_ERROR_EXCERPT]
-        return ClaudeResult(
+        return _make_result(
             text="",
             input_tokens=0,
             output_tokens=0,

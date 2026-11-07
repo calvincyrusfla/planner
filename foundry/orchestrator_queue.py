@@ -909,27 +909,165 @@ class FoundryQueue:
             ).fetchall()
         return [{"id": r["id"], "ts": r["ts"], **json.loads(r["payload"])} for r in rows]
 
-    def record_escalation(self, alert: Any, *, applied: bool = False) -> None:
-        """Store a :class:`~foundry.schemas.ForemanEscalation` (or equivalent dict)."""
+    def record_escalation(
+        self, alert: Any, *, applied: bool = False, result: Any = None
+    ) -> dict[str, Any]:
+        """Store a :class:`~foundry.schemas.ForemanEscalation` (or equivalent dict).
+
+        Idempotent per ``alert_id`` (UNIQUE in the db): recording an alert id
+        that is already stored does not insert a second row and returns the
+        earlier row unchanged (``created=False``), except that an alert stored
+        as not-yet-applied is marked applied (with ``result``) when
+        ``applied=True`` is passed. The alert id is also reserved (see
+        :meth:`reserve_alert_id`).
+
+        Returns:
+            the stored escalation: the alert payload plus ``applied_at``,
+            ``result`` (whatever JSON-able value the applier stored) and
+            ``created`` (True when this call inserted the row).
+        """
         d = alert.model_dump(mode="json") if isinstance(alert, BaseModel) else dict(alert)
+        alert_id = str(d["alert_id"])
         task_id = (d.get("target_entity") or {}).get("task_id")
         now = self.now()
         with self.transaction() as conn:
+            conn.execute("INSERT OR IGNORE INTO alert_ids (alert_id, reserved_at) VALUES (?,?)",
+                         (alert_id, now))
+            row = conn.execute("SELECT * FROM escalations WHERE alert_id=?",
+                               (alert_id,)).fetchone()
+            if row is not None:
+                if applied and row["applied_at"] is None:
+                    self._mark_applied(conn, alert_id, result, row["task_id"])
+                    row = conn.execute("SELECT * FROM escalations WHERE alert_id=?",
+                                       (alert_id,)).fetchone()
+                return {**self._escalation_dict(row), "created": False}
             conn.execute(
                 "INSERT INTO escalations (ts, alert_id, severity, category, prescribed_action,"
-                " task_id, payload, applied_at) VALUES (?,?,?,?,?,?,?,?)",
-                (now, d["alert_id"], d["severity"], d["category"], d["prescribed_action"],
-                 task_id, _dump(d), now if applied else None),
+                " task_id, payload, applied_at, result) VALUES (?,?,?,?,?,?,?,?,?)",
+                (now, alert_id, d["severity"], d["category"], d["prescribed_action"],
+                 task_id, _dump(d), now if applied else None,
+                 _dump(result) if applied and result is not None else None),
             )
             self._event(conn, "escalation", task_id,
-                        {"alert_id": d["alert_id"], "category": d["category"],
+                        {"alert_id": alert_id, "category": d["category"],
                          "prescribed_action": d["prescribed_action"]})
+            row = conn.execute("SELECT * FROM escalations WHERE alert_id=?",
+                               (alert_id,)).fetchone()
+            return {**self._escalation_dict(row), "created": True}
+
+    def mark_escalation_applied(self, alert_id: str, result: Any = None) -> dict[str, Any]:
+        """Mark a recorded escalation applied and store its ``result``.
+
+        Idempotent: an escalation that is already applied keeps its first
+        ``applied_at``/``result``. Returns the stored escalation.
+        KeyError if the alert id was never recorded.
+        """
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM escalations WHERE alert_id=?",
+                               (alert_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown escalation {alert_id!r}")
+            if row["applied_at"] is None:
+                self._mark_applied(conn, alert_id, result, row["task_id"])
+                row = conn.execute("SELECT * FROM escalations WHERE alert_id=?",
+                                   (alert_id,)).fetchone()
+            return self._escalation_dict(row)
+
+    def get_escalation(self, alert_id: str) -> dict[str, Any] | None:
+        """The stored escalation for ``alert_id`` (same shape as :meth:`escalations`), or None."""
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM escalations WHERE alert_id=?",
+                                    (alert_id,)).fetchone()
+        return self._escalation_dict(row) if row else None
+
+    def has_escalation(self, alert_id: str) -> bool:
+        """Whether an escalation with this alert id has been recorded."""
+        with self.lock:
+            return self.conn.execute("SELECT 1 FROM escalations WHERE alert_id=?",
+                                     (alert_id,)).fetchone() is not None
+
+    def reserve_alert_id(self, alert_id: str) -> bool:
+        """Persist an alert id at the moment it is *issued* (D12).
+
+        Returns True when the id was free and is now reserved; False when it
+        was already reserved or recorded (the caller should pick the next
+        sequence number). Reserved ids survive restarts; see :meth:`alert_ids`.
+        """
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM escalations WHERE alert_id=?",
+                            (alert_id,)).fetchone():
+                return False
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO alert_ids (alert_id, reserved_at) VALUES (?,?)",
+                (alert_id, self.now()))
+            return cur.rowcount == 1
+
+    def alert_ids(self, prefix: str | None = None) -> list[str]:
+        """Every reserved or recorded alert id (sorted), optionally by prefix.
+
+        Use it to seed the per-day ``ALT-YYYYMMDD-NNN`` sequence after a restart.
+        """
+        sql = ("SELECT alert_id FROM alert_ids UNION SELECT alert_id FROM escalations")
+        with self.lock:
+            ids = sorted({r[0] for r in self.conn.execute(sql)})
+        return [i for i in ids if prefix is None or i.startswith(prefix)]
 
     def escalations(self) -> list[dict[str, Any]]:
-        """All recorded escalations (payload parsed, plus ``applied_at``)."""
+        """All recorded escalations (payload parsed, plus ``applied_at`` and ``result``)."""
         with self.lock:
             rows = self.conn.execute("SELECT * FROM escalations ORDER BY id").fetchall()
-        return [{**json.loads(r["payload"]), "applied_at": r["applied_at"]} for r in rows]
+        return [self._escalation_dict(r) for r in rows]
+
+    def _mark_applied(self, conn: sqlite3.Connection, alert_id: str, result: Any,
+                      task_id: str | None) -> None:
+        conn.execute("UPDATE escalations SET applied_at=?, result=? WHERE alert_id=?",
+                     (self.now(), _dump(result) if result is not None else None, alert_id))
+        self._event(conn, "escalation_applied", task_id, {"alert_id": alert_id})
+
+    @staticmethod
+    def _escalation_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            **json.loads(row["payload"]),
+            "applied_at": row["applied_at"],
+            "result": json.loads(row["result"]) if row["result"] is not None else None,
+        }
+
+    # -------------------------------------------------------------------- kv
+
+    def kv_set(self, key: str, value: Any) -> None:
+        """Store any JSON-serializable ``value`` under ``key`` (overwrites).
+
+        A small persistent key-value store for restart safety (D9), e.g. the
+        Floor Manager's directives, order counter and board ids. Values are
+        JSON-encoded on write and decoded by :meth:`kv_get`, so a value that is
+        already a JSON string round-trips as that same string.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO kv (key, value, updated_at) VALUES (?,?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+                " updated_at=excluded.updated_at",
+                (key, _dump(value), self.now()),
+            )
+
+    def kv_get(self, key: str, default: Any = None) -> Any:
+        """The decoded value stored under ``key``, or ``default`` when absent."""
+        with self.lock:
+            row = self.conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    def kv_delete(self, key: str) -> bool:
+        """Remove ``key``; True if it existed."""
+        with self.transaction() as conn:
+            return conn.execute("DELETE FROM kv WHERE key=?", (key,)).rowcount == 1
+
+    def kv_items(self, prefix: str = "") -> dict[str, Any]:
+        """All decoded key/value pairs whose key starts with ``prefix``."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT key, value FROM kv WHERE substr(key, 1, ?) = ? ORDER BY key",
+                (len(prefix), prefix)).fetchall()
+        return {r["key"]: json.loads(r["value"]) for r in rows}
 
     # --------------------------------------------------------------- summary
 

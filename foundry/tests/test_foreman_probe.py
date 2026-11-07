@@ -277,6 +277,7 @@ def test_setup_sh_dry_run_plans_without_running_ollama(tmp_path: Path) -> None:
     assert "[dry-run] nohup ollama serve" in out
     assert "[dry-run] ollama pull gemma4:e4b" in out
     assert re.search(r"\[dry-run\] \S*python\S* -m foundry\.foreman_probe --base-url http://127\.0\.0\.1:\d+/v1 --model gemma4:e4b", out)
+    assert out.strip().splitlines()[-1].endswith('-m foundry.main --real --repo <path> --title "..."')
 
 
 @needs_bash
@@ -327,6 +328,11 @@ def test_setup_bat_structure() -> None:
         "py -3",
         "-m foundry.foreman_probe",
         'if "%FOREMAN_DRY_RUN%"=="1"',
+        "sys.version_info >= (3, 11)",
+        "closing this window stops",
+        "Ollama app",
+        '.venv\\Scripts\\python -m foundry.main --real --repo ^<path^> --title "..."',
     ):
         assert needle in text, needle
+    assert (REPO_ROOT / ".gitattributes").read_text().split() == ["*.bat", "text", "eol=crlf", "*.sh", "text", "eol=lf"]
     assert "wmic" not in text.lower().replace("wmic is deprecated", "")
