@@ -180,9 +180,10 @@
   .time-facts div { min-width: 0; }
   .time-facts dt { font-size: 11px; color: var(--muted); }
   .time-facts dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .time-now { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 13px; color: var(--muted);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .time-now { display: flex; align-items: baseline; gap: 6px; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border);
+    font-size: 13px; color: var(--muted); white-space: nowrap; min-width: 0; }
   .time-now strong { color: var(--text); }
+  .time-now .time-task { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .time-now .dur { color: var(--ok); font-weight: 600; }
 </style>
 </head>
@@ -437,14 +438,16 @@ function renderTime() {
       <div class="progress time-bar" role="img" aria-label="${esc(team.name)}: ${pct}% of the most time spent by a team"><i style="width:${pct}%"></i></div>
       <dl class="time-facts">
         <div><dt>Tasks done</dt><dd>${done}</dd></div>
-        <div><dt>Avg per done task</dt><dd>${done ? fmtDuration(avg) : '–'}</dd></div>
+        <div><dt>Avg per done task</dt><dd>${done ? fmtDuration(avg) : '—'}</dd></div>
       </dl>
       <div class="time-now">${task
-        ? `Now: <strong>${esc(task.id)}</strong> <span class="time-task">${esc(task.title)}</span> · ${liveSpan(task.teamMs?.[team.id] || 0, team.assignedAt)}`
+        ? `<span>Now:</span> <strong>${esc(task.id)}</strong> <span class="time-task" title="${esc(task.title)}">${esc(task.title)}</span> ${liveSpan(task.teamMs?.[team.id] || 0, team.assignedAt)}`
         : '<span class="none">Free, not on a task</span>'}</div>
     </article>`;
   }).join('');
 }
+// The ticker keeps the numbers live; this keeps the bars and the "Most time" badge in step (no inputs inside, safe to redraw).
+setInterval(() => state && renderTime(), 5000);
 
 function renderLog() {
   const teamName = Object.fromEntries(state.teams.map((t) => [t.id, t]));
@@ -518,7 +521,7 @@ function setLive(on, sync) {
   let tip = 'Lost the connection to the dashboard server. Retrying…';
   if (offline) {
     text = 'Shared board offline · showing last copy';
-    tip = `Can't reach the shared board${sync.url ? ' at ' + sync.url : ''}: ${sync.error || 'no response'}`
+    tip = (sync.error || `Can't reach the shared board${sync.url ? ' at ' + sync.url : ''}`)
       + (sync.lastSync ? `\nLast synced ${new Date(sync.lastSync).toLocaleString()}` : '')
       + '\nChanges are paused until it is back.';
   } else if (hub) {
