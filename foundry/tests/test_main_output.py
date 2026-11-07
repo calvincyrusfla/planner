@@ -143,7 +143,7 @@ def test_rejected_patch_is_reported_with_its_path(tmp_path: Path, monkeypatch: p
 def test_patch_not_written_in_time_exits_3_and_rerun_finishes_it(tmp_path: Path, short_shutdown: None) -> None:
     repo = write_demo_repo(tmp_path / "repo")
     lines: list[str] = []
-    code = _run(run_real(_args(repo), _config(tmp_path), demo_claude(repo, fail_first=None), _slow_gemma(5.0),
+    code = _run(run_real(_args(repo), _config(tmp_path), demo_claude(repo, fail_first=None), _slow_gemma(1.5),
                          out=lines.append, finish_timeout=0.2))
     text = "\n".join(lines)
     assert code == EXIT_IN_PROGRESS, text
