@@ -42,6 +42,9 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
+
+# Loopback calls to the local dashboard never go through a system/env proxy.
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -513,7 +516,7 @@ class BoardBridge:
         """The board state: ``GET /api/state`` on the dashboard, else ``dept.mjs json``."""
         if not self._dashboard_down:
             try:
-                with urllib.request.urlopen(f"{self.dashboard_url}/api/state", timeout=self.timeout) as resp:
+                with _LOCAL_OPENER.open(f"{self.dashboard_url}/api/state", timeout=self.timeout) as resp:
                     body = json.loads(resp.read() or b"{}")
                 if isinstance(body, dict):
                     return body.get("result") if isinstance(body.get("result"), dict) else body
@@ -525,6 +528,7 @@ class BoardBridge:
         try:
             proc = subprocess.run(
                 [node, str(self.cli_path), "json"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=max(self.timeout, 10.0), cwd=str(self.cli_path.parent.parent),
             )
             return json.loads(proc.stdout) if proc.returncode == 0 else None
@@ -542,7 +546,7 @@ class BoardBridge:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _LOCAL_OPENER.open(req, timeout=self.timeout) as resp:
                 body = json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as exc:
             # The board answered but refused the op (e.g. a team is busy): not a transport failure.
@@ -571,6 +575,8 @@ class BoardBridge:
                 [node, str(self.cli_path), *argv],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=max(self.timeout, 10.0),
                 cwd=str(self.cli_path.parent.parent),
             )
