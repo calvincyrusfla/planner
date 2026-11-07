@@ -487,7 +487,7 @@ def test_timed_out_op_is_not_replayed_through_the_cli(tmp_path: Path) -> None:
     server = _serve_slow({"reportProgress": 1.5})
     try:
         bridge = BoardBridge(
-            mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=cli, op_timeout=0.4
+            mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=cli, timeout=0.3, op_timeout=0.4
         )
         bridge.register_task("F-1", "t", team_id="alpha")
         bridge.progress("F-1", "slow")
@@ -511,7 +511,7 @@ def test_timed_out_add_task_is_found_on_the_board_by_its_foundry_tag(tmp_path: P
     server = _serve_slow({"addTask": 1.5}, tasks)
     try:
         bridge = BoardBridge(
-            mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=cli, op_timeout=0.4
+            mode="auto", dashboard_url=f"http://127.0.0.1:{server.server_port}", cli_path=cli, timeout=0.3, op_timeout=0.4
         )
         bridge.register_task("F-1", "Add login", "x", team_id="alpha")
         bridge.done("F-1")
