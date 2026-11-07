@@ -40,7 +40,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from foundry.schemas import TaskSizingDirective, TaskState
+from foundry.schemas import MAX_RETRIES, TaskSizingDirective, TaskState
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -53,9 +53,6 @@ __all__ = [
     "utc_now_iso",
 ]
 
-#: Maximum number of retries per ticket. ``attempt`` runs 0, 1, 2; a fourth
-#: build (attempt 3) is never scheduled: the task is quarantined instead.
-MAX_RETRIES: int = 2
 
 #: SQLite busy timeout in milliseconds.
 BUSY_TIMEOUT_MS: int = 5000
@@ -64,29 +61,27 @@ TicketStatus = Literal["open", "claimed", "done", "blocked"]
 
 #: States a task can never leave.
 TERMINAL_STATES: frozenset[TaskState] = frozenset(
-    {TaskState.complete, TaskState.quarantined, TaskState.failed}
+    {TaskState.COMPLETE, TaskState.QUARANTINED, TaskState.FAILED}
 )
 
 #: Explicit allowed-transition table (from-state -> allowed to-states).
 #: ``quarantined`` and ``failed`` are reachable from every non-terminal state.
 #: Setting a task to the state it is already in is a harmless no-op.
-#: ``reviewing -> validating`` exists because a task with several tickets can
-#: have one ticket under review while another one is back at the gates.
+#: The task state is task-level: with several tickets in flight workers should
+#: treat a refused move (e.g. reviewing -> validating) as "already further on".
 ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
-    TaskState.backlog: frozenset({TaskState.sizing}),
-    TaskState.sizing: frozenset({TaskState.building}),
-    TaskState.building: frozenset({TaskState.validating}),
-    TaskState.validating: frozenset({TaskState.reviewing, TaskState.building}),
-    TaskState.reviewing: frozenset(
-        {TaskState.complete, TaskState.building, TaskState.validating}
-    ),
-    TaskState.complete: frozenset(),
-    TaskState.quarantined: frozenset(),
-    TaskState.failed: frozenset(),
+    TaskState.BACKLOG: frozenset({TaskState.SIZING}),
+    TaskState.SIZING: frozenset({TaskState.BUILDING}),
+    TaskState.BUILDING: frozenset({TaskState.VALIDATING}),
+    TaskState.VALIDATING: frozenset({TaskState.REVIEWING, TaskState.BUILDING}),
+    TaskState.REVIEWING: frozenset({TaskState.COMPLETE, TaskState.BUILDING}),
+    TaskState.COMPLETE: frozenset(),
+    TaskState.QUARANTINED: frozenset(),
+    TaskState.FAILED: frozenset(),
 }
 for _state, _targets in list(ALLOWED_TRANSITIONS.items()):
     if _state not in TERMINAL_STATES:
-        ALLOWED_TRANSITIONS[_state] = _targets | {TaskState.quarantined, TaskState.failed}
+        ALLOWED_TRANSITIONS[_state] = _targets | {TaskState.QUARANTINED, TaskState.FAILED}
 del _state, _targets
 
 
@@ -333,10 +328,10 @@ class FoundryQueue:
                 "INSERT INTO tasks (task_id, title, description, team_id, state,"
                 " created_at, updated_at, state_changed_at)"
                 " VALUES (?,?,?,?,?,?,?,?)",
-                (task_id, title, description, team_id, TaskState.backlog.value, now, now, now),
+                (task_id, title, description, team_id, TaskState.BACKLOG.value, now, now, now),
             )
             self._event(conn, "task_added", task_id,
-                        {"title": title, "team_id": team_id, "state": TaskState.backlog.value})
+                        {"title": title, "team_id": team_id, "state": TaskState.BACKLOG.value})
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         """Return the task as a dict (``state`` is a :class:`TaskState`), or None."""
@@ -384,7 +379,7 @@ class FoundryQueue:
         """Mark a task failed and block its unfinished tickets."""
         now = self.now()
         with self.transaction() as conn:
-            self._transition(conn, task_id, TaskState.failed, reason)
+            self._transition(conn, task_id, TaskState.FAILED, reason)
             conn.execute(
                 "UPDATE tickets SET status='blocked', updated_at=?"
                 " WHERE task_id=? AND status IN ('open','claimed')",
@@ -421,22 +416,22 @@ class FoundryQueue:
                     "INSERT INTO tasks (task_id, title, description, team_id, state,"
                     " created_at, updated_at, state_changed_at) VALUES (?,?,?,?,?,?,?,?)",
                     (directive.task_id, directive.task_id, "", directive.team_id,
-                     TaskState.backlog.value, now, now, now),
+                     TaskState.BACKLOG.value, now, now, now),
                 )
                 self._event(conn, "task_added", directive.task_id,
                             {"title": directive.task_id, "team_id": directive.team_id,
-                             "state": TaskState.backlog.value})
-                current = TaskState.backlog
+                             "state": TaskState.BACKLOG.value})
+                current = TaskState.BACKLOG
             else:
                 current = TaskState(row["state"])
             if conn.execute("SELECT 1 FROM tickets WHERE task_id=? LIMIT 1",
                             (directive.task_id,)).fetchone():
                 raise ValueError(f"task {directive.task_id!r} is already sized; use resize()")
-            if current not in (TaskState.backlog, TaskState.sizing):
+            if current not in (TaskState.BACKLOG, TaskState.SIZING):
                 raise ValueError(
                     f"cannot size task {directive.task_id!r} in state {current.value}")
-            if current == TaskState.backlog:
-                self._transition(conn, directive.task_id, TaskState.sizing, "sizing")
+            if current == TaskState.BACKLOG:
+                self._transition(conn, directive.task_id, TaskState.SIZING, "sizing")
             conn.execute(
                 "UPDATE tasks SET complexity=?, allocated_builders=?, sizing_json=?, team_id=?,"
                 " updated_at=? WHERE task_id=?",
@@ -457,7 +452,7 @@ class FoundryQueue:
                         {"complexity": directive.complexity, "allocated_builders": n,
                          "subtasks": [s.subtask_id for s in directive.subtasks],
                          "override_reason": directive.override_reason})
-            self._transition(conn, directive.task_id, TaskState.building,
+            self._transition(conn, directive.task_id, TaskState.BUILDING,
                              f"sized {directive.complexity} -> {n} builder(s)")
         return self.tickets_for_task(directive.task_id)
 
@@ -626,7 +621,7 @@ class FoundryQueue:
             row = self._require_task(conn, t["task_id"])
             cur = TaskState(row["state"])
             if cur not in TERMINAL_STATES:
-                self._set_state_row(conn, t["task_id"], cur, TaskState.complete,
+                self._set_state_row(conn, t["task_id"], cur, TaskState.COMPLETE,
                                     "all tickets done")
             return True
 
@@ -674,12 +669,12 @@ class FoundryQueue:
             )
             self._event(conn, "ticket_reopened", t["task_id"],
                         {"ticket_id": ticket_id, "attempt": attempt, "fix_hint": fix_hint})
-            if cur != TaskState.building:
-                if TaskState.building in ALLOWED_TRANSITIONS[cur]:
-                    self._transition(conn, t["task_id"], TaskState.building,
+            if cur != TaskState.BUILDING:
+                if TaskState.BUILDING in ALLOWED_TRANSITIONS[cur]:
+                    self._transition(conn, t["task_id"], TaskState.BUILDING,
                                      f"retry {attempt}")
                 else:  # backlog/sizing cannot happen with tickets; be explicit
-                    self._set_state_row(conn, t["task_id"], cur, TaskState.building,
+                    self._set_state_row(conn, t["task_id"], cur, TaskState.BUILDING,
                                         f"retry {attempt}")
             return True
 
@@ -709,8 +704,8 @@ class FoundryQueue:
                 tasks.add(r["task_id"])
             for task_id in sorted(tasks):
                 cur = TaskState(self._require_task(conn, task_id)["state"])
-                if cur in (TaskState.validating, TaskState.reviewing):
-                    self._transition(conn, task_id, TaskState.building, "resumed after crash")
+                if cur in (TaskState.VALIDATING, TaskState.REVIEWING):
+                    self._transition(conn, task_id, TaskState.BUILDING, "resumed after crash")
             return len(rows)
 
     # ---------------------------------------------------------------- events
@@ -882,9 +877,9 @@ class FoundryQueue:
     def _quarantine(self, conn: sqlite3.Connection, task_id: str, reason: str) -> None:
         row = self._require_task(conn, task_id)
         cur = TaskState(row["state"])
-        if cur == TaskState.quarantined:
+        if cur == TaskState.QUARANTINED:
             return
-        self._transition(conn, task_id, TaskState.quarantined, reason)
+        self._transition(conn, task_id, TaskState.QUARANTINED, reason)
         now = self.now()
         conn.execute("UPDATE tasks SET quarantine_reason=?, updated_at=? WHERE task_id=?",
                      (reason, now, task_id))
