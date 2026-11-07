@@ -219,7 +219,9 @@
   .meter { --lvl: var(--idle); padding: 10px 14px 11px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border); min-width: 0; }
   .meter.ok { --lvl: var(--ok); } .meter.warn { --lvl: var(--warn); }
   .meter.bad { --lvl: var(--bad); background: color-mix(in srgb, var(--bad) 9%, var(--surface-2)); border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
-  .meter-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .meter-top { display: flex; align-items: center; gap: 4px 8px; flex-wrap: wrap; min-height: 36px; }
+  .meter-top .meter-pct { display: inline-flex; align-items: baseline; }
+  .meter.bad .meter-flag { color: color-mix(in srgb, var(--bad) 75%, white); }
   .meter-label { font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
   .meter-flag { font-size: 11px; font-weight: 650; padding: 1px 7px; border-radius: 99px; color: var(--lvl);
     border: 1px solid color-mix(in srgb, var(--lvl) 45%, transparent); background: color-mix(in srgb, var(--lvl) 10%, transparent); }

@@ -233,12 +233,17 @@ test('statusline sends in the background, throttles via the cache, and returns f
   const c3 = JSON.parse(fs.readFileSync(cache, 'utf8'));
   assert.ok(c3.sentAt > Date.now() - 10_000);
   assert.equal(c3.key, c2.key);
+  assert.ok(await waitFor(() => readState(dir)?.usage?.reportedAt === c3.sentAtIso), 'resend stored');
 
   // A broken cache file never breaks the status line.
   fs.writeFileSync(cache, '{oops');
   const r = runStatusline(more, e);
   assert.equal(r.status, 0);
   assert.match(r.stdout, /^5h 50%/);
+  // ...and it re-sent (a broken cache counts as "never sent"). Wait for that
+  // background report so it doesn't outlive the scratch dir.
+  const last = JSON.parse(fs.readFileSync(cache, 'utf8'));
+  assert.ok(await waitFor(() => readState(dir)?.usage?.reportedAt === last.sentAtIso), 'last report stored');
 });
 
 // ---------- report.mjs ----------
@@ -320,4 +325,41 @@ test('report.mjs is silent on errors and keeps a capped log', async () => {
   assert.equal(after.length, 200);
   assert.match(after.at(-1), /no payload/);
   assert.equal(readState(dir), null, 'nothing written to the board on failure');
+});
+
+test('report.mjs uses the shared board when no local server runs and a hub is configured', async (t) => {
+  const dir = scratch();
+  const deadPort = await freePort();
+  // A stand-in for the Netlify hub function: applies ops to an in-memory board.
+  const { createInitialState } = await import('../lib/core.mjs');
+  const { applyOp } = await import('../lib/ops.mjs');
+  const board = createInitialState();
+  const seen = [];
+  const http = await import('node:http');
+  const hub = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    seen.push({ method: req.method, url: req.url, key: req.headers['x-edit-key'], body: raw && JSON.parse(raw) });
+    const result = applyOp(board, JSON.parse(raw));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, result, state: board, rev: 1 }));
+  });
+  await new Promise((r) => hub.listen(0, '127.0.0.1', r));
+  t.after(() => hub.close());
+  const e = env(dir, deadPort, {
+    DEPT_HUB: '',
+    DEPT_HUB_URL: `http://127.0.0.1:${hub.address().port}`,
+    DEPT_HUB_KEY: 'k',
+    DEPT_USAGE_PAYLOAD: JSON.stringify({ fiveHour: { usedPct: 88, resetsAt: inOneHour() }, sevenDay: { usedPct: 40, resetsAt: null }, reportedAt: new Date().toISOString() }),
+  });
+  const child = spawn(process.execPath, [REPORT], { env: e, stdio: 'ignore' });
+  const code = await new Promise((r) => child.on('exit', r));
+  assert.equal(code, 0);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].method, 'POST');
+  assert.equal(seen[0].url, '/api/department');
+  assert.equal(seen[0].key, 'k');
+  assert.equal(seen[0].body.type, 'reportUsage');
+  assert.equal(board.usage.fiveHour.usedPct, 88);
+  assert.equal(readState(dir), null, 'the local file is left alone in hub mode');
 });
