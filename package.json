@@ -12,6 +12,8 @@
     "start": "node department/launch.mjs",
     "shortcut": "node department/scripts/install-shortcut.mjs",
     "shortcut:remove": "node department/scripts/install-shortcut.mjs --uninstall",
-    "icons": "node department/scripts/build-icons.mjs"
+    "icons": "node department/scripts/build-icons.mjs",
+    "usage-meter": "node department/scripts/install-usage-meter.mjs",
+    "usage-meter:remove": "node department/scripts/install-usage-meter.mjs --uninstall"
   }
 }

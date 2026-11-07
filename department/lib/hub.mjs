@@ -12,6 +12,8 @@ const cleanUrl = (u) => String(u || '').trim().replace(/\/+$/, '');
 
 // {url, key} | null. Env DEPT_HUB_URL (+ DEPT_HUB_KEY) wins over hub.json.
 export function hubConfig() {
+  // DEPT_HUB=off forces local mode everywhere (server and CLI), e.g. for tests.
+  if (String(process.env.DEPT_HUB || '').toLowerCase() === 'off') return null;
   if (process.env.DEPT_HUB_URL) {
     return { url: cleanUrl(process.env.DEPT_HUB_URL), key: process.env.DEPT_HUB_KEY || '', source: 'env' };
   }

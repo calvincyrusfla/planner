@@ -6,7 +6,7 @@ This repo holds the Juggle Planner (`index.html`, `netlify/`) and the **Agent De
 
 When the user assigns a task, you are the department head. Don't do the work alone; staff it with a team.
 
-**Department:** 3 teams (`alpha`, `bravo`, `charlie`), each with 5 builder agents (`alpha-1` … `alpha-5`, and so on). Builders are defined in `.claude/agents/builder.md`.
+**Department:** 3 teams (`alpha`, `bravo`, `charlie`), each with 6 agents: 5 builders (`alpha-1` … `alpha-5`, and so on) and 1 reviewer (`alpha-6`, `bravo-6`, `charlie-6`). Builders are defined in `.claude/agents/builder.md`, reviewers in `.claude/agents/reviewer.md`. A task with teams on it can't be marked done until each of its teams' reviewers has approved it.
 
 **Assignment rules** (enforced by `department/lib/core.mjs`):
 
@@ -18,6 +18,7 @@ When the user assigns a task, you are the department head. Don't do the work alo
 **Steps for every task the user gives you:**
 
 1. Decide if it is large (multiple features or areas, a rewrite, or work that would take one team a long time) or small.
+   Before staffing a large task, glance at `node department/dept.mjs usage`. If the 5-hour meter is at 90% or more, tell the user before spawning many agents.
 2. Register it, which also assigns the team(s):
    ```bash
    node department/dept.mjs add "Short title" --desc "What the user asked for" [--large]
@@ -28,8 +29,14 @@ When the user assigns a task, you are the department head. Don't do the work alo
    ```bash
    node department/dept.mjs progress <task> --team <team> --pct <N> -m "note"
    ```
-6. Review and integrate the builders' work, run the checks, commit and push. Then `node department/dept.mjs done <task>`; freed teams pick up queued tasks automatically.
-7. Before spawning or continuing work on a task, run `status` again. If the user removed a team from the task, stop using that team for it. If they moved a team to another task, staff that task with it.
+6. When the builders of every team on the task have finished, integrate their work and send the task to review:
+   ```bash
+   node department/dept.mjs review <task>
+   ```
+   Then spawn every assigned team's reviewer in parallel with the Agent tool (`subagent_type: "reviewer"`, agent id `<team>-6`). Its spawn prompt names the team, task id, the whole task, each builder's slice and report, and the review round. On a large task shared by several teams, give each team's reviewer a focus area (tests and code / look and behaviour / data safety and end to end), and have every reviewer also check where its team's work meets the other teams' work. If the shared board refuses `review` or `verdict` (older code on the hub), still run the reviewers, and record their verdicts once the hub is updated.
+7. Each reviewer records its verdict with `node department/dept.mjs verdict <task> --team <team> approve|changes -m "..." --issues <N>` (a later verdict in the same round replaces its earlier one). The task stays in review until every team on it has given a verdict. Wait for all of them. If any reviewer asked for changes, the task then goes back to active: send the findings to the builders who own those slices, have them fix it, then run `review` again for the next round. Repeat until every team on the task has approved.
+8. Once all reviewers have approved, do a final check of the whole task yourself (run the checks, try the feature), commit and push. Then `node department/dept.mjs done <task>`; freed teams pick up queued tasks automatically. `done` refuses a task that lacks sign-off, including one whose teams have since been removed; use `done <task> --force` only when the user says so.
+9. Before spawning or continuing work on a task, run `status` again. If the user removed a team from the task, stop using that team for it. If they moved a team to another task, staff that task with it.
 
 **Shared board:** before registering a task, run `node department/dept.mjs hub status`. When a shared board is configured (`department/data/hub.json` on the user's PC, or `DEPT_HUB_URL` in cloud sessions, where the network proxy supplies the passcode), every CLI command goes to it automatically, so tasks from Claude sessions and from the PC land on the same board. If the hub is configured but unreachable, tell the user and log the task locally.
 

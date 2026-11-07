@@ -6,18 +6,30 @@
 import * as core from './core.mjs';
 
 const LOG_LIMIT = 500;
-const OPEN = new Set(['queued', 'active', 'paused']);
+const OPEN = new Set(['queued', 'active', 'review', 'paused']);
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const taskNumber = (n) => `T-${String(n).padStart(3, '0')}`;
 
 const OPS = {
   addTask: (state, { title, description, size } = {}) => core.addTask(state, { title, description, size }),
+  // patch is passed whole, so patch.force (done without review sign-off) gets through.
   updateTask: (state, { id, patch, by } = {}) => core.updateTask(state, id, patch || {}, by ? { by } : {}),
   deleteTask: (state, { id, by } = {}) => core.deleteTask(state, id, by ? { by } : {}),
   assignTeam: (state, { taskId, teamId, focus, by } = {}) =>
     core.assignTeam(state, taskId, teamId, { ...(focus ? { focus } : {}), ...(by ? { by } : {}) }),
   unassignTeam: (state, { taskId, teamId, by } = {}) => core.unassignTeam(state, taskId, teamId, by ? { by } : {}),
   reportProgress: (state, args = {}) => core.reportProgress(state, args),
+  reviewTask: (state, { taskId, teamId, verdict, note, issues, by } = {}) =>
+    core.reviewTask(state, {
+      taskId,
+      teamId,
+      verdict,
+      ...(note !== undefined ? { note } : {}),
+      ...(issues !== undefined ? { issues } : {}),
+      ...(by ? { by } : {}),
+    }),
+  reportUsage: (state, { fiveHour, sevenDay, reportedAt, source } = {}) =>
+    core.reportUsage(state, { fiveHour, sevenDay, reportedAt, source }),
   dispatch: (state) => core.dispatch(state),
   updateSettings: (state, { autoDispatch } = {}) => core.updateSettings(state, { autoDispatch }),
   reset: (state) => {
@@ -44,12 +56,17 @@ export function applyOp(state, op) {
 //   must still recognise it.)
 // - Every other task is appended under a fresh id (T-### from nextTaskNumber);
 //   its log entries (and task ids mentioned in them) are rewritten to match.
-// - Open tasks keep a team only if that team is free here; an active task that
-//   keeps no team goes back to the queue. Done/cancelled tasks have no team.
+// - Open tasks keep a team only if that team is free here; an active (or
+//   in-review) task that keeps no team goes back to the queue. Done/cancelled
+//   tasks have no team. A kept team keeps this board's roster (so an older
+//   5-agent board can't drop the reviewer); saved agent status/work is taken.
+//   Team issuesFound is not overwritten; like totalMs, it is credited from the
+//   added tasks only (teamIssues[team], all rounds), so a re-push can't double count.
 // - Logs are merged (duplicates dropped), sorted by `at` and capped at 500.
+// - Usage: the newer report (by reportedAt) wins; an older or invalid one is ignored.
 // - Finally dispatch runs so queued work picks up free teams.
 
-const TEAM_IDENTITY = new Set(['id', 'name', 'color', 'taskId', 'totalMs']);
+const TEAM_IDENTITY = new Set(['id', 'name', 'color', 'taskId', 'totalMs', 'issuesFound', 'agents']);
 const logKey = (e) => JSON.stringify([e.at, e.kind, e.taskId, e.teamId, e.agentId, e.message]);
 
 export function importState(state, other) {
@@ -87,10 +104,16 @@ export function importState(state, other) {
         const ours = state.teams.find((t) => t.id === theirs.id);
         if (!ours || ours.taskId) continue;
         for (const [k, v] of Object.entries(theirs)) if (!TEAM_IDENTITY.has(k)) ours[k] = v;
+        const theirAgents = new Map((Array.isArray(theirs.agents) ? theirs.agents : []).map((a) => [a?.id, a]));
+        for (const agent of ours.agents) {
+          const a = theirAgents.get(agent.id);
+          if (!a) continue;
+          for (const k of ['status', 'work', 'updatedAt']) if (a[k] !== undefined) agent[k] = a[k];
+        }
         ours.taskId = task.id;
         kept++;
       }
-      if (!kept && task.status === 'active') {
+      if (!kept && core.isRunning(task)) {
         task.status = 'queued';
         if ('activeSince' in task) task.activeSince = null;
       }
@@ -102,6 +125,17 @@ export function importState(state, other) {
     for (const [teamId, ms] of Object.entries(task.teamMs || {})) {
       const team = state.teams.find((t) => t.id === teamId);
       if (team && Number.isFinite(ms)) team.totalMs = (team.totalMs || 0) + ms;
+    }
+    // Same for issues caught: credit each team's running total on the task
+    // (teamIssues, all rounds). Boards from before teamIssues fall back to the
+    // latest verdict in reviews.
+    const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : null);
+    const perTeam = obj(task.teamIssues) ||
+      Object.fromEntries(Object.entries(obj(task.reviews) || {}).map(([id, r]) => [id, r?.issues]));
+    for (const [teamId, issues] of Object.entries(perTeam)) {
+      const team = state.teams.find((t) => t.id === teamId);
+      const n = Number(issues);
+      if (team && Number.isInteger(n) && n > 0) team.issuesFound = (team.issuesFound || 0) + n;
     }
   }
 
@@ -121,6 +155,12 @@ export function importState(state, other) {
   }
   merged.sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
   state.log = merged.slice(-LOG_LIMIT);
+
+  const theirUsage = core.normalizeUsage(incoming.usage);
+  const ourUsage = core.normalizeUsage(state.usage);
+  if (theirUsage && (!ourUsage || Date.parse(theirUsage.reportedAt) > Date.parse(ourUsage.reportedAt))) {
+    state.usage = theirUsage;
+  } else state.usage = ourUsage;
 
   core.dispatch(state);
   return { added: addedTasks.length, skipped: skippedIds.size, idMap };

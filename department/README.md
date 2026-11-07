@@ -1,6 +1,6 @@
 # Agent Department
 
-A local dashboard for a department of 3 agent teams (Alpha, Bravo, Charlie), each with 5 builder agents. Use it to see which team is on which task and how far along each task is. You can also reassign teams or take them off a task.
+A local dashboard for a department of 3 agent teams (Alpha, Bravo, Charlie). Each team has 6 agents: 5 builders and a reviewer that checks the team's work before a task can be marked done. Use it to see which team is on which task and how far along each task is. You can also reassign teams or take them off a task.
 
 No dependencies: it needs only Node 18 or newer.
 
@@ -87,18 +87,40 @@ npm run icons
 
 ## What the dashboard does
 
-- **Teams:** one card per team, showing its task, progress, focus area and what each of its 5 builders is doing (idle, assigned, working, blocked or done). Use **Reassign to…** to move the team to another task, or **Remove from task** to free it.
-- **Tasks:** each open task, with its progress bar and the teams on it. Click **×** on a team to remove it, or use **+ Add team…** to add one (a busy team is moved off its old task). You can also pause, queue, mark done, cancel or delete a task.
+- **Teams:** one card per team, showing its task, progress, focus area and what each of its 5 builders and its reviewer are doing (idle, assigned, working, blocked or done). The reviewer is shown below the builders with a **Reviewer** tag. Use **Reassign to…** to move the team to another task, or **Remove from task** to free it.
+- **Tasks:** each open task, with its progress bar and the teams on it. Click **×** on a team to remove it, or use **+ Add team…** to add one (a busy team is moved off its old task). You can also pause, queue, send to review, mark done, cancel or delete a task.
 - **Activity:** a live feed of assignments, moves and progress notes from the agents.
 - Updates stream in live while agents report progress.
-- **Time by team:** one card per team with its total time, tasks done, average time per done task and the task it's on now.
+- **Time by team:** one card per team with its total time, tasks done, average time per done task, issues its reviewer caught and the task it's on now.
 - The dashboard always uses a dark theme.
+
+## Reviews
+
+Each team's 6th agent (`alpha-6`, `bravo-6`, `charlie-6`) is its reviewer. When the builders finish, the task is sent to review and each team on it gets checked by its own reviewer.
+
+- **In review:** a task waiting for its reviewers. It keeps its teams, and its timers keep running.
+- **Sign-off:** each reviewer either approves or requests changes, and can change its verdict while the task is in review (the latest one counts). The task stays in review until every team on it has given a verdict; then the round is settled. If any of them requested changes, the task goes back to active for the builders to fix, and the next verdict needs a new review round. If all approved, the task stays in review, and switching a verdict to changes still sends it back. The task card shows the review round and each team's verdict (Approved, Changes requested or Waiting); hover over a verdict for its note and issue count.
+- **Done needs sign-off:** a task with teams on it can only be marked done once every team on it has approved in the current round. A team added during review has to approve too. A task that a team worked on still needs sign-off after its teams are removed (for example when it's paused). Reopening a finished task, setting a task back from review to active, or adding a team clears the sign-off, so the task has to be reviewed again.
+- **Issues caught:** each verdict records how many issues the reviewer found. The task card shows the task's total, and **Time by team** shows each team's.
+
+On the dashboard, **Send to review** appears on an active task with a team. On a task in review, each team still waiting has **Approve** and **Request changes**; **Request changes** asks for a note and how many issues were found. Verdicts given from the dashboard show up in the activity feed as "(by user)". **Mark done** on a task without full sign-off, with or without teams still on it, asks before skipping the review.
+
+From the CLI:
+
+```bash
+node department/dept.mjs review T-002
+node department/dept.mjs verdict T-002 --team bravo approve -m "Looks good" --issues 1
+node department/dept.mjs verdict T-002 --team bravo changes -m "Export drops the last row" --issues 2
+node department/dept.mjs done T-002 --force
+```
+
+`done` refuses a task that hasn't been signed off; `--force` marks it done anyway, and the activity feed notes that the review was skipped.
 
 ## Timers
 
 Every task and team keeps time. The numbers tick live on the dashboard.
 
-- **Active time:** how long a task has been active, meaning at least one team was on it. Time while it's queued or paused doesn't count.
+- **Active time:** how long a task has been active or in review, meaning at least one team was on it. Time while it's queued or paused doesn't count.
 - **Start to finish:** for a finished task, the time from when it was added to when it was done or cancelled, including any waiting.
 - **Team time:** on a task, how long each team has spent on it. A team that was moved off and back again keeps adding to the same number.
 - **Team totals:** in **Time by team**, each team's time across all tasks (deleted tasks too), how many done tasks it worked on, and its average time per done task.
@@ -122,8 +144,11 @@ node department/dept.mjs assign T-002 bravo --focus "API"
 node department/dept.mjs unassign T-002 bravo
 node department/dept.mjs progress T-002 --agent bravo-3 -m "Endpoint done"
 node department/dept.mjs progress T-002 --team bravo --pct 60
-node department/dept.mjs done T-002
+node department/dept.mjs review T-002
+node department/dept.mjs verdict T-002 --team bravo approve -m "Looks good" --issues 0
+node department/dept.mjs done T-002 [--force]
 node department/dept.mjs times
+node department/dept.mjs usage
 node department/dept.mjs help
 ```
 
@@ -167,9 +192,78 @@ node department/dept.mjs hub disconnect
 
 The dashboard keeps showing the last copy it got, and the header says **Shared board offline · showing last copy** in yellow (hover over it for the reason). Changes are refused until the site is back, then it catches up on its own within a few seconds.
 
+## Usage meter
+
+The band at the top of the dashboard shows how much of your Claude plan you have used:
+
+- **5-hour limit:** the rolling 5-hour window.
+- **Weekly limit:** the 7-day window.
+
+Each meter shows the percentage used, a bar and a live countdown to when that window resets. The bar is green below 70%, amber from 70% and red from 90%. Below the meters, a line says how old the numbers are and which machine sent them (its computer name, or **Claude cloud** for a cloud session).
+
+### Where the numbers come from
+
+Claude Code can run a small program for its status bar, and it passes that program the current usage. The usage meter installs `department/usage/statusline.mjs` as that program. Each time Claude Code refreshes its status bar, the program shows the numbers there too, and sends them to the board in the background: about once a minute, or sooner when the numbers change, but never more often than every 15 seconds. It goes through the dashboard, the shared board or the local state file, the same way the CLI does.
+
+It only reads what Claude Code hands it. It doesn't read passwords, tokens or credential files, and it doesn't call any Claude account API.
+
+### Set it up
+
+Do this once on your PC. Open PowerShell in the repo folder and run:
+
+```powershell
+npm run usage-meter
+```
+
+Then close and restart Claude Code. The meter fills in after Claude Code's next reply.
+
+The status line points at this folder and at the Node you ran it with. If you move the folder or switch Node versions, run `npm run usage-meter` again.
+
+This adds a `statusLine` entry to your Claude Code user settings, `%USERPROFILE%\.claude\settings.json` (`~/.claude/settings.json` on macOS and Linux, or the folder in `CLAUDE_CONFIG_DIR` if you set it). The first time it changes the file, it saves a backup next to it, `settings.json.bak-agent-department`. Later runs never overwrite that backup, so it always holds your settings from before the first install. If you already have a different status line, it leaves it alone and shows you what's there. To replace it anyway:
+
+```powershell
+npm run usage-meter -- --force
+```
+
+The status line it replaces is saved to `statusline.replaced-by-agent-department.json`, next to `settings.json`, so removing the usage meter can put it back.
+
+To see what it would change without changing anything:
+
+```powershell
+npm run usage-meter -- --dry-run
+```
+
+### Remove it
+
+```powershell
+npm run usage-meter:remove
+```
+
+This removes only the usage meter's status line; any other status line is left alone. If you installed with `--force`, it puts back the status line that was replaced and deletes `statusline.replaced-by-agent-department.json`. Restart Claude Code afterwards.
+
+### Why the numbers can be out of date
+
+The meter only updates while a Claude Code session with the status line is running. When nothing has reported for 15 minutes, the band says that no session is reporting and the numbers may be out of date. Claude Code sometimes leaves one of the limits out of a report. The board then keeps the last known number for that limit until its reset time. When a window's reset time has passed, the band shows when it reset instead of the old percentage, until the next report comes in.
+
+The numbers are only there on Claude subscription plans. With an API key, Claude Code doesn't pass usage to the status line, so the band says the meter isn't connected.
+
+### From the CLI
+
+To see the current meter in the terminal:
+
+```bash
+node department/dept.mjs usage
+```
+
+It shows both limits, when they reset, and how old the last report is. To store a report by hand, for example to test the dashboard (`--source` is optional):
+
+```bash
+node department/dept.mjs usage report --five 42 --five-reset 2026-11-07T15:10:00Z --week 18 --week-reset 2026-11-12T09:00:00Z --source PC
+```
+
 ## How the agents use it
 
-`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here, staffed with the assigned team's 5 builders (`.claude/agents/builder.md`), and progress is reported back as the work happens.
+`CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here, staffed with the assigned team's 5 builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.
 
 ## Tests
 

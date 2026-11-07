@@ -22,7 +22,7 @@ test('addTask maps onto core.addTask', () => {
 test('updateTask passes patch and by', () => {
   const s = fresh();
   op(s, 'addTask', { title: 'A' });
-  const t = op(s, 'updateTask', { id: 'T-001', patch: { status: 'done' }, by: 'tester' });
+  const t = op(s, 'updateTask', { id: 'T-001', patch: { status: 'done', force: true }, by: 'tester' });
   assert.equal(t.status, 'done');
   assert.match(s.log.at(-1).message, /by tester/);
   assert.deepEqual(teamsOn(s, 'T-001'), []);
@@ -71,7 +71,7 @@ test('dispatch and updateSettings', () => {
 test('every op type is covered and missing args are tolerated', () => {
   assert.deepEqual(OP_TYPES.sort(), [
     'addTask', 'assignTeam', 'deleteTask', 'dispatch', 'importState', 'reportProgress',
-    'reset', 'unassignTeam', 'updateSettings', 'updateTask',
+    'reportUsage', 'reset', 'reviewTask', 'unassignTeam', 'updateSettings', 'updateTask',
   ]);
   const s = fresh();
   assert.deepEqual(applyOp(s, { type: 'dispatch' }), []);
@@ -201,7 +201,7 @@ test('an imported task with no free team stays queued', () => {
 
 test('done and cancelled tasks import without teams', () => {
   const there = boardWith(['Done', 'Cancelled', 'Open'], (s) => {
-    core.updateTask(s, 'T-001', { status: 'done' });
+    core.updateTask(s, 'T-001', { status: 'done', force: true });
     core.updateTask(s, 'T-002', { status: 'cancelled' });
   });
   // Simulate a stale team pointer on the source board.
@@ -270,10 +270,29 @@ test('importState result is JSON-serialisable', () => {
   assert.deepEqual(json(r), r);
 });
 
+test('importState credits team issuesFound from added tasks only once', () => {
+  const other = core.createInitialState();
+  const t = core.addTask(other, { title: 'Reviewed elsewhere', size: 'large' }).task;
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'changes', note: 'x', issues: 2 });
+  core.reviewTask(other, { taskId: t.id, teamId: 'bravo', verdict: 'approved', issues: 1 });
+  core.reviewTask(other, { taskId: t.id, teamId: 'charlie', verdict: 'approved' });
+  core.updateTask(other, t.id, { status: 'done', force: true });
+  const here = core.createInitialState();
+  applyOp(here, { type: 'importState', args: { state: json(other) } });
+  const issues = (id) => here.teams.find((x) => x.id === id).issuesFound;
+  assert.equal(issues('alpha'), 2);
+  assert.equal(issues('bravo'), 1);
+  assert.equal(issues('charlie'), 0);
+  applyOp(here, { type: 'importState', args: { state: json(other) } });
+  assert.equal(issues('alpha'), 2, 'a second import of the same board does not double it');
+  assert.equal(issues('bravo'), 1);
+});
+
 test('importState credits team time from added tasks only once', () => {
   const other = core.createInitialState();
   const t = core.addTask(other, { title: 'Done elsewhere' }).task;
-  core.updateTask(other, t.id, { status: 'done' });
+  core.updateTask(other, t.id, { status: 'done', force: true });
   t.teamMs = { alpha: 60_000 };
   const here = core.createInitialState();
   applyOp(here, { type: 'importState', args: { state: other } });
@@ -294,4 +313,35 @@ test('pushing the same board twice adds nothing the second time, even after renu
   assert.equal(second.added, 0);
   assert.equal(second.skipped, 1);
   assert.equal(hubBoard.tasks.length, 2);
+});
+
+// ---------- alpha-1 (round 3): importState credits teamIssues (all rounds) ----------
+
+test('alpha-1: importState credits issues from every round via teamIssues, once', () => {
+  const other = core.createInitialState();
+  const t = core.addTask(other, { title: 'Two rounds elsewhere' }).task;
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'changes', note: 'x', issues: 2 });
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'approved' }); // latest verdict: 0 issues
+  core.updateTask(other, t.id, { status: 'done' });
+  assert.deepEqual(t.teamIssues, { alpha: 2 });
+  const here = core.createInitialState();
+  here.teams[0].issuesFound = 1;
+  op(here, 'importState', { state: json(other) });
+  assert.equal(here.teams[0].issuesFound, 3, 'credits the round-1 issues, not just the latest verdict');
+  op(here, 'importState', { state: json(other) });
+  assert.equal(here.teams[0].issuesFound, 3, 're-push does not double count');
+});
+
+test('alpha-1: importState falls back to reviews for boards without teamIssues', () => {
+  const other = core.createInitialState();
+  const t = core.addTask(other, { title: 'Older board' }).task;
+  core.updateTask(other, t.id, { status: 'review' });
+  core.reviewTask(other, { taskId: t.id, teamId: 'alpha', verdict: 'changes', note: 'x', issues: 4 });
+  const old = json(other);
+  delete old.tasks[0].teamIssues;
+  const here = core.createInitialState();
+  op(here, 'importState', { state: old });
+  assert.equal(here.teams[0].issuesFound, 4);
 });

@@ -4,9 +4,23 @@
 // when it is not.
 import * as core from './lib/core.mjs';
 import fs from 'node:fs';
+import os from 'node:os';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
+
+// Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY is set
+// (Node 22.21+). Behind a proxy, as in Claude cloud sessions, re-run this
+// command with it so the shared board is reachable. Local addresses stay
+// direct through NO_PROXY. On a PC without a proxy nothing changes.
+if ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_USE_ENV_PROXY) {
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync(process.execPath, ['--disable-warning=UNDICI-EHPA', ...process.execArgv, ...process.argv.slice(1)], {
+    stdio: 'inherit',
+    env: { ...process.env, NODE_USE_ENV_PROXY: '1' },
+  });
+  process.exit(r.status ?? 1);
+}
 
 const BASE = process.env.DEPT_URL || `http://127.0.0.1:${process.env.PORT || 4300}`;
 
@@ -22,14 +36,25 @@ const HELP = `Agent Department CLI
   node department/dept.mjs progress <task> [--team alpha] [--agent alpha-2]
                        [--pct 40] [--status working|blocked|done] [-m "note"]
                                                        Report progress
-  node department/dept.mjs set <task> [--status queued|paused|done|cancelled] [--pct N]
+  node department/dept.mjs set <task> [--status queued|review|paused|done|cancelled] [--pct N]
                        [--title "..."] [--size small|large]
-  node department/dept.mjs done <task>                 Finish a task and free its teams
+  node department/dept.mjs review <task>               Send a task to its teams' reviewers (In review)
+  node department/dept.mjs verdict <task> --team <id> approve|changes [-m "note"] [--issues N]
+                                                       Record a team reviewer's verdict; changes
+                                                       sends the task back to the builders
+  node department/dept.mjs done <task> [--force]       Finish a task and free its teams; needs every
+                                                       team's reviewer sign-off unless --force
   node department/dept.mjs delete <task>
   node department/dept.mjs dispatch                    Hand free teams to queued tasks
   node department/dept.mjs auto on|off                 Toggle automatic dispatch
   node department/dept.mjs times [task]                Time per team (total, tasks done, average)
                                                        and finished tasks; or one task's breakdown
+  node department/dept.mjs usage                       Claude usage meter: 5-hour and weekly limits,
+                                                       when they reset, age and source of the report
+  node department/dept.mjs usage report [--five <pct>] [--five-reset <iso|epoch>]
+                       [--week <pct>] [--week-reset <iso|epoch>] [--source X]
+                                                       Store a usage report by hand (testing); the
+                                                       status line (npm run usage-meter) does this
   node department/dept.mjs json                        Dump the full state
   node department/dept.mjs reset                       Wipe all tasks and reset the teams
 
@@ -103,7 +128,121 @@ async function currentState() {
   return load();
 }
 
-const countOpen = (s) => s.tasks.filter((t) => ['queued', 'active', 'paused'].includes(t.status)).length;
+const OPEN = core.TASK_STATUSES.filter((st) => st !== 'done' && st !== 'cancelled');
+const countOpen = (s) => s.tasks.filter((t) => OPEN.includes(t.status)).length;
+
+// Per-team review state for the current round. Uses core.reviewStatus when the
+// core has it; otherwise reads task.reviews directly (same contract).
+function reviewState(s, task) {
+  if (typeof core.reviewStatus === 'function') return core.reviewStatus(s, task);
+  const round = task.reviewRound || 0;
+  const out = { round, approved: [], changes: [], pending: [] };
+  for (const team of s.teams.filter((x) => x.taskId === task.id)) {
+    const r = (task.reviews || {})[team.id];
+    if (r && r.round === round && r.verdict === 'approved') out.approved.push(team.id);
+    else if (r && r.round === round && r.verdict === 'changes') out.changes.push(team.id);
+    else out.pending.push(team.id);
+  }
+  return out;
+}
+
+function reviewLine(s, task) {
+  const rs = reviewState(s, task);
+  const mark = (id) => (rs.approved.includes(id) ? `${id} ✓` : rs.changes.includes(id) ? `${id} ✗` : `${id} …`);
+  const ids = s.teams.filter((x) => x.taskId === task.id).map((x) => x.id);
+  return `in review (round ${rs.round}): ${ids.map(mark).join(', ') || '—'}`;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+// Would marking this task done skip missing reviewer sign-off? Uses
+// core.reviewGate when present; otherwise: every team on it approved this round.
+function signOffMissing(s, task) {
+  if (typeof core.reviewGate === 'function') return !core.reviewGate(s, task).ok;
+  const on = s.teams.filter((x) => x.taskId === task.id);
+  if (!on.length) return false;
+  const rs = reviewState(s, task);
+  return rs.approved.length < on.length;
+}
+
+// ---------------------------------------------------------------- usage meter
+
+const USAGE_STALE_MS = 15 * 60 * 1000;
+const USAGE_HELP = 'Usage: usage report [--five <pct>] [--five-reset <iso|epoch>] [--week <pct>] [--week-reset <iso|epoch>] [--source X]';
+
+function usageWindowArg(opt, pctKey, resetKey) {
+  const pct = opt[pctKey];
+  const reset = opt[resetKey];
+  if (pct === undefined) {
+    if (reset !== undefined) throw new core.DeptError(`--${resetKey} needs --${pctKey} <pct> too`);
+    return null;
+  }
+  if (typeof pct !== 'string' || pct.trim() === '' || !Number.isFinite(Number(pct))) {
+    throw new core.DeptError(`--${pctKey} must be a percentage (0-100)`);
+  }
+  if (reset !== undefined && typeof reset !== 'string') throw new core.DeptError(`--${resetKey} needs a time (ISO or epoch seconds)`);
+  return { usedPct: Number(pct), resetsAt: reset ?? null };
+}
+
+function clockTime(ms, at) {
+  const d = new Date(ms);
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (Math.abs(ms - at) < 20 * 3600 * 1000 && d.getDate() === new Date(at).getDate()) return time;
+  return `${d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' })} ${time}`;
+}
+
+function usageRow(label, win, at) {
+  if (!win) return `  ${label.padEnd(9)} no data`;
+  const reset = ts(win.resetsAt);
+  if (Number.isFinite(reset) && reset <= at) {
+    return `  ${label.padEnd(9)} reset at ${clockTime(reset, at)}; will update on next report (was ${win.usedPct}%)`;
+  }
+  const pct = Number(win.usedPct) || 0;
+  const level = pct >= 90 ? '  HIGH' : pct >= 70 ? '  getting high' : '';
+  const when = Number.isFinite(reset) ? `  resets in ${dur(reset - at)} (${clockTime(reset, at)})` : '';
+  const filled = Math.max(0, Math.min(20, Math.round((pct / 100) * 20)));
+  return `  ${label.padEnd(9)} ${'█'.repeat(filled)}${'░'.repeat(20 - filled)} ${`${pct}%`.padStart(6)}${when}${level}`;
+}
+
+function printUsage(s) {
+  const u = s.usage;
+  if (!u || (!u.fiveHour && !u.sevenDay)) {
+    console.log('Usage meter not connected: run `npm run usage-meter` on your PC, then restart Claude Code.');
+    return;
+  }
+  const at = core.clockNow();
+  console.log('Claude usage');
+  console.log(usageRow('5-hour', u.fiveHour, at));
+  console.log(usageRow('Weekly', u.sevenDay, at));
+  const reported = ts(u.reportedAt);
+  const age = Number.isFinite(reported) ? Math.max(0, at - reported) : NaN;
+  const from = u.source ? ` from ${u.source}` : '';
+  console.log(`  Updated ${Number.isFinite(age) ? `${dur(age)} ago` : 'at an unknown time'}${from}`);
+  if (!Number.isFinite(age) || age > USAGE_STALE_MS) {
+    console.log('  No Claude Code session is reporting; numbers may be out of date.');
+  }
+}
+
+async function usageCommand(sub, opt) {
+  if (sub === undefined || sub === 'show' || sub === 'status') return printUsage(await currentState());
+  if (sub !== 'report') throw new core.DeptError(`Unknown usage command ${sub}; use \`usage\` or \`usage report ...\``);
+  const fiveHour = usageWindowArg(opt, 'five', 'five-reset');
+  const sevenDay = usageWindowArg(opt, 'week', 'week-reset');
+  if (!fiveHour && !sevenDay) throw new core.DeptError(USAGE_HELP);
+  const source = typeof opt.source === 'string' ? opt.source : os.hostname();
+  const args = { fiveHour, sevenDay, reportedAt: new Date(core.clockNow()).toISOString(), source };
+  const r = await run('POST', '/api/op', { type: 'reportUsage', args }, { type: 'reportUsage', args });
+  if (r && r.stored === false) console.log('Not stored: the board already has a newer usage report.');
+  else console.log('Usage report stored.');
+  const at = core.clockNow();
+  const u = r?.usage;
+  if (u) {
+    console.log(usageRow('5-hour', u.fiveHour, at));
+    console.log(usageRow('Weekly', u.sevenDay, at));
+  }
+}
+
+const VERDICTS = { approve: 'approved', approved: 'approved', ok: 'approved', changes: 'changes', change: 'changes', reject: 'changes' };
 
 async function hubCommand(sub, pos, opt) {
   switch (sub) {
@@ -198,13 +337,23 @@ function printStatus(s) {
     const total = `total ${dur(core.teamTotalMs(team, at))}`;
     if (task) console.log(`  ${bar(team.progress)}  on task ${dur(core.taskTeamMs(s, task, at)[team.id])} · ${total}`);
     else console.log(`  ${total}`);
-    for (const a of team.agents) console.log(`  · ${a.id.padEnd(10)} ${a.status.padEnd(8)} ${a.work}`);
+    for (const a of team.agents) {
+      if (a.role === 'reviewer') console.log(`  ★ ${`${a.id} reviewer`.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
+      else console.log(`  · ${a.id.padEnd(19)} ${a.status.padEnd(8)} ${a.work}`);
+    }
+    if (team.issuesFound) console.log(`  ${plural(team.issuesFound, 'issue')} caught by review`);
   }
-  const open = s.tasks.filter((t) => ['queued', 'active', 'paused'].includes(t.status));
+  const open = s.tasks.filter((t) => OPEN.includes(t.status));
   console.log(`\nOpen tasks (${open.length})`);
   for (const t of open) {
     const teams = s.teams.filter((x) => x.taskId === t.id).map((x) => x.id).join(', ') || '—';
     console.log(`  ${t.id} [${t.status}] ${t.size === 'large' ? '(large) ' : ''}${t.title}\n        ${bar(t.progress)}  teams: ${teams}  active: ${dur(core.taskActiveMs(t, at))}`);
+    if (t.status === 'review') console.log(`        ${reviewLine(s, t)}`);
+    else if (t.reviewRound) {
+      const back = Object.entries(t.reviews || {}).filter(([, r]) => r.round === t.reviewRound && r.verdict === 'changes').map(([id]) => id);
+      console.log(`        review round ${t.reviewRound}${back.length ? `: changes requested by ${back.join(', ')}` : ''}`);
+    }
+    if (t.issuesFound) console.log(`        ${plural(t.issuesFound, 'issue')} caught`);
   }
 }
 
@@ -229,6 +378,12 @@ function printTask(s, task, at) {
   console.log(`  wall time    ${dur(wallMs(task, at))}${task.finishedAt ? '' : ' (so far)'}`);
   console.log(`  created      ${task.createdAt || '—'}`);
   if (task.finishedAt) console.log(`  finished     ${task.finishedAt}`);
+  if (task.reviewRound) {
+    console.log(`  review       round ${task.reviewRound}, ${plural(task.issuesFound || 0, 'issue')} caught`);
+    for (const [id, r] of Object.entries(task.reviews || {})) {
+      console.log(`    ${id.padEnd(11)} ${r.verdict === 'approved' ? '✓ approved' : '✗ changes'} (round ${r.round}${r.issues ? `, ${plural(r.issues, 'issue')}` : ''})${r.note ? ` — ${r.note}` : ''}`);
+    }
+  }
   const per = core.taskTeamMs(s, task, at);
   const rows = Object.entries(per).filter(([, ms]) => ms > 0).sort((a, b) => b[1] - a[1]);
   console.log('  team time');
@@ -245,12 +400,13 @@ function printTimes(s, taskId) {
   if (taskId) {
     return printTask(s, core.getTask(s, taskId), at);
   }
-  const cols = ['Team', 'Total', 'Done', 'Avg/done', 'Current task'];
+  const cols = ['Team', 'Total', 'Done', 'Avg/done', 'Issues', 'Current task'];
   const rows = core.teamStats(s, at).map((st) => [
     st.name,
     dur(st.totalMs),
     String(st.tasksDone),
     st.tasksDone ? dur(st.avgDoneMs) : '—',
+    String(st.issuesFound ?? s.teams.find((x) => x.id === st.id)?.issuesFound ?? 0),
     st.currentTaskId ? `${st.currentTaskId} (${dur(st.currentMs)})` : '(free)',
   ]);
   const widths = cols.map((c, i) => Math.max(c.length, ...rows.map((r) => r[i].length)));
@@ -283,6 +439,8 @@ async function main() {
       return printTimes(await currentState(), pos[0]);
     case 'hub':
       return hubCommand(pos[0], pos.slice(1), opt);
+    case 'usage':
+      return usageCommand(pos[0], opt);
     case 'json':
       return console.log(JSON.stringify(await currentState(), null, 2));
     case 'add': {
@@ -329,9 +487,57 @@ async function main() {
       console.log(`${r.id} [${r.status}] ${r.progress}%`);
       return;
     }
+    case 'review': {
+      const id = pos[0];
+      if (!id) throw new core.DeptError('Usage: review <task>');
+      const patch = { status: 'review' };
+      const r = await run('POST', '/api/op', { type: 'updateTask', args: { id, patch, by: 'cli' } }, { type: 'updateTask', args: { id, patch, by: 'cli' } });
+      console.log(`${r.id} in review (round ${r.reviewRound ?? '?'})`);
+      return;
+    }
+    case 'verdict': {
+      const [taskId, word] = pos;
+      const verdict = VERDICTS[String(word || (opt.approve ? 'approve' : opt.changes ? 'changes' : '')).toLowerCase()];
+      if (!taskId || typeof opt.team !== 'string' || !verdict) {
+        throw new core.DeptError('Usage: verdict <task> --team <id> approve|changes [-m "note"] [--issues N]');
+      }
+      let issues = 0;
+      if (opt.issues !== undefined) {
+        if (typeof opt.issues !== 'string') throw new core.DeptError('Usage: verdict <task> --team <id> approve|changes [-m "note"] [--issues N]');
+        issues = Number(opt.issues);
+        if (!Number.isInteger(issues) || issues < 0) throw new core.DeptError('--issues must be a whole number, 0 or more');
+      }
+      const args = { taskId, teamId: opt.team, verdict, note: typeof opt.message === 'string' ? opt.message : '', issues, by: typeof opt.by === 'string' ? opt.by : 'reviewer' };
+      const r = await run('POST', '/api/op', { type: 'reviewTask', args }, { type: 'reviewTask', args });
+      const id = r.task?.id || taskId;
+      const name = r.team?.name || opt.team;
+      console.log(`${name} ${verdict === 'changes' ? 'requested changes on' : 'approved'} ${id}${issues ? ` (${plural(issues, 'issue')})` : ''}`);
+      const pending = r.pending || [];
+      const changes = Array.isArray(r.changes) ? r.changes : [];
+      const complete = typeof r.complete === 'boolean' ? r.complete : !pending.length;
+      if (!complete) console.log(`  Waiting for: ${pending.join(', ') || '—'}`);
+      else if (changes.length) console.log(`  Back to the builders: changes requested by ${changes.join(', ')} (${id} now ${r.task?.status || 'active'})`);
+      else console.log(`  Signed off by all reviewers; ${id} is ready for done`);
+      return;
+    }
     case 'done': {
-      const r = await run('PATCH', `/api/tasks/${pos[0]}`, { status: 'done' }, { type: 'updateTask', args: { id: pos[0], patch: { status: 'done' } } });
-      console.log(`${r.id} done`);
+      // `done --force T-1` would read T-1 as the flag's value; take it back.
+      if (typeof opt.force === 'string') pos.unshift(opt.force);
+      const id = pos[0];
+      if (!id) throw new core.DeptError('Usage: done <task> [--force]');
+      const patch = opt.force ? { status: 'done', force: true } : { status: 'done' };
+      let skipped = false;
+      if (opt.force) {
+        try {
+          const s = await currentState();
+          const task = s.tasks.find((t) => t.id === id);
+          skipped = Boolean(task && signOffMissing(s, task));
+        } catch {
+          // Can't tell beforehand; the done itself reports any real problem.
+        }
+      }
+      const r = await run('PATCH', `/api/tasks/${id}`, patch, { type: 'updateTask', args: { id, patch } });
+      console.log(`${r.id} done${skipped ? ' (forced, without reviewer sign-off)' : ''}`);
       return;
     }
     case 'delete': {
