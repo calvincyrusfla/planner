@@ -1185,6 +1185,7 @@ async function foremanAsk(question) {
     else foremanNote(out, err.message || String(err), true);
   } finally {
     out.removeAttribute('aria-busy');
+    ctrl.abort(); // release the stream if we stopped reading early
     if (foreman.ctrl === ctrl) foreman.ctrl = null;
     foremanSync();
   }

@@ -27,18 +27,15 @@ if /i "%~1"=="--help" goto :usage
 if not "%~1"=="" set "TARGET=%~f1"
 :args_done
 
-if not exist "%PY%" goto :dry_run
-echo [dry-run] "%PY%" -m foundry.serve --repo "%TARGET%"
-set "RC=0"
-goto :end
-
-:no_venv
+if not exist "%PY%" goto :no_venv
 if not exist "%TARGET%\" goto :no_repo
 
+set "PORT=4310"
+if defined FOUNDRY_SERVE_PORT set "PORT=%FOUNDRY_SERVE_PORT%"
 cd /d "%REPO_ROOT%"
 echo [foundry] Repo:  %TARGET%
 echo [foundry] Python: %PY%
-echo [foundry] Starting the Foundry service on http://127.0.0.1:4310 ...
+echo [foundry] Starting the Foundry service on http://127.0.0.1:%PORT% ...
 echo [foundry] Stop it with Ctrl+C, or close this window.
 echo.
 
