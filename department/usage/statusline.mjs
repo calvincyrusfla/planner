@@ -32,7 +32,7 @@ export function toIso(v) {
   if (typeof v === 'number' || (typeof v === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(v))) {
     const n = Number(v);
     if (!Number.isFinite(n) || n <= 0) return null;
-    // Same cutoff as core's USAGE_EPOCH_MS_CUTOFF (literal here so the status
+    // Same cutoff as core's EPOCH_MS_THRESHOLD (literal here so the status
     // line doesn't load the core): below 1e11 is seconds, above it ms.
     ms = n < 1e11 ? n * 1000 : n;
   } else if (typeof v === 'string') {

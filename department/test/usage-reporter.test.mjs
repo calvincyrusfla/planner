@@ -93,7 +93,7 @@ function runStatusline(input, e) {
 test('toIso accepts epoch seconds, epoch ms, numeric strings and ISO', () => {
   assert.equal(toIso(1762520400), '2025-11-07T13:00:00.000Z');
   assert.equal(toIso(1762520400000), '2025-11-07T13:00:00.000Z');
-  // 1e11 cutoff (as core's USAGE_EPOCH_MS_CUTOFF): just below is seconds, from it on ms
+  // 1e11 cutoff (as core's EPOCH_MS_THRESHOLD): just below is seconds, from it on ms
   assert.equal(toIso(99_999_999_999), new Date(99_999_999_999 * 1000).toISOString());
   assert.equal(toIso(100_000_000_000), new Date(100_000_000_000).toISOString());
   assert.equal(toIso('1762520400'), '2025-11-07T13:00:00.000Z');

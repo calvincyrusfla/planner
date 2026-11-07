@@ -203,7 +203,7 @@ Each meter shows the percentage used, a bar and a live countdown to when that wi
 
 ### Where the numbers come from
 
-Claude Code can run a small program for its status bar, and it passes that program the current usage. The usage meter installs `department/usage/statusline.mjs` as that program. Each time Claude Code refreshes its status bar, the program shows the numbers there too, and sends them to the board in the background (at most about once a minute unless they change). It goes through the dashboard, the shared board or the local state file, the same way the CLI does.
+Claude Code can run a small program for its status bar, and it passes that program the current usage. The usage meter installs `department/usage/statusline.mjs` as that program. Each time Claude Code refreshes its status bar, the program shows the numbers there too, and sends them to the board in the background: about once a minute, or sooner when the numbers change, but never more often than every 15 seconds. It goes through the dashboard, the shared board or the local state file, the same way the CLI does.
 
 It only reads what Claude Code hands it. It doesn't read passwords, tokens or credential files, and it doesn't call any Claude account API.
 
@@ -219,11 +219,13 @@ Then close and restart Claude Code. The meter fills in after Claude Code's next 
 
 The status line points at this folder and at the Node you ran it with. If you move the folder or switch Node versions, run `npm run usage-meter` again.
 
-This adds a `statusLine` entry to your Claude Code user settings, `%USERPROFILE%\.claude\settings.json` (`~/.claude/settings.json` on macOS and Linux, or the folder in `CLAUDE_CONFIG_DIR` if you set it). It saves a backup first, as `settings.json.bak-agent-department`. If you already have a different status line, it leaves it alone and shows you what's there. To replace it anyway:
+This adds a `statusLine` entry to your Claude Code user settings, `%USERPROFILE%\.claude\settings.json` (`~/.claude/settings.json` on macOS and Linux, or the folder in `CLAUDE_CONFIG_DIR` if you set it). The first time it changes the file, it saves a backup next to it, `settings.json.bak-agent-department`. Later runs never overwrite that backup, so it always holds your settings from before the first install. If you already have a different status line, it leaves it alone and shows you what's there. To replace it anyway:
 
 ```powershell
 npm run usage-meter -- --force
 ```
+
+The status line it replaces is saved to `statusline.replaced-by-agent-department.json`, next to `settings.json`, so removing the usage meter can put it back.
 
 To see what it would change without changing anything:
 
@@ -237,11 +239,11 @@ npm run usage-meter -- --dry-run
 npm run usage-meter:remove
 ```
 
-This removes only the usage meter's status line; any other status line is left alone. Restart Claude Code afterwards.
+This removes only the usage meter's status line; any other status line is left alone. If you installed with `--force`, it puts back the status line that was replaced and deletes `statusline.replaced-by-agent-department.json`. Restart Claude Code afterwards.
 
 ### Why the numbers can be out of date
 
-The meter only updates while a Claude Code session with the status line is running. When nothing has reported for 15 minutes, the band says that no session is reporting and the numbers may be out of date. When a window's reset time has passed, the band shows when it reset instead of the old percentage, until the next report comes in.
+The meter only updates while a Claude Code session with the status line is running. When nothing has reported for 15 minutes, the band says that no session is reporting and the numbers may be out of date. Claude Code sometimes leaves one of the limits out of a report. The board then keeps the last known number for that limit until its reset time. When a window's reset time has passed, the band shows when it reset instead of the old percentage, until the next report comes in.
 
 The numbers are only there on Claude subscription plans. With an API key, Claude Code doesn't pass usage to the status line, so the band says the meter isn't connected.
 
