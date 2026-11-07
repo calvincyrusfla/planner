@@ -32,6 +32,7 @@ from foundry.claude_client import (
     parse_claude_json,
     parse_retry_after,
     resolve_claude_bin,
+    windows_cmd_launch_line,
     windows_shim_command_line,
 )
 from foundry.schemas import ClaudeResult
@@ -297,14 +298,26 @@ def test_windows_prefers_exe_and_cmd_over_bare_name(monkeypatch: pytest.MonkeyPa
     assert resolve_claude_bin("claude.cmd", platform="win32") == r"C:\npm\claude.cmd"
 
 
-def _cmd_c(command_line: str) -> str:
-    """What ``cmd.exe /c "<line>"`` executes: with more than two quotes, cmd strips
-    exactly the first and the last quote character (documented ``cmd /?`` rule)."""
-    wrapped = f'"{command_line}"'  # how subprocess shell=True builds it on Windows
-    assert wrapped.count('"') > 2
-    first = wrapped.index('"')
-    last = wrapped.rindex('"')
-    return wrapped[:first] + wrapped[first + 1:last] + wrapped[last + 1:]
+def _cmd_c(full_line: str) -> tuple[str, list[str], str]:
+    """Simulate how Windows + cmd.exe treat ``"<comspec>" /d /c "<inner>"``.
+
+    Returns (program, switches, executed command). CreateProcess takes the first
+    quoted token as the program; cmd then applies its ``/c`` rule: with more than two
+    quote characters it strips exactly the first and the last quote of the rest.
+    """
+    assert full_line.startswith('"')
+    end = full_line.index('"', 1)
+    program = full_line[1:end]
+    rest = full_line[end + 1:].lstrip()
+    switches = []
+    while rest.startswith("/"):
+        sw, _, rest = rest.partition(" ")
+        switches.append(sw.lower())
+        if sw.lower() == "/c":
+            break
+    assert rest.count('"') > 2
+    first, last = rest.index('"'), rest.rindex('"')
+    return program, switches, rest[:first] + rest[first + 1:last] + rest[last + 1:]
 
 
 def _split_quoted(line: str) -> list[str]:
@@ -319,28 +332,41 @@ def _split_quoted(line: str) -> list[str]:
     return out
 
 
-def test_windows_cmd_shim_with_spaces_in_path() -> None:
+WIN_ENV = {"COMSPEC": r"C:\WINDOWS\system32\cmd.exe", "SystemRoot": r"C:\WINDOWS"}
+
+
+def test_windows_cmd_shim_with_spaces_in_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """B2: C:\\Users\\John Smith\\...\\claude.cmd must survive cmd.exe's quote stripping."""
     exe = r"C:\Users\John Smith\AppData\Roaming\npm\claude.cmd"
     client = ClaudeCodeClient(
         claude_bin=exe,
         extra_args=("--max-turns", "3", "--disallowedTools", "Bash Edit Write", "--append-system-prompt",
                     "You are a Foundry builder & output only a diff > nothing else | ok^"),
+        env={"COMSPEC": WIN_ENV["COMSPEC"]},
     )
     client._resolved = exe  # pretend resolution happened on Windows
     mode, spec = client.launch_spec(platform="win32")
-    assert mode == "shell" and isinstance(spec, str)
-    executed = _cmd_c(spec)
-    assert executed == spec
-    assert executed.startswith(f'"{exe}" ')
+    assert mode == "verbatim" and isinstance(spec, str)
+    assert spec.startswith(f'"{WIN_ENV["COMSPEC"]}" /d /c ""{exe}" ')
+    program, switches, executed = _cmd_c(spec)
+    assert program == WIN_ENV["COMSPEC"]
+    assert switches == ["/d", "/c"]  # /d: AutoRun disabled, no /s
     tokens = _split_quoted(executed)
     assert tokens[0] == exe
     assert tokens[1:4] == ["-p", "--output-format", "json"]
     assert tokens[4:] == list(client.extra_args)
-    # the old /s /c + list2cmdline approach is what broke: show the difference
-    import subprocess as sp
-    old = sp.list2cmdline(["cmd.exe", "/d", "/s", "/c", exe, "-p"])
-    assert '"C:\\Users\\John Smith' in old  # list2cmdline quoted only the path → /s strips it
+    assert executed == windows_shim_command_line(exe, client.command()[1:])
+
+
+def test_windows_launch_line_comspec_handling() -> None:
+    line = windows_cmd_launch_line(r"C:\n p\claude.cmd", ["-p"], environ={"SystemRoot": "D:\\Win\\"})
+    assert line == r'"D:\Win\System32\cmd.exe" /d /c ""C:\n p\claude.cmd" "-p""'
+    quoted = windows_cmd_launch_line(r"C:\x\claude.cmd", [], environ={"COMSPEC": '"C:\\Win Dows\\cmd.exe"'})
+    assert quoted.startswith('"C:\\Win Dows\\cmd.exe" /d /c ')
+    assert windows_cmd_launch_line(r"C:\x\claude.cmd", [], environ={}).startswith(
+        r'"C:\Windows\System32\cmd.exe" /d /c ')
+    with pytest.raises(ClaudeError):
+        windows_cmd_launch_line(r"C:\x\claude.cmd", [], environ={"COMSPEC": r"%SystemRoot%\cmd.exe"})
 
 
 def test_windows_shim_rejects_unsafe_chars_and_doubles_trailing_backslash() -> None:
@@ -360,6 +386,8 @@ def test_non_shim_paths_are_exec_d(tmp_path: Path) -> None:
     client._resolved = r"C:\Program Files\Claude\claude.exe"
     mode, spec = client.launch_spec(platform="win32")
     assert mode == "exec" and spec[0] == r"C:\Program Files\Claude\claude.exe"
+    client._resolved = r"C:\npm\CLAUDE.BAT"
+    assert client.launch_spec(platform="win32")[0] == "verbatim"
     client._resolved = "/usr/local/bin/claude"
     assert client.launch_spec(platform="linux") == ("exec", client.command())
 
@@ -508,7 +536,8 @@ NOON_UTC = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc).timestamp()
         ("resets at 15:00", 3 * 3600),
         ("resets 11am", 23 * 3600),  # already past today → tomorrow
         ("resets 12am", 12 * 3600),  # midnight
-        ("resets 12pm", 24 * 3600),  # noon exactly now → next occurrence
+        ("resets 12pm", 0),  # exactly now → already reset
+        ("resets 11:57am", 0),  # within the 5-minute skew grace → already reset
         ("resets 3pm (Mars/Olympus_Mons)", 3 * 3600),  # unknown zone → local
         ("resets 9am (America/New_York)", 2 * 3600),  # NY = 07:00 now (EST)
     ],
@@ -561,3 +590,120 @@ def test_detect_auth_error() -> None:
     assert not detect_auth_error("SyntaxError at line 4012")
     assert not detect_auth_error("rate limit exceeded")
     assert not detect_auth_error("")
+
+
+# NOON_UTC is Saturday 2026-11-07 12:00 UTC (13:00 in Berlin).
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("You've hit your weekly limit · resets Nov 8, 3pm (Europe/Berlin)", 26 * 3600),
+        ("resets Nov 8 at 3pm (Europe/Berlin)", 26 * 3600),
+        ("resets November 8th, 15:00", 27 * 3600),  # local = UTC
+        ("resets 8 Nov 3pm", 27 * 3600),
+        ("resets Sat 6pm", 6 * 3600),  # today, later
+        ("resets Saturday 6pm", 6 * 3600),
+        ("resets Sat 9am", 7 * 86400 - 3 * 3600),  # today but past → next week
+        ("resets Sun 6pm (Europe/Berlin)", 29 * 3600),  # Sun 17:00 UTC
+        ("resets Mon, 9:30am", (24 + 21.5) * 3600),
+        ("resets Nov 6, 3pm", 0),  # date already passed → limit has reset
+        ("resets Jan 2, 3pm", (31 + 23 + 31 + 1) * 86400 + 3 * 3600 - 0),  # next year
+    ],
+)
+def test_parse_weekly_reset_forms(message: str, expected: float) -> None:
+    got = parse_retry_after(message, now=NOON_UTC, local_tz=timezone.utc)
+    assert got == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("message", ["resets Feb 30, 3pm", "resets Nov 8", "resets Sat", "resets Sat 6"])
+def test_weekly_unparseable_is_none(message: str) -> None:
+    assert parse_retry_after(message, now=NOON_UTC, local_tz=timezone.utc) is None
+
+
+# --------------------------------------------------------------------------- validate_launch / verbatim runner
+
+
+def test_validate_launch_caches_spec_and_run_uses_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    exe = make_fake_claude(tmp_path, OK_BODY)
+    client = ClaudeCodeClient(claude_bin=str(exe))
+    mode, spec = client.validate_launch()
+    assert mode == "exec" and spec == [str(exe), "-p", "--output-format", "json"]
+    calls = []
+    real = client.launch_spec
+
+    def counting(**kw):
+        calls.append(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(client, "launch_spec", counting)
+    for _ in range(2):
+        assert not run(client.run("hi", agent_id="a-1", role="builder", timeout=30)).is_error
+    assert calls == []  # spec built once, in validate_launch
+
+
+def test_validate_launch_errors() -> None:
+    with pytest.raises(ClaudeNotFound):
+        ClaudeCodeClient(claude_bin="definitely-not-claude-xyz").validate_launch()
+    bad = ClaudeCodeClient(claude_bin="claude", extra_args=("--append-system-prompt", "100% sure"))
+    bad._resolved = r"C:\Users\John Smith\AppData\Roaming\npm\claude.cmd"
+    with pytest.raises(ClaudeError) as ei:
+        bad.validate_launch(platform="win32")
+    assert "claude.exe" in str(ei.value)
+    bad._resolved = "/usr/bin/claude"
+    assert bad.validate_launch(platform="linux")[0] == "exec"  # fine off Windows
+    nul = ClaudeCodeClient(claude_bin="claude", extra_args=("a\x00b",))
+    nul._resolved = "/usr/bin/claude"
+    with pytest.raises(ClaudeError):
+        nul.validate_launch(platform="linux")
+
+
+def _force_verbatim(client: ClaudeCodeClient) -> None:
+    """Route the client through the thread/Popen runner (a list spec works on POSIX)."""
+    client._spec = ("verbatim", client.command())
+
+
+def test_verbatim_runner_success(tmp_path: Path) -> None:
+    exe = make_fake_claude(tmp_path, OK_BODY)
+    client = ClaudeCodeClient(claude_bin=str(exe))
+    _force_verbatim(client)
+    res = run(client.run("via popen", agent_id="a-1", role="builder", cwd=str(tmp_path), timeout=30))
+    assert not res.is_error and res.text.startswith("echo:via popen")
+    assert res.input_tokens == 110 and res.cache_read_tokens == 5
+
+
+def test_verbatim_runner_timeout_kills_tree(tmp_path: Path) -> None:
+    marker = tmp_path / "alive.txt"
+    exe = make_fake_claude(tmp_path / "bin", f"time.sleep(4)\nopen({str(marker)!r}, 'w').write('x')\n")
+    client = ClaudeCodeClient(claude_bin=str(exe))
+    _force_verbatim(client)
+    started = time.monotonic()
+    res = run(client.run("p", agent_id="a-1", role="builder", timeout=0.5))
+    assert res.is_error and (res.error or "").startswith("timeout")
+    assert time.monotonic() - started < 3.5
+    time.sleep(4.5 - (time.monotonic() - started))
+    assert not marker.exists()
+
+
+def test_verbatim_runner_cancellation_kills_child(tmp_path: Path) -> None:
+    marker = tmp_path / "alive.txt"
+    exe = make_fake_claude(tmp_path / "bin", f"time.sleep(3)\nopen({str(marker)!r}, 'w').write('x')\n")
+    client = ClaudeCodeClient(claude_bin=str(exe))
+    _force_verbatim(client)
+
+    async def go() -> None:
+        task = asyncio.create_task(client.run("p", agent_id="a-1", role="builder", timeout=30))
+        await asyncio.sleep(0.5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(go())
+    time.sleep(3.5)
+    assert not marker.exists()
+
+
+def test_verbatim_runner_spawn_error_mapped(tmp_path: Path) -> None:
+    client = ClaudeCodeClient(claude_bin="x")
+    client._resolved = str(tmp_path / "gone" / "claude")
+    client._spec = ("verbatim", [client._resolved, "-p"])
+    with pytest.raises(ClaudeNotFound):
+        run(client.run("p", agent_id="a-1", role="builder", timeout=5))

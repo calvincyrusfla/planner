@@ -790,21 +790,51 @@ def test_limiter_charged_without_cache_reads(tmp_path: Path) -> None:
 
 
 def test_peer_reviewer_never_reviews_its_own_slot(tmp_path: Path) -> None:
+    """D13: a peer reviewer leaves its own slot's submission in the inbox for the team reviewer."""
+    from foundry.builder_worker import ReviewerWorker, ReviewItem
+
+    rig = Rig(tmp_path, lambda p, agent: APPROVE)
+    a = assignment(builder_id=f"{TEAM}-1")
+    item = ReviewItem({"ticket_id": "X", "task_id": "T-1", "attempt": 0}, a,
+                      parse_builder_reply(fenced(GOOD_DIFF), a), [])
+
+    async def scenario() -> tuple[int, int]:
+        inbox: asyncio.Queue[ReviewItem] = asyncio.Queue()
+        peer = ReviewerWorker(TEAM, rig.queue, rig.client, rig.limiter, rig.telemetry, None,
+                              inbox=inbox, reviewer_id=f"{TEAM}-1", exclude_builder=f"{TEAM}-1", poll=0.01)
+        await inbox.put(item)
+        stop = asyncio.Event()
+        task = asyncio.create_task(peer.run(stop))
+        await asyncio.sleep(0.1)
+        stop.set()
+        await task
+        return peer.claude_calls, inbox.qsize()
+
+    calls, left = asyncio.run(scenario())
+    assert calls == 0 and left == 1
+    assert rig.client.total_calls == 0
+
+
+def test_promoted_slot_claims_no_build_tickets_until_promotion_ends(tmp_path: Path) -> None:
+    """M1: while slot 1 is a peer reviewer it does not build; afterwards it does."""
     rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) or "Review task" in p else fenced(GOOD_DIFF))
 
-    async def scenario() -> int:
+    async def scenario() -> tuple[int, int]:
         pool = rig.pool()
         async with pool:
-            assert pool.promote_peer_reviewer(1, minutes=1) == f"{TEAM}-1"
-            peer = pool.peer_reviewers[f"{TEAM}-1"]
-            rig.submit("T-O", "S")  # built by bravo-1
+            assert pool.promote_peer_reviewer(1, minutes=0.3 / 60) == f"{TEAM}-1"
+            assert pool.builder(1).promoted and pool.idle_count() == 4
+            rig.submit("T-O", "S")  # slot 1's ticket
+            await asyncio.sleep(0.15)
+            during = rig.client.calls[f"{TEAM}-1"]
             await pool.wait_for_tasks(["T-O"], timeout=10)
-            return peer.claude_calls
+            assert not pool.builder(1).promoted
+            return during, rig.client.calls[f"{TEAM}-1"]
 
-    peer_calls = asyncio.run(scenario())
-    assert peer_calls == 0
-    assert rig.client.calls[REVIEWER] == 1
+    during, after = asyncio.run(scenario())
+    assert during == 0 and after == 1
     assert rig.state("T-O") == TaskState.COMPLETE
+    assert rig.queue.tickets_for_task("T-O")[0].attempt == 0
 
 
 def test_busy_slot_cannot_be_promoted(tmp_path: Path) -> None:
@@ -847,7 +877,7 @@ def _fake_claude(tmp_path: Path, body: str) -> str:
 
 @pytest.mark.skipif(__import__("sys").platform.startswith("win"), reason="POSIX shell fake")
 @pytest.mark.parametrize("body", ["sleep 5", "echo 'segfault' >&2; exit 3"])
-def test_real_client_timeout_or_no_json_never_uses_an_attempt(tmp_path: Path, body: str) -> None:
+def test_real_client_timeout_or_no_json_quarantines_at_infra_cap(tmp_path: Path, body: str) -> None:
     """Real ClaudeCodeClient shapes: 'timeout after Ns' and 'exited N without JSON output'."""
     from foundry.claude_client import ClaudeCodeClient
 
@@ -858,15 +888,156 @@ def test_real_client_timeout_or_no_json_never_uses_an_attempt(tmp_path: Path, bo
     async def scenario() -> TeamPool:
         pool = rig.pool(claude_timeout=0.3, infra_backoff_s=0.05)
         async with pool:
-            await asyncio.sleep(1.5)
+            await pool.wait_for_tasks(["T-RC"], timeout=15)
         return pool
 
     pool = asyncio.run(scenario())
     outcomes = pool.builder(1).outcomes
-    assert outcomes and set(outcomes) == {"released"}
-    assert rig.state("T-RC") == TaskState.BUILDING
+    assert outcomes == ["released", "released", "quarantined"]  # E1 cap = 3
+    task = rig.queue.get_task("T-RC")
+    assert task["state"] == TaskState.QUARANTINED
+    assert task["quarantine_reason"].startswith("infrastructure: ")
     t = rig.queue.tickets_for_task("T-RC")[0]
-    assert t.attempt == 0 and t.fix_hint is None
+    assert t.attempt == 0 and t.fix_hint is None  # no build attempt spent
     assert rig.telemetry.retries("T-RC") == 0
     errors = pool.builder(1).infra_errors
     assert errors and ("timeout after" in errors[0] or "without JSON output" in errors[0])
+
+
+# ---------------------------------------------------------------------------
+# round 2: E1 infrastructure cap (charlie-6 loop.py shapes)
+# ---------------------------------------------------------------------------
+
+TIMEOUT = dict(text="", input_tokens=0, output_tokens=0, duration_seconds=600, is_error=True,
+               error="timeout after 600s")
+MAX_TURNS = dict(text="I need to look at more files first.", input_tokens=900, output_tokens=200,
+                 duration_seconds=30, is_error=True, error="error_max_turns")
+
+
+def _loop_script(mode: str) -> Callable[[str, str], Any]:
+    from foundry.schemas import ClaudeResult
+
+    def script(prompt: str, agent: str) -> Any:
+        rev = "## Unified diff" in prompt
+        if mode == "builder_timeout" and not rev:
+            return ClaudeResult(**TIMEOUT)
+        if mode == "reviewer_maxturns" and rev:
+            return ClaudeResult(**MAX_TURNS)
+        if mode == "builder_maxturns" and not rev:
+            return ClaudeResult(**{**MAX_TURNS, "text": "Let me explore."})
+        return APPROVE if rev else fenced(GOOD_DIFF)
+
+    return script
+
+
+def _run_to_end(rig: Rig, task_id: str, **pool_kwargs: Any) -> TeamPool:
+    async def scenario() -> TeamPool:
+        pool = rig.pool(infra_backoff_s=0.001, **pool_kwargs)
+        async with pool:
+            await pool.wait_for_tasks([task_id], timeout=10)
+        return pool
+
+    return asyncio.run(scenario())
+
+
+def test_always_timeout_builder_quarantined_after_three_calls(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    rig = Rig(tmp_path, _loop_script("builder_timeout"))
+    rig.submit("T-LT", "S")
+    with caplog.at_level("WARNING", logger="foundry.builder_worker"):
+        _run_to_end(rig, "T-LT")
+    task = rig.queue.get_task("T-LT")
+    assert task["state"] == TaskState.QUARANTINED
+    assert task["quarantine_reason"].startswith("infrastructure: timeout")
+    assert rig.client.calls[f"{TEAM}-1"] == 3 and rig.client.calls[REVIEWER] == 0
+    assert rig.queue.tickets_for_task("T-LT")[0].attempt == 0
+    warnings = [r for r in caplog.records if "infrastructure error" in r.getMessage()]
+    assert len(warnings) == 3
+    assert all(len(r.getMessage()) < 260 and "## Objective" not in r.getMessage() for r in warnings)
+
+
+def test_reviewer_error_max_turns_quarantined_after_three(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, _loop_script("reviewer_maxturns"))
+    rig.submit("T-LR", "S")
+    _run_to_end(rig, "T-LR")
+    task = rig.queue.get_task("T-LR")
+    assert task["state"] == TaskState.QUARANTINED
+    assert task["quarantine_reason"].startswith("infrastructure: error_max_turns")
+    assert rig.client.calls[REVIEWER] == 3
+    assert rig.client.calls[f"{TEAM}-1"] == 1  # the builder was never charged a retry
+    assert rig.queue.tickets_for_task("T-LR")[0].attempt == 0
+    assert (rig.ws / "pkg" / "mathx.py").read_text() == ORIGINAL  # applied diff rolled back
+
+
+def test_builder_error_with_reply_uses_attempts(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, _loop_script("builder_maxturns"))
+    rig.submit("T-LM", "S")
+    _run_to_end(rig, "T-LM")
+    task = rig.queue.get_task("T-LM")
+    assert task["state"] == TaskState.QUARANTINED
+    assert rig.client.calls[f"{TEAM}-1"] == 3
+    assert not task["quarantine_reason"].startswith("infrastructure")  # normal retry limit
+
+
+def test_infra_cap_from_config(tmp_path: Path) -> None:
+    from foundry.config import FoundryConfig
+
+    rig = Rig(tmp_path, _loop_script("builder_timeout"))
+    rig.submit("T-CF", "S")
+    cfg = FoundryConfig(**({"infra_failure_cap": 5} if "infra_failure_cap" in FoundryConfig.model_fields else {}))
+    expected = getattr(cfg, "infra_failure_cap", 3)
+    _run_to_end(rig, "T-CF", config=cfg)
+    assert rig.client.calls[f"{TEAM}-1"] == expected
+
+
+def test_parsed_reply_resets_infra_count(tmp_path: Path) -> None:
+    from foundry.schemas import ClaudeResult
+
+    replies = iter([ClaudeResult(**TIMEOUT), ClaudeResult(**TIMEOUT), "no diff, sorry",
+                    ClaudeResult(**TIMEOUT), ClaudeResult(**TIMEOUT), fenced(GOOD_DIFF)])
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else next(replies))
+    rig.submit("T-RS", "S")
+    _run_to_end(rig, "T-RS")
+    assert rig.state("T-RS") == TaskState.COMPLETE  # 4 timeouts, never 3 in a row
+    t = rig.queue.tickets_for_task("T-RS")[0]
+    assert t.attempt == 1  # only the garbage reply used an attempt
+
+
+def test_gate_infrastructure_error_is_counted(tmp_path: Path) -> None:
+    try:
+        from foundry.floor_manager import InfrastructureError
+    except ImportError:  # pragma: no cover - older floor_manager
+        class InfrastructureError(Exception):  # type: ignore[no-redef]
+            pass
+
+    def broken_gates(sub: BuilderSubmission, a: TaskAssignment) -> Any:
+        raise InfrastructureError("scratch copy failed: disk full")
+
+    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=broken_gates)
+    rig.submit("T-GI", "S")
+    _run_to_end(rig, "T-GI")
+    task = rig.queue.get_task("T-GI")
+    assert task["state"] == TaskState.QUARANTINED
+    assert task["quarantine_reason"].startswith("infrastructure: scratch copy failed")
+    assert rig.client.calls[f"{TEAM}-1"] == 3 and rig.client.calls[REVIEWER] == 0
+    assert rig.queue.tickets_for_task("T-GI")[0].attempt == 0
+
+
+def test_usage_limit_is_not_counted_toward_infra_cap(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, lambda p, agent: fenced(GOOD_DIFF))
+    rig.client.inject_rate_limit(times=10_000, retry_after=7200.0)
+    rig.submit("T-UL", "S")
+
+    async def scenario() -> None:
+        pool = rig.pool(limit_cooldown_s=0.0)
+        for w in pool.builders:
+            w.limit_cooldown_s = 0.0
+        async with pool:
+            for _ in range(5):  # lift the pause repeatedly so the builder keeps hitting the limit
+                await asyncio.sleep(0.05)
+                rig.limiter._paused_until = float("-inf")
+
+    asyncio.run(scenario())
+    assert rig.client.calls[f"{TEAM}-1"] >= 3
+    assert rig.state("T-UL") == TaskState.BUILDING  # never quarantined
+    t = rig.queue.tickets_for_task("T-UL")[0]
+    assert t.attempt == 0 and getattr(t, "infra_failures", 0) == 0

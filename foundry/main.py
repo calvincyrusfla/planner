@@ -33,7 +33,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -383,39 +383,105 @@ def claude_args(config: FoundryConfig) -> list[str]:
     return args
 
 
-async def run_real(args: argparse.Namespace, config: FoundryConfig, claude_bin: str) -> int:
+#: Exit codes of ``--real``: done / failed or quarantined / still in progress (rerun to resume).
+EXIT_DONE, EXIT_FAILED, EXIT_IN_PROGRESS = 0, 1, 3
+
+
+def _find_open_order(factory: Factory, order: WorkOrder) -> str | None:
+    """A not-yet-finished task from an earlier run with the same title and files (to resume it)."""
+    for tid, old in factory.manager.orders.items():
+        if old.title == order.title and sorted(old.files) == sorted(order.files):
+            task = factory.queue.get_task(tid)
+            if task and str(getattr(task["state"], "value", task["state"])) not in ("complete", "quarantined", "failed"):
+                return tid
+    return None
+
+
+def explain_task(factory: Factory, tid: str) -> tuple[str, list[str]]:
+    """Return ``(state, lines)`` describing where a task stands, for the end of ``--real``."""
+    task = factory.queue.get_task(tid) or {}
+    state = str(getattr(task.get("state"), "value", task.get("state", "unknown")))
+    d = factory.manager.directives.get(tid)
+    lines = [f"{tid}: {state}" + (f" ({d.complexity}, {d.allocated_builders} builder(s) on {d.team_id})" if d else "")]
+    if state in ("quarantined", "failed") and task.get("quarantine_reason"):
+        lines.append(f"  reason: {task['quarantine_reason']}")
+    errors = [t.infra_last_error for t in factory.queue.tickets_for_task(tid) if getattr(t, "infra_last_error", None)]
+    if errors:
+        lines.append(f"  last infrastructure error: {errors[-1][:160]}")
+    limiter = factory.limiter
+    remaining = float(limiter.pause_remaining()) if hasattr(limiter, "pause_remaining") else 0.0
+    if state not in ("complete", "quarantined", "failed"):
+        if remaining > 0:
+            until = (datetime.now() + timedelta(seconds=remaining)).strftime("%H:%M")
+            lines.append(f"  paused until {until} (usage limit) - rerun the same command to resume")
+        else:
+            lines.append("  still in progress - rerun the same command to resume where it stopped")
+    return state, lines
+
+
+async def run_real(
+    args: argparse.Namespace,
+    config: FoundryConfig,
+    claude: Any,
+    gemma: Any = None,
+    *,
+    out: Any = print,
+) -> int:
     """Phase 2: one work order with headless Claude Code and Ollama (after the preflight).
 
     The target repo is only read: Claude runs in it (cwd) with diff-only output,
     gates patch scratch copies, and the approved result is written to
     ``config.patches_dir/<task>.patch`` for you to ``git apply``.
-    """
-    from foundry.claude_client import ClaudeCodeClient
-    from foundry.gemma_client import OllamaGemmaClient
 
+    Rerunning the same command resumes an unfinished task with the same title
+    and files instead of submitting it again. Returns :data:`EXIT_DONE`,
+    :data:`EXIT_FAILED` (quarantined/failed) or :data:`EXIT_IN_PROGRESS`
+    (timed out or paused at the usage limit). The factory is always closed.
+    """
+    if gemma is None:
+        from foundry.gemma_client import OllamaGemmaClient
+
+        gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model)
     repo = Path(args.repo).resolve()
-    claude = ClaudeCodeClient(claude_bin, extra_args=claude_args(config))
-    gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model)
     factory = build_factory(config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo)
-    order = WorkOrder(title=args.title, description=args.desc or "", files=list(args.files or []))
-    tid = await factory.manager.submit(order)
-    d = factory.manager.directives[tid]
-    print(f"{tid}: {d.complexity}, {d.allocated_builders} builder(s) on {d.team_id}")
-    async with factory.running():
-        states = await factory.wait([tid], timeout=args.timeout)
-    print(f"{tid}: {states[tid]}")
-    summary = factory.manager.pr_summaries.get(tid)
-    if summary:
-        print(summary.get("commit_message", ""))
-        print()
-        print(summary.get("pr_body", ""))
-    patch = factory.manager.patch_paths.get(tid)
-    if patch:
-        print()
-        print(f"Patch: {patch}")
-        print(f"Apply it from the repo root with:  git apply --index \"{patch}\"")
-    factory.close()
-    return 0 if states[tid] == "complete" else 1
+    try:
+        order = WorkOrder(title=args.title, description=args.desc or "", files=list(args.files or []))
+        tid = _find_open_order(factory, order)
+        if tid:
+            out(f"{tid}: resuming the unfinished task from the last run")
+        else:
+            tid = await factory.manager.submit(order)
+        d = factory.manager.directives[tid]
+        out(f"{tid}: {d.complexity}, {d.allocated_builders} builder(s) on {d.team_id}")
+        async with factory.running():
+            try:
+                await factory.wait([tid], timeout=args.timeout)
+            except asyncio.TimeoutError:
+                out(f"{tid}: not finished after {args.timeout:g}s")
+        state, lines = explain_task(factory, tid)
+        for line in lines:
+            out(line)
+        summary = factory.manager.pr_summaries.get(tid)
+        if summary:
+            out("")
+            out(summary.get("commit_message", ""))
+            out("")
+            out(summary.get("pr_body", ""))
+        patch = factory.manager.patch_paths.get(tid)
+        if patch:
+            out("")
+            out(f"Patch: {patch}")
+            out(f"Apply it from the target repo's root with:  git apply --index \"{patch}\"")
+        rejected = factory.manager.rejected_patches.get(tid)
+        if rejected:
+            out(f"The combined patch does not apply cleanly; saved as {rejected} for a manual merge.")
+    finally:
+        factory.close()
+    if state == "complete":
+        return EXIT_DONE
+    if state in ("quarantined", "failed"):
+        return EXIT_FAILED
+    return EXIT_IN_PROGRESS
 
 
 # --------------------------------------------------------------------------- CLI
@@ -456,10 +522,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.title:
         print("--real needs --title (and usually --files)", file=sys.stderr)
         return EXIT_NOT_READY
-    from foundry.claude_client import ClaudeError, resolve_claude_bin
+    from foundry.claude_client import ClaudeCodeClient, ClaudeError, resolve_claude_bin
 
     try:
-        claude_bin = resolve_claude_bin(config.claude_bin)
+        claude = ClaudeCodeClient(resolve_claude_bin(config.claude_bin), extra_args=claude_args(config))
+        validate = getattr(claude, "validate_launch", None)
+        if callable(validate):
+            validate()  # bad flags (e.g. quoting through claude.cmd) fail here, not on every ticket
     except ClaudeError as exc:
         print(f"Claude Code is not ready: {exc}", file=sys.stderr)
         return EXIT_NOT_READY
@@ -467,7 +536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not r.ok:
         print(r.message, file=sys.stderr)
         return EXIT_NOT_READY
-    return asyncio.run(run_real(args, config, claude_bin))
+    return asyncio.run(run_real(args, config, claude))
 
 
 if __name__ == "__main__":
