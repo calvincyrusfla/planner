@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Desktop-shortcut launcher for the Agent Department dashboard. No dependencies.
-//   node department/launch.mjs [--port 4300]
+//   node department/launch.mjs [--port 4300] [--browser-tab]
 // Starts server.mjs in the background if it isn't already running, opens the
-// dashboard in the default browser, then exits. Safe to run any number of times:
+// dashboard in its own app window (Edge/Chrome/Chromium --app mode; set
+// DEPT_BROWSER=<exe> to pick the browser, or --browser-tab for a normal tab in
+// the default browser), then exits. Safe to run any number of times:
 // a running dashboard is reused, never duplicated. Works from any cwd and without
 // a shell PATH (GUI launchers), since it only relies on process.execPath.
 import fs from 'node:fs';
@@ -87,27 +89,83 @@ function startServer() {
   fs.closeSync(log);
 }
 
-function openBrowser(url) {
+function openBrowserTab(url) {
   if (process.platform === 'darwin') detach('open', [url]);
   // Verbatim args so the empty `start` title stays "" instead of being escaped to \"\".
   else if (process.platform === 'win32') detach(winBin('cmd.exe'), ['/d', '/s', '/c', 'start', '""', url], { windowsVerbatimArguments: true });
   else detach('xdg-open', [url]);
 }
 
-let status = await probe();
-if (status === 'other') {
-  fail(`Port ${PORT} is in use by another program, not the dashboard. Free the port or set PORT to another number.`);
-}
-if (status === 'free') {
-  startServer();
-  for (let waited = 0; status !== 'dashboard' && waited < 10000; waited += 250) {
-    await sleep(250);
-    status = await probe();
-    if (status === 'other') fail(`Port ${PORT} is in use by another program, not the dashboard.`);
-  }
-  if (status !== 'dashboard') fail(`The dashboard did not start on port ${PORT} within 10 seconds. See ${LOG_FILE}`);
+// Where Edge, then Chrome, usually live on Windows. Pure, so it can be checked with a fake env.
+export function windowsBrowserCandidates(env) {
+  const roots = [env['ProgramFiles(x86)'], env.ProgramFiles, env.LOCALAPPDATA || env.LocalAppData].filter(Boolean);
+  const apps = ['Microsoft\\Edge\\Application\\msedge.exe', 'Google\\Chrome\\Application\\chrome.exe'];
+  return apps.flatMap((app) => roots.map((root) => path.win32.join(root, app)));
 }
 
-console.log(`Agent Department dashboard: ${URL_BASE}`);
-openBrowser(URL_BASE);
-process.exit(0);
+const MAC_BROWSERS = [
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+];
+const LINUX_BROWSERS = ['microsoft-edge', 'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
+
+function onPath(name) {
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    const full = dir && path.join(dir, name);
+    if (full && fs.existsSync(full)) return full;
+  }
+  return null;
+}
+
+function findAppBrowser() {
+  if (process.env.DEPT_BROWSER) return fs.existsSync(process.env.DEPT_BROWSER) ? process.env.DEPT_BROWSER : null;
+  if (process.platform === 'win32') return windowsBrowserCandidates(process.env).find((p) => fs.existsSync(p)) || null;
+  if (process.platform === 'darwin') return MAC_BROWSERS.find((p) => fs.existsSync(p)) || null;
+  for (const name of LINUX_BROWSERS) {
+    const found = onPath(name);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Chromium app mode: its own window and taskbar button, no tabs or address bar.
+// Uses the normal browser profile (no --user-data-dir), so no first-run screens.
+function openAppWindow(url) {
+  const browser = args.includes('--browser-tab') ? null : findAppBrowser();
+  if (!browser) return openBrowserTab(url);
+  // No windowsHide here: the browser window has to be visible.
+  detach(browser, [`--app=${url}`, '--window-size=1400,900'], { windowsHide: false });
+}
+
+async function main() {
+  let status = await probe();
+  if (status === 'other') {
+    fail(`Port ${PORT} is in use by another program, not the dashboard. Free the port or set PORT to another number.`);
+  }
+  if (status === 'free') {
+    startServer();
+    for (let waited = 0; status !== 'dashboard' && waited < 10000; waited += 250) {
+      await sleep(250);
+      status = await probe();
+      if (status === 'other') fail(`Port ${PORT} is in use by another program, not the dashboard.`);
+    }
+    if (status !== 'dashboard') fail(`The dashboard did not start on port ${PORT} within 10 seconds. See ${LOG_FILE}`);
+  }
+
+  console.log(`Agent Department dashboard: ${URL_BASE}`);
+  openAppWindow(URL_BASE);
+  process.exit(0);
+}
+
+// Run only when executed directly, so tests can import windowsBrowserCandidates.
+// Compare real paths (case-insensitive on Windows) so symlinks or drive-letter case don't matter.
+function isMain() {
+  try {
+    const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+    return norm(fs.realpathSync(process.argv[1])) === norm(fs.realpathSync(fileURLToPath(import.meta.url)));
+  } catch {
+    return false;
+  }
+}
+if (isMain()) await main();
