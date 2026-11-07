@@ -41,6 +41,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -49,6 +50,7 @@ from pydantic import ValidationError
 
 from foundry.schemas import (
     MAX_RETRIES,
+    SubtaskAllocation,
     BuilderSubmission,
     ClaudeResult,
     ContextSlice,
@@ -479,6 +481,10 @@ def parse_reviewer_reply(
         directives = []
     if not isinstance(directives, list):
         return invalid("directives is not a list")
+    known = set(LineDirective.model_fields)
+    directives = [
+        {k: v for k, v in d.items() if k in known} if isinstance(d, dict) else d for d in directives
+    ]
     try:
         return ReviewerVerdict(
             task_id=task_id,
@@ -515,6 +521,7 @@ class GateSummary:
     passed: bool
     results: list[DeterministicGateResult] = field(default_factory=list)
     first_failure: DeterministicGateResult | None = None
+    summary: str | None = None
 
 
 @dataclass
@@ -526,6 +533,9 @@ class ReviewItem:
     submission: BuilderSubmission
     gate_results: list[DeterministicGateResult]
     enqueued_at: float = field(default_factory=time.monotonic)
+    #: Pre-diff contents of the touched files (restored on REVISE/REJECTED).
+    snapshot: dict[str, str | None] | None = None
+    workspace: Path | None = None
 
     @property
     def ticket_id(self) -> Any:
@@ -619,23 +629,41 @@ class _WorkerBase:
         except (ValueError, KeyError) as exc:  # already terminal
             log.debug("quarantine(%s) skipped: %s", task_id, exc)
 
+    def _still_owned(self, ticket: Any) -> bool:
+        """False when someone else already reopened/finished the ticket (e.g. RESET_BUILDER_CONTEXT)."""
+        getter = getattr(self.queue, "get_ticket", None)
+        if getter is None:
+            return True
+        try:
+            current = getter(_get(ticket, "ticket_id"))
+        except Exception:
+            return True
+        if current is None:
+            return False
+        if _get(current, "status") != "claimed":
+            return False
+        return int(_get(current, "attempt", 0) or 0) == int(_get(ticket, "attempt", 0) or 0)
+
     def _send_back(self, ticket: Any, hint: str, *, reason: str) -> str:
         """Reopen ``ticket`` with ``hint`` (attempt + 1) or quarantine at the cap.
 
-        Returns ``"retry"`` or ``"quarantined"``.
+        Returns ``"retry"``, ``"quarantined"`` or ``"superseded"`` (the ticket
+        was already reopened or closed by someone else, so nothing is done).
         """
         task_id = _get(ticket, "task_id")
         ticket_id = _get(ticket, "ticket_id")
         attempt = int(_get(ticket, "attempt", 0) or 0)
         hint = hint if len(hint) <= MAX_FIX_HINT_CHARS else hint[: MAX_FIX_HINT_CHARS - 3] + "..."
-        ok: Any = False
-        if attempt < MAX_RETRIES:
-            try:
-                ok = self.queue.reopen_ticket(ticket_id, hint)
-            except (ValueError, KeyError) as exc:
-                log.debug("reopen_ticket(%s) refused: %s", ticket_id, exc)
-                ok = False
-        if ok is not False and ok is not None:
+        if not self._still_owned(ticket):
+            self._event("superseded", task_id, {"ticket_id": ticket_id, "agent_id": self.agent_id, "reason": reason})
+            return "superseded"
+        # The queue enforces the cap: past MAX_RETRIES it quarantines and returns False.
+        try:
+            ok: Any = self.queue.reopen_ticket(ticket_id, hint)
+        except (ValueError, KeyError) as exc:
+            log.debug("reopen_ticket(%s) refused: %s", ticket_id, exc)
+            ok = False
+        if ok:
             self._tm("record_retry", task_id)
             self._event("retry", task_id, {"ticket_id": ticket_id, "attempt": attempt + 1, "reason": reason, "fix_hint": hint})
             return "retry"
@@ -676,16 +704,23 @@ class _WorkerBase:
         self._tm("record_tokens", task_id, self.agent_id, self.role, result.input_tokens, result.output_tokens)
         return result
 
-    async def _condense(self, trace: str) -> str:
-        """1-line hint via ``foreman.condense_error_trace`` (sync or async), else a local fallback."""
+    async def _condense(self, trace: str, fallback: str | None = None) -> str:
+        """1-line hint via ``foreman.condense_error_trace`` (sync or async).
+
+        Falls back to ``fallback`` (e.g. ``GateOutcome.summary()``) and then to
+        a local deterministic condenser when the foreman is absent or fails
+        (``GemmaUnavailable`` included).
+        """
         fn = getattr(self.foreman, "condense_error_trace", None) if self.foreman is not None else None
-        if fn is not None:
+        if fn is not None and trace.strip():
             try:
                 hint = await _maybe_await(fn(trace))
                 if isinstance(hint, str) and hint.strip():
                     return _one_line(hint, MAX_FIX_HINT_CHARS)
             except Exception:
-                log.exception("foreman.condense_error_trace failed; using fallback")
+                log.warning("foreman.condense_error_trace failed; using fallback", exc_info=True)
+        if fallback and fallback.strip():
+            return _one_line(fallback)
         return _fallback_condense(trace)
 
 
@@ -740,6 +775,7 @@ class BuilderWorker(_WorkerBase):
         trust_cache: bool = True,
         on_state: Callable[[BuilderWorker], None] | None = None,
         on_task_complete: Callable[[str], Any] | None = None,
+        workspace: str | Path | None = None,
         claude_timeout: float = 600,
         cwd: str | None = None,
         backoff_attempts: int = 5,
@@ -755,6 +791,9 @@ class BuilderWorker(_WorkerBase):
             cwd=cwd,
             backoff_attempts=backoff_attempts,
         )
+        self.workspace: Path | None = Path(workspace) if workspace is not None else None
+        if self.workspace is None and (hasattr(gates, "validate_async") or hasattr(gates, "validate")):
+            raise ValueError("ValidationGates applies diffs into a workspace: pass workspace=")
         if slot < 1:
             raise ValueError("builder slots are 1-based")
         self.slot = slot
@@ -838,38 +877,51 @@ class BuilderWorker(_WorkerBase):
         info["allowed_files"] = list(info["allowed_files"] or [])
         return info
 
-    async def _context_for(self, ticket: Any, info: dict[str, Any]) -> ContextSlice:
-        """Ask the context engine for the pruned slice; fall back to a bare slice."""
+    async def _context_for(self, ticket: Any, info: dict[str, Any]) -> tuple[ContextSlice, int]:
+        """Ask the context engine for the pruned slice; returns ``(slice, tokens_saved)``.
+
+        Uses ``ContextEngine.abuild_slice`` (Gemma ranking) when the engine has
+        a Gemma client, else the deterministic ``build_slice``.  Engines with a
+        different shape may expose ``build_slice(subtask, objective, ...)``
+        returning a ``ContextSlice`` (or a dict).  No engine -> a bare slice.
+        """
         objective = _one_line(str(info["title"]).rstrip(".") + ".", 300)
         engine = self.context_engine
-        if engine is not None:
-            for name in ("build_slice", "slice_for", "context_for", "prune_context_slice"):
-                fn = getattr(engine, name, None)
-                if fn is None:
-                    continue
-                result = await _maybe_await(
-                    fn(
-                        objective=objective,
-                        acceptance_criteria=info["acceptance_criteria"],
-                        allowed_files=info["allowed_files"],
-                    )
-                )
-                if isinstance(result, ContextSlice):
-                    return result
-                if isinstance(result, Mapping):
-                    return ContextSlice.model_validate(result)
-                break
-        return ContextSlice(objective=objective, acceptance_criteria=info["acceptance_criteria"])
+        if engine is None:
+            return ContextSlice(objective=objective, acceptance_criteria=info["acceptance_criteria"]), 0
+        subtask = SubtaskAllocation(
+            subtask_id=str(_get(ticket, "subtask_id")),
+            title=str(info["title"]),
+            acceptance_criteria=info["acceptance_criteria"],
+            allowed_files=info["allowed_files"],
+        )
+        kwargs = {
+            "acceptance_criteria": info["acceptance_criteria"],
+            "allowed_files": info["allowed_files"],
+        }
+        afn = getattr(engine, "abuild_slice", None)
+        if afn is not None and getattr(engine, "gemma", None) is not None:
+            result = await afn(subtask, objective, **kwargs)
+        else:
+            result = await _maybe_await(engine.build_slice(subtask, objective, **kwargs))
+        stats = getattr(engine, "last_stats", None)
+        saved = int(getattr(stats, "tokens_saved", 0) or 0)
+        if isinstance(result, Mapping):
+            result = ContextSlice.model_validate(result)
+        if not saved:
+            # Rough estimate when the engine has no stats: ~10 tokens per elided line.
+            saved = max(0, result.source_line_count - result.snippet_line_count) * 10
+        return result, saved
 
     async def build_assignment(self, ticket: Any) -> TaskAssignment:
-        """Build the :class:`TaskAssignment` for ``ticket`` (context from the context engine)."""
+        """Build the :class:`TaskAssignment` for ``ticket`` (context from the context engine).
+
+        Records the pruning savings in telemetry (``tokens_saved`` source ``pruning``).
+        """
         info = self._subtask_info(ticket)
-        context = await self._context_for(ticket, info)
-        saved = getattr(context, "source_line_count", 0) - context.snippet_line_count
-        if saved > 0 and "pruning_recorded" not in self.scratch.get(str(_get(ticket, "ticket_id")), {}):
-            # ~10 tokens per elided source line (estimate_tokens(line) for an average 40-char line)
-            self._tm("record_tokens_saved", _get(ticket, "task_id"), "pruning", saved * 10)
-            self.scratch.setdefault(str(_get(ticket, "ticket_id")), {})["pruning_recorded"] = True
+        context, saved = await self._context_for(ticket, info)
+        if saved > 0:
+            self._tm("record_tokens_saved", _get(ticket, "task_id"), "pruning", saved)
         attempt = max(0, min(int(_get(ticket, "attempt", 0) or 0), MAX_RETRIES))
         return TaskAssignment(
             task_id=_get(ticket, "task_id"),
@@ -885,16 +937,29 @@ class BuilderWorker(_WorkerBase):
 
     # -- gates ------------------------------------------------------------------
     async def _run_gates(self, submission: BuilderSubmission, assignment: TaskAssignment) -> GateSummary:
-        """Run the deterministic gates and normalize the outcome."""
+        """Run the deterministic gates and normalize the outcome.
+
+        With a ``ValidationGates`` instance and a workspace this calls
+        ``validate_async(submission, workspace, allowed_files=...)``, which
+        applies the diff and runs the checks (an unapplicable diff is a failed
+        ``syntax`` result).  Other gate runners may expose
+        ``run(submission, assignment)`` or be plain callables.
+        """
         gates = self.gates
         if gates is None:
             return GateSummary(True)
-        fn = getattr(gates, "run", None)
-        if fn is None and callable(gates):
-            fn = gates
-        if fn is None:
-            raise TypeError("gates must provide run(submission, assignment) or be callable")
-        outcome = await _maybe_await(fn(submission, assignment))
+        if hasattr(gates, "validate_async") or hasattr(gates, "validate"):
+            if self.workspace is None:
+                raise TypeError("ValidationGates needs a workspace: pass workspace= to the worker/pool")
+            vfn = getattr(gates, "validate_async", None) or gates.validate
+            outcome = await _maybe_await(vfn(submission, self.workspace, allowed_files=assignment.allowed_files or None))
+        else:
+            fn = getattr(gates, "run", None)
+            if fn is None and callable(gates):
+                fn = gates
+            if fn is None:
+                raise TypeError("gates must provide validate_async/validate/run or be callable")
+            outcome = await _maybe_await(fn(submission, assignment))
         if isinstance(outcome, GateSummary):
             return outcome
         if hasattr(outcome, "passed") and hasattr(outcome, "results"):
@@ -902,10 +967,18 @@ class BuilderWorker(_WorkerBase):
             first = getattr(outcome, "first_failure", None)
             if first is None and not outcome.passed:
                 first = next((r for r in results if not r.passed), None)
-            return GateSummary(bool(outcome.passed), results, first)
+            summary_fn = getattr(outcome, "summary", None)
+            summary = summary_fn() if callable(summary_fn) else None
+            return GateSummary(bool(outcome.passed), results, first, summary)
         results = list(outcome or [])
         first = next((r for r in results if not r.passed), None)
         return GateSummary(first is None, results, first)
+
+    def _snapshot(self, diff: str) -> dict[str, str | None] | None:
+        """Contents of the files ``diff`` touches (None = absent), so a rejected diff can be undone."""
+        if self.workspace is None:
+            return None
+        return _snapshot_files(self.workspace, extract_diff_paths(diff))
 
     def _record_gate_results(self, results: Sequence[DeterministicGateResult]) -> None:
         fn = getattr(self.queue, "record_gate_result", None)
@@ -929,40 +1002,18 @@ class BuilderWorker(_WorkerBase):
         task_id = _get(ticket, "task_id")
         if self._task_state(task_id) in _TERMINAL_STATES:
             return "skipped"
-        self._set_state(task_id, TaskState.BUILDING)
         assignment = await self.build_assignment(ticket)
         started = time.monotonic()
 
         # 1. exact-match solution cache: a hit never calls Claude.
         cached = self.cache.lookup(assignment) if self.cache is not None else None
         if cached:
-            prompt = build_builder_prompt(assignment)
-            submission = BuilderSubmission(
-                task_id=assignment.task_id,
-                subtask_id=assignment.subtask_id,
-                builder_id=assignment.builder_id,
-                status="ready_for_review",
-                modified_files=extract_diff_paths(cached),
-                diff=cached,
-                self_check={"cache_hit": True},
-            )
-            self._set_state(task_id, TaskState.VALIDATING)
-            gates = await self._run_gates(submission, assignment)
-            self._record_gate_results(gates.results)
-            if gates.passed:
-                self._tm("record_tokens_saved", task_id, "cache", _estimate_tokens(prompt) + _estimate_tokens(cached))
-                self._event("cache_hit", task_id, {"ticket_id": _get(ticket, "ticket_id"), "builder_id": self.agent_id})
-                self._tm("record_duration", task_id, "build", time.monotonic() - started)
-                if self.trust_cache:
-                    self.queue.complete_ticket(_get(ticket, "ticket_id"))
-                    await _finish_if_done(self, task_id, self.on_task_complete)
-                    return "cached"
-                await self._enqueue_review(ticket, assignment, submission, gates.results)
-                return "review"
-            # A stale cached diff no longer passes: build normally, no retry burned.
-            self._set_state(task_id, TaskState.BUILDING)
+            outcome = await self._try_cached(ticket, assignment, cached, started)
+            if outcome is not None:
+                return outcome
+            # A stale cached diff no longer passes its gates: build normally, no retry burned.
 
-        # 2. Claude
+        # 2. Claude (inside limiter.slot + call_with_backoff)
         prompt = build_builder_prompt(assignment)
         self.scratch["last_prompt"] = prompt
         try:
@@ -979,7 +1030,7 @@ class BuilderWorker(_WorkerBase):
                 ticket, _one_line(f"Claude call failed: {result.error or 'error'}"), reason="claude_error"
             )
 
-        # 3. parse the reply (diff-only contract)
+        # 3. parse the reply (diff-only contract); a bad reply never reaches gates or reviewer
         submission = parse_builder_reply(result.text, assignment)
         self._event(
             "submission",
@@ -990,22 +1041,53 @@ class BuilderWorker(_WorkerBase):
         if submission.status == "blocked":
             self._tm("record_gate_failure", task_id)
             note = submission.blocker_notes or "submission blocked"
-            return self._send_back(ticket, _one_line(f"Fix the reply format: {note}. {_SHORT_CONTRACT}", 300), reason="blocked")
+            return self._send_back(ticket, _one_line(f"Fix the reply: {note}. {_SHORT_CONTRACT}", 300), reason="blocked")
 
         # 4. deterministic gates, short-circuit before any reviewer
         self._set_state(task_id, TaskState.VALIDATING)
+        snapshot = self._snapshot(submission.diff)
         gates = await self._run_gates(submission, assignment)
         self._record_gate_results(gates.results)
         if not gates.passed:
+            _restore_files(self.workspace, snapshot)
             self._tm("record_gate_failure", task_id)
             failure = gates.first_failure
-            trace = "\n".join(x for x in (getattr(failure, "stdout", ""), getattr(failure, "stderr", "")) if x)
-            hint = await self._condense(trace or getattr(failure, "note", "") or "gate failed")
+            trace = (getattr(failure, "stderr", "") or "") + "\n" + (getattr(failure, "stdout", "") or "")
+            hint = await self._condense(trace, gates.summary or getattr(failure, "note", None))
             check = getattr(failure, "check_type", "gate")
-            self._set_state(task_id, TaskState.BUILDING)
             return self._send_back(ticket, f"[{check}] {hint}", reason=f"gate_{check}")
 
-        await self._enqueue_review(ticket, assignment, submission, gates.results)
+        await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot)
+        return "review"
+
+    async def _try_cached(self, ticket: Any, assignment: TaskAssignment, cached: str, started: float) -> str | None:
+        """Use an approved cached diff; returns the outcome, or None if it no longer passes."""
+        task_id = assignment.task_id
+        submission = BuilderSubmission(
+            task_id=task_id,
+            subtask_id=assignment.subtask_id,
+            builder_id=assignment.builder_id,
+            status="ready_for_review",
+            modified_files=extract_diff_paths(cached),
+            diff=cached,
+            self_check={"cache_hit": True},
+        )
+        self._set_state(task_id, TaskState.VALIDATING)
+        snapshot = self._snapshot(cached)
+        gates = await self._run_gates(submission, assignment)
+        self._record_gate_results(gates.results)
+        if not gates.passed:
+            _restore_files(self.workspace, snapshot)
+            self._event("cache_stale", task_id, {"ticket_id": _get(ticket, "ticket_id")})
+            return None
+        prompt = build_builder_prompt(assignment)
+        self._tm("record_tokens_saved", task_id, "cache", _estimate_tokens(prompt) + _estimate_tokens(cached))
+        self._event("cache_hit", task_id, {"ticket_id": _get(ticket, "ticket_id"), "builder_id": self.agent_id})
+        self._tm("record_duration", task_id, "build", time.monotonic() - started)
+        if self.trust_cache:
+            await _complete_ticket(self, _get(ticket, "ticket_id"), task_id, self.on_task_complete)
+            return "cached"
+        await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot)
         return "review"
 
     async def _enqueue_review(
@@ -1014,36 +1096,27 @@ class BuilderWorker(_WorkerBase):
         assignment: TaskAssignment,
         submission: BuilderSubmission,
         results: list[DeterministicGateResult],
+        snapshot: dict[str, str | None] | None = None,
     ) -> None:
         self._set_state(assignment.task_id, TaskState.REVIEWING)
         self._tm("mark_review_wait", assignment.task_id)
-        await self.review_inbox.put(ReviewItem(ticket, assignment, submission, list(results)))
+        await self.review_inbox.put(
+            ReviewItem(ticket, assignment, submission, list(results), snapshot=snapshot, workspace=self.workspace)
+        )
 
 
 _SHORT_CONTRACT = "Reply with exactly one ```diff block holding a unified diff of the allowed files."
 
 
-async def _finish_if_done(worker: _WorkerBase, task_id: str, callback: Callable[[str], Any] | None) -> bool:
-    """Mark ``task_id`` complete when every one of its tickets is done."""
-    queue = worker.queue
-    done: bool | None = None
-    for name in ("all_tickets_done", "task_tickets_done"):
-        fn = getattr(queue, name, None)
-        if fn is not None:
-            done = bool(fn(task_id))
-            break
-    if done is None:
-        lister = getattr(queue, "tickets_for", None) or getattr(queue, "list_tickets", None)
-        if lister is None:
-            return False
-        tickets = list(lister(task_id))
-        done = bool(tickets) and all(_get(t, "status") == "done" for t in tickets)
-    if not done:
-        return False
-    if worker._task_state(task_id) == TaskState.COMPLETE.value:
-        return True
-    worker._set_state(task_id, TaskState.REVIEWING)
-    if not worker._set_state(task_id, TaskState.COMPLETE, "all subtasks approved"):
+async def _complete_ticket(
+    worker: _WorkerBase, ticket_id: Any, task_id: str, callback: Callable[[str], Any] | None
+) -> bool:
+    """``queue.complete_ticket``; when it reports the last ticket done, fire ``callback``.
+
+    The queue itself moves the task to ``complete`` when every ticket is done.
+    """
+    all_done = worker.queue.complete_ticket(ticket_id)
+    if not all_done:
         return False
     worker._event("task_complete", task_id, {"by": worker.agent_id})
     if callback is not None:
@@ -1052,6 +1125,39 @@ async def _finish_if_done(worker: _WorkerBase, task_id: str, callback: Callable[
         except Exception:
             log.exception("on_task_complete(%s) failed", task_id)
     return True
+
+
+def _snapshot_files(workspace: Path, paths: Iterable[str]) -> dict[str, str | None]:
+    """Read the current text of ``paths`` under ``workspace`` (None when absent)."""
+    snap: dict[str, str | None] = {}
+    root = workspace.resolve()
+    for rel in paths:
+        target = (root / rel).resolve()
+        if not target.is_relative_to(root):
+            continue  # apply_diff refuses these anyway
+        try:
+            snap[rel] = target.read_text(encoding="utf-8") if target.is_file() else None
+        except (OSError, UnicodeDecodeError):
+            snap[rel] = None
+    return snap
+
+
+def _restore_files(workspace: Path | None, snapshot: dict[str, str | None] | None) -> None:
+    """Undo an applied diff: write back snapshotted files, delete ones that did not exist."""
+    if workspace is None or not snapshot:
+        return
+    root = workspace.resolve()
+    for rel, text in snapshot.items():
+        target = root / rel
+        try:
+            if text is None:
+                if target.is_file():
+                    target.unlink()
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+        except OSError:
+            log.exception("could not restore %s", rel)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1234,7 @@ class ReviewerWorker(_WorkerBase):
                 raise
             except Exception as exc:
                 log.exception("%s crashed reviewing %s", self.agent_id, item.ticket_id)
+                _restore_files(item.workspace, item.snapshot)
                 self._send_back(item.ticket, _one_line(f"review error: {exc}"), reason="review_error")
             finally:
                 self.busy = False
@@ -1136,7 +1243,9 @@ class ReviewerWorker(_WorkerBase):
     async def review(self, item: ReviewItem) -> ReviewerVerdict | None:
         """Review one submission and act on the verdict; ``None`` if the task is already terminal."""
         task_id = item.assignment.task_id
-        if self._task_state(task_id) in _TERMINAL_STATES:
+        if self._task_state(task_id) in _TERMINAL_STATES or not self._still_owned(item.ticket):
+            # Quarantined/superseded meanwhile: no Claude call, undo the applied diff.
+            _restore_files(item.workspace, item.snapshot)
             return None
         self._tm("mark_review_start", task_id)
         retry = item.assignment.attempt
@@ -1170,12 +1279,12 @@ class ReviewerWorker(_WorkerBase):
                 self.cache.store(item.assignment, item.submission.diff)
             if self.on_approved is not None:
                 await _maybe_await(self.on_approved(item, verdict))
-            self.queue.complete_ticket(item.ticket_id)
-            await _finish_if_done(self, task_id, self.on_task_complete)
+            await _complete_ticket(self, item.ticket_id, task_id, self.on_task_complete)
         elif verdict.verdict == "REVISE":
-            self._set_state(task_id, TaskState.BUILDING)
+            _restore_files(item.workspace, item.snapshot)
             self._send_back(item.ticket, directives_to_hint(verdict.directives), reason="revise")
         else:
+            _restore_files(item.workspace, item.snapshot)
             reason = directives_to_hint(verdict.directives).replace("Reviewer asked for changes", "Reviewer rejected")
             self._quarantine(task_id, _one_line(reason, 300))
             self._event("rejected", task_id, {"ticket_id": item.ticket_id, "reviewer_id": self.agent_id})
@@ -1187,8 +1296,6 @@ class ReviewerWorker(_WorkerBase):
             try:
                 fn(verdict)
                 return
-            except TypeError:
-                pass
             except Exception:  # pragma: no cover - defensive
                 log.exception("record_verdict failed")
         self._event("verdict", verdict.task_id, {**verdict.model_dump(), "ticket_id": item.ticket_id})
@@ -1228,6 +1335,7 @@ class TeamPool:
         trust_cache: bool = True,
         on_task_complete: Callable[[str], Any] | None = None,
         on_approved: Callable[[ReviewItem, ReviewerVerdict], Any] | None = None,
+        workspace: str | Path | None = None,
         claude_timeout: float = 600,
         cwd: str | None = None,
     ) -> None:
@@ -1262,6 +1370,7 @@ class TeamPool:
                 trust_cache=trust_cache,
                 on_state=self._on_builder_state,
                 on_task_complete=self._task_completed,
+                workspace=workspace,
                 claude_timeout=claude_timeout,
                 cwd=cwd,
             )
@@ -1378,11 +1487,17 @@ class TeamPool:
         return self.builders[slot - 1]
 
     def reset_builder_context(self, slot: int) -> None:
-        """RESET_BUILDER_CONTEXT: clear a builder slot's scratch state."""
+        """RESET_BUILDER_CONTEXT: clear a builder slot's scratch state.
+
+        The Floor Manager reopens the stalled ticket itself; the worker notices
+        (``_still_owned``) and drops its stale result instead of acting on it.
+        """
         self.builder(slot).reset_context()
 
-    def promote_peer_reviewer(self, slot: int | None = None, seconds: float = 300.0) -> str | None:
-        """PROMOTE_PEER_REVIEWER: run an extra reviewer as builder ``slot`` for ``seconds``.
+    reset_builder = reset_builder_context
+
+    def promote_peer_reviewer(self, slot: int | None = None, minutes: float = 15.0) -> str | None:
+        """PROMOTE_PEER_REVIEWER: run an extra reviewer as builder ``slot`` for ``minutes``.
 
         Picks the highest idle builder slot when ``slot`` is None.  The peer
         shares the team's review inbox and stops when the window ends or the
@@ -1407,7 +1522,7 @@ class TeamPool:
         async def run_peer() -> None:
             async def expire() -> None:
                 try:
-                    await asyncio.wait_for(pool_stop.wait(), timeout=seconds)
+                    await asyncio.wait_for(pool_stop.wait(), timeout=minutes * 60.0)
                 except asyncio.TimeoutError:
                     pass
                 peer_stop.set()

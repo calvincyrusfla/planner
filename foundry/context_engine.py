@@ -81,11 +81,7 @@ _CAMEL = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
 _BACKTICK = re.compile(r"`([^`]+)`")
 
 _STOPWORDS = frozenset(
-    """a an and are as at be by can for from has have if in into is it its of on or
-    should that the then this to was were when where which will with without must not
-    no yes all any each every one two new add adds added make makes use uses using
-    return returns given file files code test tests function functions class method
-    def self cls none true false str int float bool list dict set tuple""".split()
+    ["a", "an", "and", "are", "as", "at", "be", "by", "can", "for", "from", "has", "have", "if", "in", "into", "is", "it", "its", "of", "on", "or", "should", "that", "the", "then", "this", "to", "was", "were", "when", "where", "which", "will", "with", "without", "must", "not", "no", "yes", "all", "any", "each", "every", "one", "two", "new", "add", "adds", "added", "make", "makes", "use", "uses", "using", "return", "returns", "given", "file", "files", "code", "test", "tests", "function", "functions", "class", "method", "def", "self", "cls", "none", "true", "false", "str", "int", "float", "bool", "list", "dict", "set", "tuple"]
 )
 
 
@@ -316,7 +312,7 @@ def _header_colon(line: str) -> int:
             depth += 1
         elif ch in ")]}":
             depth -= 1
-        elif ch == ":" and depth == 0 and not line[i + 1 : i + 2] == "=":
+        elif ch == ":" and depth == 0 and line[i + 1:i + 2] != "=":
             return i
     return -1
 
@@ -893,7 +889,7 @@ class ContextEngine:
 
 def _strip_fence(text: str) -> str:
     """Remove a surrounding ```json fence if present."""
-    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     return m.group(1) if m else text.strip()
 
 
@@ -1150,7 +1146,7 @@ def condense_error_trace(trace: str, repo_root: str | Path | None = None) -> str
         result = _condense_pytest(lines, root) or _condense_ruff(lines, root)
         if result:
             return result
-    except Exception:  # noqa: BLE001 - a trace condenser must never crash the factory
+    except Exception:  # noqa: BLE001, S110 - a trace condenser must never crash the factory
         pass
     meaningful = [line.strip() for line in lines if line.strip()]
     loc_match = next((m for m in (_ANY_LOC.search(line) for line in meaningful) if m), None)
