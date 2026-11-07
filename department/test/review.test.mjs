@@ -756,3 +756,109 @@ test('alpha-1: deleting or pausing a task in review does not settle the round on
   core.deleteTask(b.s, b.task.id);
   assert.ok(!b.s.log.some((e) => /approved by all reviewers|back to the builders/.test(e.message)));
 });
+
+// ---------- alpha-1 (round 4): sign-off only covers the work that was reviewed ----------
+
+const signOffRefused = isDeptError(/was worked on but has no reviewer sign-off/);
+
+test('alpha-1 (round 4): approve then changes in the same round voids sign-off (repro)', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Repro' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  assert.equal(task.approvedRound, 1);
+  verdict(s, task.id, 'alpha', 'changes', { note: 'oops' });
+  assert.equal(task.status, 'active');
+  assert.equal(task.approvedRound, 0);
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.equal(core.reviewGate(s, task).ok, false);
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), signOffRefused);
+  assert.equal(task.status, 'paused');
+});
+
+test('alpha-1 (round 4): approve, change, approve again in the same round re-sets approvedRound', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Two teams', size: 'large' });
+  core.unassignTeam(s, task.id, 'charlie');
+  assert.deepEqual(teamsOn(s, task.id), ['alpha', 'bravo']);
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  verdict(s, task.id, 'alpha', 'changes', { note: 'hm' }); // bravo pending: round stays open
+  assert.equal(task.status, 'review');
+  verdict(s, task.id, 'alpha', 'approved');
+  assert.equal(task.approvedRound, 0);
+  verdict(s, task.id, 'bravo', 'approved');
+  assert.equal(task.status, 'review');
+  assert.equal(task.approvedRound, 1);
+  assert.equal(core.reviewGate(s, task).ok, true);
+});
+
+test('alpha-1 (round 4): a reopened done task needs a new review', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Reopen' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  core.updateTask(s, task.id, { status: 'done' });
+  assert.equal(task.status, 'done');
+  core.updateTask(s, task.id, { status: 'queued' }); // dispatch hands it back to alpha
+  assert.equal(task.status, 'active');
+  assert.equal(task.approvedRound, 0);
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), isDeptError(/needs reviewer sign-off/));
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), signOffRefused);
+});
+
+test('alpha-1 (round 4): a reopened cancelled task loses its sign-off', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Cancel' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  core.updateTask(s, task.id, { status: 'cancelled' });
+  core.updateSettings(s, { autoDispatch: false });
+  core.updateTask(s, task.id, { status: 'queued' });
+  assert.equal(task.status, 'queued');
+  assert.equal(task.approvedRound, 0);
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), signOffRefused);
+});
+
+test('alpha-1 (round 4): taking an approved task from review back to active clears sign-off', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'More work' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  core.updateTask(s, task.id, { status: 'active' });
+  assert.equal(task.approvedRound, 0);
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), isDeptError(/needs reviewer sign-off/));
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), signOffRefused);
+});
+
+test('alpha-1 (round 4): a team joining a fully approved task in review is pending and voids sign-off', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Join' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  assert.equal(task.approvedRound, 1);
+  core.assignTeam(s, task.id, 'bravo');
+  assert.equal(task.status, 'review');
+  assert.equal(task.approvedRound, 0);
+  assert.deepEqual(core.reviewStatus(s, task).pending, ['bravo']);
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), isDeptError(/Team Bravo/));
+  verdict(s, task.id, 'bravo', 'approved');
+  assert.equal(task.approvedRound, 1);
+});
+
+test('alpha-1 (round 4): a team joining an approved task outside review voids sign-off until a new round', () => {
+  const s = fresh();
+  const { task } = core.addTask(s, { title: 'Join later' });
+  toReview(s, task.id);
+  verdict(s, task.id, 'alpha', 'approved');
+  core.updateTask(s, task.id, { status: 'paused' });
+  assert.equal(core.reviewGate(s, task).ok, true, 'paused after full approval keeps sign-off');
+  core.assignTeam(s, task.id, 'bravo');
+  assert.equal(task.status, 'active');
+  assert.equal(task.approvedRound, 0);
+  core.unassignTeam(s, task.id, 'bravo');
+  assert.equal(task.status, 'paused');
+  assert.throws(() => core.updateTask(s, task.id, { status: 'done' }), signOffRefused);
+});

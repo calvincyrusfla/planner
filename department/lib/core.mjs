@@ -207,6 +207,10 @@ function attach(state, task, team, { focus = '', by = 'dispatcher' } = {}) {
   team.progress = task.progress;
   setAgents(team, 'assigned');
   if (!task.teamHistory.includes(team.id)) task.teamHistory.push(team.id);
+  // Sign-off only covers the work that was reviewed: a team joining a task
+  // whose round was fully approved voids it. In review, that team is simply
+  // pending; otherwise sign-off is gone until a new review round.
+  task.approvedRound = 0;
   // A team joining a task in review joins the review: its reviewer is pending.
   if (task.status === 'review') setAgent(reviewerOf(team), 'working', `Reviewing round ${task.reviewRound}`);
   else task.status = 'active';
@@ -355,6 +359,10 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
         forced = true;
       }
     }
+    // Reopening a finished task, or taking a task out of review for more work,
+    // voids any sign-off: the work changes after it was reviewed.
+    const reopened = (task.status === 'done' || task.status === 'cancelled') && OPEN.has(status);
+    if (reopened || (task.status === 'review' && status === 'active')) task.approvedRound = 0;
     if (status === 'review') {
       task.reviewRound = (task.reviewRound || 0) + 1;
       task.reviews ||= {};
@@ -386,16 +394,21 @@ export function updateTask(state, taskId, patch = {}, { by = 'user' } = {}) {
 // the task can be marked done (unless forced).
 
 // Can `task` be marked done without force? Mirrors updateTask's done gate.
-// - Teams on the task: each must have approved the current round.
+// - Teams on the task: each must have approved the current round, and that
+//   round's sign-off must still stand (approvedRound === reviewRound).
 // - No teams, but worked on before: its latest round must have been approved
 //   by all reviewers (task.approvedRound === task.reviewRound).
 // - Never worked by a team: always ok.
 export function reviewGate(state, task) {
   if (typeof task === 'string') task = getTask(state, task);
   const onTask = teamsOn(state, task.id);
+  const signedOff = task.reviewRound > 0 && task.approvedRound === task.reviewRound;
   if (onTask.length) {
     const { changes, pending } = reviewStatus(state, task);
-    const missing = onTask.map((t) => t.id).filter((id) => changes.includes(id) || pending.includes(id));
+    let missing = onTask.map((t) => t.id).filter((id) => changes.includes(id) || pending.includes(id));
+    // Approvals from a round whose sign-off was voided (reopened, taken back to
+    // active) no longer count: every team on the task must review again.
+    if (!missing.length && !signedOff) missing = onTask.map((t) => t.id);
     if (!missing.length) return { ok: true, missing: [], message: '' };
     const names = missing.map((id) => getTeam(state, id).name).join(', ');
     return {
@@ -405,7 +418,6 @@ export function reviewGate(state, task) {
     };
   }
   const worked = Array.isArray(task.teamHistory) && task.teamHistory.length > 0;
-  const signedOff = task.reviewRound > 0 && task.approvedRound === task.reviewRound;
   if (!worked || signedOff) return { ok: true, missing: [], message: '' };
   return { ok: false, missing: [], message: `${task.id} was worked on but has no reviewer sign-off. Mark it done with force.` };
 }
@@ -485,6 +497,7 @@ function settleReview(state, task) {
       }
     } else {
       task.status = 'active'; // back to the builders
+      task.approvedRound = 0; // sign-off is void once a reviewer asks for changes
       syncActive(task);
       const names = status.changes.map((id) => getTeam(state, id).name).join(', ');
       log(state, { kind: 'review', taskId: task.id, message: `${task.id} back to the builders: changes requested by ${names}` });
@@ -602,6 +615,13 @@ export function normalize(state) {
     if (team.taskId && reviewer && reviewer.status === 'idle') reviewer.status = 'assigned';
     if (team.taskId) team.assignedAt ||= tasks.get(team.taskId).startedAt || now();
     else team.assignedAt = null;
+  }
+  // States saved before approvedRound existed: a task in review whose teams
+  // all approved the current round is signed off.
+  for (const task of state.tasks) {
+    if (task.status !== 'review' || !task.reviewRound || task.approvedRound === task.reviewRound) continue;
+    const st = reviewStatus(state, task);
+    if (st.approved.length && !st.changes.length && !st.pending.length) task.approvedRound = task.reviewRound;
   }
   return state;
 }
