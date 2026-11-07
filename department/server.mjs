@@ -4,7 +4,7 @@
 // Local mode (no hub configured): the board lives in department/data/state.json.
 // Hub mode (DEPT_HUB_URL or data/hub.json): the shared board on the Netlify site is
 // the source of truth; mutations are forwarded to it, it is polled every 3 s and
-// state.json is kept only as an offline cache. --hub-off or DEPT_HUB=off forces local.
+// data/hub-cache.json is kept as an offline cache (state.json is left untouched). --hub-off or DEPT_HUB=off forces local.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
