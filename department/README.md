@@ -199,7 +199,7 @@ The band at the top of the dashboard shows how much of your Claude plan you have
 - **5-hour limit:** the rolling 5-hour window.
 - **Weekly limit:** the 7-day window.
 
-Each meter shows the percentage used, a bar and a live countdown to when that window resets. The bar is green below 70%, amber from 70% and red from 90%. Below the meters, a line says how old the numbers are and which machine sent them.
+Each meter shows the percentage used, a bar and a live countdown to when that window resets. The bar is green below 70%, amber from 70% and red from 90%. Below the meters, a line says how old the numbers are and which machine sent them (its computer name, or **Claude cloud** for a cloud session).
 
 ### Where the numbers come from
 
@@ -215,7 +215,9 @@ Do this once on your PC. Open PowerShell in the repo folder and run:
 npm run usage-meter
 ```
 
-Then close and restart Claude Code. The meter fills in the next time a Claude Code session refreshes its status bar.
+Then close and restart Claude Code. The meter fills in after Claude Code's next reply.
+
+The status line points at this folder and at the Node you ran it with. If you move the folder or switch Node versions, run `npm run usage-meter` again.
 
 This adds a `statusLine` entry to your Claude Code user settings, `%USERPROFILE%\.claude\settings.json` (`~/.claude/settings.json` on macOS and Linux, or the folder in `CLAUDE_CONFIG_DIR` if you set it). It saves a backup first, as `settings.json.bak-agent-department`. If you already have a different status line, it leaves it alone and shows you what's there. To replace it anyway:
 
@@ -235,7 +237,7 @@ npm run usage-meter -- --dry-run
 npm run usage-meter:remove
 ```
 
-This removes only the usage meter's status line. Restart Claude Code afterwards.
+This removes only the usage meter's status line; any other status line is left alone. Restart Claude Code afterwards.
 
 ### Why the numbers can be out of date
 
@@ -249,6 +251,12 @@ To see the current meter in the terminal:
 
 ```bash
 node department/dept.mjs usage
+```
+
+It shows both limits, when they reset, and how old the last report is. To store a report by hand, for example to test the dashboard (`--source` is optional):
+
+```bash
+node department/dept.mjs usage report --five 42 --five-reset 2026-11-07T15:10:00Z --week 18 --week-reset 2026-11-12T09:00:00Z --source PC
 ```
 
 ## How the agents use it
