@@ -93,6 +93,13 @@ export function importState(state, other) {
       }
     }
     state.tasks.push(task);
+    // Credit each team with the closed time it spent on this task on the other
+    // board. Only added tasks count, so importing the same board twice can't
+    // double a team's total.
+    for (const [teamId, ms] of Object.entries(task.teamMs || {})) {
+      const team = state.teams.find((t) => t.id === teamId);
+      if (team && Number.isFinite(ms)) team.totalMs = (team.totalMs || 0) + ms;
+    }
   }
 
   // Merge logs: entries about added tasks are new by definition (rewritten);

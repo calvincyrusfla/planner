@@ -54,7 +54,7 @@ function hubFailed(err) {
   sync.ok = false;
   sync.error = err.code === 'HUB_UNREACHABLE' ? err.message || 'unreachable' : err.message;
   if (changed) {
-    console.warn(`Shared board: ${sync.error}`);
+    console.warn(sync.error.startsWith('Shared board') ? sync.error : `Shared board: ${sync.error}`);
     broadcast();
   }
 }
@@ -108,6 +108,7 @@ async function hubMutate(op) {
     }
     throw err; // the hub's own error (400/404/409/401...) passes through
   }
+  if (!sync.ok) console.log(`Shared board: reconnected (rev ${out.rev})`);
   sync.ok = true;
   sync.error = null;
   sync.lastSync = new Date().toISOString();

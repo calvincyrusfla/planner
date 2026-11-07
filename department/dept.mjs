@@ -132,8 +132,20 @@ async function hubCommand(sub, pos, opt) {
       const file = pos[0] || DATA_FILE;
       if (!fs.existsSync(file)) throw new core.DeptError(`Nothing to push: ${file} does not exist`);
       const local = load(file);
+      // importState skips a task only if id AND createdAt match, but it renumbers
+      // what it adds, so a second push would duplicate. Drop tasks the hub already
+      // has under another id (same createdAt + title), and their log entries.
+      const remote = (await hubGet(cfg)).state;
+      const there = new Set(remote.tasks.map((t) => `${t.createdAt}\u0000${t.title}`));
+      const sameId = new Set(remote.tasks.map((t) => `${t.id}\u0000${t.createdAt}`));
+      const dropped = new Set(local.tasks.filter((t) => there.has(`${t.createdAt}\u0000${t.title}`) && !sameId.has(`${t.id}\u0000${t.createdAt}`)).map((t) => t.id));
+      if (dropped.size) {
+        local.tasks = local.tasks.filter((t) => !dropped.has(t.id));
+        local.log = (local.log || []).filter((e) => !dropped.has(e.taskId));
+        for (const team of local.teams || []) if (dropped.has(team.taskId)) team.taskId = null;
+      }
       const { result, state, rev } = await hubOp(cfg, { type: 'importState', args: { state: local } });
-      console.log(`Pushed ${file} to ${cfg.url}: ${result.added} added, ${result.skipped} already there`);
+      console.log(`Pushed ${file} to ${cfg.url}: ${result.added} added, ${result.skipped + dropped.size} already there`);
       for (const [from, to] of Object.entries(result.idMap || {})) if (from !== to) console.log(`  ${from} → ${to}`);
       console.log(`Shared board now: rev ${rev}, ${state.tasks.length} tasks (${countOpen(state)} open)`);
       return;

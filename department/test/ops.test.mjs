@@ -269,3 +269,15 @@ test('importState result is JSON-serialisable', () => {
   const r = op(s, 'importState', { state: json(boardWith(['A'])) });
   assert.deepEqual(json(r), r);
 });
+
+test('importState credits team time from added tasks only once', () => {
+  const other = core.createInitialState();
+  const t = core.addTask(other, { title: 'Done elsewhere' }).task;
+  core.updateTask(other, t.id, { status: 'done' });
+  t.teamMs = { alpha: 60_000 };
+  const here = core.createInitialState();
+  applyOp(here, { type: 'importState', args: { state: other } });
+  assert.equal(here.teams.find((x) => x.id === 'alpha').totalMs, 60_000);
+  applyOp(here, { type: 'importState', args: { state: other } });
+  assert.equal(here.teams.find((x) => x.id === 'alpha').totalMs, 60_000);
+});
