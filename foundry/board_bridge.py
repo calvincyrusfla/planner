@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import queue as queue_mod
 import shutil
@@ -116,7 +117,8 @@ class BoardBridge:
     Args:
         mode: ``"auto"`` (dashboard, then CLI, then no-op), ``"dry"`` (record
             ops in :attr:`ops`, no I/O) or ``"off"`` (drop everything).
-        dashboard_url: base URL of the local dashboard.
+        dashboard_url: base URL of the local dashboard (default:
+            ``FOUNDRY_DASHBOARD_URL``, else :data:`DEFAULT_DASHBOARD_URL`).
         timeout: timeout in seconds for reading the board state from the
             dashboard (and the minimum for everything else).
         op_timeout: timeout in seconds for one op POST to the dashboard (it
@@ -139,7 +141,7 @@ class BoardBridge:
         self,
         mode: BridgeMode = "auto",
         *,
-        dashboard_url: str = DEFAULT_DASHBOARD_URL,
+        dashboard_url: str | None = None,
         timeout: float = 3.0,
         op_timeout: float = DEFAULT_OP_TIMEOUT,
         stall_timeout: float | None = None,
@@ -151,7 +153,7 @@ class BoardBridge:
         if mode not in ("auto", "off", "dry"):
             raise ValueError(f"unknown board bridge mode {mode!r}")
         self.mode: BridgeMode = mode
-        self.dashboard_url = dashboard_url.rstrip("/")
+        self.dashboard_url = (dashboard_url or os.environ.get("FOUNDRY_DASHBOARD_URL") or DEFAULT_DASHBOARD_URL).rstrip("/")
         self.timeout = timeout
         self.op_timeout = max(float(op_timeout), float(timeout))
         # one op can take: a state read (dashboard + CLI json) and the op (dashboard + CLI)

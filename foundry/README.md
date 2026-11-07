@@ -154,23 +154,48 @@ Before doing anything, real mode runs two preflight checks. If either fails it p
 
 It then sizes the order and runs the teams with `ClaudeCodeClient` and `OllamaGemmaClient`. Claude Code must be logged in under your subscription.
 
-When the run ends, real mode prints each task's state. As applicable, it also prints the quarantine reason and the last infrastructure error. For a task that isn't finished it prints the real cause:
+When the reviewer has approved, real mode waits (up to 10 minutes) for the Shop Foreman to draft the commit message and write the patch, then shuts the line down. It no longer stops halfway: earlier versions left before a real Gemma draft finished, so nothing was written and only the task state was printed.
+
+For a finished task it prints the commit message's first line, the full paths of the patch and the `.md`, and the exact commands to run next. For example, on Windows:
+
+```text
+F-001: S, 1 builder(s) on alpha
+F-001: approved - the Shop Foreman is writing the commit message and the patch...
+F-001: complete (S, 1 builder(s) on alpha)
+
+Commit message: feat(shop): add clamp helper
+Patch:          C:\path\to\planner\foundry\data\patches\F-001.patch
+Message + PR:   C:\path\to\planner\foundry\data\patches\F-001.md
+
+Your repository has not been changed yet. Open a terminal in the repository folder
+  C:\path\to\repo
+and run:
+  1. look at the change:  type "C:\path\to\planner\foundry\data\patches\F-001.patch"
+  2. apply it:            git apply "C:\path\to\planner\foundry\data\patches\F-001.patch"
+  3. commit it:           git add -A
+                          git commit -F "C:\path\to\planner\foundry\data\patches\F-001.md"
+```
+
+(On Linux and macOS step 1 uses `cat`.) If the combined patch does not apply cleanly to your repository, the report says the patch was **REJECTED** and prints the path of `<task>.patch.rejected` for a manual merge, with no `git apply` step. An empty approved change is reported as "nothing to apply".
+
+For a task that isn't finished it prints the state and, as applicable, the quarantine reason and the last infrastructure error, plus the real cause:
 
 - `paused until 15:00 (usage limit) - rerun the same command to resume`. The weekday and date are added when the pause doesn't end today, e.g. `Sun 8 Nov 15:00`;
 - `Claude Code is not logged in - run claude and /login, then rerun the same command`;
 - `Claude Code was not found - install it or set FOUNDRY_CLAUDE_BIN, ...`;
+- `approved, but the patch was not written within 600s (the Shop Foreman is still drafting) - rerun the same command to finish it`;
 - otherwise, still in progress.
 
 The factory is always shut down cleanly, even after `--timeout`.
 
 | Exit code | Meaning |
 |---|---|
-| `0` | done; the patch was written |
+| `0` | done; the patch (or, if it doesn't apply, the `.patch.rejected`) and the `.md` were written |
 | `1` | quarantined or failed (the reason is printed) |
 | `2` | preflight failed (Claude Code or Gemma not ready) |
-| `3` | still in progress: `--timeout` was reached, or the line is paused at the usage limit |
+| `3` | still in progress: `--timeout` was reached, the line is paused at the usage limit, or the patch isn't written yet |
 
-**Resuming.** Run the same command again. An unfinished task with the same `--title`, `--files` and `--repo` is resumed from the database, not submitted a second time.
+**Resuming.** Run the same command again. An unfinished task with the same `--title`, `--files` and `--repo` is resumed from the database, not submitted a second time. That includes a task that was approved but whose patch was never written (for example a run from before this fix that printed only `F-001: complete`): the rerun writes the patch and prints the report above.
 
 **Tasks belong to a repository.** Each task records the `--repo` it was submitted for, and `--real` only dispatches tasks of the current `--repo`. At startup it lists every other unfinished task with the command to resume it, for example `F-001 (repo C:\work\A) is unfinished - rerun with --repo "C:\work\A" to resume it`. Repo names match case-insensitively on Windows. Tasks from older databases have no recorded repo; they are listed as `unknown repo` and are never dispatched by `--real`.
 
