@@ -163,9 +163,20 @@ class RateLimiter:
 
     def _factor(self, now: float) -> float:
         """The active throttle factor (1.0 once the throttle window has passed)."""
-        if now >= self._throttle_until:
-            self._throttle_factor = 1.0
-        return self._throttle_factor
+        return self._throttle_factor if now < self._throttle_until else 1.0
+
+    def _refill(self, now: float) -> float:
+        """Refill both buckets up to ``now`` and return the factor active at ``now``.
+
+        Time spent inside a throttle window accrues at the throttled rate even
+        when the window ended between two refills, so lifting a throttle never
+        produces a catch-up burst.
+        """
+        for bucket in (self._req_bucket, self._tok_bucket):
+            if bucket.updated_at < self._throttle_until < now:
+                bucket.refill(self._throttle_until, factor=self._throttle_factor)
+            bucket.refill(now, factor=self._factor(bucket.updated_at))
+        return self._factor(now)
 
     def _prune(self, now: float) -> None:
         cutoff = now - WINDOW_SECONDS
@@ -196,9 +207,7 @@ class RateLimiter:
             async with gate:  # FIFO over the buckets: one waiter computes its wait at a time
                 while True:
                     now = self._clock()
-                    factor = self._factor(now)
-                    self._req_bucket.refill(now, factor=factor)
-                    self._tok_bucket.refill(now, factor=factor)
+                    factor = self._refill(now)
                     charge = min(float(estimate), self._tok_bucket.capacity * factor)
                     wait = max(
                         self._cooldown_until - now,
@@ -254,7 +263,7 @@ class RateLimiter:
         if delta == 0:
             return
         now = self._clock()
-        self._tok_bucket.refill(now, factor=self._factor(now))
+        self._refill(now)
         self._tok_bucket.level = min(self._tok_bucket.capacity, self._tok_bucket.level - delta)
         self._prune(now)
         self._tokens.append((now, delta))
@@ -312,8 +321,7 @@ class RateLimiter:
         if seconds < 0:
             raise ValueError("throttle seconds must be >= 0")
         now = self._clock()
-        self._req_bucket.refill(now, factor=self._factor(now))
-        self._tok_bucket.refill(now, factor=self._factor(now))
+        self._refill(now)
         self._throttle_factor = float(factor)
         self._throttle_until = now + float(seconds)
         self._req_bucket.level = min(self._req_bucket.level, self._req_bucket.capacity * factor)

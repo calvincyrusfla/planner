@@ -5,3 +5,6 @@ department/data/
 foundry/data/
 *.db-wal
 *.db-shm
+__pycache__/
+*.pyc
+.pytest_cache/
