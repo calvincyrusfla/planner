@@ -704,7 +704,7 @@ class _WorkerBase:
         self._tm("record_tokens", task_id, self.agent_id, self.role, result.input_tokens, result.output_tokens)
         return result
 
-    async def _condense(self, trace: str, fallback: str | None = None) -> str:
+    async def _condense(self, trace: str, fallback: str | None = None, *, task_id: str | None = None) -> str:
         """1-line hint via ``foreman.condense_error_trace`` (sync or async).
 
         Falls back to ``fallback`` (e.g. ``GateOutcome.summary()``) and then to
@@ -714,7 +714,11 @@ class _WorkerBase:
         fn = getattr(self.foreman, "condense_error_trace", None) if self.foreman is not None else None
         if fn is not None and trace.strip():
             try:
-                hint = await _maybe_await(fn(trace))
+                try:
+                    raw = fn(trace, task_id=task_id)
+                except TypeError:  # condensers without the task_id keyword
+                    raw = fn(trace)
+                hint = await _maybe_await(raw)
                 if isinstance(hint, str) and hint.strip():
                     return _one_line(hint, MAX_FIX_HINT_CHARS)
             except Exception:
@@ -1053,7 +1057,7 @@ class BuilderWorker(_WorkerBase):
             self._tm("record_gate_failure", task_id)
             failure = gates.first_failure
             trace = (getattr(failure, "stderr", "") or "") + "\n" + (getattr(failure, "stdout", "") or "")
-            hint = await self._condense(trace, gates.summary or getattr(failure, "note", None))
+            hint = await self._condense(trace, gates.summary or getattr(failure, "note", None), task_id=task_id)
             check = getattr(failure, "check_type", "gate")
             return self._send_back(ticket, f"[{check}] {hint}", reason=f"gate_{check}")
 
