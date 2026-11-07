@@ -151,6 +151,16 @@ async function post(url, headers = {}) {
   return { status: res.status, text, json: JSON.parse(text), headers: res.headers };
 }
 
+// First `state` event of the SSE stream.
+async function firstEvent(url) {
+  const res = await fetch(`${url}/api/events`);
+  const reader = res.body.getReader();
+  let text = '';
+  while (!text.includes('\n\n')) text += new TextDecoder().decode((await reader.read()).value);
+  await reader.cancel();
+  return JSON.parse(text.split('\n').find((l) => l.startsWith('data: ')).slice(6));
+}
+
 const getState = async (url) => (await (await fetch(`${url}/api/state`)).json()).result;
 
 function assertNoToken(...texts) {
@@ -223,12 +233,7 @@ test('capabilities.usageRefresh is on the SSE payload too', async () => {
   const dir = scratch();
   const srv = await startServer(dir);
   try {
-    const res = await fetch(`${srv.url}/api/events`);
-    const reader = res.body.getReader();
-    let text = '';
-    while (!text.includes('\n\n')) text += new TextDecoder().decode((await reader.read()).value);
-    await reader.cancel();
-    const data = JSON.parse(text.split('\n').find((l) => l.startsWith('data: ')).slice(6));
+    const data = await firstEvent(srv.url);
     assert.deepEqual(data.capabilities, { usageRefresh: true });
   } finally {
     await srv.stop();
@@ -273,12 +278,28 @@ test('refused unless the request comes from this machine', async () => {
     assert.equal(cross.status, 403);
     assert.equal(cross.json.code, 'forbidden');
 
+    // capabilities.usageRefresh is per request: true for this computer, false for a foreign Host.
+    assert.equal((await getState(srv.url)).capabilities.usageRefresh, true);
+    const foreignState = await new Promise((resolve, reject) => {
+      http.get({ host: '127.0.0.1', port: srv.port, path: '/api/state', headers: { host: `evil.example:${srv.port}` } }, (res) => {
+        let b = '';
+        res.on('data', (d) => (b += d));
+        res.on('end', () => resolve(JSON.parse(b).result));
+      }).on('error', reject);
+    });
+    assert.equal(foreignState.capabilities.usageRefresh, false);
+
     // A real non-loopback address of this machine, when it has one.
     const external = Object.values(os.networkInterfaces()).flat().find((i) => i && i.family === 'IPv4' && !i.internal);
     if (external) {
-      const r = await post(`http://${external.address}:${srv.port}`);
+      const remote = `http://${external.address}:${srv.port}`;
+      const r = await post(remote);
       assert.equal(r.status, 403);
       assert.equal(r.json.code, 'forbidden');
+      // A phone on the LAN is told there is no refresh, on GET /api/state and on the SSE stream.
+      assert.equal((await getState(remote)).capabilities.usageRefresh, false);
+      assert.equal((await firstEvent(remote)).capabilities.usageRefresh, false);
+      assert.equal((await firstEvent(srv.url)).capabilities.usageRefresh, true);
     } else {
       test.diagnostic('no non-loopback IPv4 interface; remote-address case skipped');
     }
@@ -391,12 +412,24 @@ test('dept.mjs usage refresh: without a dashboard it stores to the local board',
   assert.equal(st.usage.fiveHour.usedPct, 37.5);
   assert.ok(st.usage.source.endsWith('· Anthropic'));
 
-  // Errors are the short message, exit code 1.
+  // Same 30 s throttle as the dashboard, kept next to the state file.
+  const lastFile = path.join(dir, 'usage-refresh-last.json');
+  assert.ok(fs.existsSync(lastFile), 'throttle file written');
+  assertNoToken(fs.readFileSync(lastFile, 'utf8'));
+  const again = await runCli(['usage', 'refresh'], e);
+  assert.equal(again.code, 1);
+  assert.match(again.out, /Error: Wait \d+ s before refreshing again/);
+  assert.equal(fake.requests.length, 1, 'throttled run did not call Anthropic');
+
+  // Once 30 s have passed: errors are the short message, exit code 1, and count for the throttle.
+  fs.writeFileSync(lastFile, JSON.stringify({ at: Date.now() - 31e3 }));
   fake.mode = '401';
   const bad = await runCli(['usage', 'refresh'], e);
   assert.equal(bad.code, 1);
   assert.match(bad.out, /Error: Your Claude login has expired/);
   assertNoToken(bad.out);
+  assert.equal(fake.requests.length, 2);
+  assert.ok(JSON.parse(fs.readFileSync(lastFile, 'utf8')).at > Date.now() - 10e3, 'attempt that reached Anthropic marks the throttle');
 
   const off = await runCli(['usage', 'refresh'], { ...e, DEPT_USAGE_DIRECT: 'off' });
   assert.equal(off.code, 1);
@@ -422,6 +455,47 @@ test('dept.mjs usage refresh: goes through the running dashboard (and its thrott
     assertNoToken(r.out, again.out, srv.out.text);
   } finally {
     await srv.stop();
+    await fake.close();
+  }
+});
+
+test('dept.mjs usage refresh: an expired login does not use up the direct throttle', async () => {
+  const dir = scratch();
+  const fake = await fakeAnthropic('ok');
+  const config = writeCreds(dir, { expiresAt: Date.now() - 60e3 });
+  const e = childEnv(dir, await freePort(), { CLAUDE_CONFIG_DIR: config, DEPT_ANTHROPIC_BASE: fake.base });
+  const bad = await runCli(['usage', 'refresh'], e);
+  assert.equal(bad.code, 1);
+  assert.match(bad.out, /Claude login has expired/);
+  assert.equal(fake.requests.length, 0);
+  assert.ok(!fs.existsSync(path.join(dir, 'usage-refresh-last.json')));
+  writeCreds(dir); // "renewed" the login
+  const ok = await runCli(['usage', 'refresh'], e);
+  assert.equal(ok.code, 0, ok.out);
+  assert.equal(fake.requests.length, 1);
+  await fake.close();
+});
+
+test('dept.mjs usage refresh: a dashboard running older code gets a restart hint, no direct fallback', async () => {
+  const dir = scratch();
+  const fake = await fakeAnthropic('ok');
+  // Stand-in for a pre-refresh dashboard: unknown /api routes answer 404 {"error":"Not found"}.
+  const old = http.createServer((req, res) => {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Not found' }));
+  });
+  await new Promise((r) => old.listen(0, '127.0.0.1', r));
+  fakes.add(old);
+  try {
+    const e = childEnv(dir, old.address().port, { CLAUDE_CONFIG_DIR: writeCreds(dir), DEPT_ANTHROPIC_BASE: fake.base });
+    const r = await runCli(['usage', 'refresh'], e);
+    assert.equal(r.code, 1);
+    assert.match(r.out, /Error: Your dashboard is running older code — restart it \(close it, stop the server, reopen the shortcut\) to enable usage refresh\./);
+    assert.equal(fake.requests.length, 0, 'no fallback to the direct path');
+    assert.ok(!fs.existsSync(path.join(dir, 'state.json')), 'local board untouched');
+  } finally {
+    fakes.delete(old);
+    await new Promise((r) => old.close(r));
     await fake.close();
   }
 });
