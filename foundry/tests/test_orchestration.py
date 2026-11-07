@@ -634,6 +634,7 @@ def test_two_runs_on_one_db_continue_where_the_first_stopped(tmp_path: Path) -> 
     assert ids1[0] in f2.manager.directives  # manager state reloaded from the queue's kv table
     assert f2.manager.pr_summaries[ids1[0]] == f1.manager.pr_summaries[ids1[0]]
     assert f2.bridge.board_ids[ids1[0]] == board_id
+    assert f2.bridge.board_teams[ids1[0]] == ["alpha"]  # who signs off survives the restart
     ids2, states2 = _run(_submit_and_run(f2, {**S_ORDER, "title": "Add wrap helper"}))
     assert ids1 == ["F-001"] and ids2 == ["F-002"]  # no id collision on restart
     assert states1 == {"F-001": "complete"} and states2 == {"F-002": "complete"}
