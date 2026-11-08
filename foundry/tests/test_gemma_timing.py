@@ -22,7 +22,7 @@ import pytest
 from foundry.config import FoundryConfig
 from foundry.gemma_client import GemmaRequest, GemmaUnavailable, OllamaGemmaClient, SimulatedGemmaClient
 from foundry.orchestrator_queue import FoundryQueue
-from foundry.shop_foreman import ShopForeman
+from foundry.shop_foreman import ASK_BUDGET_CAP_S, ShopForeman
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -216,8 +216,50 @@ def test_no_gemma_counts_fallbacks_without_calls(tmp_path: Path) -> None:
         task = {"task_id": "F-2", "team_id": "alpha", "title": "Tiny", "description": "x", "files": ["a.py"]}
         asyncio.run(foreman.size_task_scope(task))
         stats = foreman.gemma_stats()
-        assert stats["calls"] == 0 and stats["fallbacks"] == 1
-        assert stats["by_hook"]["size_task_scope"]["fallbacks"] == 1
+        assert foreman.last_source["size_task_scope"] == "heuristic"
+        # Gemma was never asked, so no fallback is counted (fallbacks never exceed calls).
+        assert stats["calls"] == 0 and stats["fallbacks"] == 0 and stats["by_hook"] == {}
         assert foreman.last_timing == {}
+    finally:
+        queue.close()
+
+
+class _Engine:
+    """Context engine stub: builds a slice without asking Gemma."""
+
+    last_stats = type("S", (), {"tokens_saved": 0, "ranked_by_gemma": False})()
+
+    async def abuild_slice(self, subtask: Any, objective: str, **kwargs: Any) -> Any:
+        from foundry.schemas import ContextSlice
+
+        return ContextSlice(objective=objective or "x", acceptance_criteria=[])
+
+
+def test_prune_without_gemma_ranking_is_not_a_fallback(tmp_path: Path) -> None:
+    gemma = SimulatedGemmaClient()
+    queue = FoundryQueue(tmp_path / "foundry.db")
+    foreman = ShopForeman(gemma, queue, None, _Engine(), FoundryConfig(db_path=tmp_path / "foundry.db"))
+    try:
+        asyncio.run(foreman.prune_context_slice(None, "Do the thing.", task_id="F-3"))
+        assert foreman.last_source["prune_context_slice"] == "heuristic"
+        stats = foreman.gemma_stats()
+        assert stats["calls"] == 0 and stats["fallbacks"] == 0 and gemma.calls == 0
+    finally:
+        queue.close()
+
+
+def test_ask_budget_is_capped_below_api_chunk_timeout(tmp_path: Path) -> None:
+    from foundry import serve_api
+
+    assert ASK_BUDGET_CAP_S == serve_api.ASK_CHUNK_TIMEOUT_S - 10
+    config = FoundryConfig.from_env({"FOUNDRY_ASK_TIMEOUT_S": "200", "FOUNDRY_DB_PATH": str(tmp_path / "f.db")})
+    assert config.ask_timeout_s == 200
+    gemma = SimulatedGemmaClient(lambda req: "All quiet.")
+    queue = FoundryQueue(tmp_path / "f.db")
+    foreman = ShopForeman(gemma, queue, None, None, config)
+    try:
+        text = "".join(asyncio.run(_collect(foreman.answer_question("status?"))))
+        assert text == "All quiet."
+        assert gemma.timeouts and ASK_BUDGET_CAP_S - 5 < gemma.timeouts[0] <= ASK_BUDGET_CAP_S
     finally:
         queue.close()

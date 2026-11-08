@@ -987,22 +987,23 @@ async function pollFoundry() {
 function fmtMs(ms) {
   const n = Number(ms);
   if (ms == null || ms === '' || !Number.isFinite(n) || n < 0) return '';
-  if (n < 1000) return `${Math.round(n)} ms`;
-  const sec = n / 1000;
-  if (sec < 10) return `${sec.toFixed(1)} s`;
-  if (sec < 60) return `${Math.round(sec)} s`;
-  const m = Math.floor(sec / 60), r = Math.round(sec % 60);
+  // Round to the unit shown first, then pick the format, so 999.6 ms, 9990 ms and 59600 ms don't print "1000 ms", "10.0 s", "60 s".
+  if (Math.round(n) < 1000) return `${Math.round(n)} ms`;
+  const tenths = Math.round(n / 100) / 10;
+  if (tenths < 10) return `${tenths.toFixed(1)} s`;
+  const sec = Math.round(n / 1000);
+  if (sec < 60) return `${sec} s`;
+  const m = Math.floor(sec / 60), r = sec % 60;
   return r ? `${m} min ${r} s` : `${m} min`;
 }
 // Chip tooltip line from /api/health gemma_speed {avg_ms, last_ms, fallbacks, calls}.
 function gemmaSpeedTip(sp) {
   if (!sp || typeof sp !== 'object') return '';
   const calls = Number(sp.calls) || 0, fb = Number(sp.fallbacks) || 0;
-  const fbText = `${fb} fallback${fb === 1 ? '' : 's'}`;
+  const fbText = `${fb} fallback${fb === 1 ? '' : 's'} (all Foreman jobs)`;
   if (!calls) return fb ? `\nGemma: no answers yet, ${fbText}` : '\nGemma: no calls yet';
-  const avg = fmtMs(sp.avg_ms), last = fmtMs(sp.last_ms);
-  return `\nGemma: ${avg ? `avg ${avg} per call` : `${calls} call${calls === 1 ? '' : 's'}`}, ${fbText}`
-    + (last ? ` (last ${last}, ${calls} call${calls === 1 ? '' : 's'})` : '');
+  const avg = fmtMs(sp.avg_ms), last = fmtMs(sp.last_ms), n = `${calls} call${calls === 1 ? '' : 's'}`;
+  return `\nGemma: ${avg ? `avg ${avg} per call (${last ? `last ${last}, ` : ''}${n})` : n}, ${fbText}`;
 }
 // Compact Foundry task list in the Foreman card; refreshed by the same 10 s poll. Text only, never HTML.
 async function foundryTasks(up) {
@@ -1024,7 +1025,7 @@ async function foundryTasks(up) {
       const g = src === 'gemma';
       const b = el('span', 'fo-badge ' + (g ? 'gemma' : 'fallback'), (g ? 'Gemma' : 'Fallback') + (took ? ` · ${took}` : ''));
       b.title = g ? `Sized by Gemma${took ? ` in ${took}` : ''}`
-        : `Sized by the built-in fallback rules (Gemma didn't answer${took ? ` within ${took}` : ''})`;
+        : `Sized by the built-in fallback rules (Gemma's answer wasn't usable or didn't come in time${took ? `; took ${took}` : ''})`;
       li.append(b);
     } else if (t.state === 'sizing') {
       li.append(el('span', 'fo-badge', 'Sizing…'));
