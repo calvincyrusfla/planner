@@ -697,7 +697,7 @@ The Ask the Foreman card on the dashboard has a **Foreman actions** log, newest 
 
 Undo is safe to click twice: the second click does nothing. If things have moved on since the action (for example the moved work is already finished, or the task was already quarantined again), Undo refuses and says why, and nothing changes.
 
-The Foreman never retries the same task twice. Every action (and every undo) is also posted to the board task as a progress note.
+The Foreman never retries the same task twice. Every action is also posted to the board task as a progress note.
 
 ## Honest limits
 
