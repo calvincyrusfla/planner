@@ -12,6 +12,8 @@
 #   6. run `python -m foundry.foreman_probe` with the repo's python
 #   7. run `python -m foundry.gemma_doctor` (GPU % and tokens/s, standard library only).
 #      A slow or CPU-only Gemma is reported, not treated as a failed setup.
+#   8. report whether the GitHub CLI (`gh`) is installed and logged in, for automatic
+#      pull requests. Read-only (`gh auth status`); never fails the setup.
 #
 # Environment:
 #   FOREMAN_MODEL        model tag (default gemma4:e4b)
@@ -155,6 +157,25 @@ gemma_doctor() {
   return 0
 }
 
+# gh_check: is the GitHub CLI installed and logged in (automatic pull requests)?
+# Read-only (`gh auth status`, also in dry-run). Never changes the exit status.
+gh_check() {
+  say "GitHub check: automatic pull requests need the GitHub CLI (gh), logged in."
+  if ! command -v gh >/dev/null 2>&1; then
+    say "gh is not installed. Foundry still writes patches, but cannot open pull requests."
+    say "Install it from https://cli.github.com/ then run: gh auth login"
+    say "(Or turn automatic pull requests off: FOUNDRY_AUTO_PR=0.)"
+    return 0
+  fi
+  say "gh found: $(command -v gh)"
+  if gh auth status >/dev/null 2>&1; then
+    say "gh is logged in: Foundry opens a pull request for every approved task."
+  else
+    say "gh is not logged in. Run: gh auth login   (then Foundry can open pull requests)"
+  fi
+  return 0
+}
+
 # --- 6. probe -----------------------------------------------------------------
 if [ -z "$PYTHON" ]; then
   say "Python 3.11 or newer not found; install it, then run: python3 -m foundry.foreman_probe"
@@ -167,6 +188,8 @@ if [ "$status" -eq 0 ]; then
   [ "$DRY_RUN" = "1" ] || say "Shop Foreman ready."
   # --- 7. speed check -------------------------------------------------------
   gemma_doctor
+  # --- 8. GitHub CLI --------------------------------------------------------
+  gh_check
   if [ "$PYTHON" = "$REPO_ROOT/.venv/bin/python" ]; then
     say "Next (from $REPO_ROOT): $PYTHON -m foundry.main --real --repo <path> --title \"...\""
   else

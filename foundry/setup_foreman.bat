@@ -12,6 +12,8 @@ rem   5. "ollama pull" the model unless it is already installed
 rem   6. run "python -m foundry.foreman_probe" with the repo's python (.venv, py -3 or python)
 rem   7. run "python -m foundry.gemma_doctor" (GPU %% and tokens/s, standard library only).
 rem      A slow or CPU-only Gemma is reported, not treated as a failed setup.
+rem   8. report whether the GitHub CLI (gh) is installed and logged in, for automatic
+rem      pull requests. Read-only ("gh auth status"); never fails the setup.
 rem
 rem Environment:
 rem   FOREMAN_MODEL        model tag (default gemma4:e4b)
@@ -182,6 +184,8 @@ echo [foreman] Shop Foreman ready.
 rem ---- 7. speed check -------------------------------------------------------
 call :doctor
 :next_step
+rem ---- 8. GitHub CLI --------------------------------------------------------
+call :gh_check
 if "%PY_IS_VENV%"=="1" goto :next_step_venv
 rem The probe ran without a usable .venv; the orchestrator needs pydantic, so set up the venv first.
 echo [foreman] No .venv yet - the probe ran with %PY%. Create the venv first, from %REPO_ROOT%
@@ -226,6 +230,36 @@ exit /b 0
 :doctor_unreachable
 echo [foreman] The speed check could not reach Gemma or find the model. Run it again later:
 echo [foreman]   %PY% -m foundry.gemma_doctor --model %MODEL%
+exit /b 0
+
+rem :gh_check - step 8: is the GitHub CLI installed and logged in (automatic pull requests)?
+rem Read-only ("gh auth status", also in dry-run). Never changes RC.
+:gh_check
+echo [foreman] GitHub check: automatic pull requests need the GitHub CLI - gh - logged in.
+where gh >nul 2>&1
+if not errorlevel 1 goto :gh_found
+rem A fresh winget install may not be on this console's PATH yet: try the default location.
+if not exist "%ProgramFiles%\GitHub CLI\gh.exe" goto :gh_missing
+set "PATH=%ProgramFiles%\GitHub CLI;%PATH%"
+:gh_found
+for /f "delims=" %%G in ('where gh 2^>nul') do (
+  echo [foreman] gh found: %%G
+  goto :gh_auth
+)
+:gh_auth
+gh auth status >nul 2>&1
+if errorlevel 1 goto :gh_logged_out
+echo [foreman] gh is logged in: Foundry opens a pull request for every approved task.
+exit /b 0
+:gh_logged_out
+echo [foreman] gh is not logged in. Run: gh auth login
+echo [foreman] Until then Foundry still writes patches, but cannot open pull requests.
+exit /b 0
+:gh_missing
+echo [foreman] gh is not installed. Foundry still writes patches, but cannot open pull requests.
+echo [foreman] Install it with: winget install --id GitHub.cli
+echo [foreman] then open a new window and run: gh auth login
+echo [foreman] Or turn automatic pull requests off: set FOUNDRY_AUTO_PR=0
 exit /b 0
 
 rem :gpu_line "name" "memory MB" - print one nvidia-smi row and keep the largest VRAM.

@@ -50,6 +50,11 @@ function startFake(port) {
       if (!b.title) return json(400, { ok: false, error: 'title is required' });
       return json(200, { ok: true, task_id: 'T-900', echo: b });
     }
+    if (req.url === '/api/actions') return json(200, { ok: true, actions: [{ action_id: 'A-1', action: 'REASSIGN_TEAM', undoable: true }] });
+    let m = req.url.match(/^\/api\/actions\/([^/]+)\/undo$/);
+    if (m && req.method === 'POST') return m[1] === 'A-1' ? json(200, { ok: true, action_id: 'A-1' }) : json(409, { ok: false, reason: 'state moved on' });
+    m = req.url.match(/^\/api\/tasks\/([^/]+)\/pr\/retry$/);
+    if (m && req.method === 'POST') return json(200, { ok: true, task_id: m[1], pr: { state: 'pending' } });
     if (req.url === '/api/ask') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
       res.write(`data: ${JSON.stringify({ text: 'Hello ' })}\n\n`);
@@ -180,6 +185,35 @@ test('POST ask streams the SSE answer chunk by chunk', async () => {
   assert.match(text, /data: \{"text":"world"\}/);
   assert.match(text, /event: done/);
   assert.equal(JSON.parse(seen.at(-1).body).question, 'How is the line?');
+});
+
+test('actions log, undo and PR retry pass through; bad ids and methods are refused', async () => {
+  const a = await request('GET', '/api/foundry/actions');
+  assert.equal(a.status, 200);
+  assert.equal(a.json.actions[0].action_id, 'A-1');
+  assert.equal(seen.at(-1).url, '/api/actions');
+  const u = await request('POST', '/api/foundry/actions/A-1/undo', { body: {} });
+  assert.equal(u.status, 200);
+  assert.deepEqual(u.json, { ok: true, action_id: 'A-1' });
+  assert.equal(seen.at(-1).method, 'POST');
+  assert.equal(seen.at(-1).url, '/api/actions/A-1/undo');
+  const moved = await request('POST', '/api/foundry/actions/A-2/undo');
+  assert.equal(moved.status, 409);
+  assert.equal(moved.json.reason, 'state moved on');
+  const r = await request('POST', '/api/foundry/tasks/F-012/pr/retry', { body: {} });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.task_id, 'F-012');
+  assert.equal(seen.at(-1).url, '/api/tasks/F-012/pr/retry');
+  const before = seen.length;
+  assert.equal((await request('GET', '/api/foundry/actions/A-1/undo')).status, 405);
+  assert.equal((await request('POST', '/api/foundry/actions')).status, 405);
+  assert.equal((await request('GET', '/api/foundry/tasks/F-012/pr/retry')).status, 405);
+  assert.equal((await request('POST', '/api/foundry/actions/%2e%2e/undo')).status, 404);
+  assert.equal((await request('POST', '/api/foundry/actions/a%20b/undo')).status, 404);
+  assert.equal((await request('POST', '/api/foundry/tasks/F-1/pr/delete')).status, 404);
+  const foreign = await request('POST', '/api/foundry/actions/A-1/undo', { headers: { origin: 'http://evil.example' } });
+  assert.equal(foreign.status, 403);
+  assert.equal(seen.length, before);
 });
 
 test('unknown endpoints get 404, wrong methods 405, and are not forwarded', async () => {
