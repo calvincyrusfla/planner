@@ -77,7 +77,11 @@ class BoardUnavailable(RuntimeError):
 
 
 class BoardRefused(RuntimeError):
-    """The board answered and refused the op."""
+    """The board answered and refused the op (``code``: the HTTP status, 409 when unknown)."""
+
+    def __init__(self, message: str, code: int = 409) -> None:
+        super().__init__(message)
+        self.code = int(code)
 
 
 # --------------------------------------------------------------------------- settings
@@ -162,7 +166,7 @@ class DashboardBoard:
                 detail = ""
             if exc.code in (502, 503, 504):
                 raise BoardUnavailable(f"{type_}: {exc.code} {detail}".strip()) from exc
-            raise BoardRefused(detail or f"{type_} refused ({exc.code})") from exc
+            raise BoardRefused(detail or f"{type_} refused ({exc.code})", exc.code) from exc
         except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
             raise BoardUnavailable(f"{type_}: the dashboard is not reachable: {exc}") from exc
         if isinstance(body, dict) and body.get("ok") is False:
@@ -478,7 +482,11 @@ class BatchWatcher:
                 note = (f"requested base {batch.get('base')}; this Foundry opens PRs against "
                         f"{base or 'the repo default branch'}")
 
-        changed = {k: v for k, v in results.items() if rec["pushed"].get(k) != v}
+        # The board closes a batch (and refuses further updates) once every subtask is
+        # terminal, so "complete" is only reported once the subtask's PR is settled.
+        auto_pr = self._auto_pr()
+        board_view = {k: self._board_result(v, auto_pr) for k, v in results.items()}
+        changed = {k: v for k, v in board_view.items() if rec["pushed"].get(k) != v}
         args: dict[str, Any] = {"id": bid, "service": self.service_id, "heartbeat": True}
         if changed:
             args["results"] = changed
@@ -490,7 +498,10 @@ class BatchWatcher:
         try:
             await asyncio.to_thread(self.board.op, "updateBatch", args)
         except BoardRefused as exc:
-            # cancelled, finished or taken over by another Foundry: stop pushing
+            if exc.code not in (404, 409):
+                log.warning("board dispatch: %s update refused: %s", bid, exc)
+                return  # tried again next round
+            # cancelled, finished, deleted or taken over by another Foundry: stop pushing
             log.info("board dispatch: %s update refused (%s); no longer followed", bid, exc)
             rec["closed"] = True
             self._save(bid, rec)
@@ -501,10 +512,26 @@ class BatchWatcher:
             log.info("board dispatch: %s finished", bid)
         self._save(bid, rec)
 
+    def _auto_pr(self) -> bool:
+        return bool(getattr(self.service.config, "auto_pr", False)) and getattr(
+            self.service.factory.manager, "publisher", None) is not None
+
+    @staticmethod
+    def _pr_pending(result: Mapping[str, Any]) -> bool:
+        pr = result.get("pr")
+        return not pr or pr.get("state") == "pending"
+
+    def _board_result(self, result: Mapping[str, Any], auto_pr: bool) -> dict[str, Any]:
+        out = dict(result)
+        if out.get("state") == "complete" and auto_pr and self._pr_pending(out):
+            out["state"] = "reviewing"  # approved; the pull request is being opened
+        if out.get("foundryTask"):
+            out.setdefault("error", None)
+        return out
+
     def _settled(self, keys: list[str], results: Mapping[str, Mapping[str, Any]], cancelled: bool) -> bool:
         """Every subtask finished (or never to start) and every PR settled."""
-        auto_pr = bool(getattr(self.service.config, "auto_pr", False)) and getattr(
-            self.service.factory.manager, "publisher", None) is not None
+        auto_pr = self._auto_pr()
         for key in keys:
             r = results.get(key)
             if r is None:
@@ -513,10 +540,8 @@ class BatchWatcher:
                 return False
             if r.get("state") not in TERMINAL:
                 return False
-            if r.get("state") == "complete" and auto_pr:
-                pr = r.get("pr")
-                if not pr or pr.get("state") == "pending":
-                    return False
+            if r.get("state") == "complete" and auto_pr and self._pr_pending(r):
+                return False
         return True
 
     def _submit(self, batch: Mapping[str, Any], key: str, sub: Mapping[str, Any]) -> str:

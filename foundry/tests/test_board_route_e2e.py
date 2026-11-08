@@ -175,6 +175,20 @@ def _wait_batch(base: str, sid: str, statuses: tuple[str, ...], timeout: float =
         raise AssertionError(f"{sid}: {json.dumps(_batches(base).get(sid), indent=1)}") from None
 
 
+def _wait_prs(base: str, sid: str, timeout: float = 60.0) -> dict[str, Any]:
+    """The batch once every subtask's PR has left ``pending``."""
+    def settled() -> dict[str, Any] | None:
+        b = _batches(base).get(sid) or {}
+        res = (b.get("results") or {}).values()
+        ok = res and all((r.get("pr") or {}).get("state") not in (None, "pending") for r in res)
+        return b if ok else None
+
+    try:
+        return _wait(settled, f"{sid} PRs settled", timeout)
+    except AssertionError:
+        raise AssertionError(f"{sid}: {json.dumps(_batches(base).get(sid), indent=1)}") from None
+
+
 # --------------------------------------------------------------------------- git + fake gh (as in group 3)
 
 
@@ -361,8 +375,11 @@ def test_batches_from_cli_and_python_run_to_done_and_other_repo_is_left_alone(
         assert py_id not in (other_id, cli_id) and sprint.status == "queued", sprint
 
         with _service(tmp_path, repo, board, auto_pr=True) as (service, _base):
-            done_cli = _wait_batch(board, cli_id, ("done", "failed", "cancelled"))
-            done_py = _wait_batch(board, py_id, ("done", "failed", "cancelled"))
+            _wait_batch(board, cli_id, ("done", "failed", "cancelled"))
+            _wait_batch(board, py_id, ("done", "failed", "cancelled"))
+            # The PR is opened after a subtask completes; the watcher keeps pushing it onto the batch.
+            done_cli = _wait_prs(board, cli_id)
+            done_py = _wait_prs(board, py_id)
             tasks = _foundry_tasks(service)
 
         for batch in (done_cli, done_py):
