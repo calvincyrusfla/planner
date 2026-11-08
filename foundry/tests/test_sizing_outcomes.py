@@ -16,7 +16,8 @@ from foundry.floor_manager import WorkOrder
 from foundry.main import demo_claude, write_demo_repo
 from foundry.orchestrator_queue import FoundryQueue, normalize_repo_root
 from foundry.schemas import TaskSizingDirective
-from foundry.sizing_outcomes import actual_complexity, effort_score, sizing_accuracy
+from foundry.schemas import BUILDERS_FOR
+from foundry.sizing_outcomes import actual_complexity, effort_score, same_size, size_delta, sizing_accuracy
 from foundry.telemetry import Telemetry
 from foundry.tests.test_orchestration import S_ORDER, _alert, _factory, _submit_and_run
 
@@ -47,18 +48,41 @@ def _directive(task_id: str, n: int = 2, complexity: str = "M") -> TaskSizingDir
 # ------------------------------------------------------------------ pure helpers
 
 
+def _clean(size: str) -> dict[str, Any]:
+    n = BUILDERS_FOR[size]  # one subtask per builder, 1 build + 1 review each, no retries
+    return {"predicted": size, "subtasks": n, "builders": n, "attempts": n, "claude_calls": 2 * n}
+
+
+def test_a_clean_run_of_each_size_scores_that_size() -> None:
+    for size in ("S", "M", "L", "XL"):
+        assert same_size(actual_complexity(_clean(size)), size), size
+    assert actual_complexity(_clean("XL")) == "L"  # L and XL cannot be told apart by effort...
+    assert sizing_accuracy([_clean(s) for s in ("S", "M", "L", "XL")])["exact"] == 4  # ...so both are exact
+
+
 def test_actual_complexity_thresholds() -> None:
-    assert actual_complexity({"claude_calls": 2, "attempts": 1, "subtasks": 1}) == "S"
     assert actual_complexity({"claude_calls": 6, "attempts": 3, "subtasks": 3}) == "M"
     assert actual_complexity({"claude_calls": 9, "attempts": 3, "subtasks": 2}) == "L"  # 9 + 1 retry
     assert actual_complexity({"claude_calls": 20, "attempts": 8, "subtasks": 5}) == "XL"
     # no telemetry: two calls per attempt are assumed
     assert effort_score({"attempts": 2, "subtasks": 2}) == 4
-    # wall time: one point per ten minutes
-    assert actual_complexity({"claude_calls": 2, "attempts": 1, "subtasks": 1, "wall_time_s": 3600}) == "L"
-    # a quarantined task is at least L
-    assert actual_complexity({"claude_calls": 2, "attempts": 1, "subtasks": 1, "final_state": "quarantined"}) == "L"
+    # wall time is recorded but not effort: a clean one-subtask task that took 20 minutes is S
+    assert actual_complexity({**_clean("S"), "wall_time_s": 1200}) == "S"
+    # only exhausted retries floor a quarantined task at L
+    q = {**_clean("S"), "final_state": "quarantined"}
+    assert actual_complexity({**q, "quarantine_kind": "retries_exhausted"}) == "L"
+    assert actual_complexity({**q, "quarantine_kind": "other"}) == "S"
     assert actual_complexity({}) == "S"
+
+
+def test_accuracy_uses_raw_predicted_and_skips_excluded_rows() -> None:
+    rows = [
+        {"predicted": "L", "raw_predicted": "M", "actual": "L"},  # calibration was right: raw M was under
+        {"predicted": "M", "actual": "M", "excluded_from_calibration": True},
+    ]
+    acc = sizing_accuracy(rows)
+    assert (acc["n"], acc["under"]) == (1, 1) and acc["by_predicted"] == {"M": {"n": 1, "exact": 0, "under": 1, "over": 0}}
+    assert size_delta("XL", "L") == 0 and size_delta("M", "L") == 1 and size_delta("L", "S") == -2
 
 
 def test_sizing_accuracy_counts_exact_under_over() -> None:
@@ -66,16 +90,17 @@ def test_sizing_accuracy_counts_exact_under_over() -> None:
         {"predicted": "M", "actual": "M"},
         {"predicted": "M", "actual": "L"},
         {"predicted": "M", "actual": "XL"},
+        {"predicted": "L", "actual": "XL"},  # L vs XL: exact
         {"predicted": "L", "actual": "S"},
         {"predicted": "S", "claude_calls": 2, "attempts": 1, "subtasks": 1},  # actual computed: S
         {"predicted": None, "actual": "M"},  # skipped
     ]
     acc = sizing_accuracy(rows)
-    assert (acc["n"], acc["exact"], acc["under"], acc["over"]) == (5, 2, 2, 1)
+    assert (acc["n"], acc["exact"], acc["under"], acc["over"]) == (6, 3, 2, 1)
     assert acc["by_predicted"] == {
         "S": {"n": 1, "exact": 1, "under": 0, "over": 0},
         "M": {"n": 3, "exact": 1, "under": 2, "over": 0},
-        "L": {"n": 1, "exact": 0, "under": 0, "over": 1},
+        "L": {"n": 2, "exact": 1, "under": 0, "over": 1},
     }
     assert sizing_accuracy([]) == {"n": 0, "exact": 0, "under": 0, "over": 0, "by_predicted": {}}
 
@@ -102,13 +127,14 @@ def test_record_sizing_outcome_counts_effort_and_is_idempotent(tmp_path: Path) -
         tm.record_tokens("F-001", "alpha-1", "builder", 100, 20)
     clock.t += timedelta(minutes=5)
     q.quarantine("F-001", "test")
+    clock.t += timedelta(minutes=30)  # recorded later: wall time ends at the quarantine
 
-    row = q.record_sizing_outcome("F-001", sizing_source="gemma")
+    row = q.record_sizing_outcome("F-001", sizing_source="gemma", raw_predicted="S")
     assert row is not None
     assert row["task_id"] == "F-001" and row["title"] == "Add clamp"
     assert row["repo"] == normalize_repo_root(tmp_path)
     assert row["files"] == ["src/f1.py", "src/f2.py"]
-    assert row["predicted"] == "M" and row["sizing_source"] == "gemma"
+    assert row["predicted"] == "M" and row["raw_predicted"] == "S" and row["sizing_source"] == "gemma"
     assert row["builders"] == 2 and row["subtasks"] == 2
     assert row["attempts"] == 4  # ticket 1: 3 attempts, ticket 2: 1
     assert row["pre_review_sendbacks"] == 1
@@ -117,12 +143,14 @@ def test_record_sizing_outcome_counts_effort_and_is_idempotent(tmp_path: Path) -
     assert row["claude_calls"] == 5 and row["tokens"] == 600
     assert row["wall_time_s"] == 300
     assert row["final_state"] == "quarantined"
-    assert row["actual"] == "L"  # quarantined
+    assert row["quarantine_kind"] == "other" and row["excluded_from_calibration"] is True
+    assert row["actual"] == "M"  # 5 calls + 2 retries; an "other" quarantine is not floored at L
 
     # idempotent: the first row stays
     again = q.record_sizing_outcome("F-001", sizing_source="heuristic", attempts=99)
     assert again == row
-    assert len(q.sizing_outcomes()) == 1
+    assert q.sizing_outcomes() == []  # excluded from calibration by default
+    assert len(q.sizing_outcomes(include_excluded=True)) == 1
     assert q.record_sizing_outcome("nope") is None
     q.close()
 
@@ -200,11 +228,13 @@ def test_quarantined_task_records_an_outcome_once(tmp_path: Path) -> None:
         return tid
 
     tid = asyncio.run(go())
-    rows = f.queue.sizing_outcomes()
+    assert f.queue.sizing_outcomes() == []  # an escalation quarantine says nothing about size
+    rows = f.queue.sizing_outcomes(include_excluded=True)
     assert [r["task_id"] for r in rows] == [tid]
-    assert rows[0]["final_state"] == "quarantined" and rows[0]["actual"] in ("L", "XL")
+    assert rows[0]["final_state"] == "quarantined" and rows[0]["quarantine_kind"] == "other"
+    assert rows[0]["excluded_from_calibration"] is True
     f.manager.record_outcome(tid)
-    assert len(f.queue.sizing_outcomes()) == 1
+    assert len(f.queue.sizing_outcomes(include_excluded=True)) == 1
     f.close()
 
 
@@ -270,5 +300,51 @@ def test_pre_review_sendback_that_hits_the_retry_cap_is_counted(tmp_path: Path) 
     assert not q.reopen_ticket(t.ticket_id, "[pre-review] TODO left")  # retry_exhausted -> quarantined
     row = q.record_sizing_outcome("F-001")
     assert row["final_state"] == "quarantined"
+    assert row["quarantine_kind"] == "retries_exhausted" and not row["excluded_from_calibration"]
+    assert row["actual"] in ("L", "XL")  # floored: it needed more than it got
     assert row["pre_review_sendbacks"] == 1
+    q.close()
+
+
+def test_raw_size_flows_from_the_foreman_into_the_outcome(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, demo_claude(repo, fail_first=None), repo=repo, teams=["alpha"])
+    real = f.foreman.size_task_scope
+
+    async def sized(task: Any) -> Any:
+        out = await real(task) if asyncio.iscoroutinefunction(real) else real(task)
+        f.foreman.last_raw_complexity = "XL"  # pretend calibration shifted the size
+        return out
+
+    f.foreman.size_task_scope = sized
+    ids, states = asyncio.run(_submit_and_run(f, S_ORDER))
+    tid = ids[0]
+    assert states[tid] == "complete"
+    assert f.manager.sizing_meta[tid]["raw"] == "XL"
+    row = f.queue.sizing_outcomes()[0]
+    assert row["raw_predicted"] == "XL" and row["predicted"] == f.manager.directives[tid].complexity
+    f.close()
+    g = _factory(tmp_path, demo_claude(repo, fail_first=None), repo=repo, teams=["alpha"])
+    assert g.manager.sizing_meta[tid]["raw"] == "XL"  # persisted across a restart
+    g.close()
+
+
+def test_old_outcomes_table_gains_the_new_columns(tmp_path: Path) -> None:
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sizing_outcomes (task_id TEXT PRIMARY KEY, recorded_at TEXT NOT NULL,"
+                 " repo TEXT, title TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '[]',"
+                 " predicted TEXT, sizing_source TEXT, builders INTEGER NOT NULL DEFAULT 0,"
+                 " subtasks INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,"
+                 " gate_failures INTEGER NOT NULL DEFAULT 0, pre_review_sendbacks INTEGER NOT NULL DEFAULT 0,"
+                 " reviewer_rejections INTEGER NOT NULL DEFAULT 0, claude_calls INTEGER NOT NULL DEFAULT 0,"
+                 " tokens INTEGER NOT NULL DEFAULT 0, wall_time_s REAL NOT NULL DEFAULT 0,"
+                 " final_state TEXT NOT NULL, actual TEXT)")
+    conn.execute("INSERT INTO sizing_outcomes (task_id, recorded_at, predicted, final_state, actual)"
+                 " VALUES ('F-001', '2026-11-01T00:00:00Z', 'M', 'complete', 'M')")
+    conn.commit()
+    conn.close()
+    q = FoundryQueue(db)
+    (row,) = q.sizing_outcomes()
+    assert row["raw_predicted"] is None and row["excluded_from_calibration"] is False
     q.close()

@@ -120,6 +120,15 @@ def _num(v: Any) -> float | None:
     return round(float(v), 1)
 
 
+def _accepts_repo(fn: Any) -> bool:
+    """True when ``fn`` takes a ``repo`` keyword (older foremen don't)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "repo" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _count(v: Any) -> int:
     if isinstance(v, bool):
         return 0
@@ -414,7 +423,7 @@ class Service:
         if not callable(fn):
             return {}
         try:
-            summary = fn()
+            summary = fn(repo=str(self.repo)) if _accepts_repo(fn) else fn()  # same scope as sizing
         except Exception as exc:  # a status call must not fail
             log.debug("foundry serve: calibration_summary failed: %s", exc)
             return {}

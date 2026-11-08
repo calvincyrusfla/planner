@@ -47,7 +47,7 @@ def test_status_carries_pre_review_and_calibration(tmp_path: Path) -> None:
                 f.telemetry.record_pre_review("T-1", outcome)
             assert svc.status()["foreman"]["pre_review"] == {
                 "passed": 2, "sent_back": 1, "advised": 1, "skipped": 0, "fallback": 1, "claude_reviews_avoided": 1}
-        f.foreman.calibration_summary = lambda: {  # type: ignore[attr-defined]
+        f.foreman.calibration_summary = lambda: {  # type: ignore[attr-defined]  # old no-arg signature
             "n": 9, "accuracy_pct": 66.666, "under": 2, "over": 1, "shift_rules": [{"predicted": "M", "to": "L"}]}
         assert svc.status()["foreman"]["calibration"] == {
             "n": 9, "accuracy_pct": 66.7, "exact": 0, "under": 2, "over": 1, "shift_rules": [{"predicted": "M", "to": "L"}]}
@@ -98,5 +98,20 @@ def test_real_calibration_summary_is_passed_through(tmp_path: Path) -> None:
         assert cal["accuracy_pct"] is None or isinstance(cal["accuracy_pct"], float)
         assert isinstance(cal["shift_rules"], list)
         json.dumps(cal)
+
+    _run(tmp_path, check)
+
+
+def test_calibration_summary_is_scoped_to_the_repo(tmp_path: Path) -> None:
+    def check(svc: Service) -> None:
+        seen: list[Any] = []
+
+        def summary(repo: str | None = None) -> dict[str, Any]:
+            seen.append(repo)
+            return {"n": 1, "accuracy_pct": 100, "exact": 1, "under": 0, "over": 0, "shift_rules": []}
+
+        svc.factory.foreman.calibration_summary = summary  # type: ignore[attr-defined]
+        assert svc.status()["foreman"]["calibration"]["n"] == 1
+        assert seen == [str(svc.repo)]
 
     _run(tmp_path, check)

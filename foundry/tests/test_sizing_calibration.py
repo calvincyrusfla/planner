@@ -214,3 +214,38 @@ def test_calibration_summary_takes_repo(queue: FoundryQueue) -> None:
     scoped = f.calibration_summary("/other")
     assert scoped["n"] == 1 and scoped["shift_rules"] == []
     assert provider.calls[-1] == ("/other", 50)
+
+
+FIVE = [f"pkg/f{k}.py" for k in range(5)]
+
+
+def _check(directive: Any, files: list[str]) -> None:
+    assert directive.allocated_builders == len(directive.subtasks)
+    assigned = [f for s in directive.subtasks for f in s.allowed_files]
+    assert sorted(assigned) == sorted(files)  # every file once, no overlap
+    assert all(s.allowed_files and s.acceptance_criteria for s in directive.subtasks)  # no idle builder
+
+
+def test_shift_up_with_gemma_subtasks_for_old_size(queue: FoundryQueue) -> None:
+    reply = {"complexity": "M", "rationale": "Two parts.", "subtasks": [
+        {"title": "A", "acceptance_criteria": ["a"], "allowed_files": FIVE[:3]},
+        {"title": "B", "acceptance_criteria": ["b"], "allowed_files": FIVE[3:]},
+    ]}
+    f = foreman(queue, history_m_was_l(), SimulatedGemmaClient(lambda req: reply))
+    directive = run(f.size_task_scope(dict(M_TASK, files=FIVE)))
+    assert directive.complexity == "L" and directive.allocated_builders == 5
+    assert "split deterministically" in directive.rationale and "calibrated" in directive.rationale
+    _check(directive, FIVE)
+
+
+def test_shift_down_with_gemma_subtasks_for_old_size(queue: FoundryQueue) -> None:
+    reply = {"complexity": "L", "rationale": "Five parts.", "subtasks": [
+        {"title": f"P{k}", "acceptance_criteria": [f"c{k}"], "allowed_files": [FIVE[k]]} for k in range(5)
+    ]}
+    rows = [outcome(f"P-{k}", "L", "M") for k in range(8)]
+    f = foreman(queue, rows, SimulatedGemmaClient(lambda req: reply))
+    directive = run(f.size_task_scope(dict(M_TASK, files=FIVE)))
+    assert directive.complexity == "M" and directive.allocated_builders == 2
+    assert f.last_raw_complexity == "L"
+    _check(directive, FIVE)
+    assert {c for s in directive.subtasks for c in s.acceptance_criteria} >= {f"c{k}" for k in range(5)}

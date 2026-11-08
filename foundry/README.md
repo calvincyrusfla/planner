@@ -209,6 +209,8 @@ Limits that keep a wrong Gemma cheap:
 - **Once per ticket.** Gemma can send a ticket back at most once. The next submission of that ticket always goes to the Claude reviewer, with Gemma's notes attached. The cap is stored in the queue, so it holds across restarts.
 - **A send-back counts as a rejected attempt**, like a gate failure, so the usual retry and quarantine limits still apply.
 - **Gemma never blocks on errors.** If Gemma is off, times out or gives an unusable answer, the diff passes on to the Claude reviewer. That doesn't use up an attempt.
+- **Never on the last attempt.** On a ticket's last allowed attempt Gemma never sends the diff back, because a send-back there would quarantine work no Claude reviewer has seen. The diff goes to the Claude reviewer with Gemma's notes attached.
+- **Pause after repeated failures.** After 3 Gemma failures (timeouts or errors) in a row, the pre-review is skipped for 10 minutes and diffs go straight to the Claude reviewer. These count as `skipped`. One usable Gemma answer resets the count.
 
 Counters for passed, sent back, advised, skipped and fallback, plus `claude_reviews_avoided` (one per send-back), are in `/api/status` under `foreman.pre_review`. The dashboard's Foundry tasks summary line shows them as "Pre-review: N sent back (≈N Claude reviews saved)".
 
@@ -222,16 +224,36 @@ When a task finishes (approved and the patch is written) or is quarantined, Foun
 - the effort it took: builder attempts, gate failures, pre-review send-backs, reviewer rejections, Claude calls, tokens (input + output) and wall time;
 - the final state.
 
-Each task is recorded once. From the effort, Foundry works out the size the task **actually** was and compares it with the prediction (`foundry/sizing_outcomes.py`: `actual_complexity` and `sizing_accuracy`, which counts exact, under and over, also per predicted size). The effort score is:
+Each task is recorded once. From the effort, Foundry works out the size the task **actually** was and compares it with the prediction (see `foundry/sizing_outcomes.py`: `actual_complexity` and `sizing_accuracy`, which counts exact, under and over, also per predicted size). The effort score is:
 
-`effort = Claude calls + retries + wall time in minutes / 10`
+`effort = Claude calls + retries`
 
-Here retries means builder attempts beyond the first per subtask. A score up to 3 is **S**, up to 7 **M**, up to 14 **L**, and above that **XL**. A clean one-file task (1 build + 1 review) is S, and 9 Claude calls is L. A quarantined task counts as at least L.
+- **Claude calls** are the builder and reviewer calls recorded for the task. When none were recorded (for example in simulated runs), Foundry counts 2 calls per builder attempt: one build plus one review.
+- **Retries** are builder attempts beyond the first per subtask.
+- **Wall time is stored but doesn't count.** It reflects queueing, rate limits and the PC as much as the task.
 
-The next sizing uses this in two ways:
+A score up to 3 is **S**, up to 7 **M**, up to 20 **L**, and above that **XL**. A clean run of each size (2 calls per subtask, no retries) scores within its own size: S = 2, M = 4, L = 10. L and XL get the same crew of 5 builders, so effort can't tell them apart. L-versus-XL counts as a match.
 
-1. **Examples.** Before Gemma sizes a new order, the Foreman picks up to 5 recent, similar finished tasks in the same repo (shared files first, then shared title words) and adds them to the prompt, for example "Past task Add clamp helper (files shop/mathx.py): you predicted M, it actually took L (3 attempts, 9 Claude calls)".
-2. **Shift rule.** Look at the finished tasks with the same predicted size (up to the 20 most recent). If there are at least 8 of them, the rule applies. If at least 60 % of them actually turned out bigger, the new prediction moves up one size; if at least 60 % turned out smaller, it moves down one size. It never moves more than one step. This applies whether Gemma or the heuristic sized the task. The shift is logged, and the rationale says "calibrated from N past tasks".
+Quarantined tasks:
+
+- **The retry cap ran out.** The task counts as at least L, because it needed more than it got.
+- **Quarantined for another reason** (an escalation, a sizing problem). The row is kept but left out of accuracy and calibration, because it says nothing about the size.
+
+Each row also keeps two predictions:
+
+- the size that was actually applied;
+- the Foreman's raw size, from Gemma or the heuristic, before any calibration shift.
+
+The shift rule groups tasks by the raw size, so calibration never learns from its own corrections.
+
+The next sizing uses this in two ways. Both look only at the same repo's tasks; accuracy and shift rules are worked out per repo.
+
+1. **Examples.** Before Gemma sizes a new order, the Foreman picks up to 5 recent, similar finished tasks (shared files first, then shared title words) and adds them to the prompt, for example "Past task Add clamp helper (files shop/mathx.py): you predicted M, it actually took L (3 attempts, 9 Claude calls)".
+2. **Shift rule.** Look at the repo's finished tasks with the same raw predicted size (up to the 20 most recent). The rule applies once there are at least 8:
+   - if at least 60 % of them actually turned out bigger, the new prediction moves up one size;
+   - if at least 60 % turned out smaller, it moves down one size.
+
+   It never moves more than one step. The rule applies whether Gemma or the heuristic sized the task. The shift is logged, and the rationale says "calibrated from N past tasks".
 
 `/api/status` has the summary under `foreman.calibration` (`n`, `accuracy_pct`, `under`, `over`, `shift_rules`). The dashboard's Foundry tasks summary line shows it as "Sizing accuracy: X % over N tasks".
 

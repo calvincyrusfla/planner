@@ -115,14 +115,21 @@ async def _maybe_await(value: Any) -> Any:
 
 
 def _clean_meta(m: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalise a sizing record to ``{"source": "gemma"|"heuristic"|None, "ms": int|None}``."""
+    """Normalise a sizing record to ``{"source": "gemma"|"heuristic"|None, "ms": int|None}``.
+
+    ``"raw"`` (the Foreman's size before calibration, S/M/L/XL) is kept when valid.
+    """
     source = m.get("source")
     source = source if source in ("gemma", "heuristic") else None
     try:
         ms = max(0, int(m.get("ms"))) if m.get("ms") is not None else None
     except (TypeError, ValueError):
         ms = None
-    return {"source": source, "ms": ms}
+    out: dict[str, Any] = {"source": source, "ms": ms}
+    raw = str(m.get("raw") or "").upper()
+    if raw in ("S", "M", "L", "XL"):
+        out["raw"] = raw
+    return out
 
 
 def _val(x: Any) -> Any:
@@ -568,7 +575,9 @@ class FloorManager:
         ms = int(round((time.monotonic() - started) * 1000))
         last = getattr(self.foreman, "last_source", None)
         source = last.get("size_task_scope") if isinstance(last, Mapping) else None
-        self._sized_meta[order.task_id] = _clean_meta({"source": source, "ms": ms})
+        # the Foreman's size before calibration (outcomes learn from this, not the shifted size)
+        raw = getattr(self.foreman, "last_raw_complexity", None)
+        self._sized_meta[order.task_id] = _clean_meta({"source": source, "ms": ms, "raw": raw})
         if isinstance(result, TaskSizingDirective):
             return result
         return TaskSizingDirective.model_validate(result)
@@ -726,7 +735,7 @@ class FloorManager:
         order = self.orders.get(task_id)
         d = self.directives.get(task_id)
         meta = self.sizing_meta.get(task_id) or {}
-        kwargs: dict[str, Any] = {"sizing_source": meta.get("source")}
+        kwargs: dict[str, Any] = {"sizing_source": meta.get("source"), "raw_predicted": meta.get("raw")}
         if order is not None:
             kwargs["title"] = order.title
             if order.files:
