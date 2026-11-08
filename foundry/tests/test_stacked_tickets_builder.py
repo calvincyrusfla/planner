@@ -78,6 +78,11 @@ def make_repo(root: Path) -> Path:
     return root
 
 
+OTHER = "pkg/other.py"
+OTHER_SRC = '"""Unrelated."""\n\n\ndef zap(value: int) -> int:\n    secret = value * 7\n    return secret\n'
+
+
+
 class _Foreman:
     def condense_error_trace(self, trace: str) -> str:
         return trace[-300:]
@@ -98,8 +103,8 @@ class Rig:
             subtasks=[
                 SubtaskAllocation(subtask_id="T-9.1", title="Add mul to the calculator",
                                   acceptance_criteria=["mul multiplies"], allowed_files=[CALC]),
-                SubtaskAllocation(subtask_id="T-9.2", title="Test mul",
-                                  acceptance_criteria=["tests cover mul"], allowed_files=[TESTS, CALC]),
+                SubtaskAllocation(subtask_id="T-9.2", title="Test the calculator",
+                                  acceptance_criteria=["tests cover the new helper"], allowed_files=[TESTS]),
             ],
         ))
         self.worker = BuilderWorker(TEAM, 2, self.queue, self.client, None, None, self.engine,
@@ -191,7 +196,7 @@ def test_prepare_stacked_workspace_names_the_diff_that_does_not_stack(tmp_path: 
         prepare_stacked_workspace(base, tmp_path / "stack", [("T-9.2", IMPL_DIFF.replace("a + b", "a - b"))])
 
 
-def test_workspace_gates_validate_on_the_given_base(tmp_path: Path) -> None:
+def test_workspace_gates_validate_in_the_given_workspace_without_copying(tmp_path: Path) -> None:
     base = make_repo(tmp_path / "base")
     stacked = prepare_stacked_workspace(base, tmp_path / "stack", [IMPL_DIFF])
     gates = WorkspaceGates(ValidationGates(checks=("syntax",)), base)
@@ -201,8 +206,19 @@ def test_workspace_gates_validate_on_the_given_base(tmp_path: Path) -> None:
                             modified_files=[CALC], diff=diff)
     asg = _assignment()
     assert not asyncio.run(gates.run(sub, asg)).passed  # `mul` is not in the base
-    assert asyncio.run(gates.run(sub, asg, base=stacked)).passed
-    assert (stacked / CALC).read_text(encoding="utf-8").count("a * b") == 1  # the stack itself is not patched
+    assert asyncio.run(gates.run(sub, asg, workspace=stacked)).passed
+    assert "return b * a" in (stacked / CALC).read_text(encoding="utf-8")  # patched in place, no copy
+    assert (base / CALC).read_text(encoding="utf-8") == BASE_CALC
+
+
+def test_stack_is_strict_like_the_combined_patch(tmp_path: Path) -> None:
+    """A hunk whose context does not match exactly is refused (git apply, no fuzz)."""
+    base = make_repo(tmp_path / "base")
+    fuzzy = IMPL_DIFF.replace(" def add(a: int, b: int) -> int:\n", " def add(a: int, b: int) -> int:  \n")
+    if not shutil.which("git"):
+        pytest.skip("git not installed")
+    with pytest.raises(DiffApplyError, match="T-9.1"):
+        prepare_stacked_workspace(base, tmp_path / "stack", [("T-9.1", fuzzy)])
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +242,13 @@ def test_tests_ticket_builds_on_the_approved_impl(tmp_path: Path, monkeypatch: p
 
     outcome = asyncio.run(rig.worker.process_ticket(ticket))
     assert outcome == "review", rig.worker.scratch.get("last_reply")
+    # one repo copy per attempt: the stacked copy is also the gate workspace
+    assert [p.name.split("-")[1] for p in made] == ["stack"]
 
     prompt = rig.client.prompts_for("alpha-2")[0]
+    assert "## Your files\n- tests/test_calc.py\n" in prompt
+    also = prompt.split("## You may also touch", 1)[1].split("##", 1)[0]
+    assert f"- {CALC}" in also and TESTS not in also
     assert "## Already done on this piece" in prompt
     assert "- T-9.1: Add mul to the calculator" in prompt and "`mul`" in prompt
     context = prompt.split("## Context", 1)[1]
@@ -249,6 +270,32 @@ def test_tests_ticket_builds_on_the_approved_impl(tmp_path: Path, monkeypatch: p
         on_impl = prepare_stacked_workspace(rig.repo, tmp_path / "on_impl", [IMPL_DIFF])
         res = _git_apply_check(on_impl, diff)
         assert res.returncode == 0, res.stderr
+
+
+def test_context_takes_focus_files_first_and_others_as_outlines(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, stacked_reply())
+    (rig.repo / OTHER).write_text(OTHER_SRC, encoding="utf-8")
+    t = rig.ticket("T-9.2")
+    # the task's union also holds an unrelated sibling file nobody names
+    ticket = t.model_copy(update={"allowed_files": [TESTS, CALC, OTHER], "focus_files": [TESTS]})
+    rig.approve_impl()
+    rig.worker.approved_diffs_before = lambda _tid: [("T-9.1", IMPL_DIFF)]
+    info = rig.worker._subtask_info(ticket)
+    assert info["focus_files"] == [TESTS]
+    rig.worker._stack = asyncio.run(rig.worker._prepare_stack(ticket))
+    try:
+        ctx, _ = asyncio.run(rig.worker._context_for(ticket, info))
+    finally:
+        shutil.rmtree(rig.worker._stack.tmp, ignore_errors=True)  # type: ignore[union-attr]
+        rig.worker._stack = None
+    text = "\n".join(f"### {s.path}\n{s.text}" for s in ctx.snippets)
+    assert "def mul(a: int, b: int) -> int:" in text and "return a * b" in text  # named by earlier work: full
+    assert "secret = value * 7" not in text  # unnamed sibling file: no body
+
+
+def test_focus_equal_to_allowed_keeps_the_single_list() -> None:
+    prompt = build_builder_prompt(_assignment(), focus_files=[TESTS, CALC])
+    assert "## Files you may modify" in prompt and "## You may also touch" not in prompt
 
 
 def test_first_ticket_is_not_stacked(tmp_path: Path) -> None:

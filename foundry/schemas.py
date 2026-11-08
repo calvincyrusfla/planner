@@ -278,6 +278,14 @@ class SubtaskAllocation(FoundryModel):
             "its ticket sequential (never parallel_ok). Empty = no explicit dependency."
         ),
     )
+    independent: bool = Field(
+        default=False,
+        description=(
+            "True only when the Foreman judged this subtask needs nothing from the task's "
+            "other subtasks; only then may its ticket run in parallel with earlier ones "
+            "(and only with separate files). Default: sequential."
+        ),
+    )
 
     @field_validator("depends_on", mode="before")
     @classmethod

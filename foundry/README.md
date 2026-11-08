@@ -5,7 +5,7 @@ Foundry is a Python "factory" that runs coding work for the Agent Department.
 - The **Floor Manager** (`floor_manager.py`) is the planning tier. It takes work orders, has the Shop Foreman size them, queues one ticket per allocated builder, carries out escalations and drafts the PR text when a task is finished. It makes no polling Claude calls.
 - The **Shop Foreman** (`shop_foreman.py`) is a local **Gemma 4** model served by **Ollama** (OpenAI-compatible API at `http://localhost:11434/v1`). It sizes tasks (S = 1 builder, M = 2, L/XL = 5), prunes context, condenses tracebacks into one-line fix hints, drafts commit/PR text, answers questions through read-only tools and raises structured `ForemanEscalation`s. Every Foreman hook has a deterministic fallback, so the factory keeps working with Gemma offline.
 - **Builders** (up to 5 per team) and **reviewers** (1 per team, `<team>-6`) are **Claude**. They run as headless Claude Code (`claude -p --output-format json`) on your PC under your Claude subscription. Foundry uses no API keys anywhere.
-- **Deterministic gates** (`validation_gates.py`, in this order: syntax → linter → typecheck → tests → schema) run before any reviewer. A failure skips the reviewer and sends the builder a one-line fix hint. A task gets at most 2 retries, then it is quarantined.
+- **Deterministic gates** (`validation_gates.py`, in this order: syntax → linter → typecheck → tests → schema) run before any reviewer. A failure skips the reviewer and sends the builder a one-line fix hint. Each ticket gets `FOUNDRY_MAX_RETRIES` retries (default 3, so 4 attempts; allowed 1..5), then its task is quarantined. Gate failures, REVISE verdicts and BLOCKED replies use up retries; infrastructure failures don't. Each retry widens the builder's context: attempt 1 gets level 1, attempt 2 gets level 2, attempt 3 and later get level 3.
 - Underneath: a SQLite (WAL) queue with crash resume (`orchestrator_queue.py`), a token-bucket rate limiter with jittered backoff (`rate_limiter.py`), telemetry (`telemetry.py`) and an exact-match solution cache (`solution_cache.py`).
 
 Foundry **feeds the existing Agent Department dashboard**; it does not replace it (see [Board bridge](#how-it-feeds-the-agent-department-dashboard)).
@@ -92,7 +92,18 @@ Time in the demo is simulated. The queue, telemetry and limiter share a virtual 
 7. escalation validation and every Floor Manager action
 8. `foreman_probe` offline and online
 
-It also runs the demo itself. Each module also has its own `test_<area>.py`.
+It also runs the demo itself. Each module also has its own `test_<area>.py`. `tests/test_stacked_tickets_e2e.py` reproduces the split-piece failures (see [Pieces split across builders](#pieces-split-across-builders)) and the retry cap.
+
+## Pieces split across builders
+
+When the Shop Foreman splits a piece (one task) into several subtasks, each subtask becomes a ticket, and the builders build on each other's work instead of all starting from the base:
+
+- **Build order.** Tickets keep the Foreman's subtask order, with tests and docs subtasks (every file is a test or doc file) moved last.
+- **Sequential by default.** A ticket is claimed only after every earlier ticket of the piece is approved. A ticket may run alongside earlier ones (`parallel_ok`) only when the Foreman marked its subtask `independent` (it needs nothing from the others), its files are separate from every earlier ticket's, no test files are involved and no `depends_on` is set. The heuristic split (Gemma offline) never marks a subtask independent.
+- **Shared files.** Every builder may touch all of the piece's files. Its own files come first in the prompt (its focus). Edits outside the piece's files are still refused.
+- **Already done on this piece.** A ticket is built in a scratch copy of the repo with the earlier approved diffs applied in order, so the context slice shows teammates' new functions and files. The prompt lists each earlier ticket's title and the files and symbols it changed, and tells the builder to build on them. The submitted diff is relative to that stacked workspace, so the reviewer sees only this ticket's change.
+- **Stacked combined patch.** When the piece is approved, the diffs are applied in ticket order in a scratch copy, and the final diff against the base becomes `<task>.patch`. It is then checked with `git apply --check` on the base.
+- **Reopened tickets.** If an earlier ticket is sent back after a later one started, the later tickets that aren't done go back to open (their attempt count unchanged), so none of them is built on stale code.
 
 ## Setting up the Shop Foreman (phase 2)
 
@@ -727,6 +738,7 @@ Foundry only claims batches while the service is running. If the batch stays on 
 | `FOUNDRY_CLAUDE_ARGS` | extra flags **appended** to the safe defaults above |
 | `FOUNDRY_CLAUDE_ARGS_REPLACE` | `1` = `FOUNDRY_CLAUDE_ARGS` replaces the defaults instead |
 | `FOUNDRY_INFRA_FAILURE_CAP` | `3` consecutive infrastructure failures on one ticket before it is quarantined |
+| `FOUNDRY_MAX_RETRIES` | `3` retries after a ticket's first attempt (4 attempts), allowed `1`..`5`. Gate failures, REVISE verdicts and BLOCKED replies count; when the retries are used up, the task is quarantined. Context level per attempt: 1, 2, then 3 for attempt 3 and later |
 | `FOUNDRY_CLAUDE_APPEND_PROMPT` | the Foundry role prompt; `none` = no `--append-system-prompt` |
 | `FOUNDRY_PATCHES_DIR` | `patches/` next to the database (`foundry/data/patches` by default) |
 | `FOUNDRY_AUTO_PR` | `true`: every approved task gets its own branch and pull request (see [Automatic pull requests](#automatic-pull-requests)) |

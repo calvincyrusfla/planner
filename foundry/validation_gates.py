@@ -399,9 +399,12 @@ def prepare_stacked_workspace(
     This is the workspace a stacked ticket is built in: the repository plus
     the approved diffs of the task's earlier tickets, each relative to the
     ones before it.  ``diffs`` items are diff texts or ``(label, diff)``
-    pairs (e.g. ``(subtask_id, diff)``); empty diffs are skipped.  No
-    allow-list applies (the diffs were already gated and approved); the
-    workspace boundary is still enforced.  ``base`` is never modified.
+    pairs (e.g. ``(subtask_id, diff)``); empty diffs are skipped.  Each is
+    applied strictly with ``git apply`` (no fuzz, no offsets), matching
+    ``floor_manager.stack_diffs`` (the combined patch), so a diff the
+    combined patch could not fold in fails here too.  No allow-list applies
+    (the diffs were already gated and approved).  ``base`` is never modified;
+    ``dst``'s parent must be a scratch directory (patch files go there).
 
     Raises:
         DiffApplyError: an earlier diff does not apply on top of the ones
@@ -419,10 +422,44 @@ def prepare_stacked_workspace(
         if not str(diff or "").strip():
             continue
         try:
-            apply_diff(diff, out)
+            _strict_apply(diff, out, n)
         except DiffApplyError as exc:
             raise DiffApplyError(f"earlier approved diff {label} does not apply: {exc}") from exc
     return out
+
+
+#: ``git`` options for stacking (same as ``floor_manager.stack_diffs``): no CRLF rewriting.
+_GIT_STACK_CFG = ("-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.quotepath=false")
+
+
+def _strict_apply(diff: str, workspace: Path, n: int = 1) -> None:
+    """Apply one approved diff exactly as ``floor_manager.stack_diffs`` does: ``git apply``, no fuzz.
+
+    A hunk that only matches at a different place or with changed context is
+    refused, so the stacked workspace is exactly what the combined patch
+    produces.  Without git (rare) :func:`apply_diff` is used instead.
+    """
+    git = shutil.which("git")
+    if git is None:
+        apply_diff(diff, workspace)
+        return
+    text = diff if diff.endswith("\n") else diff + "\n"
+    patch = workspace.parent / f".stack-{n}.patch"
+    patch.write_bytes(text.encode("utf-8"))
+    # never let git discover a repository above the scratch copy
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(workspace.parent.resolve())}
+    try:
+        proc = subprocess.run(
+            [git, *_GIT_STACK_CFG, "apply", "--whitespace=nowarn", str(patch.resolve())],
+            cwd=str(workspace), capture_output=True, timeout=120, env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DiffApplyError(f"git apply failed to run: {exc}") from exc
+    finally:
+        patch.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()
+        raise DiffApplyError(err or "git apply failed")
 
 
 # --------------------------------------------------------------------------

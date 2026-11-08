@@ -22,9 +22,11 @@ from foundry.schemas import SubtaskAllocation, TaskSizingDirective
 HAS_GIT = shutil.which("git") is not None
 
 
-def sub(i: int, files: list[str], title: str | None = None, criteria: list[str] | None = None) -> SubtaskAllocation:
+def sub(i: int, files: list[str], title: str | None = None, criteria: list[str] | None = None,
+        independent: bool = False) -> SubtaskAllocation:
     return SubtaskAllocation(subtask_id=f"T-1.{i}", title=title or f"part {i}",
-                             acceptance_criteria=criteria or [f"c{i}"], allowed_files=files)
+                             acceptance_criteria=criteria or [f"c{i}"], allowed_files=files,
+                             independent=independent)
 
 
 def directive(subs: list[SubtaskAllocation], n: int | None = None) -> TaskSizingDirective:
@@ -64,14 +66,30 @@ def test_plan_orders_tests_last_and_gives_every_ticket_the_task_files() -> None:
     assert not any(p.parallel_ok for p in plan)  # overlap / tests / docs after tests
 
 
-def test_parallel_ok_only_when_disjoint_without_tests_or_dependencies() -> None:
-    plan = plan_tickets([sub(1, ["a.py"]), sub(2, ["b.py"]), sub(3, ["a.py"]), sub(4, ["c.py"])])
-    assert [p.parallel_ok for p in plan] == [False, True, False, True]
+def test_disjoint_files_alone_never_make_a_ticket_parallel() -> None:
+    """The Foreman always hands out disjoint files: that must not make tickets parallel (F-011)."""
+    plan = plan_tickets([sub(1, ["foundry/config.py"]), sub(2, ["foundry/shop_foreman.py"]),
+                         sub(3, ["foundry/tests/test_x.py"])])
+    assert [p.parallel_ok for p in plan] == [False, False, False]
+    assert plan[1].allowed_files == ["foundry/shop_foreman.py", "foundry/config.py", "foundry/tests/test_x.py"]
+
+
+def test_parallel_ok_only_when_independent_disjoint_without_tests_or_dependencies() -> None:
+    plan = plan_tickets([sub(1, ["a.py"]), sub(2, ["b.py"], independent=True), sub(3, ["a.py"], independent=True),
+                         sub(4, ["c.py"], independent=True), sub(5, ["d.py"])])
+    assert [p.parallel_ok for p in plan] == [False, True, False, True, False]
+    # concurrent tickets never share a file: parallel ones keep to their own files,
+    # and nobody sees a later parallel ticket's files
+    assert plan[0].allowed_files == ["a.py", "d.py"]
+    assert plan[1].allowed_files == ["b.py"]
+    assert plan[2].allowed_files == ["a.py", "b.py", "d.py"]
+    assert plan[3].allowed_files == ["c.py"]
+    assert plan[4].allowed_files == ["d.py", "a.py", "b.py", "c.py"]
     # the Foreman marked a dependency on an earlier subtask
-    plan = plan_tickets([sub(1, ["a.py"]), sub(2, ["b.py"], criteria=["uses the helper from T-1.1"])])
+    plan = plan_tickets([sub(1, ["a.py"]), sub(2, ["b.py"], criteria=["uses the helper from T-1.1"], independent=True)])
     assert plan[1].parallel_ok is False
     # a test file anywhere before (or in) the ticket keeps it sequential
-    plan = plan_tickets([sub(1, ["a.py", "tests/test_a.py"]), sub(2, ["b.py"])])
+    plan = plan_tickets([sub(1, ["a.py", "tests/test_a.py"]), sub(2, ["b.py"], independent=True)])
     assert plan[1].parallel_ok is False
     # unknown files: sequential, and still unrestricted as before
     plan = plan_tickets([sub(1, ["a.py"]), sub(2, [])])
@@ -79,6 +97,7 @@ def test_parallel_ok_only_when_disjoint_without_tests_or_dependencies() -> None:
     # an explicit depends_on (when the directive carries one) is honoured
     class Dep:
         subtask_id, title, acceptance_criteria, allowed_files, depends_on = "T-1.2", "x", [], ["b.py"], ["T-1.1"]
+        independent = True
     assert plan_tickets([sub(1, ["a.py"]), Dep()])[1].parallel_ok is False
 
 
@@ -107,7 +126,7 @@ def test_sequential_ticket_waits_until_every_earlier_ticket_is_done(q: FoundryQu
 
 
 def test_parallel_ok_tickets_run_alongside_earlier_ones(q: FoundryQueue) -> None:
-    q.apply_sizing(directive([sub(1, ["a.py"]), sub(2, ["b.py"]), sub(3, ["a.py"])]))
+    q.apply_sizing(directive([sub(1, ["a.py"]), sub(2, ["b.py"], independent=True), sub(3, ["a.py"])]))
     t1 = q.claim_ticket("alpha", 1)
     t2 = q.claim_ticket("alpha", 2)
     assert t1 is not None and t2 is not None and t2.parallel_ok
@@ -116,6 +135,30 @@ def test_parallel_ok_tickets_run_alongside_earlier_ones(q: FoundryQueue) -> None
     assert q.claim_ticket("alpha", 3) is None  # T-1.2 is earlier too
     q.complete_ticket(t2.ticket_id)
     assert q.claim_ticket("alpha", 3) is not None
+
+
+def test_foreman_shaped_impl_tickets_are_not_both_claimable(q: FoundryQueue) -> None:
+    q.apply_sizing(directive([sub(1, ["foundry/config.py"]), sub(2, ["foundry/shop_foreman.py"])]))
+    t1 = q.claim_ticket("alpha", 1)
+    assert t1 is not None and q.claim_ticket("alpha", 2) is None
+    q.complete_ticket(t1.ticket_id, diff="D1")
+    t2 = q.claim_ticket("alpha", 2)
+    assert t2 is not None and "foundry/config.py" in t2.allowed_files  # may finish the sibling's file
+    assert q.approved_diffs_before(t2.ticket_id) == [("T-1.1", "D1")]
+
+
+def test_concurrent_tickets_cannot_produce_conflicting_diffs(q: FoundryQueue) -> None:
+    """alpha-6's case: two tickets running at once, both editing one file -> rejected patch.
+
+    Whatever ran at the same time has disjoint allowed files, so their diffs never collide.
+    """
+    q.apply_sizing(directive([sub(1, ["a.py"]), sub(2, ["b.py"], independent=True), sub(3, ["c.py"])]))
+    running = [q.claim_ticket("alpha", s) for s in (1, 2, 3)]
+    claimed = [t for t in running if t is not None]
+    assert [t.subtask_id for t in claimed] == ["T-1.1", "T-1.2"]  # T-1.3 waits
+    a, b = (set(t.allowed_files) for t in claimed)
+    assert not a & b, (a, b)
+    assert "b.py" not in a and "a.py" not in b
 
 
 def test_one_slot_takes_tickets_in_build_order(q: FoundryQueue) -> None:

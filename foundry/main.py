@@ -152,7 +152,7 @@ def append_diff(path: str, original: str, new_lines: Sequence[str]) -> str:
     return "\n".join(body) + "\n"
 
 
-_FILES_RE = re.compile(r"## Files you may modify\n((?:- .+\n)+)")
+_FILES_RE = re.compile(r"## (?:Files you may modify|Your files)\n((?:- .+\n)+)")
 _BUILDER_RE = re.compile(r"You are builder (\S+) on team")
 _SUBTASK_RE = re.compile(r"subtask (\S+), attempt")
 

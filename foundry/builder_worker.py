@@ -302,6 +302,8 @@ class StackedWork:
     title: str
     files: tuple[str, ...]
     symbols: tuple[str, ...]
+    #: ``((path, (symbol, ...)), ...)``: where each added/changed symbol lives.
+    by_file: tuple[tuple[str, tuple[str, ...]], ...] = field(default=(), compare=False)
 
 
 _DEF_KW = r"(?:async\s+def|def|class|(?:export\s+)?(?:async\s+)?function)"
@@ -326,14 +328,51 @@ def summarize_diff(diff: str) -> tuple[list[str], list[str]]:
     return files, list(symbols)
 
 
+def symbols_by_file(diff: str) -> dict[str, list[str]]:
+    """Added/changed symbols of a diff grouped by the file they are in (deleted files skipped)."""
+    out: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].split("\t", 1)[0].strip()
+            current = None if target == "/dev/null" else _normalize_path(target[2:] if target.startswith("b/") else target)
+            continue
+        if line.startswith("--- ") or current is None:
+            continue
+        m = _ADDED_DEF_RE.match(line) or _HUNK_CTX_RE.match(line) or _ADDED_CONST_RE.match(line)
+        if m and m.group(1) not in out.setdefault(current, []):
+            out[current].append(m.group(1))
+    return out
+
+
 def stacked_work(items: Iterable[tuple[str, str]], titles: Mapping[str, str] | None = None) -> list[StackedWork]:
     """:class:`StackedWork` per ``(subtask_id, diff)`` (titles by subtask id; default the id)."""
     out: list[StackedWork] = []
     for subtask_id, diff in items:
         files, symbols = summarize_diff(diff or "")
+        by_file = tuple((p, tuple(names)) for p, names in symbols_by_file(diff or "").items() if names)
         sid = str(subtask_id)
-        out.append(StackedWork(sid, str((titles or {}).get(sid) or sid), tuple(files), tuple(symbols)))
+        out.append(StackedWork(sid, str((titles or {}).get(sid) or sid), tuple(files), tuple(symbols), by_file))
     return out
+
+
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+
+
+def _defines_any(path: Path, names: set[str]) -> bool:
+    """True when the file defines (def/class/function/CONST =) one of ``names``."""
+    if not names:
+        return False
+    try:
+        if not path.is_file() or path.stat().st_size > 2_000_000:
+            return False
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for m in re.finditer(r"^[ \t]*" + _DEF_KW + r"\s+([A-Za-z_$][\w$]*)|^([A-Za-z_][\w]*)\s*(?::[^=\n]+)?=", text, re.M):
+        if (m.group(1) or m.group(2)) in names:
+            return True
+    return False
 
 
 #: At most this many symbols are listed per earlier ticket.
@@ -366,11 +405,15 @@ def build_builder_prompt(
     *,
     max_retries: int = MAX_RETRIES,
     already_done: Sequence[StackedWork] | None = None,
+    focus_files: Sequence[str] | None = None,
 ) -> str:
     """Return the exact prompt a builder sends to Claude for ``assignment``.
 
     ``already_done`` (stacked tickets): the task's earlier approved tickets,
     listed under "## Already done on this piece" (title, files, symbols).
+    ``focus_files``: this subtask's own files; when they are a strict subset
+    of the allowed files the prompt lists "## Your files" and, separately,
+    "## You may also touch" (the rest of the task's files).
 
     Contains only: who/what (ids, attempt), the objective, acceptance criteria,
     allowed files, the pruned ``ContextSlice`` snippets (edit targets in full,
@@ -391,8 +434,22 @@ def build_builder_prompt(
         "## Acceptance criteria",
     ]
     parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
-    parts += ["", "## Files you may modify"]
-    parts += [f"- {f}" for f in assignment.allowed_files] or ["- (no restriction given)"]
+    allowed = list(assignment.allowed_files)
+    focus = [f for f in (focus_files or ()) if f in allowed]
+    also = [f for f in allowed if f not in focus]
+    if focus and also:
+        parts += ["", "## Your files"]
+        parts += [f"- {f}" for f in focus]
+        parts += [
+            "",
+            "## You may also touch",
+            "Other files of this task (teammates' subtasks). Change one only when your subtask "
+            "needs it; together with 'Your files' these are the files you may modify.",
+        ]
+        parts += [f"- {f}" for f in also]
+    else:
+        parts += ["", "## Files you may modify"]
+        parts += [f"- {f}" for f in allowed] or ["- (no restriction given)"]
     if already_done:
         parts += _already_done_section(already_done)
     if ctx.snippets:
@@ -1539,6 +1596,9 @@ class BuilderWorker(_WorkerBase):
         info["title"] = info["title"] or str(_get(ticket, "subtask_id"))
         info["acceptance_criteria"] = list(info["acceptance_criteria"] or [])
         info["allowed_files"] = list(info["allowed_files"] or [])
+        allowed = info["allowed_files"]
+        focus = [f for f in (_get(ticket, "focus_files") or []) if f in allowed]
+        info["focus_files"] = focus or list(allowed)
         return info
 
     async def _context_for(self, ticket: Any, info: dict[str, Any]) -> tuple[ContextSlice, int]:
@@ -1563,6 +1623,10 @@ class BuilderWorker(_WorkerBase):
             "acceptance_criteria": info["acceptance_criteria"],
             "allowed_files": info["allowed_files"],
         }
+        # Focus first: the ticket's own files are edit targets; the task's other files
+        # only when named (in the subtask text or by an earlier ticket's work), else outlines.
+        focus = list(info.get("focus_files") or info["allowed_files"])
+        others = [f for f in info["allowed_files"] if f not in focus]
         # Retries widen the context: attempt 1 -> level 1, attempt 2 -> 2, attempt 3+ -> 3;
         # symbols a builder asked for (BLOCKED note) are always shown in full.
         attempt = max(0, int(_get(ticket, "attempt", 0) or 0))
@@ -1574,6 +1638,21 @@ class BuilderWorker(_WorkerBase):
         if description:
             widen["description"] = description
         extra = self._requested_symbols(ticket)
+        stacked = self._stacked_symbols()
+        if others:
+            root = getattr(engine, "repo_root", None)
+            text = " ".join([str(info["title"]), *map(str, info["acceptance_criteria"]), description,
+                             *(str(e) for e in extra)])
+            names = set(_IDENT_RE.findall(text))
+            by_earlier = {path for path, _name in stacked}
+            named = [f for f in others if f in by_earlier
+                     or (root is not None and _defines_any(Path(root) / f, names))]
+            kwargs["allowed_files"] = focus + named
+            rest = [f for f in others if f not in named]
+            if rest:
+                widen["extra_files"] = rest
+        visible = set(kwargs["allowed_files"])
+        extra = list(extra) + [f"{p}::{n}" for p, n in stacked if p in visible]
         if extra:
             widen["extra_symbols"] = extra
         afn = getattr(engine, "abuild_slice", None)
@@ -1637,11 +1716,25 @@ class BuilderWorker(_WorkerBase):
                 fn = gates
             if fn is None:
                 raise TypeError("gates must provide validate_async/validate/run or be callable")
+            stack = self._stack
             extra: dict[str, Any] = {}
-            if self._stack is not None and self._stack.tmp is not None:
-                # gate the diff on top of the earlier approved diffs (WorkspaceGates(base=))
-                extra = _supported_kwargs(fn, {"base": self._stack.root})
-            outcome = await _maybe_await(fn(submission, assignment, **extra))
+            if stack is not None and stack.tmp is not None and stack.root is not None:
+                # gate the diff on top of the earlier approved diffs, in the stacked copy
+                # itself (WorkspaceGates(workspace=)): one repo copy per attempt
+                extra = _supported_kwargs(fn, {"workspace": stack.root})
+            if extra:
+                assert stack is not None and stack.root is not None
+                before = _snapshot_files(stack.root, extract_diff_paths(submission.diff))
+                try:
+                    outcome = await _maybe_await(fn(submission, assignment, **extra))
+                except BaseException:
+                    _restore_files(stack.root, before)
+                    raise
+                if not bool(getattr(outcome, "passed", True)):
+                    # e.g. a stale cached diff: the build that follows starts from the clean stack
+                    _restore_files(stack.root, before)
+            else:
+                outcome = await _maybe_await(fn(submission, assignment))
         if isinstance(outcome, GateSummary):
             return outcome
         if hasattr(outcome, "passed") and hasattr(outcome, "results"):
@@ -1779,6 +1872,20 @@ class BuilderWorker(_WorkerBase):
             log.exception("%s: could not re-root the context engine at the stacked workspace", self.agent_id)
             return engine
 
+    def _stacked_symbols(self, limit: int = 12) -> list[tuple[str, str]]:
+        """``(path, symbol)`` the earlier tickets added/changed (newest work first), at most ``limit``."""
+        out: list[tuple[str, str]] = []
+        for w in reversed(self._already_done()):
+            for path, names in w.by_file:
+                for n in names:
+                    if (path, n) not in out:
+                        out.append((path, n))
+        return out[:limit]
+
+    @staticmethod
+    def _focus_files(ticket: Any, assignment: TaskAssignment) -> list[str]:
+        return [f for f in (_get(ticket, "focus_files") or []) if f in assignment.allowed_files]
+
     def _already_done(self) -> list[StackedWork]:
         return list(self._stack.work) if self._stack is not None else []
 
@@ -1805,7 +1912,8 @@ class BuilderWorker(_WorkerBase):
             # A stale cached diff no longer passes its gates: build normally, no retry burned.
 
         # 2. Claude (inside limiter.slot + call_with_backoff)
-        prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done())
+        prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
+                                      focus_files=self._focus_files(ticket, assignment))
         self.scratch["last_prompt"] = prompt
         try:
             result = await self._call_claude(prompt, task_id=task_id)
@@ -2087,7 +2195,8 @@ class BuilderWorker(_WorkerBase):
             _restore_files(self.workspace, snapshot)
             self._event("cache_stale", task_id, {"ticket_id": _get(ticket, "ticket_id")})
             return None
-        prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done())
+        prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
+                                      focus_files=self._focus_files(ticket, assignment))
         self._tm("record_tokens_saved", task_id, "cache", _estimate_tokens(prompt) + _estimate_tokens(cached))
         self._event("cache_hit", task_id, {"ticket_id": _get(ticket, "ticket_id"), "builder_id": self.agent_id})
         self._tm("record_duration", task_id, "build", time.monotonic() - started)

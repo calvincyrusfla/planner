@@ -11,7 +11,8 @@ only Claude for ``SimulatedClaudeClient``. No real Claude, Ollama or GitHub.
     the sibling sequential).
 (c) F-013: a ticket that fails its gates twice still gets a 3rd attempt at
     context level 3 (default cap ``MAX_RETRIES`` = 3); the cap is configurable.
-(d) ``parallel_ok`` tickets (disjoint files, no tests) still run concurrently.
+(d) ``parallel_ok`` tickets (disjoint files, no tests, marked independent by
+    the Foreman) still run concurrently; a heuristic split never is.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from foundry.claude_client import SimulatedClaudeClient
 from foundry.config import FoundryConfig
 from foundry.context_engine import ContextEngine
 from foundry.floor_manager import Factory, WorkOrder
+from foundry.gemma_client import GemmaRequest, SimulatedGemmaClient
 from foundry.main import write_demo_repo
 from foundry.orchestrator_queue import FoundryQueue
 from foundry.schemas import (
@@ -298,15 +300,38 @@ def test_queue_cap_is_clamped_and_old_attempts_still_load(tmp_path: Path) -> Non
 # --------------------------------------------------------------------------- (d) parallel_ok
 
 
-def test_parallel_ok_tickets_still_run_concurrently(tmp_path: Path) -> None:
+def _sizing_gemma(subtasks: list[dict[str, Any]]) -> SimulatedGemmaClient:
+    """Gemma that sizes every order as M with ``subtasks``; other hooks fall back."""
+
+    def responder(req: GemmaRequest) -> Any:
+        schema = req.json_schema or {}
+        if "subtasks" in schema.get("properties", {}):
+            return {"complexity": "M", "rationale": "two helpers", "subtasks": subtasks}
+        return "{}" if req.json_schema is not None else ""
+
+    return SimulatedGemmaClient(responder)
+
+
+def test_gemma_marks_independent_subtasks_and_they_run_concurrently(tmp_path: Path) -> None:
     script = Script({
         "1": edits_reply({"op": "append", "file": "shop/strings.py", "code": "def mumble(value):\n    return value\n"}),
         "2": edits_reply({"op": "append", "file": "shop/slug.py", "code": "def dash(value):\n    return value\n"}),
     }, latency=0.3)
-    f = _factory(tmp_path, script.client, teams=["alpha"])
+    gemma = _sizing_gemma([
+        {"title": "Mumble", "acceptance_criteria": ["mumbles"], "allowed_files": ["shop/strings.py"],
+         "independent": True},
+        {"title": "Dash", "acceptance_criteria": ["dashes"], "allowed_files": ["shop/slug.py"],
+         "independent": True},
+    ])
+    f = _factory(tmp_path, script.client, gemma=gemma, teams=["alpha"], pre_review="off")
     tid, state = asyncio.run(_run(f, {"title": "Two helpers", "description": "independent helpers",
                                       "team_id": "alpha", "files": ["shop/strings.py", "shop/slug.py"]}))
     assert state == TaskState.COMPLETE.value
+    directive = f.manager.directives[tid]
+    assert [s.independent for s in directive.subtasks] == [True, True]
+    sizing = [r for r in gemma.requests if "subtasks" in (r.json_schema or {}).get("properties", {})]
+    assert sizing and "independent" in (sizing[0].json_schema or {})["properties"]["subtasks"]["items"]["properties"]
+    assert "independent" in str(sizing[0].messages[0]["content"])  # the prompt explains when to set it
     tickets = sorted(f.queue.tickets_for_task(tid), key=lambda t: t.order_index)
     assert [t.parallel_ok for t in tickets] == [False, True]
     assert script.client.calls["alpha-1"] == 1 and script.client.calls["alpha-2"] == 1
@@ -314,6 +339,28 @@ def test_parallel_ok_tickets_still_run_concurrently(tmp_path: Path) -> None:
     assert "## Already done on this piece" not in script.prompts("2")[0]
     patch = _patch_for(tmp_path)
     assert "def mumble(value):" in patch and "def dash(value):" in patch
+    f.close()
+
+
+def test_only_a_literal_true_marks_a_subtask_independent(tmp_path: Path) -> None:
+    gemma = _sizing_gemma([
+        {"title": "Mumble", "acceptance_criteria": ["mumbles"], "allowed_files": ["shop/strings.py"],
+         "independent": "yes"},
+        {"title": "Dash", "acceptance_criteria": ["dashes"], "allowed_files": ["shop/slug.py"]},
+    ])
+    f = _factory(tmp_path, Script({}).client, gemma=gemma, teams=["alpha"])
+    tid = asyncio.run(f.manager.submit(WorkOrder(title="Two helpers", team_id="alpha",
+                                                 files=["shop/strings.py", "shop/slug.py"])))
+    assert [s.independent for s in f.manager.directives[tid].subtasks] == [False, False]
+    f.close()
+
+
+def test_heuristic_split_never_marks_independent(tmp_path: Path) -> None:
+    f = _factory(tmp_path, Script({}).client, teams=["alpha"])
+    tid = asyncio.run(f.manager.submit(WorkOrder(title="Two helpers", team_id="alpha",
+                                                 files=["shop/strings.py", "shop/slug.py"])))
+    directive = f.manager.directives[tid]
+    assert len(directive.subtasks) == 2 and not any(s.independent for s in directive.subtasks)
     f.close()
 
 

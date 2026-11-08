@@ -56,6 +56,7 @@ def directive(
                 "title": f"part {i}",
                 "acceptance_criteria": [f"c{i}"],
                 "allowed_files": [f"f{i}.py"],
+                "independent": True,  # slot mechanics: the slices may run side by side
             }
             for i in range(1, n + 1)
         ],

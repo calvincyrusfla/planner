@@ -1898,15 +1898,18 @@ class WorkspaceGates:
         self.base_workspace = Path(base_workspace)
         self.calls = 0
 
-    async def run(self, submission: Any, assignment: Any, *, base: str | Path | None = None) -> Any:
+    async def run(self, submission: Any, assignment: Any, *, workspace: str | Path | None = None) -> Any:
         """Validate ``submission`` in a scratch copy of the workspace.
 
-        ``base`` (stacked tickets): copy this directory instead of
-        ``base_workspace``, i.e. the repo with the task's earlier approved
-        diffs already applied, so the diff is checked relative to them.
+        ``workspace`` (stacked tickets): a scratch directory the caller owns
+        and already prepared (the repo plus the task's earlier approved
+        diffs); the diff is applied and checked there directly, without a
+        second copy.  It must never be the user's working tree.
         """
         self.calls += 1
-        source = Path(base) if base is not None else self.base_workspace
+        allowed = list(assignment.allowed_files) or None
+        if workspace is not None:
+            return await self.gates.validate_async(submission, Path(workspace), allowed_files=allowed)
         try:
             tmp = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="foundry-gates-"))
         except OSError as exc:
@@ -1914,10 +1917,8 @@ class WorkspaceGates:
         try:
             ws = tmp / "ws"
             # copying a real repo is slow: keep it off the event loop
-            await asyncio.to_thread(_copy_workspace, source, ws)
-            return await self.gates.validate_async(
-                submission, ws, allowed_files=list(assignment.allowed_files) or None
-            )
+            await asyncio.to_thread(_copy_workspace, self.base_workspace, ws)
+            return await self.gates.validate_async(submission, ws, allowed_files=allowed)
         finally:
             await asyncio.to_thread(shutil.rmtree, tmp, True)
 

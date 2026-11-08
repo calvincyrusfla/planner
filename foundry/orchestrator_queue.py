@@ -367,12 +367,17 @@ def plan_tickets(subtasks: list[Any]) -> list[TicketPlan]:
 
     * ``order_index``: the directive's subtask order, with tests/docs
       subtasks (every file a test or doc file) moved last, order kept.
-    * ``allowed_files``: the union of every subtask's files, the subtask's
-      own files first (its "focus"), so a builder may touch a sibling's file.
-    * ``parallel_ok``: only when the subtask's files are known and disjoint
-      from every earlier subtask's files, no test file is involved on either
-      side, and no dependency on an earlier subtask is marked. Otherwise the
-      ticket waits until every earlier ticket is done (approved).
+    * ``parallel_ok``: sequential by default. Only when the subtask is
+      explicitly marked ``independent`` by the Foreman, its files are known
+      and disjoint from every earlier subtask's files, no test file is
+      involved on either side, and no dependency on an earlier subtask is
+      marked (``depends_on`` or an earlier id named in its text). Otherwise
+      the ticket waits until every earlier ticket is done (approved).
+    * ``allowed_files``: the subtask's own files first (its "focus"). A
+      sequential ticket then gets every other file of the task except those
+      of later parallel_ok tickets (which may be built at the same time); a
+      parallel_ok ticket gets only its own files. So two tickets that may
+      run concurrently never share a file and their diffs never collide.
     """
     own = [[_norm_file(f) for f in getattr(s, "allowed_files", []) if str(f).strip()] for s in subtasks]
 
@@ -380,30 +385,41 @@ def plan_tickets(subtasks: list[Any]) -> list[TicketPlan]:
         return bool(files) and all(is_test_file(f) or is_doc_file(f) for f in files)
 
     order = sorted(range(len(subtasks)), key=lambda i: (trailing(own[i]), i))
-    union: list[str] = []
-    for i in order:
-        for f in own[i]:
-            if f not in union:
-                union.append(f)
-    plans: dict[int, TicketPlan] = {}
+    # pass 1: who may run alongside earlier tickets
+    parallel: list[bool] = []
     seen: set[str] = set()
     seen_tests = False
     earlier: list[Any] = []
     for pos, i in enumerate(order):
         files = own[i]
         has_tests = any(is_test_file(f) for f in files)
-        parallel = (
-            pos > 0 and bool(files) and not seen_tests and not has_tests
-            and not (set(files) & seen) and not _marks_dependency(subtasks[i], earlier)
+        parallel.append(
+            pos > 0 and bool(getattr(subtasks[i], "independent", False)) and bool(files)
+            and not seen_tests and not has_tests and not (set(files) & seen)
+            and not _marks_dependency(subtasks[i], earlier)
         )
-        focus = list(dict.fromkeys(files))
-        # a subtask without files stays unrestricted (as before); others get the task's union
-        allowed = focus + [f for f in union if f not in focus] if focus else []
-        plans[i] = TicketPlan(order_index=pos, parallel_ok=parallel, focus_files=focus,
-                              allowed_files=allowed)
         seen.update(files)
         seen_tests = seen_tests or has_tests
         earlier.append(subtasks[i])
+    # pass 2: allowed files = own files + files of tickets that never run at the same time
+    plans: dict[int, TicketPlan] = {}
+    for pos, i in enumerate(order):
+        focus = list(dict.fromkeys(own[i]))
+        if not focus:  # a subtask without files stays unrestricted (as before)
+            plans[i] = TicketPlan(order_index=pos, parallel_ok=parallel[pos], focus_files=[],
+                                  allowed_files=[])
+            continue
+        extra: list[str] = []
+        if not parallel[pos]:
+            # a parallel_ok ticket keeps to its own files (earlier tickets may be running and
+            # may touch any later file); a sequential one may touch every file of the task
+            # except those of later parallel_ok tickets, which may be built at the same time
+            busy = {f for q, j in enumerate(order) if q > pos and parallel[q] for f in own[j]}
+            for q, j in enumerate(order):
+                if q != pos and not (q > pos and parallel[q]):
+                    extra += [f for f in own[j] if f not in focus and f not in extra and f not in busy]
+        plans[i] = TicketPlan(order_index=pos, parallel_ok=parallel[pos], focus_files=focus,
+                              allowed_files=focus + extra)
     return [plans[i] for i in range(len(subtasks))]
 
 

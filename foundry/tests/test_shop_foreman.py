@@ -116,7 +116,7 @@ def sized_task(queue: FoundryQueue, task_id: str = "F-001", team: str = "alpha",
         rationale="test",
         subtasks=[
             SubtaskAllocation(subtask_id=f"{task_id}.{k}", title=f"part {k}", acceptance_criteria=["works"],
-                              allowed_files=[f"f{k}.py"])
+                              allowed_files=[f"f{k}.py"], independent=True)  # side by side
             for k in range(1, n + 1)
         ],
     )
