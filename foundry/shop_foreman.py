@@ -1320,32 +1320,32 @@ class ShopForeman:
     def calibration_summary(self, repo: str | None = None) -> dict[str, Any]:
         """How well past sizing matched reality, and the bias shifts in force.
 
-        ``{n, accuracy_pct, under, over, shift_rules: [...]}``; ``under`` counts
-        tasks that were actually bigger than predicted, ``over`` smaller.
-        ``accuracy_pct`` is ``None`` with no outcomes. Accuracy compares the
-        applied (post-shift) prediction with the actual size; ``shift_rules``
-        use the same outcomes (``repo`` scope) as :meth:`size_task_scope`.
+        ``{n, accuracy_pct, exact, under, over, shift_rules: [...]}``. The counts
+        come from :func:`foundry.sizing_outcomes.sizing_accuracy`: the raw
+        (pre-calibration) prediction versus the actual size, L and XL counted
+        as the same, rows marked ``excluded_from_calibration`` skipped.
+        ``under`` = actually bigger than predicted, ``over`` = smaller;
+        ``accuracy_pct`` is ``None`` with no outcomes. ``shift_rules`` use the
+        same outcomes (``repo`` scope) as :meth:`size_task_scope`.
         """
-        n = exact = under = over = 0
+        from foundry.sizing_outcomes import sizing_accuracy
+
         outcomes = self._outcomes(repo)
-        for outcome in outcomes:
-            pred, actual = _outcome_predicted(outcome), _outcome_actual(outcome)
-            if pred is None or actual is None:
-                continue
-            n += 1
-            diff = _size_delta(pred, actual)
-            exact += diff == 0
-            under += diff > 0
-            over += diff < 0
+        rows = [dict(o) for o in outcomes if isinstance(o, Mapping)]
+        try:
+            acc = sizing_accuracy(rows)
+        except Exception as exc:  # noqa: BLE001 - a malformed row must not break /api/status
+            log.info("Shop Foreman: sizing accuracy unavailable (%s)", exc)
+            acc = {"n": 0, "exact": 0, "under": 0, "over": 0}
+        n = int(acc["n"])
         shifts = calibration_shifts(outcomes)
-        rules = [shifts[k] for k in SIZE_ORDER if k in shifts]
         return {
             "n": n,
-            "accuracy_pct": round(100 * exact / n) if n else None,
-            "exact": exact,
-            "under": under,
-            "over": over,
-            "shift_rules": rules,
+            "accuracy_pct": round(100 * acc["exact"] / n) if n else None,
+            "exact": int(acc["exact"]),
+            "under": int(acc["under"]),
+            "over": int(acc["over"]),
+            "shift_rules": [shifts[k] for k in SIZE_ORDER if k in shifts],
         }
 
     async def _gemma_sizing(

@@ -258,3 +258,15 @@ def test_l_and_xl_count_as_the_same_size(queue: FoundryQueue) -> None:
     f = ShopForeman(None, queue, None, None, FoundryConfig(), outcomes_provider=Provider(clean_xl))
     summary = f.calibration_summary()
     assert summary["exact"] == 10 and summary["accuracy_pct"] == 100
+
+
+def test_summary_matches_sizing_accuracy(queue: FoundryQueue) -> None:
+    from foundry.sizing_outcomes import sizing_accuracy
+
+    rows = history_m_was_l() + [outcome("E-1", "XL", "L"), outcome("Q-1", "S", "L")]
+    rows[-1]["excluded_from_calibration"] = 1
+    rows[0]["raw_predicted"] = "L"  # raw L, actual L: exact
+    f = ShopForeman(None, queue, None, None, FoundryConfig(), outcomes_provider=Provider(rows))
+    summary, acc = f.calibration_summary(), sizing_accuracy(rows)
+    assert {k: summary[k] for k in ("n", "exact", "under", "over")} == {k: acc[k] for k in ("n", "exact", "under", "over")}
+    assert summary["n"] == 9 and summary["exact"] == 2 and summary["under"] == 7
