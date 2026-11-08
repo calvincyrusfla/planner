@@ -115,7 +115,8 @@ The scripts are idempotent and need no admin rights. They:
 3. pick the model;
 4. start `ollama serve` if the API isn't answering;
 5. run `ollama pull` for the model;
-6. finish with the probe.
+6. finish with the probe;
+7. run the speed check, `python -m foundry.gemma_doctor` (see [Make Gemma fast](#make-gemma-fast)). A slow Gemma or one on the CPU is reported but doesn't fail the setup: Foundry still works and falls back to its built-in sizing when Gemma is too slow. Without a `.venv` the script prints the command to run once the venv exists.
 
 Environment variables:
 
@@ -140,6 +141,45 @@ Two variables point at Ollama, one per tool:
 If you move Ollama, set both.
 
 Tip: Ollama's default context window is small. For long sizing and PR prompts, start the server with a larger window, for example `set OLLAMA_CONTEXT_LENGTH=8192` (cmd), `$env:OLLAMA_CONTEXT_LENGTH=8192` (PowerShell) or `OLLAMA_CONTEXT_LENGTH=8192 ollama serve`. If you use the Ollama tray app, quit and restart it after setting the variable.
+
+### Make Gemma fast
+
+Gemma sizes every Foundry task and answers Ask the Foreman. If it runs on the CPU it can take minutes per answer, and sizing often gives up and uses the built-in heuristic instead. The steps below are for Windows; run them from the repo root.
+
+1. **Run the speed check.**
+
+   ```bat
+   .venv\Scripts\python -m foundry.gemma_doctor
+   ```
+
+   It lists the installed models, asks Ollama how much of Gemma is loaded on the GPU, times a tiny answer and ends with a plain verdict, for example `Gemma is running 100% on the GPU at 42 tokens/s - good.` or `Gemma is running on the CPU (0% GPU) at 3 tokens/s - sizing will often fall back`. It counts as fast when at least 90% of the model is on the GPU and it writes 10 tokens/s or more. It exits with 0 when Gemma is fast, 1 when it is slow or (partly) on the CPU, and 2 when Ollama isn't answering or the model isn't installed. When it is slow it also suggests what to change, such as a smaller Gemma tag. Add `--json` for a machine-readable report, or `--model` / `--base-url` to check another tag or server (by default it uses `FOUNDRY_GEMMA_MODEL` / `FOREMAN_MODEL` and `FOUNDRY_GEMMA_BASE_URL` / `FOREMAN_OLLAMA_URL`).
+
+2. **Read the GPU %.** It is the share of the model that sits in the graphics card's memory (`ollama ps` shows the same figure in its `PROCESSOR` column).
+   - `100% GPU`: as fast as this card goes.
+   - Something like `40%/60% CPU/GPU`: the model doesn't fit in the card's memory, so part of it runs on the much slower CPU. Use a smaller tag (step 4) or free GPU memory (step 5).
+   - `100% CPU` / `0% GPU`: Ollama isn't using the card at all. Update Ollama and the driver (step 3).
+
+3. **Update Ollama and the GPU driver.** Install the latest Ollama from https://ollama.com/download (the tray app updates itself; restart it when it offers to). Update the graphics driver from NVIDIA (GeForce Experience / NVIDIA app) or AMD (Adrenalin). Restart Ollama afterwards and run the speed check again.
+
+4. **Pick a smaller Gemma.** `gemma4:e2b` is about half the size of the default `gemma4:e4b` and fits cards with less than 8 GB of memory. Pull it with the setup script, then tell Foundry to use it:
+
+   ```bat
+   set FOREMAN_MODEL=gemma4:e2b
+   foundry\setup_foreman.bat
+   setx FOUNDRY_GEMMA_MODEL gemma4:e2b
+   ```
+
+   `setx` keeps the setting for new windows, so restart `foundry\start_foundry.bat` afterwards. (Foundry reads `FOUNDRY_GEMMA_MODEL` and falls back to `FOREMAN_MODEL`.)
+
+5. **Leave room on the card.** Close games, video editors and other AI apps while Foundry runs; they hold GPU memory and push part of Gemma onto the CPU.
+
+6. **Don't make the context window bigger than needed.** `OLLAMA_CONTEXT_LENGTH` (see the tip above) costs GPU memory. `8192` is enough for Foundry; if a larger value pushes the GPU % below 100, lower it again.
+
+7. **Tune the time limits if Gemma is still slow.** These are a safety net, not a speed-up:
+   - `FOUNDRY_GEMMA_TIMEOUT_S` (default `180`): how long one sizing or review call may take before Foundry uses its heuristic.
+   - `FOUNDRY_ASK_TIMEOUT_S` (default `90`): how long Ask the Foreman waits for Gemma. When the time runs out you get the built-in status answer instead of an error. Keep it below 110 seconds, the dashboard's own limit for one answer.
+
+   For example `setx FOUNDRY_GEMMA_TIMEOUT_S 300`, then restart Foundry.
 
 ### Real mode (phase 2, untested against live services)
 
@@ -390,6 +430,17 @@ The **Ask the Foreman** panel lets you ask the Shop Foreman a question in plain 
 
 When Foundry isn't running, the box and the button are disabled and the panel says `Foundry isn't running. Start it with foundry\start_foundry.bat to ask questions.` The answers need Gemma, so set up the [Shop Foreman](#setting-up-the-shop-foreman-phase-2) first.
 
+### Is Gemma doing the work?
+
+The dashboard shows which tasks Gemma really sized:
+
+- The **Foundry** list near Ask the Foreman shows each Foundry task with its id, title, state and team, and a badge:
+  - **Gemma · 41 s**: Gemma sized the task, and it took 41 seconds.
+  - **Fallback**: Gemma was too slow or didn't answer, so the built-in heuristic sized it. The task still runs normally; the heuristic is just less precise about team size.
+- Hover over the **Foundry** chip to see Gemma's recent speed, for example `Gemma: avg 38 s per call, 2 fallbacks`.
+
+Many Fallback badges or a high average mean Gemma is too slow on this PC; see [Make Gemma fast](#make-gemma-fast). The same figures are in the service's API: each task row in `/api/status` has `sizing_source` (`gemma` or `heuristic`) and `sizing_ms`, `/api/status` has `foreman.gemma` with the call stats, and `/api/health` has `gemma_speed`.
+
 ### When something doesn't work
 
 - **The chip says not running but the Foundry window is open.** Look at the window for an error. Check that nothing else uses port 4310, and that `FOUNDRY_SERVE_PORT` is either unset or the same for Foundry and the dashboard.
@@ -438,6 +489,7 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_GEMMA_BASE_URL` | `http://localhost:11434/v1` |
 | `FOUNDRY_GEMMA_MODEL` | `gemma4:e4b` (falls back to `FOREMAN_MODEL`) |
 | `FOUNDRY_GEMMA_TIMEOUT_S` | `180` seconds one Gemma request may take before the Foreman falls back to its heuristic (sizing runs in the background, so a slow CPU Gemma is fine) |
+| `FOUNDRY_ASK_TIMEOUT_S` | `90` seconds Ask the Foreman waits for Gemma before it gives the built-in status answer (keep it below the service's 110 s per-answer limit) |
 | `FOUNDRY_CLAUDE_BIN` | `claude` |
 | `FOUNDRY_RPM` / `FOUNDRY_TPM` / `FOUNDRY_MAX_CONCURRENT` | `20` / `100000` / `3` |
 | `FOUNDRY_REVIEW_DWELL_S` | `600` (REVIEW_BOTTLENECK → PROMOTE_PEER_REVIEWER) |

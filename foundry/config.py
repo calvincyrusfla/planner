@@ -19,6 +19,9 @@ Environment variable               Field (default)
 ``FOUNDRY_GEMMA_TIMEOUT_S``        ``gemma_timeout_s`` (``180``): seconds one
                                    Gemma request may take (a CPU Gemma is slow;
                                    sizing runs in the background)
+``FOUNDRY_ASK_TIMEOUT_S``          ``ask_timeout_s`` (``90``): seconds Ask the
+                                   Foreman waits for Gemma (all tool rounds)
+                                   before answering with the built-in status
 ``FOUNDRY_CLAUDE_BIN``             ``claude_bin`` (``claude``)
 ``FOUNDRY_RPM``                    ``rpm`` (``20``)
 ``FOUNDRY_TPM``                    ``tpm`` (``100000``)
@@ -201,6 +204,14 @@ class FoundryConfig(BaseModel):
         gt=0,
         description="Seconds one Gemma (Shop Foreman) request may take before the heuristic fallback.",
     )
+    ask_timeout_s: float = Field(
+        default=90.0,
+        gt=0,
+        description=(
+            "Seconds Ask the Foreman waits for Gemma (all tool rounds together) before "
+            "answering with the built-in line status; keep it below the API's ask chunk timeout."
+        ),
+    )
     limit_cooldown_s: float = Field(
         default=1200.0,
         gt=0,
@@ -341,6 +352,7 @@ class FoundryConfig(BaseModel):
             "TRUST_CACHE": "trust_cache",
             "LIMIT_COOLDOWN_S": "limit_cooldown_s",
             "GEMMA_TIMEOUT_S": "gemma_timeout_s",
+            "ASK_TIMEOUT_S": "ask_timeout_s",
             "PATCHES_DIR": "patches_dir",
             "INFRA_FAILURE_CAP": "infra_failure_cap",
         }

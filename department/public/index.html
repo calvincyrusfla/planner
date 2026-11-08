@@ -298,6 +298,20 @@
   .foreman-answer[aria-busy="true"]::after { content: "\2026"; color: var(--muted); }
   .foreman-answer .foreman-note { display: block; margin-top: 6px; font-size: 12px; color: var(--muted); }
   .foreman-answer .foreman-err { color: var(--bad); }
+  /* Foundry task list in the Foreman card: text is --text/--muted on --surface (>= 6:1); badge text is --ok/--warn on --surface-2 (>= 7:1). */
+  .fo-tasks { margin-top: 12px; }
+  .fo-tasks summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .fo-tasks summary b { color: var(--text); font-weight: 600; }
+  .fo-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 300px; overflow-y: auto; }
+  .fo-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 13px; }
+  .fo-list .fo-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  .fo-list .fo-title { flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+  .fo-list .fo-meta { font-size: 12px; color: var(--muted); }
+  .fo-badge { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; white-space: nowrap;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); }
+  .fo-badge.gemma { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
+  .fo-badge.fallback { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+  .fo-empty { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
 </style>
 </head>
 <body>
@@ -353,6 +367,8 @@
       <button type="button" id="foreman-stop" hidden>Stop</button>
     </form>
     <div class="foreman-answer" id="foreman-answer" role="region" aria-label="Foreman's answer" aria-live="polite" hidden></div>
+    <details class="fo-tasks" id="fo-tasks" hidden><summary id="fo-sum"><b>Foundry tasks</b></summary>
+      <ul class="fo-list" id="fo-list" aria-label="Foundry tasks"></ul><p class="fo-empty" id="fo-empty" hidden>No Foundry tasks yet.</p></details>
   </section>
 
   <h2>Teams</h2>
@@ -953,6 +969,7 @@ async function pollFoundry() {
       + (health.model ? `\nModel: ${health.model}` : '')
       + `\nGemma: ${health.gemma_ok ? 'ok' : 'not reachable'}`
       + (health.claude_ok === false ? '\nClaude: not reachable' : '')
+      + gemmaSpeedTip(health.gemma_speed)
       + (health.version ? `\nVersion ${health.version}` : '');
   } else {
     text = '<b>Foundry</b> · not running';
@@ -964,6 +981,64 @@ async function pollFoundry() {
   chip.querySelector('.fc-text').innerHTML = text;
   syncFoundryRow();
   foremanSetUp(foundryUp, health); // the Ask the Foreman panel shares this poll
+  await foundryTasks(foundryUp);
+}
+// "41 s", "2.5 s", "850 ms", "3 min 5 s"; '' for missing values.
+function fmtMs(ms) {
+  const n = Number(ms);
+  if (ms == null || ms === '' || !Number.isFinite(n) || n < 0) return '';
+  if (n < 1000) return `${Math.round(n)} ms`;
+  const sec = n / 1000;
+  if (sec < 10) return `${sec.toFixed(1)} s`;
+  if (sec < 60) return `${Math.round(sec)} s`;
+  const m = Math.floor(sec / 60), r = Math.round(sec % 60);
+  return r ? `${m} min ${r} s` : `${m} min`;
+}
+// Chip tooltip line from /api/health gemma_speed {avg_ms, last_ms, fallbacks, calls}.
+function gemmaSpeedTip(sp) {
+  if (!sp || typeof sp !== 'object') return '';
+  const calls = Number(sp.calls) || 0, fb = Number(sp.fallbacks) || 0;
+  const fbText = `${fb} fallback${fb === 1 ? '' : 's'}`;
+  if (!calls) return fb ? `\nGemma: no answers yet, ${fbText}` : '\nGemma: no calls yet';
+  const avg = fmtMs(sp.avg_ms), last = fmtMs(sp.last_ms);
+  return `\nGemma: ${avg ? `avg ${avg} per call` : `${calls} call${calls === 1 ? '' : 's'}`}, ${fbText}`
+    + (last ? ` (last ${last}, ${calls} call${calls === 1 ? '' : 's'})` : '');
+}
+// Compact Foundry task list in the Foreman card; refreshed by the same 10 s poll. Text only, never HTML.
+async function foundryTasks(up) {
+  const wrap = $('#fo-tasks');
+  if (!up) { wrap.hidden = true; return; }
+  let r = null;
+  try { r = await foundryJson('/status'); } catch {}
+  const tasks = r && r.json && r.json.ok && Array.isArray(r.json.tasks) ? r.json.tasks : null;
+  if (!tasks) { wrap.hidden = true; return; } // keep the card quiet if status isn't available
+  wrap.hidden = false;
+  const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
+  const teamName = (id) => (state && state.teams && state.teams.find((t) => t.id === id)?.name) || id;
+  const rows = tasks.slice().reverse().map((t) => {
+    const li = document.createElement('li');
+    li.append(el('span', 'fo-id', String(t.id ?? '')), el('span', 'fo-title', String(t.title || '(untitled)')));
+    const src = String(t.sizing_source || '').toLowerCase();
+    const took = fmtMs(t.sizing_ms);
+    if (src === 'gemma' || src === 'heuristic' || src === 'fallback') {
+      const g = src === 'gemma';
+      const b = el('span', 'fo-badge ' + (g ? 'gemma' : 'fallback'), (g ? 'Gemma' : 'Fallback') + (took ? ` · ${took}` : ''));
+      b.title = g ? `Sized by Gemma${took ? ` in ${took}` : ''}`
+        : `Sized by the built-in fallback rules (Gemma didn't answer${took ? ` within ${took}` : ''})`;
+      li.append(b);
+    } else if (t.state === 'sizing') {
+      li.append(el('span', 'fo-badge', 'Sizing…'));
+    }
+    const meta = [String(t.state || ''), t.team ? teamName(t.team) : ''].filter(Boolean).join(' · ');
+    if (meta) li.append(el('span', 'fo-meta', meta));
+    return li;
+  });
+  $('#fo-list').replaceChildren(...rows);
+  $('#fo-empty').hidden = rows.length > 0;
+  const gem = tasks.filter((t) => String(t.sizing_source || '').toLowerCase() === 'gemma').length;
+  const fb = tasks.filter((t) => ['heuristic', 'fallback'].includes(String(t.sizing_source || '').toLowerCase())).length;
+  $('#fo-sum').replaceChildren(el('b', '', 'Foundry tasks'),
+    ` · ${tasks.length}` + (gem || fb ? ` (${gem} by Gemma, ${fb} fallback)` : ''));
 }
 function syncFoundryRow() {
   const on = $('#t-foundry').checked;

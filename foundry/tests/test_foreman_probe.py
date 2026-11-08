@@ -277,6 +277,11 @@ def test_setup_sh_dry_run_plans_without_running_ollama(tmp_path: Path) -> None:
     assert "[dry-run] nohup ollama serve" in out
     assert "[dry-run] ollama pull gemma4:e4b" in out
     assert re.search(r"\[dry-run\] \S*python\S* -m foundry\.foreman_probe --base-url http://127\.0\.0\.1:\d+/v1 --model gemma4:e4b", out)
+    # Step 7: the speed check runs after the probe and before the next-step line.
+    assert re.search(
+        r"\[dry-run\] \S*python\S* -m foundry\.gemma_doctor --base-url http://127\.0\.0\.1:\d+ --model gemma4:e4b\n", out
+    )
+    assert out.index("-m foundry.foreman_probe") < out.index("-m foundry.gemma_doctor")
     assert out.strip().splitlines()[-1].endswith('-m foundry.main --real --repo <path> --title "..."')
 
 
@@ -293,6 +298,7 @@ def test_setup_sh_dry_run_custom_model_server_up(tmp_path: Path) -> None:
     assert "consider FOREMAN_MODEL" not in out
     assert "[dry-run] ollama pull gemma4:e2b" in out
     assert f"--base-url {root}/v1 --model gemma4:e2b" in out
+    assert f"-m foundry.gemma_doctor --base-url {root} --model gemma4:e2b" in out
 
 
 @needs_bash
@@ -322,6 +328,9 @@ def test_setup_sh_without_venv_says_to_create_it(tmp_path: Path) -> None:
     assert proc.returncode == 0, out + proc.stderr
     assert not marker.exists()
     assert "No .venv yet - the probe ran with python" in out
+    # The doctor is standard library only, so it runs on the system python too.
+    assert re.search(r"\[dry-run\] python3? -m foundry\.gemma_doctor --base-url ", out)
+    assert out.index("-m foundry.gemma_doctor") < out.index("No .venv yet")
     assert "python3 -m venv .venv" in out and '"Install" in foundry/README.md' in out
     assert out.strip().splitlines()[-1].endswith(
         '.venv/bin/python -m foundry.main --real --repo <path> --title "..."'
@@ -371,11 +380,22 @@ def test_setup_bat_structure() -> None:
         "py -3.11 -m venv .venv",
         ".venv\\Scripts\\python -m pip install -r foundry\\requirements.txt",
         'see "Install" in foundry\\README.md',
+        "-m foundry.gemma_doctor",
+        "call :doctor",
+        '-m foundry.gemma_doctor --base-url "%OLLAMA_URL%" --model "%MODEL%"',
+        'if "%DOC_RC%"=="1" goto :doctor_slow',
+        '"Make Gemma fast" in foundry\\README.md',
     ):
         assert needle in text, needle
     # The venv branch is only taken when .venv\Scripts\python.exe passed the version check.
     venv_set = text.index('set PY="%REPO_ROOT%\\.venv\\Scripts\\python.exe"')
     assert venv_set < text.index('if defined PY set "PY_IS_VENV=1"') < text.index("\r\n:try_py_launcher\r\n")
     assert 'if "%PY_IS_VENV%"=="1" goto :next_step_venv' in text
+    # The speed check never changes RC: a slow / CPU Gemma (exit 1) must not fail the setup.
+    doctor = text[text.index("\r\n:doctor\r\n") : text.index("\r\n:finish\r\n")]
+    assert "RC=" not in doctor.replace("DOC_RC=", "")
+    # Runs after a passing probe (and in dry-run), before the next-step lines.
+    assert text.index('if not "%RC%"=="0" goto :finish') < text.index("call :doctor\r\n:next_step")
+    assert text.count("call :doctor") == 2
     assert (REPO_ROOT / ".gitattributes").read_text().split() == ["*.bat", "text", "eol=crlf", "*.sh", "text", "eol=lf"]
     assert "wmic" not in text.lower().replace("wmic is deprecated", "")

@@ -114,6 +114,17 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _clean_meta(m: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalise a sizing record to ``{"source": "gemma"|"heuristic"|None, "ms": int|None}``."""
+    source = m.get("source")
+    source = source if source in ("gemma", "heuristic") else None
+    try:
+        ms = max(0, int(m.get("ms"))) if m.get("ms") is not None else None
+    except (TypeError, ValueError):
+        ms = None
+    return {"source": source, "ms": ms}
+
+
 def _val(x: Any) -> Any:
     return getattr(x, "value", x)
 
@@ -199,6 +210,11 @@ class FloorManager:
         self._sizing_tasks: dict[str, asyncio.Task[Any]] = {}
         #: task id -> why its background sizing failed.
         self.sizing_errors: dict[str, str] = {}
+        #: task id -> how it was sized: ``{"source": "gemma"|"heuristic"|None, "ms": int}``
+        #: (kept with the directives in the saved state, so it survives a restart).
+        self.sizing_meta: dict[str, dict[str, Any]] = {}
+        #: sizing info of a finished :meth:`_size` call not yet applied (task id -> meta).
+        self._sized_meta: dict[str, dict[str, Any]] = {}
         #: Current builder allocation per task (updated on RESIZE_ALLOCATION).
         self.allocations: dict[str, int] = {}
         #: alert_id -> outcome of every escalation already applied (idempotency).
@@ -246,6 +262,7 @@ class FloorManager:
             "applied_alerts": {k: v.__dict__ for k, v in self.applied_alerts.items()},
             "diffs": {t: v for t, v in self.diffs.items() if t not in self._completed},
             "patch_names": dict(self.patch_names),
+            "sizing_meta": {t: dict(m) for t, m in self.sizing_meta.items()},
         }
         try:
             fn(_KV_KEY, state)
@@ -265,6 +282,9 @@ class FloorManager:
             self.pr_summaries = {t: dict(v) for t, v in (state.get("pr_summaries") or {}).items()}
             self.applied_alerts = {k: ActionOutcome(**v) for k, v in (state.get("applied_alerts") or {}).items()}
             self.patch_names = {str(k): str(v) for k, v in (state.get("patch_names") or {}).items()}
+            self.sizing_meta = {
+                str(t): _clean_meta(m) for t, m in (state.get("sizing_meta") or {}).items() if isinstance(m, dict)
+            }
             self.diffs = {}
             for t, v in (state.get("diffs") or {}).items():
                 # older saves stored a list; key it by position so nothing is lost
@@ -400,10 +420,14 @@ class FloorManager:
         # recorded only once the tickets exist: a directive without tickets would look applied
         self.directives[task_id] = directive
         self.allocations[task_id] = directive.allocated_builders
+        meta = self._sized_meta.pop(task_id, None)
+        if meta is not None:
+            self.sizing_meta[task_id] = meta
         self.queue.record_event(
             "sized",
             task_id,
-            {"complexity": directive.complexity, "builders": directive.allocated_builders, "team": directive.team_id},
+            {"complexity": directive.complexity, "builders": directive.allocated_builders, "team": directive.team_id,
+             "source": (meta or {}).get("source"), "ms": (meta or {}).get("ms")},
         )
         self.bridge.register_task(
             task_id,
@@ -535,7 +559,14 @@ class FloorManager:
             "files": list(order.files),
             "acceptance_criteria": list(order.acceptance_criteria),
         }
+        started = time.monotonic()
         result = await _maybe_await(self.foreman.size_task_scope(task))
+        # read right after the await (no other coroutine runs in between), so a
+        # concurrent sizing cannot overwrite the source before it is captured
+        ms = int(round((time.monotonic() - started) * 1000))
+        last = getattr(self.foreman, "last_source", None)
+        source = last.get("size_task_scope") if isinstance(last, Mapping) else None
+        self._sized_meta[order.task_id] = _clean_meta({"source": source, "ms": ms})
         if isinstance(result, TaskSizingDirective):
             return result
         return TaskSizingDirective.model_validate(result)

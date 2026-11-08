@@ -16,7 +16,7 @@ Interface used by the HTTP layer (all ``async`` methods must run on the
 service's event loop; ``*_threadsafe`` wrappers are for handler threads):
 
 * ``await service.start()`` / ``await service.stop()``
-* ``service.health() -> dict``  - ``{ok, repo, model, gemma_ok, claude_ok, version}``
+* ``service.health() -> dict``  - ``{ok, repo, model, gemma_ok, claude_ok, version, gemma_speed}``
 * ``service.status() -> dict``  - ``{ok, tasks, foreman, paused_until, last_account_error}``
 * ``await service.submit(payload) -> task_id`` - raises :class:`OrderError` (HTTP 400)
 * ``service.ask(question)`` - async iterator of answer text chunks
@@ -111,6 +111,22 @@ def monitor_interval() -> float:
 def _state(task: Any) -> str:
     raw = (task or {}).get("state", "unknown")
     return str(getattr(raw, "value", raw))
+
+
+def _num(v: Any) -> float | None:
+    """A finite number (rounded to 0.1) or ``None``."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+        return None
+    return round(float(v), 1)
+
+
+def _count(v: Any) -> int:
+    if isinstance(v, bool):
+        return 0
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _iso(epoch: float) -> str:
@@ -334,7 +350,12 @@ class Service:
     # ------------------------------------------------------------------ API surface
 
     def health(self) -> dict[str, Any]:
-        """``{ok, repo, model, gemma_ok, claude_ok, version}``."""
+        """``{ok, repo, model, gemma_ok, claude_ok, version, gemma_speed}``.
+
+        ``gemma_speed`` is ``{avg_ms, last_ms, fallbacks, calls}`` from the Shop
+        Foreman's call stats (all ``None``/0 before the first Gemma call).
+        """
+        stats = self._gemma_stats()
         return {
             "ok": bool(self.running),
             "repo": str(self.repo),
@@ -342,7 +363,26 @@ class Service:
             "gemma_ok": bool(self.gemma_ok),
             "claude_ok": bool(self.claude_ok),
             "version": __version__,
+            "gemma_speed": {
+                "avg_ms": _num(stats.get("avg_ms")),
+                "last_ms": _num(stats.get("last_ms")),
+                "fallbacks": _count(stats.get("fallbacks")),
+                "calls": _count(stats.get("calls")),
+            },
         }
+
+    def _gemma_stats(self) -> dict[str, Any]:
+        """The Shop Foreman's ``gemma_stats()`` (``{}`` when absent or failing)."""
+        foreman = getattr(self.factory, "foreman", None) if self.factory is not None else None
+        fn = getattr(foreman, "gemma_stats", None)
+        if not callable(fn):
+            return {}
+        try:
+            stats = fn()
+        except Exception as exc:  # a status call must not fail
+            log.debug("foundry serve: gemma_stats failed: %s", exc)
+            return {}
+        return dict(stats) if isinstance(stats, Mapping) else {}
 
     def _task_row(self, task: Mapping[str, Any]) -> dict[str, Any]:
         from foundry.main import task_outputs
@@ -359,6 +399,7 @@ class Service:
         if state in ("backlog", "sizing") and callable(is_sizing) and is_sizing(tid):
             state = "sizing"  # the Shop Foreman is sizing it in the background
         reason = task.get("quarantine_reason") if state in ("quarantined", "failed") else None
+        meta = (getattr(f.manager, "sizing_meta", None) or {}).get(tid) or {}
         return {
             "id": tid,
             "title": task.get("title") or (f.manager.orders[tid].title if tid in f.manager.orders else ""),
@@ -369,6 +410,8 @@ class Service:
             "md": str(files["md"]) if files.get("md") else None,
             "rejected": str(files["rejected"]) if files.get("rejected") else None,
             "reason": reason,
+            "sizing_source": meta.get("source"),
+            "sizing_ms": meta.get("ms"),
         }
 
     def status(self) -> dict[str, Any]:
@@ -390,6 +433,7 @@ class Service:
             "last_alert": self.last_alert,
             "last_action": self.last_action,
             "last_error": self.last_monitor_error,
+            "gemma": self._gemma_stats(),
         })
         paused_until = None
         remaining = getattr(f.limiter, "pause_remaining", None)

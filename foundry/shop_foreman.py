@@ -54,8 +54,12 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
+import inspect
 import math
 import re
+import time
+from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -95,6 +99,7 @@ __all__ = [
     "MAX_HINT_CHARS",
     "MAX_TOOL_ROUNDS",
     "Anomaly",
+    "GemmaStats",
     "ShopForeman",
     "diff_stats",
     "heuristic_complexity",
@@ -213,6 +218,92 @@ _PR_SCHEMA: dict[str, Any] = {
 
 
 # --------------------------------------------------------------------------- helpers
+
+
+class GemmaStats:
+    """Small rolling record of Gemma calls and hook fallbacks.
+
+    * ``calls`` -- Gemma requests attempted (successful or not).
+    * ``errors`` / ``timeouts`` -- requests that failed (timeouts included in errors).
+    * ``fallbacks`` -- hook results produced by the deterministic fallback
+      (Gemma absent, failed, timed out or gave an unusable reply).
+    * ``avg_ms`` / ``last_ms`` -- duration of the last :attr:`window` requests
+      (failed ones included: a timeout is time the user waited).
+    """
+
+    def __init__(self, window: int = 20) -> None:
+        self.window = int(window)
+        self._total = self._new()
+        self._hooks: dict[str, dict[str, Any]] = {}
+        self.last_error: str | None = None
+
+    def _new(self) -> dict[str, Any]:
+        return {"calls": 0, "errors": 0, "timeouts": 0, "fallbacks": 0, "gemma": 0,
+                "last_ms": None, "durations": deque(maxlen=self.window)}
+
+    def _targets(self, hook: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self._total, self._hooks.setdefault(hook, self._new())
+
+    def record_call(self, hook: str, ms: float, *, error: str | None = None, timed_out: bool = False) -> None:
+        """Record one Gemma request that took ``ms`` milliseconds."""
+        ms = round(float(ms), 1)
+        for rec in self._targets(hook):
+            rec["calls"] += 1
+            rec["last_ms"] = ms
+            rec["durations"].append(ms)
+            if error is not None:
+                rec["errors"] += 1
+                if timed_out:
+                    rec["timeouts"] += 1
+        if error is not None:
+            self.last_error = error
+
+    def record_source(self, hook: str, source: str) -> None:
+        """Record which path served a hook result (``"gemma"`` or ``"heuristic"``)."""
+        key = "gemma" if source == "gemma" else "fallbacks"
+        for rec in self._targets(hook):
+            rec[key] += 1
+
+    @staticmethod
+    def _view(rec: dict[str, Any]) -> dict[str, Any]:
+        durations = rec["durations"]
+        return {
+            "calls": rec["calls"],
+            "errors": rec["errors"],
+            "timeouts": rec["timeouts"],
+            "fallbacks": rec["fallbacks"],
+            "served_by_gemma": rec["gemma"],
+            "avg_ms": round(sum(durations) / len(durations), 1) if durations else None,
+            "last_ms": rec["last_ms"],
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        """JSON-ready ``{calls, errors, timeouts, fallbacks, served_by_gemma, avg_ms, last_ms, last_error, by_hook}``."""
+        out = self._view(self._total)
+        out["last_error"] = self.last_error
+        out["by_hook"] = {hook: self._view(rec) for hook, rec in sorted(self._hooks.items())}
+        return out
+
+
+class _SourceLog(dict):
+    """``last_source`` mapping that also feeds :class:`GemmaStats` on every write."""
+
+    def __init__(self, stats: GemmaStats) -> None:
+        super().__init__()
+        self._stats = stats
+
+    def __setitem__(self, hook: str, source: str) -> None:
+        super().__setitem__(hook, source)
+        self._stats.record_source(hook, source)
+
+
+def _accepts_timeout(chat: Any) -> bool:
+    """True when a client's ``chat`` takes a ``timeout`` keyword."""
+    try:
+        params = inspect.signature(chat).parameters
+    except (TypeError, ValueError):
+        return False
+    return "timeout" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _jsonable(value: Any) -> Any:
@@ -432,8 +523,13 @@ class ShopForeman:
         self._raised: dict[str, datetime] = {}
         self._alert_day: str | None = None
         self._alert_seq = 0
+        self._stats = GemmaStats()
         #: Which hooks were served by Gemma vs. the fallback (for tests/demo).
-        self.last_source: dict[str, str] = {}
+        self.last_source: dict[str, str] = _SourceLog(self._stats)
+        #: Milliseconds the latest Gemma request of each hook took.
+        self.last_timing: dict[str, float] = {}
+        #: Whether the latest failed Gemma request timed out (used for the ask fallback wording).
+        self._last_timed_out = False
 
     # ------------------------------------------------------------------ infra
     def _now(self) -> datetime:
@@ -451,22 +547,54 @@ class ShopForeman:
         except Exception as exc:  # noqa: BLE001 - bookkeeping is best effort
             log.debug("record_tokens_saved failed: %s", exc)
 
+    def gemma_stats(self) -> dict[str, Any]:
+        """Recent Gemma speed and fallback counts (JSON-ready).
+
+        ``{calls, errors, timeouts, fallbacks, served_by_gemma, avg_ms,
+        last_ms, last_error, by_hook: {hook: {...same counters...}}}``;
+        ``avg_ms``/``last_ms`` are ``None`` before the first call.
+        """
+        return self._stats.snapshot()
+
     async def _chat(
         self,
         messages: list[dict[str, Any]],
         *,
+        hook: str,
         json_schema: dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.1,
+        timeout: float | None = None,
     ) -> GemmaReply | None:
-        """Call Gemma; ``None`` when it is absent or fails."""
+        """Call Gemma for ``hook``; ``None`` when it is absent, fails or times out.
+
+        ``timeout`` (seconds) bounds this call: it is passed to clients whose
+        ``chat`` accepts it and also enforced with :func:`asyncio.wait_for`.
+        Every attempt is timed into :attr:`last_timing` and :meth:`gemma_stats`.
+        """
         if self.gemma is None:
             return None
+        kwargs: dict[str, Any] = {"tools": tools, "json_schema": json_schema, "temperature": temperature}
+        if timeout is not None and _accepts_timeout(self.gemma.chat):
+            kwargs["timeout"] = timeout
+        started = time.monotonic()
+        error: str | None = None
+        timed_out = False
         try:
-            return await self.gemma.chat(messages, tools=tools, json_schema=json_schema, temperature=temperature)
+            call = self.gemma.chat(messages, **kwargs)
+            reply = await (asyncio.wait_for(call, timeout) if timeout is not None else call)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            error, timed_out, reply = f"timed out after {timeout:g}s" if timeout else str(exc), True, None
         except Exception as exc:  # noqa: BLE001 - Gemma is optional everywhere
-            log.info("Shop Foreman: Gemma unavailable (%s); using fallback", exc)
-            return None
+            error, reply = str(exc) or type(exc).__name__, None
+            timed_out = "timed out" in error
+        ms = (time.monotonic() - started) * 1000.0
+        self.last_timing[hook] = round(ms, 1)
+        self._stats.record_call(hook, ms, error=error, timed_out=timed_out)
+        if error is not None:
+            self._last_timed_out = timed_out
+            log.info("Shop Foreman: Gemma unavailable for %s (%s); using fallback", hook, error)
+        return reply
 
     def _sql(self, sql: str, params: Sequence[Any] = ()) -> list[Any]:
         """Run a read-only query on the queue database (empty list on error)."""
@@ -835,7 +963,7 @@ class ShopForeman:
                 ),
             },
         ]
-        reply = await self._chat(messages, json_schema=_SIZING_SCHEMA, temperature=0.0)
+        reply = await self._chat(messages, hook="size_task_scope", json_schema=_SIZING_SCHEMA, temperature=0.0)
         if reply is None:
             return None
         try:
@@ -1036,7 +1164,7 @@ class ShopForeman:
                 },
                 {"role": "user", "content": f"Deterministic summary: {fallback}\n\nOutput (tail):\n{tail}"},
             ]
-            reply = await self._chat(messages, temperature=0.0)
+            reply = await self._chat(messages, hook="condense_error_trace", temperature=0.0)
             if reply is not None:
                 hint = self._valid_hint(reply.text, fallback)
                 if hint is not None:
@@ -1121,7 +1249,7 @@ class ShopForeman:
                     ),
                 },
             ]
-            reply = await self._chat(messages, json_schema=_PR_SCHEMA, temperature=0.2)
+            reply = await self._chat(messages, hook="draft_pr_summary", json_schema=_PR_SCHEMA, temperature=0.2)
             if reply is not None:
                 try:
                     data = _decode_json(reply.text)
@@ -1137,7 +1265,7 @@ class ShopForeman:
         return self._fallback_pr(diff, title)
 
     # ---------------------------------------------------------------------- Q&A
-    def _fallback_answer(self, text: str) -> str:
+    def _fallback_answer(self, text: str, *, reason: str | None = None) -> str:
         summary = self.get_queue_summary()
         tasks = summary.get("tasks", {})
         busy = ", ".join(f"{k}: {v}" for k, v in tasks.items() if v) or "no tasks"
@@ -1146,7 +1274,7 @@ class ShopForeman:
         waits = sum(len(t["waiting_for_review"]) for t in bottlenecks.values())
         stalls = sum(len(t["stalled_tickets"]) for t in bottlenecks.values())
         return (
-            "The Gemma Shop Foreman is offline, so here is the line status instead. "
+            f"{reason or 'The Gemma Shop Foreman is offline'}, so here is the line status instead. "
             f"Tasks: {busy}. Open tickets: {summary.get('queue_depth', 0)}. "
             f"Current burn: {velocity.get('current_tpm', 0.0):.0f} tokens/min of {velocity['tpm_cap']:.0f}. "
             f"Waiting for review: {waits}. Stalled tickets: {stalls}."
@@ -1173,6 +1301,10 @@ class ShopForeman:
         :data:`MAX_TOOL_ROUNDS` tool rounds, then asks for a final answer
         without tools. Without Gemma (or if it fails) a deterministic status
         answer built from the tools is streamed.
+
+        All rounds together get ``config.ask_timeout_s`` seconds (kept below the
+        API's per-chunk timeout); when Gemma runs out of time the status answer
+        is streamed instead of an error.
         """
         if self.gemma is None:
             self.last_source["answer_question"] = "heuristic"
@@ -1191,12 +1323,27 @@ class ShopForeman:
         ]
         tokens = 0
         answer: str | None = None
+        budget = float(getattr(self.config, "ask_timeout_s", 90.0))
+        deadline = time.monotonic() + budget
+        timed_out = False
+        self._last_timed_out = False
         for round_no in range(MAX_TOOL_ROUNDS + 1):
             final_round = round_no == MAX_TOOL_ROUNDS
             if final_round:
                 messages.append({"role": "system", "content": "Tool budget used up. Answer now with what you have."})
-            reply = await self._chat(messages, tools=None if final_round else FOREMAN_TOOLS, temperature=0.1)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            reply = await self._chat(
+                messages,
+                hook="answer_question",
+                tools=None if final_round else FOREMAN_TOOLS,
+                temperature=0.1,
+                timeout=remaining,
+            )
             if reply is None:
+                timed_out = self._last_timed_out
                 break
             tokens += _reply_tokens(reply, messages)
             if reply.tool_calls and not final_round:
@@ -1226,7 +1373,8 @@ class ShopForeman:
             break
         if not answer:
             self.last_source["answer_question"] = "heuristic"
-            answer = self._fallback_answer(text)
+            reason = f"The Gemma Shop Foreman did not answer within {budget:g} s" if timed_out else None
+            answer = self._fallback_answer(text, reason=reason)
         else:
             self.last_source["answer_question"] = "gemma"
             self._save(_QA_TASK_ID, "triage", tokens)
@@ -1469,7 +1617,7 @@ class ShopForeman:
                     ),
                 },
             ]
-            reply = await self._chat(messages, temperature=0.1)
+            reply = await self._chat(messages, hook="evaluate_line_anomaly", temperature=0.1)
             if reply is not None:
                 written = self._valid_diagnosis(reply.text)
                 if written is not None:

@@ -7,7 +7,8 @@ OpenAI-compatible API (``http://localhost:11434/v1``). This module provides:
 * :class:`GemmaReply` / :class:`GemmaToolCall` / :class:`GemmaUsage` -- the
   normalised reply model.
 * :class:`OllamaGemmaClient` -- the real HTTP client (standard library
-  ``urllib`` executed in a worker thread via :func:`asyncio.to_thread`).
+  ``urllib`` executed in a short-lived *daemon* thread, so a cancelled call
+  returns at once and an in-flight request never holds up process exit).
 * :class:`SimulatedGemmaClient` -- a deterministic stand-in used by tests and
   the ``--simulate`` demo; it records every request it receives.
 * :class:`GemmaUnavailable` -- raised when the Foreman cannot be reached or
@@ -21,6 +22,8 @@ import inspect
 import ipaddress
 import json
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -131,6 +134,9 @@ class GemmaClient(Protocol):
             tools: OpenAI tool definitions, passed through unchanged.
             json_schema: when given, the reply text must be JSON matching it.
             temperature: sampling temperature.
+
+        Real clients may also accept an optional ``timeout`` keyword (seconds
+        for this call only); callers check for it before passing it.
         """
         ...
 
@@ -220,8 +226,11 @@ def parse_chat_completion(payload: dict[str, Any]) -> GemmaReply:
 class OllamaGemmaClient:
     """Real client for Gemma served by Ollama's OpenAI-compatible endpoint.
 
-    The blocking ``urllib`` call runs in a worker thread so the event loop
-    stays free. When ``json_schema`` is given the request uses
+    The blocking ``urllib`` call runs in a daemon thread so the event loop
+    stays free: cancelling :meth:`chat` returns immediately (the abandoned
+    request finishes or times out on its own) and, unlike
+    :func:`asyncio.to_thread`, the thread never delays ``asyncio.run`` or
+    interpreter exit. When ``json_schema`` is given the request uses
     ``response_format={"type": "json_schema", ...}``; if the server rejects
     that with HTTP 400 the client retries once with ``{"type": "json_object"}``
     (and remembers, so later calls go straight to ``json_object``).
@@ -290,8 +299,12 @@ class OllamaGemmaClient:
                 payload["response_format"] = {"type": "json_object"}
         return payload
 
-    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Blocking POST; maps every transport problem to :class:`GemmaUnavailable`."""
+    def _post(self, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        """Blocking POST; maps every transport problem to :class:`GemmaUnavailable`.
+
+        ``timeout`` overrides :attr:`timeout` for this request only.
+        """
+        timeout = self.timeout if timeout is None else timeout
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self.endpoint,
@@ -304,7 +317,7 @@ class OllamaGemmaClient:
             },
         )
         try:
-            with self._opener.open(req, timeout=self.timeout) as resp:
+            with self._opener.open(req, timeout=timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as exc:
             try:
@@ -317,13 +330,13 @@ class OllamaGemmaClient:
             ) from exc
         except TimeoutError as exc:
             raise GemmaUnavailable(
-                f"Gemma Shop Foreman at {self.base_url} timed out after {self.timeout:g}s"
+                f"Gemma Shop Foreman at {self.base_url} timed out after {timeout:g}s"
             ) from exc
         except urllib.error.URLError as exc:
             reason = exc.reason
             if isinstance(reason, (TimeoutError, socket.timeout)):
                 raise GemmaUnavailable(
-                    f"Gemma Shop Foreman at {self.base_url} timed out after {self.timeout:g}s"
+                    f"Gemma Shop Foreman at {self.base_url} timed out after {timeout:g}s"
                 ) from exc
             raise GemmaUnavailable(
                 f"Gemma Shop Foreman is not reachable at {self.base_url} ({reason}). "
@@ -351,14 +364,22 @@ class OllamaGemmaClient:
         tools: list[dict] | None = None,
         json_schema: dict | None = None,
         temperature: float = 0.1,
+        timeout: float | None = None,
     ) -> GemmaReply:
-        """POST to ``/chat/completions`` and parse the reply (see :class:`GemmaClient`)."""
+        """POST to ``/chat/completions`` and parse the reply (see :class:`GemmaClient`).
+
+        Args:
+            timeout: seconds this call may take in total (including the
+                ``json_object`` retry); ``None`` uses :attr:`timeout`.
+        """
+        budget = self.timeout if timeout is None else float(timeout)
+        deadline = time.monotonic() + budget
         use_schema = self._json_schema_supported
         payload = self.build_payload(
             messages, tools=tools, json_schema=json_schema, temperature=temperature, use_json_schema=use_schema
         )
         try:
-            raw = await asyncio.to_thread(self._post, payload)
+            raw = await self._post_in_thread(payload, budget)
         except GemmaUnavailable as exc:
             if json_schema is None or not use_schema or exc.status != 400:
                 raise
@@ -366,8 +387,46 @@ class OllamaGemmaClient:
             payload = self.build_payload(
                 messages, tools=tools, json_schema=json_schema, temperature=temperature, use_json_schema=False
             )
-            raw = await asyncio.to_thread(self._post, payload)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GemmaUnavailable(
+                    f"Gemma Shop Foreman at {self.base_url} timed out after {budget:g}s"
+                ) from exc
+            raw = await self._post_in_thread(payload, remaining)
         return parse_chat_completion(raw)
+
+    async def _post_in_thread(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """Run :meth:`_post` in a daemon thread and await its result.
+
+        The result is handed back with ``loop.call_soon_threadsafe``. If the
+        awaiting task is cancelled (or the loop has closed) the thread's late
+        result is dropped; the thread itself ends when the socket times out.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+
+        def deliver(result: Any, error: BaseException | None) -> None:
+            if future.done():
+                return
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
+
+        def worker() -> None:
+            result: Any = None
+            error: BaseException | None = None
+            try:
+                result = self._post(payload, timeout)
+            except BaseException as exc:  # noqa: BLE001 - forwarded to the awaiting task
+                error = exc
+            try:
+                loop.call_soon_threadsafe(deliver, result, error)
+            except RuntimeError:  # loop already closed: nobody is waiting any more
+                pass
+
+        threading.Thread(target=worker, name="gemma-post", daemon=True).start()
+        return await future
 
 
 ResponderResult = GemmaReply | str | dict | list | None
@@ -400,6 +459,8 @@ class SimulatedGemmaClient:
         self.responder = responder
         self.unavailable = unavailable
         self.requests: list[GemmaRequest] = []
+        #: The ``timeout`` passed with each call (``None`` when not given).
+        self.timeouts: list[float | None] = []
 
     @property
     def calls(self) -> int:
@@ -436,8 +497,14 @@ class SimulatedGemmaClient:
         tools: list[dict] | None = None,
         json_schema: dict | None = None,
         temperature: float = 0.1,
+        timeout: float | None = None,
     ) -> GemmaReply:
-        """Record the request and return the responder's (deterministic) reply."""
+        """Record the request and return the responder's (deterministic) reply.
+
+        ``timeout`` is accepted for parity with :class:`OllamaGemmaClient` and
+        recorded in :attr:`timeouts`; callers enforce it themselves.
+        """
+        self.timeouts.append(timeout)
         request = GemmaRequest(
             messages=[dict(m) for m in messages],
             tools=tools,
