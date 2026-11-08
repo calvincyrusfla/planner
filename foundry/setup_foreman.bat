@@ -10,6 +10,8 @@ rem   3. pick the model: %FOREMAN_MODEL%, default gemma4:e4b (suggest gemma4:e2b
 rem   4. start "ollama serve" in the background if http://localhost:11434 does not answer
 rem   5. "ollama pull" the model unless it is already installed
 rem   6. run "python -m foundry.foreman_probe" with the repo's python (.venv, py -3 or python)
+rem   7. run "python -m foundry.gemma_doctor" (GPU %% and tokens/s, standard library only).
+rem      A slow or CPU-only Gemma is reported, not treated as a failed setup.
 rem
 rem Environment:
 rem   FOREMAN_MODEL        model tag (default gemma4:e4b)
@@ -170,12 +172,15 @@ goto :finish
 cd /d "%REPO_ROOT%"
 if not "%DRY%"=="1" goto :run_probe_real
 echo [dry-run] %PY% -m foundry.foreman_probe --base-url "%OLLAMA_URL%/v1" --model "%MODEL%"
+call :doctor
 goto :next_step
 :run_probe_real
 %PY% -m foundry.foreman_probe --base-url "%OLLAMA_URL%/v1" --model "%MODEL%"
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :finish
 echo [foreman] Shop Foreman ready.
+rem ---- 7. speed check -------------------------------------------------------
+call :doctor
 :next_step
 if "%PY_IS_VENV%"=="1" goto :next_step_venv
 rem The probe ran without a usable .venv; the orchestrator needs pydantic, so set up the venv first.
@@ -198,6 +203,30 @@ set "RC=1"
 goto :finish
 
 rem ---- helpers --------------------------------------------------------------
+
+rem :doctor - step 7, the speed check (GPU offload, tokens/s). Never changes RC:
+rem exit 1 (slow / CPU) still means the Foreman works, with heuristic fallbacks.
+:doctor
+echo [foreman] Speed check: is Gemma on the GPU, and how fast? (python -m foundry.gemma_doctor)
+if not "%DRY%"=="1" goto :doctor_real
+echo [dry-run] %PY% -m foundry.gemma_doctor --base-url "%OLLAMA_URL%" --model "%MODEL%"
+exit /b 0
+:doctor_real
+%PY% -m foundry.gemma_doctor --base-url "%OLLAMA_URL%" --model "%MODEL%"
+set "DOC_RC=%ERRORLEVEL%"
+if "%DOC_RC%"=="0" exit /b 0
+if "%DOC_RC%"=="1" goto :doctor_slow
+if "%DOC_RC%"=="2" goto :doctor_unreachable
+echo [foreman] The speed check stopped with exit code %DOC_RC%. Run it again later: %PY% -m foundry.gemma_doctor
+exit /b 0
+:doctor_slow
+echo [foreman] Gemma works, but slowly or on the CPU. Setup still succeeded: Foundry falls back to its
+echo [foreman] built-in sizing when Gemma is too slow. To speed it up see "Make Gemma fast" in foundry\README.md.
+exit /b 0
+:doctor_unreachable
+echo [foreman] The speed check could not reach Gemma or find the model. Run it again later:
+echo [foreman]   %PY% -m foundry.gemma_doctor --model %MODEL%
+exit /b 0
 
 rem :gpu_line "name" "memory MB" - print one nvidia-smi row and keep the largest VRAM.
 :gpu_line

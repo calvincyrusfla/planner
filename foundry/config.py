@@ -19,6 +19,9 @@ Environment variable               Field (default)
 ``FOUNDRY_GEMMA_TIMEOUT_S``        ``gemma_timeout_s`` (``180``): seconds one
                                    Gemma request may take (a CPU Gemma is slow;
                                    sizing runs in the background)
+``FOUNDRY_ASK_TIMEOUT_S``          ``ask_timeout_s`` (``90``): seconds Ask the
+                                   Foreman waits for Gemma (all tool rounds)
+                                   before answering with the built-in status
 ``FOUNDRY_CLAUDE_BIN``             ``claude_bin`` (``claude``)
 ``FOUNDRY_RPM``                    ``rpm`` (``20``)
 ``FOUNDRY_TPM``                    ``tpm`` (``100000``)
@@ -73,6 +76,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 __all__ = [
     "AnomalyThresholds",
     "BoardBridgeMode",
+    "PreReviewMode",
     "DEFAULT_CLAUDE_APPEND_PROMPT",
     "DEFAULT_CLAUDE_EXTRA_ARGS",
     "DEFAULT_DATA_DIR",
@@ -124,6 +128,7 @@ DEFAULT_CLAUDE_APPEND_PROMPT: str = (
 _NONE_WORD = "none"
 
 BoardBridgeMode = Literal["auto", "off", "dry"]
+PreReviewMode = Literal["off", "advise", "gate"]
 
 _BOOL = TypeAdapter(bool)
 
@@ -201,6 +206,14 @@ class FoundryConfig(BaseModel):
         gt=0,
         description="Seconds one Gemma (Shop Foreman) request may take before the heuristic fallback.",
     )
+    ask_timeout_s: float = Field(
+        default=90.0,
+        gt=0,
+        description=(
+            "Seconds Ask the Foreman waits for Gemma (all tool rounds together) before "
+            "answering with the built-in line status; keep it below the API's ask chunk timeout."
+        ),
+    )
     limit_cooldown_s: float = Field(
         default=1200.0,
         gt=0,
@@ -229,6 +242,21 @@ class FoundryConfig(BaseModel):
             "replies; not usage limits/auth/missing claude) on one ticket before "
             "its task is quarantined."
         ),
+    )
+
+    pre_review: PreReviewMode = Field(
+        default="gate",
+        description=(
+            "Gemma pre-review of a diff that passed the gates, before the Claude reviewer: "
+            "off = skip; advise = attach Gemma's notes to the review; gate = also send an "
+            "obviously broken diff back to the builder (at most once per ticket)."
+        ),
+    )
+    pre_review_min_confidence: float = Field(
+        default=0.7,
+        ge=0,
+        le=1,
+        description="Minimum Gemma confidence for a pre-review send-back in gate mode.",
     )
 
     @field_validator("gemma_base_url")
@@ -341,13 +369,16 @@ class FoundryConfig(BaseModel):
             "TRUST_CACHE": "trust_cache",
             "LIMIT_COOLDOWN_S": "limit_cooldown_s",
             "GEMMA_TIMEOUT_S": "gemma_timeout_s",
+            "ASK_TIMEOUT_S": "ask_timeout_s",
             "PATCHES_DIR": "patches_dir",
             "INFRA_FAILURE_CAP": "infra_failure_cap",
+            "PRE_REVIEW": "pre_review",
+            "PRE_REVIEW_MIN_CONFIDENCE": "pre_review_min_confidence",
         }
         for var, field in simple.items():
             value = get(var)
             if value is not None:
-                data[field] = value.lower() if field == "board_bridge_mode" else value
+                data[field] = value.lower() if field in ("board_bridge_mode", "pre_review") else value
 
         if "gemma_model" not in data:
             foreman_model = env.get("FOREMAN_MODEL", "").strip()

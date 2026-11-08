@@ -114,6 +114,24 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _clean_meta(m: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalise a sizing record to ``{"source": "gemma"|"heuristic"|None, "ms": int|None}``.
+
+    ``"raw"`` (the Foreman's size before calibration, S/M/L/XL) is kept when valid.
+    """
+    source = m.get("source")
+    source = source if source in ("gemma", "heuristic") else None
+    try:
+        ms = max(0, int(m.get("ms"))) if m.get("ms") is not None else None
+    except (TypeError, ValueError):
+        ms = None
+    out: dict[str, Any] = {"source": source, "ms": ms}
+    raw = str(m.get("raw") or "").upper()
+    if raw in ("S", "M", "L", "XL"):
+        out["raw"] = raw
+    return out
+
+
 def _val(x: Any) -> Any:
     return getattr(x, "value", x)
 
@@ -199,6 +217,11 @@ class FloorManager:
         self._sizing_tasks: dict[str, asyncio.Task[Any]] = {}
         #: task id -> why its background sizing failed.
         self.sizing_errors: dict[str, str] = {}
+        #: task id -> how it was sized: ``{"source": "gemma"|"heuristic"|None, "ms": int}``
+        #: (kept with the directives in the saved state, so it survives a restart).
+        self.sizing_meta: dict[str, dict[str, Any]] = {}
+        #: sizing info of a finished :meth:`_size` call not yet applied (task id -> meta).
+        self._sized_meta: dict[str, dict[str, Any]] = {}
         #: Current builder allocation per task (updated on RESIZE_ALLOCATION).
         self.allocations: dict[str, int] = {}
         #: alert_id -> outcome of every escalation already applied (idempotency).
@@ -246,6 +269,7 @@ class FloorManager:
             "applied_alerts": {k: v.__dict__ for k, v in self.applied_alerts.items()},
             "diffs": {t: v for t, v in self.diffs.items() if t not in self._completed},
             "patch_names": dict(self.patch_names),
+            "sizing_meta": {t: dict(m) for t, m in self.sizing_meta.items()},
         }
         try:
             fn(_KV_KEY, state)
@@ -265,6 +289,9 @@ class FloorManager:
             self.pr_summaries = {t: dict(v) for t, v in (state.get("pr_summaries") or {}).items()}
             self.applied_alerts = {k: ActionOutcome(**v) for k, v in (state.get("applied_alerts") or {}).items()}
             self.patch_names = {str(k): str(v) for k, v in (state.get("patch_names") or {}).items()}
+            self.sizing_meta = {
+                str(t): _clean_meta(m) for t, m in (state.get("sizing_meta") or {}).items() if isinstance(m, dict)
+            }
             self.diffs = {}
             for t, v in (state.get("diffs") or {}).items():
                 # older saves stored a list; key it by position so nothing is lost
@@ -400,10 +427,14 @@ class FloorManager:
         # recorded only once the tickets exist: a directive without tickets would look applied
         self.directives[task_id] = directive
         self.allocations[task_id] = directive.allocated_builders
+        meta = self._sized_meta.pop(task_id, None)
+        if meta is not None:
+            self.sizing_meta[task_id] = meta
         self.queue.record_event(
             "sized",
             task_id,
-            {"complexity": directive.complexity, "builders": directive.allocated_builders, "team": directive.team_id},
+            {"complexity": directive.complexity, "builders": directive.allocated_builders, "team": directive.team_id,
+             "source": (meta or {}).get("source"), "ms": (meta or {}).get("ms")},
         )
         self.bridge.register_task(
             task_id,
@@ -534,8 +565,19 @@ class FloorManager:
             "description": order.description,
             "files": list(order.files),
             "acceptance_criteria": list(order.acceptance_criteria),
+            # calibration reads only this repository's past sizing outcomes
+            "repo_root": order.repo_root,
         }
+        started = time.monotonic()
         result = await _maybe_await(self.foreman.size_task_scope(task))
+        # read right after the await (no other coroutine runs in between), so a
+        # concurrent sizing cannot overwrite the source before it is captured
+        ms = int(round((time.monotonic() - started) * 1000))
+        last = getattr(self.foreman, "last_source", None)
+        source = last.get("size_task_scope") if isinstance(last, Mapping) else None
+        # the Foreman's size before calibration (outcomes learn from this, not the shifted size)
+        raw = getattr(self.foreman, "last_raw_complexity", None)
+        self._sized_meta[order.task_id] = _clean_meta({"source": source, "ms": ms, "raw": raw})
         if isinstance(result, TaskSizingDirective):
             return result
         return TaskSizingDirective.model_validate(result)
@@ -672,11 +714,39 @@ class FloorManager:
         return True, f"{task_id} quarantined", {"reason": reason}
 
     def _report_quarantine(self, task_id: str, reason: str) -> None:
-        """Post a quarantine to the board once per task."""
+        """Post a quarantine to the board once per task (and record its sizing outcome)."""
         if task_id in self._reported_quarantine:
             return
         self._reported_quarantine.add(task_id)
+        self.record_outcome(task_id)
         self.bridge.quarantined(task_id, reason)
+
+    def record_outcome(self, task_id: str) -> dict[str, Any] | None:
+        """Record the task's sizing outcome in the queue (predicted vs actual effort).
+
+        Called when a task completes (patch written) or is quarantined. The
+        queue keeps the first row per task, so repeated calls are harmless.
+        Best effort: a queue without ``record_sizing_outcome`` or an error
+        never disturbs completion.
+        """
+        fn = getattr(self.queue, "record_sizing_outcome", None)
+        if not callable(fn):
+            return None
+        order = self.orders.get(task_id)
+        d = self.directives.get(task_id)
+        meta = self.sizing_meta.get(task_id) or {}
+        kwargs: dict[str, Any] = {"sizing_source": meta.get("source"), "raw_predicted": meta.get("raw")}
+        if order is not None:
+            kwargs["title"] = order.title
+            if order.files:
+                kwargs["files"] = [str(f) for f in order.files]
+        if d is not None:
+            kwargs["predicted"] = d.complexity
+        try:
+            return fn(task_id, **kwargs)
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.warning("floor manager: could not record the sizing outcome of %s: %s", task_id, exc)
+            return None
 
     async def _reset_builder_context(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         agent_id = alert.target_entity.agent_id or alert.action_parameters.get("agent_id")
@@ -893,6 +963,7 @@ class FloorManager:
         self._drafts.pop(task_id, None)
         self.pr_summaries[task_id] = summary
         self._completed.add(task_id)
+        self.record_outcome(task_id)
         try:
             self.queue.store_pr_summary(task_id, summary)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
@@ -1262,6 +1333,9 @@ def build_factory(
     limiter = limiter or RateLimiter(config.rpm, config.tpm, config.max_concurrent)
     context = ContextEngine(repo_root, gemma)
     foreman = ShopForeman(gemma, queue, telemetry, context, config)
+    # sizing calibration: the Foreman reads past outcomes as
+    # ``outcomes_provider(repo=None, limit=50) -> list[dict]`` (newest first)
+    foreman.outcomes_provider = queue.sizing_outcomes
     cache = SolutionCache(db)
     if gates is None:
         gates = WorkspaceGates(ValidationGates(checks=("syntax", "linter")), workspace or repo_root)

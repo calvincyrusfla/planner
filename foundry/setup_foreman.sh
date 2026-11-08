@@ -10,6 +10,8 @@
 #   4. start `ollama serve` in the background if the API does not answer
 #   5. `ollama pull` the model unless it is already installed
 #   6. run `python -m foundry.foreman_probe` with the repo's python
+#   7. run `python -m foundry.gemma_doctor` (GPU % and tokens/s, standard library only).
+#      A slow or CPU-only Gemma is reported, not treated as a failed setup.
 #
 # Environment:
 #   FOREMAN_MODEL        model tag (default gemma4:e4b)
@@ -137,6 +139,22 @@ else
   fi
 fi
 
+# gemma_doctor: speed check (GPU offload, tokens/s). Never changes the exit status.
+gemma_doctor() {
+  say "Speed check: is Gemma on the GPU, and how fast? (python -m foundry.gemma_doctor)"
+  run "$PYTHON" -m foundry.gemma_doctor --base-url "$OLLAMA_URL" --model "$MODEL"
+  doc=$?
+  case "$doc" in
+    0) ;;
+    1) say "Gemma works, but slowly or on the CPU. Setup still succeeded: Foundry falls back to its"
+       say "built-in sizing when Gemma is too slow. To speed it up see \"Make Gemma fast\" in foundry/README.md." ;;
+    2) say "The speed check could not reach Gemma or find the model. Run it again later:"
+       say "  $PYTHON -m foundry.gemma_doctor --model $MODEL" ;;
+    *) say "The speed check stopped with exit code $doc. Run it again later: $PYTHON -m foundry.gemma_doctor" ;;
+  esac
+  return 0
+}
+
 # --- 6. probe -----------------------------------------------------------------
 if [ -z "$PYTHON" ]; then
   say "Python 3.11 or newer not found; install it, then run: python3 -m foundry.foreman_probe"
@@ -147,6 +165,8 @@ run "$PYTHON" -m foundry.foreman_probe --base-url "$OLLAMA_URL/v1" --model "$MOD
 status=$?
 if [ "$status" -eq 0 ]; then
   [ "$DRY_RUN" = "1" ] || say "Shop Foreman ready."
+  # --- 7. speed check -------------------------------------------------------
+  gemma_doctor
   if [ "$PYTHON" = "$REPO_ROOT/.venv/bin/python" ]; then
     say "Next (from $REPO_ROOT): $PYTHON -m foundry.main --real --repo <path> --title \"...\""
   else

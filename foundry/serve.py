@@ -16,7 +16,7 @@ Interface used by the HTTP layer (all ``async`` methods must run on the
 service's event loop; ``*_threadsafe`` wrappers are for handler threads):
 
 * ``await service.start()`` / ``await service.stop()``
-* ``service.health() -> dict``  - ``{ok, repo, model, gemma_ok, claude_ok, version}``
+* ``service.health() -> dict``  - ``{ok, repo, model, gemma_ok, claude_ok, version, gemma_speed}``
 * ``service.status() -> dict``  - ``{ok, tasks, foreman, paused_until, last_account_error}``
 * ``await service.submit(payload) -> task_id`` - raises :class:`OrderError` (HTTP 400)
 * ``service.ask(question)`` - async iterator of answer text chunks
@@ -111,6 +111,31 @@ def monitor_interval() -> float:
 def _state(task: Any) -> str:
     raw = (task or {}).get("state", "unknown")
     return str(getattr(raw, "value", raw))
+
+
+def _num(v: Any) -> float | None:
+    """A finite number (rounded to 0.1) or ``None``."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+        return None
+    return round(float(v), 1)
+
+
+def _accepts_repo(fn: Any) -> bool:
+    """True when ``fn`` takes a ``repo`` keyword (older foremen don't)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "repo" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _count(v: Any) -> int:
+    if isinstance(v, bool):
+        return 0
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _iso(epoch: float) -> str:
@@ -334,7 +359,12 @@ class Service:
     # ------------------------------------------------------------------ API surface
 
     def health(self) -> dict[str, Any]:
-        """``{ok, repo, model, gemma_ok, claude_ok, version}``."""
+        """``{ok, repo, model, gemma_ok, claude_ok, version, gemma_speed}``.
+
+        ``gemma_speed`` is ``{avg_ms, last_ms, fallbacks, calls}`` from the Shop
+        Foreman's call stats (all ``None``/0 before the first Gemma call).
+        """
+        stats = self._gemma_stats()
         return {
             "ok": bool(self.running),
             "repo": str(self.repo),
@@ -342,6 +372,72 @@ class Service:
             "gemma_ok": bool(self.gemma_ok),
             "claude_ok": bool(self.claude_ok),
             "version": __version__,
+            "gemma_speed": {
+                "avg_ms": _num(stats.get("avg_ms")),
+                "last_ms": _num(stats.get("last_ms")),
+                "fallbacks": _count(stats.get("fallbacks")),
+                "calls": _count(stats.get("calls")),
+            },
+        }
+
+    def _gemma_stats(self) -> dict[str, Any]:
+        """The Shop Foreman's ``gemma_stats()`` (``{}`` when absent or failing)."""
+        foreman = getattr(self.factory, "foreman", None) if self.factory is not None else None
+        fn = getattr(foreman, "gemma_stats", None)
+        if not callable(fn):
+            return {}
+        try:
+            stats = fn()
+        except Exception as exc:  # a status call must not fail
+            log.debug("foundry serve: gemma_stats failed: %s", exc)
+            return {}
+        return dict(stats) if isinstance(stats, Mapping) else {}
+
+    _PRE_REVIEW_KEYS = ("passed", "sent_back", "advised", "skipped", "fallback", "claude_reviews_avoided")
+
+    def _pre_review_stats(self, full: Mapping[str, Any]) -> dict[str, int]:
+        """Gemma pre-review counters (``{}`` when telemetry has none).
+
+        Taken from the telemetry snapshot's ``pre_review`` key, else from
+        ``telemetry.pre_review_counts()`` (older/odd telemetry: ``{}``).
+        """
+        raw: Any = full.get("pre_review") if isinstance(full, Mapping) else None
+        if raw is None:
+            fn = getattr(getattr(self.factory, "telemetry", None), "pre_review_counts", None)
+            if callable(fn):
+                try:
+                    raw = fn()
+                except Exception as exc:  # a status call must not fail
+                    log.debug("foundry serve: pre_review_counts failed: %s", exc)
+        if not isinstance(raw, Mapping):
+            return {}
+        out = {k: _count(raw.get(k)) for k in self._PRE_REVIEW_KEYS}
+        if raw.get("claude_reviews_avoided") is None:
+            out["claude_reviews_avoided"] = out["sent_back"]
+        return out
+
+    def _calibration(self) -> dict[str, Any]:
+        """The Shop Foreman's ``calibration_summary()`` (``{}`` when absent or failing)."""
+        foreman = getattr(self.factory, "foreman", None) if self.factory is not None else None
+        fn = getattr(foreman, "calibration_summary", None)
+        if not callable(fn):
+            return {}
+        try:
+            summary = fn(repo=str(self.repo)) if _accepts_repo(fn) else fn()  # same scope as sizing
+        except Exception as exc:  # a status call must not fail
+            log.debug("foundry serve: calibration_summary failed: %s", exc)
+            return {}
+        if not isinstance(summary, Mapping):
+            return {}
+        rules = summary.get("shift_rules")
+        return {
+            "n": _count(summary.get("n")),
+            "accuracy_pct": _num(summary.get("accuracy_pct")),
+            "exact": _count(summary.get("exact")),
+            "under": _count(summary.get("under")),
+            "over": _count(summary.get("over")),
+            "shift_rules": [r if isinstance(r, (str, Mapping)) else str(r) for r in rules]
+            if isinstance(rules, (list, tuple)) else [],
         }
 
     def _task_row(self, task: Mapping[str, Any]) -> dict[str, Any]:
@@ -359,6 +455,7 @@ class Service:
         if state in ("backlog", "sizing") and callable(is_sizing) and is_sizing(tid):
             state = "sizing"  # the Shop Foreman is sizing it in the background
         reason = task.get("quarantine_reason") if state in ("quarantined", "failed") else None
+        meta = (getattr(f.manager, "sizing_meta", None) or {}).get(tid) or {}
         return {
             "id": tid,
             "title": task.get("title") or (f.manager.orders[tid].title if tid in f.manager.orders else ""),
@@ -369,6 +466,8 @@ class Service:
             "md": str(files["md"]) if files.get("md") else None,
             "rejected": str(files["rejected"]) if files.get("rejected") else None,
             "reason": reason,
+            "sizing_source": meta.get("source"),
+            "sizing_ms": meta.get("ms"),
         }
 
     def status(self) -> dict[str, Any]:
@@ -378,6 +477,7 @@ class Service:
             return {"ok": False, "tasks": [], "foreman": {}, "paused_until": None, "last_account_error": None}
         tasks = [self._task_row(t) for t in f.queue.all_tasks() if self._mine(t["task_id"])]
         snap: dict[str, Any] = {}
+        full: Any = {}
         try:
             full = f.telemetry.snapshot()
             snap = {k: full[k] for k in ("generated_at", "tokens", "current_tpm", "current_rpm", "burn_rate",
@@ -390,6 +490,9 @@ class Service:
             "last_alert": self.last_alert,
             "last_action": self.last_action,
             "last_error": self.last_monitor_error,
+            "gemma": self._gemma_stats(),
+            "pre_review": self._pre_review_stats(full if isinstance(full, Mapping) else {}),
+            "calibration": self._calibration(),
         })
         paused_until = None
         remaining = getattr(f.limiter, "pause_remaining", None)

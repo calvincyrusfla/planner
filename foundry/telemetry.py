@@ -16,6 +16,9 @@ Metrics
 * queue dwell: time each submission spends waiting for a reviewer
   (``mark_review_wait`` / ``mark_review_start`` / ``queue_dwell``); a task
   reports its oldest unstarted submission
+* Gemma pre-review outcomes (``record_pre_review`` / ``pre_review_counts``):
+  passed / sent_back / advised / skipped / fallback, plus
+  ``claude_reviews_avoided`` (= sent_back)
 * cache-read tokens, stored apart and excluded from burn rates / TPM
 * moving burn rates over 1- and 15-minute windows, including RPM
   (``burn_rate``)
@@ -49,12 +52,16 @@ __all__ = [
     "ROLES",
     "SAVED_SOURCES",
     "PHASES",
+    "PRE_REVIEW_OUTCOMES",
 ]
 
 Role = AgentRole
 """Claude agent roles (``schemas.AgentRole``). Gemma usage is not Claude burn."""
 SavedSource = TokensSavedSource
 Phase = DurationPhase
+
+#: Outcomes of the Gemma pre-review step (see ``BuilderWorker``).
+PRE_REVIEW_OUTCOMES: tuple[str, ...] = ("passed", "sent_back", "advised", "skipped", "fallback")
 
 ROLES: tuple[str, ...] = get_args(Role)
 SAVED_SOURCES: tuple[str, ...] = get_args(SavedSource)
@@ -108,6 +115,13 @@ CREATE TABLE IF NOT EXISTS telemetry_review_wait (
     item TEXT,
     enqueued_at REAL NOT NULL,
     started_at REAL
+);
+CREATE TABLE IF NOT EXISTS telemetry_pre_review (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    ts_iso TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    outcome TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_telemetry_review_wait_open
     ON telemetry_review_wait(task_id, started_at);
@@ -271,6 +285,35 @@ class Telemetry:
     def record_retry(self, task_id: str) -> None:
         """Record one retry (ticket reopened with a fix hint or REVISE directives)."""
         self._record_gate(task_id, "retry")
+
+    def record_pre_review(self, task_id: str, outcome: str) -> None:
+        """Record one Gemma pre-review outcome (one of ``PRE_REVIEW_OUTCOMES``)."""
+        _check_choice(outcome, PRE_REVIEW_OUTCOMES, "outcome")
+        now = self._now()
+        with self._tx() as cur:
+            cur.execute(
+                "INSERT INTO telemetry_pre_review(ts, ts_iso, task_id, outcome) VALUES (?, ?, ?, ?)",
+                (now, _iso(now), task_id, outcome),
+            )
+
+    def pre_review_counts(self, task_id: str | None = None) -> dict[str, int]:
+        """Pre-review outcome counters (all tasks, or one) plus ``claude_reviews_avoided``.
+
+        Every outcome key is present (0 when unseen); ``claude_reviews_avoided``
+        equals ``sent_back``: each send-back is one Claude reviewer call not made.
+        """
+        if task_id is None:
+            rows = self._query("SELECT outcome, COUNT(*) FROM telemetry_pre_review GROUP BY outcome")
+        else:
+            rows = self._query(
+                "SELECT outcome, COUNT(*) FROM telemetry_pre_review WHERE task_id=? GROUP BY outcome", (task_id,)
+            )
+        counts = {o: 0 for o in PRE_REVIEW_OUTCOMES}
+        for outcome, n in rows:
+            if outcome in counts:
+                counts[outcome] = int(n)
+        counts["claude_reviews_avoided"] = counts["sent_back"]
+        return counts
 
     def set_idle(self, team_id: str, count: int) -> None:
         """Set the current number of idle agents on a team (latest value wins)."""
@@ -488,7 +531,8 @@ class Telemetry:
         ``idle_agent_count`` (per team, total), ``gates`` (failures/retries in
         total and per task), ``queue_dwell`` (per task the oldest waiting
         submission, number of waiting submissions, max), ``burn_rate``
-        (``1m`` and ``15m``), ``current_tpm`` and ``current_rpm``.
+        (``1m`` and ``15m``), ``pre_review`` (Gemma pre-review counters),
+        ``current_tpm`` and ``current_rpm``.
         """
         now = self._now()
         by_role = self.tokens_by_role()
@@ -532,6 +576,7 @@ class Telemetry:
                 "max_seconds": max(waiting.values(), default=0.0),
             },
             "burn_rate": {"1m": burn_1, "15m": burn_15},
+            "pre_review": self.pre_review_counts(),
             "current_tpm": burn_1["tokens_per_min"],
             "current_rpm": burn_1["rpm"],
         }

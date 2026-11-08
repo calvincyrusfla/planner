@@ -115,7 +115,8 @@ The scripts are idempotent and need no admin rights. They:
 3. pick the model;
 4. start `ollama serve` if the API isn't answering;
 5. run `ollama pull` for the model;
-6. finish with the probe.
+6. finish with the probe;
+7. run the speed check, `python -m foundry.gemma_doctor` (see [Make Gemma fast](#make-gemma-fast)). A slow Gemma or one on the CPU is reported but doesn't fail the setup: Foundry still works and falls back to its built-in sizing when Gemma is too slow. Without a `.venv` it runs with the system Python (the check needs only the standard library).
 
 Environment variables:
 
@@ -140,6 +141,121 @@ Two variables point at Ollama, one per tool:
 If you move Ollama, set both.
 
 Tip: Ollama's default context window is small. For long sizing and PR prompts, start the server with a larger window, for example `set OLLAMA_CONTEXT_LENGTH=8192` (cmd), `$env:OLLAMA_CONTEXT_LENGTH=8192` (PowerShell) or `OLLAMA_CONTEXT_LENGTH=8192 ollama serve`. If you use the Ollama tray app, quit and restart it after setting the variable.
+
+### Make Gemma fast
+
+Gemma sizes every Foundry task and answers Ask the Foreman. If it runs on the CPU it can take minutes per answer, and sizing often gives up and uses the built-in heuristic instead. The steps below are for Windows; run them from the repo root.
+
+1. **Run the speed check.**
+
+   ```bat
+   .venv\Scripts\python -m foundry.gemma_doctor
+   ```
+
+   It lists the installed models, asks Ollama how much of Gemma is loaded on the GPU, times a tiny answer and ends with a plain verdict, for example `Gemma is running 100% on the GPU at 42 tokens/s - good.` or `Gemma is running on the CPU (0% GPU) at 3 tokens/s - sizing will often fall back`. It counts as fast when at least 90% of the model is on the GPU and it writes 10 tokens/s or more. It exits with 0 when Gemma is fast, 1 when it is slow or (partly) on the CPU, and 2 when Ollama isn't answering or the model isn't installed. When it is slow it also suggests what to change, such as a smaller Gemma tag. Add `--json` for a machine-readable report, or `--model` / `--base-url` to check another tag or server (by default it uses `FOUNDRY_GEMMA_MODEL` / `FOREMAN_MODEL` and `FOUNDRY_GEMMA_BASE_URL` / `FOREMAN_OLLAMA_URL`).
+
+2. **Read the GPU %.** It is the share of the model that sits in the graphics card's memory (`ollama ps` shows the same figure in its `PROCESSOR` column).
+   - `100% GPU`: as fast as this card goes.
+   - Something like `40%/60% CPU/GPU`: the model doesn't fit in the card's memory, so part of it runs on the much slower CPU. Use a smaller tag (step 4) or free GPU memory (step 5).
+   - `100% CPU` / `0% GPU`: Ollama isn't using the card at all. Update Ollama and the driver (step 3).
+
+3. **Update Ollama and the GPU driver.** Install the latest Ollama from https://ollama.com/download (the tray app updates itself; restart it when it offers to). Update the graphics driver from NVIDIA (GeForce Experience / NVIDIA app) or AMD (Adrenalin). Restart Ollama afterwards and run the speed check again.
+
+4. **Pick a smaller Gemma.** `gemma4:e2b` is about half the size of the default `gemma4:e4b` and fits cards with less than 8 GB of memory. Pull it with the setup script, then tell Foundry to use it:
+
+   ```bat
+   set FOREMAN_MODEL=gemma4:e2b
+   foundry\setup_foreman.bat
+   setx FOUNDRY_GEMMA_MODEL gemma4:e2b
+   ```
+
+   `setx` keeps the setting for new windows, so restart `foundry\start_foundry.bat` afterwards. (Foundry reads `FOUNDRY_GEMMA_MODEL` and falls back to `FOREMAN_MODEL`.)
+
+5. **Leave room on the card.** Close games, video editors and other AI apps while Foundry runs; they hold GPU memory and push part of Gemma onto the CPU.
+
+6. **Don't make the context window bigger than needed.** `OLLAMA_CONTEXT_LENGTH` (see the tip above) costs GPU memory. `8192` is enough for Foundry; if a larger value pushes the GPU % below 100, lower it again.
+
+7. **Tune the time limits if Gemma is still slow.** These are a safety net, not a speed-up:
+   - `FOUNDRY_GEMMA_TIMEOUT_S` (default `180`): how long one sizing or review call may take before Foundry uses its heuristic.
+   - `FOUNDRY_ASK_TIMEOUT_S` (default `90`): how long Ask the Foreman waits for Gemma. When the time runs out you get the built-in status answer instead of an error. Keep it below 110 seconds, the service's own limit for one answer (`ASK_CHUNK_TIMEOUT_S` in `serve_api.py`).
+
+   For example `setx FOUNDRY_GEMMA_TIMEOUT_S 300`, then restart Foundry.
+
+### Gemma pre-review
+
+Before a builder's diff goes to the Claude reviewer, Gemma takes a quick look at it. The order is: Claude builder reply → the deterministic gates (syntax, lint) → **Gemma pre-review** → Claude reviewer. When Gemma spots an obvious problem, the diff goes back to the builder and a Claude review call is saved.
+
+Gemma is a small model and can be wrong, so it may only send work back for **obvious, objective problems**:
+
+- the diff doesn't touch the files or do the job the builder was asked for;
+- unfinished code where the work should be (`TODO`, placeholders, empty stubs);
+- breakage the gates can't catch;
+- debug leftovers (stray prints, breakpoints);
+- secrets or credentials in the diff;
+- edits to files outside the builder's allowed files.
+
+Style and taste never count as blocking. Gemma answers `pass` or `send_back`, with a list of issues (each `blocking` or `minor`) and a confidence from 0 to 1.
+
+Set the mode with `FOUNDRY_PRE_REVIEW`:
+
+| Mode | What happens |
+|---|---|
+| `gate` (default) | The diff goes back to the builder, with the hint `[pre-review] <notes>`, only when Gemma says `send_back`, lists at least one blocking issue **and** its confidence is at least `FOUNDRY_PRE_REVIEW_MIN_CONFIDENCE` (default `0.7`). Otherwise it goes on to the Claude reviewer with Gemma's notes attached. |
+| `advise` | Nothing is sent back. Gemma's notes are added to the Claude reviewer's prompt as "Gemma pre-review notes (may be wrong): …". |
+| `off` | No pre-review. |
+
+Limits that keep a wrong Gemma cheap:
+
+- **Once per ticket.** Gemma can send a ticket back at most once. The next submission of that ticket always goes to the Claude reviewer, with Gemma's notes attached. The cap is stored in the queue, so it holds across restarts.
+- **A send-back counts as a rejected attempt**, like a gate failure, so the usual retry and quarantine limits still apply.
+- **Gemma never blocks on errors.** If Gemma is off, times out or gives an unusable answer, the diff passes on to the Claude reviewer. That doesn't use up an attempt.
+- **Never on the last attempt.** On a ticket's last allowed attempt Gemma never sends the diff back, because a send-back there would quarantine work no Claude reviewer has seen. The diff goes to the Claude reviewer with Gemma's notes attached.
+- **Pause after repeated failures.** After 3 Gemma failures (timeouts or errors) in a row, the pre-review is skipped for 10 minutes and diffs go straight to the Claude reviewer. These count as `skipped`. One usable Gemma answer resets the count.
+
+Counters for passed, sent back, advised, skipped and fallback, plus `claude_reviews_avoided` (one per send-back), are in `/api/status` under `foreman.pre_review`. The dashboard's Foundry tasks summary line shows them as "Pre-review: N sent back (≈N Claude reviews saved)".
+
+### Sizing that learns
+
+When a task finishes (approved and the patch is written) or is quarantined, Foundry stores one row in the `sizing_outcomes` table of the queue database. Each row has:
+
+- the task, its repo, title and files;
+- the size Gemma or the heuristic predicted (S/M/L/XL), and which of them sized it;
+- the builders allocated and the number of subtasks;
+- the effort it took: builder attempts, gate failures, pre-review send-backs, reviewer rejections, Claude calls, tokens (input + output) and wall time;
+- the final state.
+
+Each task is recorded once. From the effort, Foundry works out the size the task **actually** was and compares it with the prediction (see `foundry/sizing_outcomes.py`: `actual_complexity` and `sizing_accuracy`, which counts exact, under and over, also per predicted size). The effort score is:
+
+`effort = Claude calls + retries`
+
+- **Claude calls** are the builder and reviewer calls recorded for the task. When none were recorded (for example in simulated runs), Foundry counts 2 calls per builder attempt: one build plus one review.
+- **Retries** are builder attempts beyond the first per subtask.
+- **Wall time is stored but doesn't count.** It reflects queueing, rate limits and the PC as much as the task.
+
+A score up to 3 is **S**, up to 7 **M**, up to 20 **L**, and above that **XL**. A clean run of each size (2 calls per subtask, no retries) scores within its own size: S = 2, M = 4, L = 10. L and XL get the same crew of 5 builders, so effort can't tell them apart. L-versus-XL counts as a match.
+
+Quarantined tasks:
+
+- **The retry cap ran out.** The task counts as at least L, because it needed more than it got.
+- **Quarantined for another reason** (an escalation, a sizing problem). The row is kept but left out of accuracy and calibration, because it says nothing about the size.
+
+Each row also keeps two predictions:
+
+- the size that was actually applied;
+- the Foreman's raw size, from Gemma or the heuristic, before any calibration shift.
+
+The shift rule groups tasks by the raw size, so calibration never learns from its own corrections.
+
+The next sizing uses this in two ways. Both look only at the same repo's tasks; accuracy and shift rules are worked out per repo.
+
+1. **Examples.** Before Gemma sizes a new order, the Foreman picks up to 5 recent, similar finished tasks (shared files first, then shared title words) and adds them to the prompt, for example "Past task Add clamp helper (files shop/mathx.py): you predicted M, it actually took L (3 attempts, 9 Claude calls)".
+2. **Shift rule.** Look at the repo's finished tasks with the same raw predicted size (up to the 20 most recent). The rule applies once there are at least 8:
+   - if at least 60 % of them actually turned out bigger, the new prediction moves up one size;
+   - if at least 60 % turned out smaller, it moves down one size.
+
+   It never moves more than one step. The rule applies whether Gemma or the heuristic sized the task. The shift is logged, and the rationale says "calibrated from N past tasks".
+
+`/api/status` has the summary under `foreman.calibration` (`n`, `accuracy_pct`, `under`, `over`, `shift_rules`). The dashboard's Foundry tasks summary line shows it as "Sizing accuracy: X % over N tasks".
 
 ### Real mode (phase 2, untested against live services)
 
@@ -390,6 +506,18 @@ The **Ask the Foreman** panel lets you ask the Shop Foreman a question in plain 
 
 When Foundry isn't running, the box and the button are disabled and the panel says `Foundry isn't running. Start it with foundry\start_foundry.bat to ask questions.` The answers need Gemma, so set up the [Shop Foreman](#setting-up-the-shop-foreman-phase-2) first.
 
+### Is Gemma doing the work?
+
+The dashboard shows which tasks Gemma really sized:
+
+- While Foundry is running, the Ask the Foreman card has a **Foundry tasks** list (click it to open it; the summary line counts how many were sized by Gemma and how many by the fallback). Each row shows the task's id, title, state and team, and a badge:
+  - **Gemma · 41 s**: Gemma sized the task, and it took 41 seconds.
+  - **Fallback**: Gemma was too slow or didn't answer, so the built-in rules sized it (with the time sizing took, when known). The task still runs normally; the rules are just less precise about the crew size.
+  - **Sizing…**: the task is still being sized.
+- Hover over the **Foundry** chip to see Gemma's recent speed, for example `Gemma: avg 38 s per call, 2 fallbacks (last 41 s, 12 calls)`.
+
+Many Fallback badges or a high average mean Gemma is too slow on this PC; see [Make Gemma fast](#make-gemma-fast). The same figures are in the service's API: each task row in `/api/status` has `sizing_source` (`gemma` or `heuristic`) and `sizing_ms`, `/api/status` has `foreman.gemma` (call counts, fallbacks, timeouts, average and last time, per hook), and `/api/health` has `gemma_speed` (`avg_ms`, `last_ms`, `fallbacks`, `calls`).
+
 ### When something doesn't work
 
 - **The chip says not running but the Foundry window is open.** Look at the window for an error. Check that nothing else uses port 4310, and that `FOUNDRY_SERVE_PORT` is either unset or the same for Foundry and the dashboard.
@@ -438,6 +566,9 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_GEMMA_BASE_URL` | `http://localhost:11434/v1` |
 | `FOUNDRY_GEMMA_MODEL` | `gemma4:e4b` (falls back to `FOREMAN_MODEL`) |
 | `FOUNDRY_GEMMA_TIMEOUT_S` | `180` seconds one Gemma request may take before the Foreman falls back to its heuristic (sizing runs in the background, so a slow CPU Gemma is fine) |
+| `FOUNDRY_ASK_TIMEOUT_S` | `90` seconds Ask the Foreman waits for Gemma before it gives the built-in status answer (keep it below the service's 110 s per-answer limit) |
+| `FOUNDRY_PRE_REVIEW` | `gate` (`off`, `advise`, `gate`; see [Gemma pre-review](#gemma-pre-review)) |
+| `FOUNDRY_PRE_REVIEW_MIN_CONFIDENCE` | `0.7` (how sure Gemma must be before `gate` mode sends a diff back) |
 | `FOUNDRY_CLAUDE_BIN` | `claude` |
 | `FOUNDRY_RPM` / `FOUNDRY_TPM` / `FOUNDRY_MAX_CONCURRENT` | `20` / `100000` / `3` |
 | `FOUNDRY_REVIEW_DWELL_S` | `600` (REVIEW_BOTTLENECK → PROMOTE_PEER_REVIEWER) |
