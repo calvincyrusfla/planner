@@ -76,6 +76,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 __all__ = [
     "AnomalyThresholds",
     "BoardBridgeMode",
+    "PreReviewMode",
     "DEFAULT_CLAUDE_APPEND_PROMPT",
     "DEFAULT_CLAUDE_EXTRA_ARGS",
     "DEFAULT_DATA_DIR",
@@ -127,6 +128,7 @@ DEFAULT_CLAUDE_APPEND_PROMPT: str = (
 _NONE_WORD = "none"
 
 BoardBridgeMode = Literal["auto", "off", "dry"]
+PreReviewMode = Literal["off", "advise", "gate"]
 
 _BOOL = TypeAdapter(bool)
 
@@ -242,6 +244,21 @@ class FoundryConfig(BaseModel):
         ),
     )
 
+    pre_review: PreReviewMode = Field(
+        default="gate",
+        description=(
+            "Gemma pre-review of a diff that passed the gates, before the Claude reviewer: "
+            "off = skip; advise = attach Gemma's notes to the review; gate = also send an "
+            "obviously broken diff back to the builder (at most once per ticket)."
+        ),
+    )
+    pre_review_min_confidence: float = Field(
+        default=0.7,
+        ge=0,
+        le=1,
+        description="Minimum Gemma confidence for a pre-review send-back in gate mode.",
+    )
+
     @field_validator("gemma_base_url")
     @classmethod
     def _check_base_url(cls, value: str) -> str:
@@ -355,11 +372,13 @@ class FoundryConfig(BaseModel):
             "ASK_TIMEOUT_S": "ask_timeout_s",
             "PATCHES_DIR": "patches_dir",
             "INFRA_FAILURE_CAP": "infra_failure_cap",
+            "PRE_REVIEW": "pre_review",
+            "PRE_REVIEW_MIN_CONFIDENCE": "pre_review_min_confidence",
         }
         for var, field in simple.items():
             value = get(var)
             if value is not None:
-                data[field] = value.lower() if field == "board_bridge_mode" else value
+                data[field] = value.lower() if field in ("board_bridge_mode", "pre_review") else value
 
         if "gemma_model" not in data:
             foreman_model = env.get("FOREMAN_MODEL", "").strip()

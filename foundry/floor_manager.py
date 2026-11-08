@@ -703,11 +703,39 @@ class FloorManager:
         return True, f"{task_id} quarantined", {"reason": reason}
 
     def _report_quarantine(self, task_id: str, reason: str) -> None:
-        """Post a quarantine to the board once per task."""
+        """Post a quarantine to the board once per task (and record its sizing outcome)."""
         if task_id in self._reported_quarantine:
             return
         self._reported_quarantine.add(task_id)
+        self.record_outcome(task_id)
         self.bridge.quarantined(task_id, reason)
+
+    def record_outcome(self, task_id: str) -> dict[str, Any] | None:
+        """Record the task's sizing outcome in the queue (predicted vs actual effort).
+
+        Called when a task completes (patch written) or is quarantined. The
+        queue keeps the first row per task, so repeated calls are harmless.
+        Best effort: a queue without ``record_sizing_outcome`` or an error
+        never disturbs completion.
+        """
+        fn = getattr(self.queue, "record_sizing_outcome", None)
+        if not callable(fn):
+            return None
+        order = self.orders.get(task_id)
+        d = self.directives.get(task_id)
+        meta = self.sizing_meta.get(task_id) or {}
+        kwargs: dict[str, Any] = {"sizing_source": meta.get("source")}
+        if order is not None:
+            kwargs["title"] = order.title
+            if order.files:
+                kwargs["files"] = [str(f) for f in order.files]
+        if d is not None:
+            kwargs["predicted"] = d.complexity
+        try:
+            return fn(task_id, **kwargs)
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.warning("floor manager: could not record the sizing outcome of %s: %s", task_id, exc)
+            return None
 
     async def _reset_builder_context(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         agent_id = alert.target_entity.agent_id or alert.action_parameters.get("agent_id")
@@ -924,6 +952,7 @@ class FloorManager:
         self._drafts.pop(task_id, None)
         self.pr_summaries[task_id] = summary
         self._completed.add(task_id)
+        self.record_outcome(task_id)
         try:
             self.queue.store_pr_summary(task_id, summary)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
@@ -1293,6 +1322,9 @@ def build_factory(
     limiter = limiter or RateLimiter(config.rpm, config.tpm, config.max_concurrent)
     context = ContextEngine(repo_root, gemma)
     foreman = ShopForeman(gemma, queue, telemetry, context, config)
+    # sizing calibration: the Foreman reads past outcomes as
+    # ``outcomes_provider(repo=None, limit=50) -> list[dict]`` (newest first)
+    foreman.outcomes_provider = queue.sizing_outcomes
     cache = SolutionCache(db)
     if gates is None:
         gates = WorkspaceGates(ValidationGates(checks=("syntax", "linter")), workspace or repo_root)

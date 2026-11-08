@@ -181,6 +181,60 @@ Gemma sizes every Foundry task and answers Ask the Foreman. If it runs on the CP
 
    For example `setx FOUNDRY_GEMMA_TIMEOUT_S 300`, then restart Foundry.
 
+### Gemma pre-review
+
+Before a builder's diff goes to the Claude reviewer, Gemma takes a quick look at it. The order is: Claude builder reply → the deterministic gates (syntax, lint) → **Gemma pre-review** → Claude reviewer. When Gemma spots an obvious problem, the diff goes back to the builder and a Claude review call is saved.
+
+Gemma is a small model and can be wrong, so it may only send work back for **obvious, objective problems**:
+
+- the diff doesn't touch the files or do the job the builder was asked for;
+- unfinished code where the work should be (`TODO`, placeholders, empty stubs);
+- breakage the gates can't catch;
+- debug leftovers (stray prints, breakpoints);
+- secrets or credentials in the diff;
+- edits to files outside the builder's allowed files.
+
+Style and taste never count as blocking. Gemma answers `pass` or `send_back`, with a list of issues (each `blocking` or `minor`) and a confidence from 0 to 1.
+
+Set the mode with `FOUNDRY_PRE_REVIEW`:
+
+| Mode | What happens |
+|---|---|
+| `gate` (default) | The diff goes back to the builder, with the hint `[pre-review] <notes>`, only when Gemma says `send_back`, lists at least one blocking issue **and** its confidence is at least `FOUNDRY_PRE_REVIEW_MIN_CONFIDENCE` (default `0.7`). Otherwise it goes on to the Claude reviewer with Gemma's notes attached. |
+| `advise` | Nothing is sent back. Gemma's notes are added to the Claude reviewer's prompt as "Gemma pre-review notes (may be wrong): …". |
+| `off` | No pre-review. |
+
+Limits that keep a wrong Gemma cheap:
+
+- **Once per ticket.** Gemma can send a ticket back at most once. The next submission of that ticket always goes to the Claude reviewer, with Gemma's notes attached. The cap is stored in the queue, so it holds across restarts.
+- **A send-back counts as a rejected attempt**, like a gate failure, so the usual retry and quarantine limits still apply.
+- **Gemma never blocks on errors.** If Gemma is off, times out or gives an unusable answer, the diff passes on to the Claude reviewer. That doesn't use up an attempt.
+
+Counters for passed, sent back, advised, skipped and fallback, plus `claude_reviews_avoided` (one per send-back), are in `/api/status` under `foreman.pre_review`. The dashboard's Foundry tasks summary line shows them as "Pre-review: N sent back (≈N Claude reviews saved)".
+
+### Sizing that learns
+
+When a task finishes (approved and the patch is written) or is quarantined, Foundry stores one row in the `sizing_outcomes` table of the queue database. Each row has:
+
+- the task, its repo, title and files;
+- the size Gemma or the heuristic predicted (S/M/L/XL), and which of them sized it;
+- the builders allocated and the number of subtasks;
+- the effort it took: builder attempts, gate failures, pre-review send-backs, reviewer rejections, Claude calls, tokens (input + output) and wall time;
+- the final state.
+
+Each task is recorded once. From the effort, Foundry works out the size the task **actually** was and compares it with the prediction (`foundry/sizing_outcomes.py`: `actual_complexity` and `sizing_accuracy`, which counts exact, under and over, also per predicted size). The effort score is:
+
+`effort = Claude calls + retries + wall time in minutes / 10`
+
+Here retries means builder attempts beyond the first per subtask. A score up to 3 is **S**, up to 7 **M**, up to 14 **L**, and above that **XL**. A clean one-file task (1 build + 1 review) is S, and 9 Claude calls is L. A quarantined task counts as at least L.
+
+The next sizing uses this in two ways:
+
+1. **Examples.** Before Gemma sizes a new order, the Foreman picks up to 5 recent, similar finished tasks in the same repo (shared files first, then shared title words) and adds them to the prompt, for example "Past task Add clamp helper (files shop/mathx.py): you predicted M, it actually took L (3 attempts, 9 Claude calls)".
+2. **Shift rule.** Look at the finished tasks with the same predicted size (up to the 20 most recent). If there are at least 8 of them, the rule applies. If at least 60 % of them actually turned out bigger, the new prediction moves up one size; if at least 60 % turned out smaller, it moves down one size. It never moves more than one step. This applies whether Gemma or the heuristic sized the task. The shift is logged, and the rationale says "calibrated from N past tasks".
+
+`/api/status` has the summary under `foreman.calibration` (`n`, `accuracy_pct`, `under`, `over`, `shift_rules`). The dashboard's Foundry tasks summary line shows it as "Sizing accuracy: X % over N tasks".
+
 ### Real mode (phase 2, untested against live services)
 
 ```powershell
@@ -491,6 +545,8 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_GEMMA_MODEL` | `gemma4:e4b` (falls back to `FOREMAN_MODEL`) |
 | `FOUNDRY_GEMMA_TIMEOUT_S` | `180` seconds one Gemma request may take before the Foreman falls back to its heuristic (sizing runs in the background, so a slow CPU Gemma is fine) |
 | `FOUNDRY_ASK_TIMEOUT_S` | `90` seconds Ask the Foreman waits for Gemma before it gives the built-in status answer (keep it below the service's 110 s per-answer limit) |
+| `FOUNDRY_PRE_REVIEW` | `gate` (`off`, `advise`, `gate`; see [Gemma pre-review](#gemma-pre-review)) |
+| `FOUNDRY_PRE_REVIEW_MIN_CONFIDENCE` | `0.7` (how sure Gemma must be before `gate` mode sends a diff back) |
 | `FOUNDRY_CLAUDE_BIN` | `claude` |
 | `FOUNDRY_RPM` / `FOUNDRY_TPM` / `FOUNDRY_MAX_CONCURRENT` | `20` / `100000` / `3` |
 | `FOUNDRY_REVIEW_DWELL_S` | `600` (REVIEW_BOTTLENECK → PROMOTE_PEER_REVIEWER) |

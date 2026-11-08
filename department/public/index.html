@@ -300,7 +300,7 @@
   .foreman-answer .foreman-err { color: var(--bad); }
   /* Foundry task list in the Foreman card: text is --text/--muted on --surface (>= 6:1); badge text is --ok/--warn on --surface-2 (>= 7:1). */
   .fo-tasks { margin-top: 12px; }
-  .fo-tasks summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .fo-tasks summary { cursor: pointer; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
   .fo-tasks summary b { color: var(--text); font-weight: 600; }
   .fo-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 300px; overflow-y: auto; }
   .fo-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 13px; }
@@ -1039,7 +1039,22 @@ async function foundryTasks(up) {
   const gem = tasks.filter((t) => String(t.sizing_source || '').toLowerCase() === 'gemma').length;
   const fb = tasks.filter((t) => ['heuristic', 'fallback'].includes(String(t.sizing_source || '').toLowerCase())).length;
   $('#fo-sum').replaceChildren(el('b', '', 'Foundry tasks'),
-    ` · ${tasks.length}` + (gem || fb ? ` (${gem} by Gemma, ${fb} fallback)` : ''));
+    ` · ${tasks.length}` + (gem || fb ? ` (${gem} by Gemma, ${fb} fallback)` : '') + foremanLearning(r.json.foreman));
+}
+// " · Pre-review: N sent back (≈N Claude reviews saved) · Sizing accuracy: X % over N tasks"; parts with no data are left out.
+function foremanLearning(fm) {
+  const n = (v) => (typeof v === 'number' && isFinite(v) && v >= 0 ? v : null);
+  const parts = [];
+  const pr = fm && typeof fm.pre_review === 'object' ? fm.pre_review : null;
+  const sent = pr && n(pr.sent_back);
+  if (sent) {
+    const saved = n(pr.claude_reviews_avoided) ?? sent;
+    parts.push(`Pre-review: ${sent} sent back (≈${saved} Claude review${saved === 1 ? '' : 's'} saved)`);
+  }
+  const cal = fm && typeof fm.calibration === 'object' ? fm.calibration : null;
+  const cn = cal && n(cal.n), acc = cal && n(cal.accuracy_pct);
+  if (cn && acc !== null) parts.push(`Sizing accuracy: ${Math.round(acc)} % over ${cn} task${cn === 1 ? '' : 's'}`);
+  return parts.length ? ' · ' + parts.join(' · ') : '';
 }
 function syncFoundryRow() {
   const on = $('#t-foundry').checked;

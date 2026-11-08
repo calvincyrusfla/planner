@@ -12,6 +12,9 @@ tokens are spent only on real building and reviewing:
   from a failing gate's output.
 * :meth:`ShopForeman.draft_pr_summary` -- conventional commit message and PR
   body for a finished task.
+* :meth:`ShopForeman.pre_review_diff` -- quick Gemma look at a diff that passed
+  the gates, before the Claude reviewer; flags only obvious, objective
+  problems (a :class:`PreReview`; falls back to "pass", never blocks).
 * :meth:`ShopForeman.answer_question` -- streams an answer about the line,
   using the read-only tools below in a bounded tool-calling loop.
 * :meth:`ShopForeman.evaluate_line_anomaly` -- deterministic anomaly
@@ -100,11 +103,16 @@ __all__ = [
     "FOREMAN_TOOLS",
     "MAX_HINT_CHARS",
     "MAX_TOOL_ROUNDS",
+    "PRE_REVIEW_TIMEOUT_CAP_S",
     "Anomaly",
     "GemmaStats",
+    "PreReview",
+    "PreReviewIssue",
     "ShopForeman",
     "diff_stats",
+    "calibration_shifts",
     "heuristic_complexity",
+    "similar_outcomes",
 ]
 
 #: Maximum tool-calling rounds in :meth:`ShopForeman.answer_question`.
@@ -118,6 +126,15 @@ ASK_BUDGET_CAP_S: float = 100.0
 #: Hooks that called Gemma in the current asyncio task since their last
 #: ``last_source`` write (immutable, so concurrent tasks never share it).
 _ASKED: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar("foreman_gemma_asked", default=frozenset())
+
+#: Upper bound (seconds) on one pre-review Gemma call, whatever
+#: ``gemma_timeout_s`` says: a slow Gemma must not hold good work for long.
+PRE_REVIEW_TIMEOUT_CAP_S: float = 60.0
+
+#: Diff characters sent to Gemma for a pre-review.
+_PRE_REVIEW_DIFF_CHARS = 16000
+_PRE_REVIEW_MAX_ISSUES = 8
+_PRE_REVIEW_NOTE_CHARS = 240
 
 #: Maximum length of a condensed error hint.
 MAX_HINT_CHARS: int = 160
@@ -217,6 +234,38 @@ _SIZING_SCHEMA: dict[str, Any] = {
     },
     "required": ["complexity", "rationale", "subtasks"],
 }
+
+_PRE_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "send_back"]},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocking", "minor"]},
+                    "note": {"type": "string"},
+                },
+                "required": ["severity", "note"],
+            },
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["verdict", "issues", "confidence"],
+}
+
+_PRE_REVIEW_PROMPT = (
+    "You pre-screen a code change (unified diff) before a senior reviewer sees it. It already passed "
+    "syntax, lint and test gates. Mark an issue 'blocking' ONLY for an obvious, objective problem: the "
+    "diff does not touch the files or the objective it was asked for; unfinished work (TODO, "
+    "placeholder, stub, 'not implemented', 'pass' where the work should be); breakage the gates can't "
+    "catch (e.g. a broken non-Python file, truncated code); debug leftovers (print/console.log debugging, "
+    "breakpoints); secrets or credentials; edits to files outside the allowed list. Style, naming, "
+    "design opinions and possible improvements are NEVER blocking (use 'minor' or leave them out). "
+    "A '[diff truncated]' marker is not a problem. If unsure, verdict 'pass'. verdict 'send_back' requires at least one blocking issue. confidence "
+    "(0..1) is how sure you are of the verdict. Reply with JSON only."
+)
 
 _PR_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -429,6 +478,138 @@ def heuristic_complexity(
     return "S", f"Heuristic: {facts}; one builder."
 
 
+# --------------------------------------------------------------------------- sizing calibration
+
+#: Sizes in order, smallest first (a calibration shift moves one step along it).
+SIZE_ORDER: tuple[str, ...] = ("S", "M", "L", "XL")
+#: Past outcomes shown to Gemma as sizing examples.
+CALIBRATION_EXAMPLES: int = 5
+#: Outcomes with the same predicted size needed before a bias shift applies.
+CALIBRATION_MIN_OUTCOMES: int = 8
+#: Share of those outcomes that must be bigger (or smaller) to shift one size.
+CALIBRATION_SHIFT_SHARE: float = 0.6
+#: Most recent outcomes per predicted size the bias rule looks at.
+CALIBRATION_WINDOW: int = 20
+_TITLE_STOP = frozenset({"the", "and", "for", "with", "add", "fix", "into", "from", "that", "this", "make", "use"})
+
+
+def _outcome_get(outcome: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        value = _field(outcome, name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _outcome_files(outcome: Any) -> list[str]:
+    files = _outcome_get(outcome, "files", default=[])
+    if isinstance(files, str):
+        try:
+            files = json.loads(files)
+        except ValueError:
+            files = [files]
+    return _str_list(files)
+
+
+def _outcome_predicted(outcome: Any) -> str | None:
+    value = str(_outcome_get(outcome, "predicted_complexity", "predicted", "complexity", default="")).upper()
+    return value if value in SIZE_ORDER else None
+
+
+def _outcome_actual(outcome: Any) -> str | None:
+    """The outcome's actual size: its stored value, else the queue's ``actual_complexity``."""
+    value = str(_outcome_get(outcome, "actual_complexity", "actual", default="")).upper()
+    if value in SIZE_ORDER:
+        return value
+    try:
+        from foundry.sizing_outcomes import actual_complexity  # pure effort -> size scorer
+    except ImportError:  # pragma: no cover - module missing on an old checkout
+        return None
+    try:
+        value = str(actual_complexity(outcome)).upper()
+    except Exception:  # noqa: BLE001 - a malformed row is just skipped
+        return None
+    return value if value in SIZE_ORDER else None
+
+
+def _title_words(title: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (title or "").lower()) if len(w) >= 3 and w not in _TITLE_STOP}
+
+
+def similar_outcomes(
+    outcomes: Sequence[Any], title: str, files: Sequence[str], *, task_id: str | None = None,
+    limit: int = CALIBRATION_EXAMPLES,
+) -> list[Any]:
+    """Up to ``limit`` past outcomes most like this task: file overlap first, then title-word overlap.
+
+    Outcomes sharing nothing are left out; ties keep the provider's order
+    (most recent first). The task's own earlier outcome is skipped.
+    """
+    want_files, want_words = set(files), _title_words(title)
+    scored = []
+    for k, outcome in enumerate(outcomes):
+        if task_id and str(_field(outcome, "task_id") or "") == task_id:
+            continue
+        if _outcome_predicted(outcome) is None or _outcome_actual(outcome) is None:
+            continue
+        f = len(want_files & set(_outcome_files(outcome)))
+        w = len(want_words & _title_words(str(_field(outcome, "title") or "")))
+        if f or w:
+            scored.append((-f, -w, k, outcome))
+    scored.sort(key=lambda item: item[:3])
+    return [item[3] for item in scored[:limit]]
+
+
+def _example_line(outcome: Any) -> str:
+    title = _clip(str(_field(outcome, "title") or _field(outcome, "task_id") or "?"), 80)
+    files = _outcome_files(outcome)
+    shown = ", ".join(files[:4]) + (f" +{len(files) - 4} more" if len(files) > 4 else "") if files else "none listed"
+    attempts = _outcome_get(outcome, "builder_attempts", "total_attempts", "attempts", default=0)
+    calls = _outcome_get(outcome, "claude_calls", default=0)
+    return (
+        f"Past task {title} (files {shown}): you predicted {_outcome_predicted(outcome)}, "
+        f"it actually took {_outcome_actual(outcome)} ({attempts} attempts, {calls} Claude calls)"
+    )
+
+
+def calibration_shifts(outcomes: Sequence[Any]) -> dict[str, dict[str, Any]]:
+    """Bias rules: predicted size -> {to, n, bigger, smaller, pct, direction}.
+
+    For each predicted size, the most recent :data:`CALIBRATION_WINDOW`
+    outcomes are counted; with at least :data:`CALIBRATION_MIN_OUTCOMES` of
+    them and :data:`CALIBRATION_SHIFT_SHARE` or more actually bigger (or
+    smaller), sizes predicted that way move one step up (or down). Never more
+    than one step, never past S or XL.
+    """
+    by_pred: dict[str, list[str]] = {}
+    for outcome in outcomes:
+        pred, actual = _outcome_predicted(outcome), _outcome_actual(outcome)
+        if pred is None or actual is None:
+            continue
+        bucket = by_pred.setdefault(pred, [])
+        if len(bucket) < CALIBRATION_WINDOW:
+            bucket.append(actual)
+    rules: dict[str, dict[str, Any]] = {}
+    for pred, actuals in by_pred.items():
+        n = len(actuals)
+        if n < CALIBRATION_MIN_OUTCOMES:
+            continue
+        idx = SIZE_ORDER.index(pred)
+        bigger = sum(1 for a in actuals if SIZE_ORDER.index(a) > idx)
+        smaller = sum(1 for a in actuals if SIZE_ORDER.index(a) < idx)
+        if bigger / n >= CALIBRATION_SHIFT_SHARE and idx < len(SIZE_ORDER) - 1:
+            to, direction, share = SIZE_ORDER[idx + 1], "up", bigger / n
+        elif smaller / n >= CALIBRATION_SHIFT_SHARE and idx > 0:
+            to, direction, share = SIZE_ORDER[idx - 1], "down", smaller / n
+        else:
+            continue
+        rules[pred] = {
+            "predicted": pred, "to": to, "direction": direction, "n": n,
+            "bigger": bigger, "smaller": smaller, "pct": round(share * 100),
+        }
+    return rules
+
+
 def diff_stats(diff: str) -> dict[str, Any]:
     """Summarise a unified diff.
 
@@ -502,6 +683,101 @@ class Anomaly:
 # --------------------------------------------------------------------------- the foreman
 
 
+@dataclass(frozen=True)
+class PreReviewIssue:
+    """One problem Gemma found in a pre-review (``severity``: blocking|minor)."""
+
+    severity: str
+    note: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"severity": self.severity, "note": self.note}
+
+
+@dataclass(frozen=True)
+class PreReview:
+    """Result of :meth:`ShopForeman.pre_review_diff`.
+
+    Attributes:
+        verdict: ``"pass"`` or ``"send_back"`` (Gemma's call; the fallback is
+            always ``"pass"``).
+        issues: problems Gemma listed (blocking ones first is not guaranteed).
+        confidence: 0..1, Gemma's confidence in ``verdict`` (0 for the fallback).
+        source: ``"gemma"`` or ``"fallback"`` (Gemma off, failed, timed out or
+            gave an unusable reply).
+        error: why the fallback was used, when it was.
+    """
+
+    verdict: str = "pass"
+    issues: tuple[PreReviewIssue, ...] = ()
+    confidence: float = 0.0
+    source: str = "fallback"
+    error: str | None = None
+
+    @property
+    def blocking(self) -> list[PreReviewIssue]:
+        """The issues marked ``blocking``."""
+        return [i for i in self.issues if i.severity == "blocking"]
+
+    @property
+    def is_fallback(self) -> bool:
+        return self.source != "gemma"
+
+    def should_send_back(self, min_confidence: float) -> bool:
+        """True only for a Gemma ``send_back`` with >= 1 blocking issue and
+        ``confidence >= min_confidence`` (never for the fallback)."""
+        return (
+            self.source == "gemma"
+            and self.verdict == "send_back"
+            and bool(self.blocking)
+            and self.confidence >= float(min_confidence)
+        )
+
+    def notes_text(self, limit: int = 600) -> str:
+        """Issues as one line (blocking first), e.g. ``"blocking: TODO left in f(); minor: ..."``;
+        ``""`` when there are none."""
+        ordered = self.blocking + [i for i in self.issues if i.severity != "blocking"]
+        text = "; ".join(f"{i.severity}: {i.note}" for i in ordered)
+        return _clip(text, limit) if text else ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "issues": [i.to_dict() for i in self.issues],
+            "confidence": self.confidence,
+            "source": self.source,
+            "error": self.error,
+        }
+
+
+def _parse_pre_review(data: Any) -> PreReview | None:
+    """Validate Gemma's pre-review JSON; ``None`` when unusable."""
+    if not isinstance(data, Mapping):
+        return None
+    verdict = str(data.get("verdict") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if verdict not in ("pass", "send_back"):
+        return None
+    raw_conf = data.get("confidence")
+    if isinstance(raw_conf, bool) or not isinstance(raw_conf, (int, float)) or math.isnan(float(raw_conf)):
+        return None
+    confidence = min(1.0, max(0.0, float(raw_conf)))
+    raw_issues = data.get("issues") or []
+    if not isinstance(raw_issues, list):
+        return None
+    issues: list[PreReviewIssue] = []
+    for item in raw_issues:
+        if not isinstance(item, Mapping):
+            continue
+        note = " ".join(str(item.get("note") or "").split())
+        if not note:
+            continue
+        severity = "blocking" if str(item.get("severity") or "").strip().lower() == "blocking" else "minor"
+        issues.append(PreReviewIssue(severity, _clip(note, _PRE_REVIEW_NOTE_CHARS)))
+        if len(issues) >= _PRE_REVIEW_MAX_ISSUES:
+            break
+    return PreReview(verdict=verdict, issues=tuple(issues), confidence=confidence, source="gemma")
+
+
 class ShopForeman:
     """The Gemma-backed Shop Foreman (every hook has a deterministic fallback).
 
@@ -519,6 +795,9 @@ class ShopForeman:
             raised again.
         peer_review_minutes: duration requested for PROMOTE_PEER_REVIEWER.
         throttle_seconds: duration requested for THROTTLE_DISPATCH.
+        outcomes_provider: ``(repo=None, limit=50) -> list`` of finished sizing
+            outcomes, newest first, used to calibrate :meth:`size_task_scope`
+            (defaults to ``queue.sizing_outcomes`` when the queue has it).
     """
 
     def __init__(
@@ -532,6 +811,7 @@ class ShopForeman:
         cooldown_s: float = 300.0,
         peer_review_minutes: float = 15.0,
         throttle_seconds: float = 60.0,
+        outcomes_provider: Any = None,
     ) -> None:
         self.gemma = gemma
         self.queue = queue
@@ -541,6 +821,8 @@ class ShopForeman:
         self.cooldown_s = float(cooldown_s)
         self.peer_review_minutes = float(peer_review_minutes)
         self.throttle_seconds = float(throttle_seconds)
+        #: ``(repo=None, limit=50) -> list[outcome]`` (newest first); ``queue.sizing_outcomes`` when absent.
+        self.outcomes_provider = outcomes_provider
         self._raised: dict[str, datetime] = {}
         self._alert_day: str | None = None
         self._alert_seq = 0
@@ -953,19 +1235,94 @@ class ShopForeman:
         description = str(_field(task, "description") or "").strip()
         files = _str_list(_field(task, "files") or _field(task, "allowed_files"))
         criteria = _str_list(_field(task, "acceptance_criteria"))
+        repo = str(_field(task, "repo_root") or _field(task, "repo") or "").strip() or None
+        outcomes = self._outcomes(repo)
+        shifts = calibration_shifts(outcomes)
+        examples = similar_outcomes(outcomes, title, files, task_id=task_id)
 
         if self.gemma is not None:
-            directive = await self._gemma_sizing(task_id, team_id, title, description, files, criteria)
+            directive = await self._gemma_sizing(
+                task_id, team_id, title, description, files, criteria, examples=examples, shifts=shifts
+            )
             if directive is not None:
                 self.last_source["size_task_scope"] = "gemma"
                 return directive
         self.last_source["size_task_scope"] = "heuristic"
         complexity, rationale = heuristic_complexity(title, description, files, criteria)
+        complexity, rationale = self._calibrate(task_id, complexity, rationale, shifts)
         return self._build_directive(task_id, team_id, title, complexity, rationale, files, criteria, None)
 
+    def _outcomes(self, repo: str | None = None, limit: int = 50) -> list[Any]:
+        """Finished sizing outcomes (newest first) from the provider; ``[]`` on any problem."""
+        provider = self.outcomes_provider or getattr(self.queue, "sizing_outcomes", None)
+        if not callable(provider):
+            return []
+        try:
+            rows = provider(repo=repo, limit=limit)
+        except Exception as exc:  # noqa: BLE001 - calibration is best effort, never blocks sizing
+            log.info("Shop Foreman: sizing outcomes unavailable (%s)", exc)
+            return []
+        return list(rows or [])
+
+    @staticmethod
+    def _calibrate(
+        task_id: str, complexity: str, rationale: str, shifts: Mapping[str, Mapping[str, Any]]
+    ) -> tuple[str, str]:
+        """Apply the one-step bias shift for ``complexity`` (if a rule exists)."""
+        rule = shifts.get(complexity)
+        if not rule:
+            return complexity, rationale
+        new = str(rule["to"])
+        word = "bigger" if rule["direction"] == "up" else "smaller"
+        log.info(
+            "Shop Foreman: calibrated %s from %s to %s (%s%% of %s past %s tasks were %s)",
+            task_id, complexity, new, rule["pct"], rule["n"], complexity, word,
+        )
+        note = (
+            f" [calibrated from {rule['n']} past tasks: {rule['pct']}% of {complexity}-sized tasks "
+            f"were actually {word}, so {complexity} -> {new}]"
+        )
+        return new, _clip(rationale, 500 - len(note)) + note
+
+    def calibration_summary(self) -> dict[str, Any]:
+        """How well past sizing matched reality, and the bias shifts in force.
+
+        ``{n, accuracy_pct, under, over, shift_rules: [...]}``; ``under`` counts
+        tasks that were actually bigger than predicted, ``over`` smaller.
+        ``accuracy_pct`` is ``None`` with no outcomes.
+        """
+        n = exact = under = over = 0
+        outcomes = self._outcomes()
+        for outcome in outcomes:
+            pred, actual = _outcome_predicted(outcome), _outcome_actual(outcome)
+            if pred is None or actual is None:
+                continue
+            n += 1
+            diff = SIZE_ORDER.index(actual) - SIZE_ORDER.index(pred)
+            exact += diff == 0
+            under += diff > 0
+            over += diff < 0
+        shifts = calibration_shifts(outcomes)
+        rules = [shifts[k] for k in SIZE_ORDER if k in shifts]
+        return {
+            "n": n,
+            "accuracy_pct": round(100 * exact / n) if n else None,
+            "exact": exact,
+            "under": under,
+            "over": over,
+            "shift_rules": rules,
+        }
+
     async def _gemma_sizing(
-        self, task_id: str, team_id: str, title: str, description: str, files: list[str], criteria: list[str]
+        self, task_id: str, team_id: str, title: str, description: str, files: list[str], criteria: list[str],
+        *, examples: Sequence[Any] = (), shifts: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> TaskSizingDirective | None:
+        history = ""
+        if examples:
+            history = (
+                "\n\nHow similar past tasks in this repo went (learn from these):\n"
+                + "\n".join(f"- {_example_line(o)}" for o in examples)
+            )
         messages = [
             {
                 "role": "system",
@@ -982,6 +1339,7 @@ class ShopForeman:
                     f"Task {task_id}: {title}\n\n{_clip(description, 4000)}\n\n"
                     f"Files: {', '.join(files) or '(not listed)'}\n"
                     "Acceptance criteria:\n" + ("\n".join(f"- {c}" for c in criteria) or "- (none given)")
+                    + history
                 ),
             },
         ]
@@ -996,6 +1354,7 @@ class ShopForeman:
             if complexity not in BUILDERS_FOR:
                 raise ValueError(f"unknown complexity {complexity!r}")
             rationale = _clip(str(data.get("rationale") or "Sized by the Shop Foreman."), 500)
+            complexity, rationale = self._calibrate(task_id, complexity, rationale, shifts or {})
             raw_subtasks = data.get("subtasks")
             if not isinstance(raw_subtasks, list):
                 raise TypeError("subtasks is not a list")
@@ -1285,6 +1644,97 @@ class ShopForeman:
                     log.info("Shop Foreman: invalid Gemma PR draft (%s)", exc)
         self.last_source["draft_pr_summary"] = "heuristic"
         return self._fallback_pr(diff, title)
+
+    # --------------------------------------------------------------- pre-review
+    async def pre_review_diff(
+        self,
+        task: Any,
+        assignment: Any,
+        diff: str,
+        gate_results: Any = None,
+        *,
+        task_id: str | None = None,
+    ) -> PreReview:
+        """Quick Gemma check of a diff that passed the gates (before the Claude reviewer).
+
+        Args:
+            task: the task (mapping or object; ``title``/``description``/``task_id`` read).
+            assignment: the subtask/assignment (``title``, ``acceptance_criteria``,
+                ``allowed_files``, ``subtask_id``; mapping or object; may be ``None``).
+            diff: the builder's unified diff.
+            gate_results: the passing gate results (list of
+                ``DeterministicGateResult``/mappings, or a ``GateOutcome``); only
+                their names/notes are shown to Gemma.
+            task_id: telemetry task id (default: read from ``task``).
+
+        Returns a :class:`PreReview`. Gemma flags only obvious, objective
+        problems as ``blocking``; the caller decides with
+        :meth:`PreReview.should_send_back`. Never raises: Gemma absent,
+        failing, timing out (capped at :data:`PRE_REVIEW_TIMEOUT_CAP_S`) or
+        replying with unusable JSON gives ``PreReview(verdict="pass",
+        source="fallback")``. ``last_source["pre_review_diff"]`` is
+        ``"gemma"`` or ``"fallback"``.
+        """
+        try:
+            if self.gemma is None:
+                result = PreReview(error="gemma off")
+            else:
+                messages = self._pre_review_messages(task, assignment, diff, gate_results)
+                timeout = min(float(getattr(self.config, "gemma_timeout_s", PRE_REVIEW_TIMEOUT_CAP_S)), PRE_REVIEW_TIMEOUT_CAP_S)
+                reply = await self._chat(
+                    messages, hook="pre_review_diff", json_schema=_PRE_REVIEW_SCHEMA, temperature=0.0, timeout=timeout
+                )
+                if reply is None:
+                    result = PreReview(error="gemma unavailable")
+                else:
+                    try:
+                        parsed = _parse_pre_review(_decode_json(reply.text))
+                    except (ValueError, TypeError, AttributeError):
+                        parsed = None
+                    if parsed is None:
+                        log.info("Shop Foreman: unusable Gemma pre-review; passing it on")
+                        result = PreReview(error="unusable reply")
+                    else:
+                        result = parsed
+        except Exception as exc:  # noqa: BLE001 - pre-review must never block work
+            log.info("Shop Foreman: pre-review failed (%s); passing it on", exc)
+            result = PreReview(error=str(exc) or type(exc).__name__)
+        self.last_source["pre_review_diff"] = result.source
+        return result
+
+    @staticmethod
+    def _pre_review_messages(task: Any, assignment: Any, diff: str, gate_results: Any) -> list[dict[str, Any]]:
+        title = str(_field(task, "title", "") or "").strip()
+        desc = str(_field(task, "description", "") or "").strip()
+        lines = [f"Task: {title}" if title else "Task: (untitled)"]
+        if desc:
+            lines.append(f"Description: {_clip(desc, 1500)}")
+        if assignment is not None:
+            sub_title = str(_field(assignment, "title", "") or "").strip()
+            if sub_title:
+                lines.append(f"Subtask: {sub_title}")
+            criteria = _str_list(_field(assignment, "acceptance_criteria"))
+            if criteria:
+                lines.append("Acceptance criteria:\n" + "\n".join(f"- {c}" for c in criteria[:12]))
+            allowed = _str_list(_field(assignment, "allowed_files"))
+            lines.append("Allowed files: " + (", ".join(allowed[:40]) if allowed else "(not restricted)"))
+        results = getattr(gate_results, "results", gate_results)
+        if isinstance(results, (list, tuple)) and results:
+            names = [str(_field(r, "check_type", "") or "") for r in results]
+            names = [n for n in names if n]
+            if names:
+                lines.append("Gates passed: " + ", ".join(names))
+        stats = diff_stats(diff or "")
+        if stats["files"]:
+            lines.append("Files changed: " + ", ".join(f"{f['path']} ({f['status']})" for f in stats["files"][:40]))
+        text = diff or ""
+        if len(text) > _PRE_REVIEW_DIFF_CHARS:
+            text = text[:_PRE_REVIEW_DIFF_CHARS] + "\n[diff truncated]"
+        lines.append(f"\nDiff:\n{text}")
+        return [
+            {"role": "system", "content": _PRE_REVIEW_PROMPT},
+            {"role": "user", "content": "\n".join(lines)},
+        ]
 
     # ---------------------------------------------------------------------- Q&A
     def _fallback_answer(self, text: str, *, reason: str | None = None) -> str:

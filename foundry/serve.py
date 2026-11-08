@@ -384,6 +384,53 @@ class Service:
             return {}
         return dict(stats) if isinstance(stats, Mapping) else {}
 
+    _PRE_REVIEW_KEYS = ("passed", "sent_back", "advised", "skipped", "fallback", "claude_reviews_avoided")
+
+    def _pre_review_stats(self, full: Mapping[str, Any]) -> dict[str, int]:
+        """Gemma pre-review counters (``{}`` when telemetry has none).
+
+        Taken from the telemetry snapshot's ``pre_review`` key, else from
+        ``telemetry.pre_review_counts()`` (older/odd telemetry: ``{}``).
+        """
+        raw: Any = full.get("pre_review") if isinstance(full, Mapping) else None
+        if raw is None:
+            fn = getattr(getattr(self.factory, "telemetry", None), "pre_review_counts", None)
+            if callable(fn):
+                try:
+                    raw = fn()
+                except Exception as exc:  # a status call must not fail
+                    log.debug("foundry serve: pre_review_counts failed: %s", exc)
+        if not isinstance(raw, Mapping):
+            return {}
+        out = {k: _count(raw.get(k)) for k in self._PRE_REVIEW_KEYS}
+        if raw.get("claude_reviews_avoided") is None:
+            out["claude_reviews_avoided"] = out["sent_back"]
+        return out
+
+    def _calibration(self) -> dict[str, Any]:
+        """The Shop Foreman's ``calibration_summary()`` (``{}`` when absent or failing)."""
+        foreman = getattr(self.factory, "foreman", None) if self.factory is not None else None
+        fn = getattr(foreman, "calibration_summary", None)
+        if not callable(fn):
+            return {}
+        try:
+            summary = fn()
+        except Exception as exc:  # a status call must not fail
+            log.debug("foundry serve: calibration_summary failed: %s", exc)
+            return {}
+        if not isinstance(summary, Mapping):
+            return {}
+        rules = summary.get("shift_rules")
+        return {
+            "n": _count(summary.get("n")),
+            "accuracy_pct": _num(summary.get("accuracy_pct")),
+            "exact": _count(summary.get("exact")),
+            "under": _count(summary.get("under")),
+            "over": _count(summary.get("over")),
+            "shift_rules": [r if isinstance(r, (str, Mapping)) else str(r) for r in rules]
+            if isinstance(rules, (list, tuple)) else [],
+        }
+
     def _task_row(self, task: Mapping[str, Any]) -> dict[str, Any]:
         from foundry.main import task_outputs
 
@@ -421,6 +468,7 @@ class Service:
             return {"ok": False, "tasks": [], "foreman": {}, "paused_until": None, "last_account_error": None}
         tasks = [self._task_row(t) for t in f.queue.all_tasks() if self._mine(t["task_id"])]
         snap: dict[str, Any] = {}
+        full: Any = {}
         try:
             full = f.telemetry.snapshot()
             snap = {k: full[k] for k in ("generated_at", "tokens", "current_tpm", "current_rpm", "burn_rate",
@@ -434,6 +482,8 @@ class Service:
             "last_action": self.last_action,
             "last_error": self.last_monitor_error,
             "gemma": self._gemma_stats(),
+            "pre_review": self._pre_review_stats(full if isinstance(full, Mapping) else {}),
+            "calibration": self._calibration(),
         })
         paused_until = None
         remaining = getattr(f.limiter, "pause_remaining", None)

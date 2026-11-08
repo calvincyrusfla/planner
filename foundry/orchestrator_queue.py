@@ -42,6 +42,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from foundry.schemas import MAX_RETRIES, TaskSizingDirective, TaskState
+from foundry.sizing_outcomes import SIZES, actual_complexity
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -241,6 +242,28 @@ CREATE TABLE IF NOT EXISTS kv (
     value       TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sizing_outcomes (
+    task_id              TEXT PRIMARY KEY,
+    recorded_at          TEXT NOT NULL,
+    repo                 TEXT,
+    title                TEXT NOT NULL DEFAULT '',
+    files                TEXT NOT NULL DEFAULT '[]',
+    predicted            TEXT,
+    sizing_source        TEXT,
+    builders             INTEGER NOT NULL DEFAULT 0,
+    subtasks             INTEGER NOT NULL DEFAULT 0,
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    gate_failures        INTEGER NOT NULL DEFAULT 0,
+    pre_review_sendbacks INTEGER NOT NULL DEFAULT 0,
+    reviewer_rejections  INTEGER NOT NULL DEFAULT 0,
+    claude_calls         INTEGER NOT NULL DEFAULT 0,
+    tokens               INTEGER NOT NULL DEFAULT 0,
+    wall_time_s          REAL NOT NULL DEFAULT 0,
+    final_state          TEXT NOT NULL,
+    actual               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sizing_outcomes_repo ON sizing_outcomes(repo, recorded_at);
 """
 
 #: Columns added after the first release; ``_migrate`` adds them to old dbs.
@@ -253,6 +276,18 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     "escalations": {"result": "TEXT"},
     "tasks": {"repo_root": "TEXT"},
 }
+
+
+def _seconds_between(start: str | None, end: str | None) -> float:
+    """Seconds from ISO timestamp ``start`` to ``end`` (0 when unparsable or negative)."""
+    try:
+        a = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return 0.0
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        a, b = a.replace(tzinfo=None), b.replace(tzinfo=None)
+    return max(0.0, round((b - a).total_seconds(), 3))
 
 
 def _state(value: TaskState | str) -> TaskState:
@@ -1207,6 +1242,156 @@ class FoundryQueue:
                 "SELECT key, value FROM kv WHERE substr(key, 1, ?) = ? ORDER BY key",
                 (len(prefix), prefix)).fetchall()
         return {r["key"]: json.loads(r["value"]) for r in rows}
+
+    # -------------------------------------------------------- sizing outcomes
+
+    #: Fix-hint prefix of a Gemma pre-review send-back (counted per outcome).
+    PRE_REVIEW_HINT_PREFIX = "[pre-review]"
+
+    def record_sizing_outcome(
+        self,
+        task_id: str,
+        *,
+        files: list[str] | None = None,
+        sizing_source: str | None = None,
+        title: str | None = None,
+        predicted: str | None = None,
+        **overrides: Any,
+    ) -> dict[str, Any] | None:
+        """Record what a finished task cost versus its predicted size (once per task).
+
+        Counts are taken from the queue's own tables: attempts (``attempt + 1``
+        per ticket), gate failures (Telemetry's ``telemetry_gates``, else failed
+        ``gate_results`` submissions), pre-review send-backs (reopens whose fix
+        hint starts with ``[pre-review]``), reviewer rejections (non-APPROVED
+        verdicts), Claude calls and tokens (``telemetry_tokens``, when the
+        Telemetry shares this db) and wall time (task creation to now).
+        ``overrides`` may replace any of those counts (tests, callers that know
+        better). ``final_state`` is the task's current state.
+
+        Idempotent: a task that already has an outcome keeps its first row and
+        that row is returned. Returns None for an unknown task.
+        """
+        with self.transaction() as conn:
+            known = conn.execute("SELECT * FROM sizing_outcomes WHERE task_id=?",
+                                 (task_id,)).fetchone()
+            if known is not None:
+                return self._outcome_dict(known)
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if task is None:
+                return None
+            tickets = conn.execute("SELECT attempt, allowed_files FROM tickets WHERE task_id=?",
+                                   (task_id,)).fetchall()
+            if files is None:
+                seen: dict[str, None] = {}
+                for t in tickets:
+                    for f in json.loads(t["allowed_files"] or "[]"):
+                        seen.setdefault(str(f), None)
+                files = list(seen)
+            sizing = json.loads(task["sizing_json"]) if task["sizing_json"] else {}
+            now = self.now()
+            row: dict[str, Any] = {
+                "repo": task["repo_root"],
+                "title": title if title is not None else task["title"],
+                "files": [str(f) for f in files],
+                "predicted": predicted or task["complexity"],
+                "sizing_source": sizing_source,
+                "builders": int(task["allocated_builders"] or 0),
+                "subtasks": len(tickets) or len(sizing.get("subtasks") or []),
+                "attempts": sum(int(t["attempt"] or 0) + 1 for t in tickets),
+                "gate_failures": self._gate_failures(conn, task_id),
+                "pre_review_sendbacks": self._pre_review_sendbacks(conn, task_id),
+                "reviewer_rejections": int(conn.execute(
+                    "SELECT COUNT(*) FROM verdicts WHERE task_id=? AND verdict!='APPROVED'",
+                    (task_id,)).fetchone()[0]),
+                "wall_time_s": _seconds_between(task["created_at"], now),
+                "final_state": task["state"],
+                **self._claude_usage(conn, task_id),
+            }
+            for key, value in overrides.items():
+                if key in row:
+                    row[key] = value
+            row["actual"] = actual_complexity(row)
+            conn.execute(
+                "INSERT INTO sizing_outcomes (task_id, recorded_at, repo, title, files, predicted,"
+                " sizing_source, builders, subtasks, attempts, gate_failures, pre_review_sendbacks,"
+                " reviewer_rejections, claude_calls, tokens, wall_time_s, final_state, actual)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, now, row["repo"], row["title"], _dump(row["files"]), row["predicted"],
+                 row["sizing_source"], int(row["builders"]), int(row["subtasks"]),
+                 int(row["attempts"]), int(row["gate_failures"]), int(row["pre_review_sendbacks"]),
+                 int(row["reviewer_rejections"]), int(row["claude_calls"]), int(row["tokens"]),
+                 float(row["wall_time_s"]), str(row["final_state"]), row["actual"]),
+            )
+            self._event(conn, "sizing_outcome", task_id,
+                        {"predicted": row["predicted"], "actual": row["actual"],
+                         "final_state": row["final_state"]})
+            stored = conn.execute("SELECT * FROM sizing_outcomes WHERE task_id=?",
+                                  (task_id,)).fetchone()
+        return self._outcome_dict(stored)
+
+    def sizing_outcomes(self, repo: str | Path | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """Recorded sizing outcomes, newest first (at most ``limit``).
+
+        With ``repo`` given only that repository's rows are returned (compared
+        normalized, like ``repo_root``). Each dict has: task_id, recorded_at,
+        repo, title, files (list), predicted, sizing_source, builders,
+        subtasks, attempts, gate_failures, pre_review_sendbacks,
+        reviewer_rejections, claude_calls, tokens, wall_time_s, final_state
+        and actual (``S``/``M``/``L``/``XL``, see
+        :func:`foundry.sizing_outcomes.actual_complexity`).
+        """
+        sql = "SELECT * FROM sizing_outcomes"
+        args: list[Any] = []
+        root = normalize_repo_root(repo)
+        if root is not None:
+            sql += f" WHERE repo = ?{_REPO_COLLATE}"
+            args.append(root)
+        sql += " ORDER BY recorded_at DESC, rowid DESC LIMIT ?"
+        args.append(max(0, int(limit)))
+        with self.lock:
+            rows = self.conn.execute(sql, args).fetchall()
+        return [self._outcome_dict(r) for r in rows]
+
+    @staticmethod
+    def _outcome_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = {k: row[k] for k in row.keys()}
+        d["files"] = json.loads(d.get("files") or "[]")
+        if d.get("actual") not in SIZES:
+            d["actual"] = actual_complexity(d)
+        return d
+
+    @staticmethod
+    def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                            (name,)).fetchone() is not None
+
+    def _gate_failures(self, conn: sqlite3.Connection, task_id: str) -> int:
+        if self._has_table(conn, "telemetry_gates"):
+            n = int(conn.execute("SELECT COUNT(*) FROM telemetry_gates WHERE task_id=?"
+                                 " AND kind='failure'", (task_id,)).fetchone()[0])
+            if n:
+                return n
+        # one failed submission may fail several checks: count distinct (time, subtask)
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT ts, subtask_id FROM gate_results"
+            " WHERE task_id=? AND passed=0)", (task_id,)).fetchone()[0])
+
+    def _pre_review_sendbacks(self, conn: sqlite3.Connection, task_id: str) -> int:
+        n = 0
+        for r in conn.execute("SELECT payload FROM events WHERE task_id=? AND kind='ticket_reopened'",
+                              (task_id,)):
+            hint = str(json.loads(r["payload"] or "{}").get("fix_hint") or "")
+            if hint.lstrip().lower().startswith(self.PRE_REVIEW_HINT_PREFIX):
+                n += 1
+        return n
+
+    def _claude_usage(self, conn: sqlite3.Connection, task_id: str) -> dict[str, int]:
+        if not self._has_table(conn, "telemetry_tokens"):
+            return {"claude_calls": 0, "tokens": 0}
+        r = conn.execute("SELECT COUNT(*), COALESCE(SUM(input_tokens + output_tokens), 0)"
+                         " FROM telemetry_tokens WHERE task_id=?", (task_id,)).fetchone()
+        return {"claude_calls": int(r[0]), "tokens": int(r[1])}
 
     # --------------------------------------------------------------- summary
 
