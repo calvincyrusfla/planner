@@ -16,7 +16,7 @@ Foundry service on the user's PC runs one :class:`BatchWatcher`, which every
    given, else the configured base (``FOUNDRY_PR_BASE`` / the repo default). A subtask with ``dependsOn`` is submitted only once
    all its dependencies are ``complete``; when a dependency ends any other way
    the subtask fails without being submitted;
-4. pushes each subtask's Foundry task id, state, PR record and error back with
+4. pushes each subtask's Foundry task id, state, PR record, token usage and error back with
    ``updateBatch`` when something changed, else as a heartbeat at most every 2 minutes, until every subtask is
    finished and its PR settled.
 
@@ -44,6 +44,8 @@ from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from foundry.metrics_report import build_metrics
 
 log = logging.getLogger("foundry.board_dispatch")
 
@@ -296,6 +298,8 @@ class BatchWatcher:
         self._allowed_keys = frozenset(r.strip().lower() for r in self.allowed_repos)
         self._warned_no_allowlist = False
         self.heartbeat_s = HEARTBEAT_S
+        #: The board refused a result carrying usage: results go without it for this run.
+        self._usage_refused = False
         #: batch id -> when the last updateBatch was accepted (this run).
         self._last_sent: dict[str, float] = {}
 
@@ -454,6 +458,7 @@ class BatchWatcher:
         rec.setdefault("tasks", {})
         rec.setdefault("failed", {})
         rec.setdefault("pushed", {})
+        rec.setdefault("usage", {})
         return rec
 
     def _save(self, bid: str, rec: Mapping[str, Any]) -> None:
@@ -547,7 +552,11 @@ class BatchWatcher:
             args["status"] = "running"
         self._save(bid, rec)
         last = self._last_sent.get(bid)
-        if not changed and "status" not in args and last is not None and self._now() - last < self.heartbeat_s:
+        write_due = bool(changed) or "status" in args or last is None or self._now() - last >= self.heartbeat_s
+        with_usage = self._usage_results(rec, board_view, changed) if write_due else {}
+        if with_usage:
+            args["results"] = {**changed, **with_usage}
+        if not write_due:
             # nothing new and the claim is fresh: no write to the (shared) board this round
             if self._settled(keys, results, cancelled):
                 rec["closed"] = True
@@ -556,6 +565,11 @@ class BatchWatcher:
         try:
             await asyncio.to_thread(self.board.op, "updateBatch", args)
         except BoardRefused as exc:
+            if exc.code == 400 and with_usage:
+                # e.g. a hub that does not know the field: states matter more, so next round goes without it
+                log.warning("board dispatch: %s results with usage refused (%s); sending them without usage", bid, exc)
+                self._usage_refused = True
+                return
             if exc.code == 400 and "results" in args:
                 # the board rejected a result (a limit we did not know): keep the heartbeat going
                 log.warning("board dispatch: %s results refused (%s); sending the heartbeat only", bid, exc)
@@ -580,6 +594,7 @@ class BatchWatcher:
             return
         self._last_sent[bid] = self._now()
         rec["pushed"].update(changed)
+        rec["usage"].update({k: v["usage"] for k, v in with_usage.items()})
         if self._settled(keys, results, cancelled):
             rec["closed"] = True
             log.info("board dispatch: %s finished", bid)
@@ -623,6 +638,28 @@ class BatchWatcher:
             out["state"] = "reviewing"  # approved; the pull request is being opened
         if out.get("foundryTask"):
             out.setdefault("error", None)
+        return out
+
+    def _usage_results(self, rec: Mapping[str, Any], view: Mapping[str, Mapping[str, Any]],
+                       changed: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        """Results carrying ``usage``: every changed subtask with usage, and any whose usage moved.
+
+        Called only when a write is due anyway, so usage alone never adds a board write, and on
+        the service loop, because a SQLite connection belongs to its thread. Never raises:
+        without readable telemetry the results go out without usage.
+        """
+        if self._usage_refused or not rec["tasks"]:
+            return {}
+        try:
+            by_task = build_metrics(getattr(self.service.factory, "telemetry", None))["byTask"]
+        except Exception as exc:  # usage is optional: states and heartbeats must still go out
+            log.info("board dispatch: usage not available: %s", exc)
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for key, tid in rec["tasks"].items():
+            usage = by_task.get(str(tid))
+            if usage is not None and key in view and (key in changed or rec["usage"].get(key) != usage):
+                out[key] = {**view[key], "usage": usage}
         return out
 
     def _settled(self, keys: list[str], results: Mapping[str, Mapping[str, Any]], cancelled: bool) -> bool:

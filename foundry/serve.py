@@ -39,7 +39,7 @@ import os
 import queue as _queue_mod
 import signal
 import sys
-import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator, Mapping, Sequence
@@ -56,6 +56,9 @@ __all__ = [
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4310
 DEFAULT_MONITOR_S = 60.0
+DEFAULT_METRICS_REPORT_S = 600.0
+#: Board-bridge methods that take ``(op type, args)``, tried in this order.
+_BRIDGE_OP_METHODS = ("op", "send_op", "post_op", "enqueue_op", "enqueue", "send")
 #: How long :meth:`Service.stop` waits for background sizing before cancelling
 #: it. Cancelling is safe: nothing is applied until the Foreman answers, and a
 #: cancelled order is sized again on the next start.
@@ -236,6 +239,12 @@ class Service:
         self._batch_board = batch_board
         self._own_factory = factory is None
         self.batch_watcher: Any = batch_watcher
+        #: Seconds between ``reportFoundryMetrics`` sends (a finished task sends one sooner).
+        self.metrics_s = _env_float("FOUNDRY_METRICS_REPORT_S", DEFAULT_METRICS_REPORT_S)
+        self.metrics_reports = 0
+        self.last_metrics_error: str | None = None
+        self._metrics_elapsed = 0.0
+        self._metrics_finished: set[str] = set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -282,6 +291,7 @@ class Service:
         # gh auth status may take a moment: check in the background (health says "not checked yet")
         self._preflight_task = self.loop.create_task(self.check_pr_ready())
         await self.refresh_gemma()
+        self._metrics_finished = self._finished_tasks()  # tasks finished before this run send nothing
         self._monitor_task = self.loop.create_task(self._monitor_loop())
         self._start_batches()
         log.info("foundry serve: running for %s (%d pool(s))", self.repo, len(self.factory.pools))
@@ -419,11 +429,14 @@ class Service:
 
     async def _monitor_loop(self) -> None:
         while self.running:
+            started = time.monotonic()
             await _maybe_await(self._sleep(self.monitor_s))
             if not self.running:
                 return
             await self.monitor_once()
             await self.refresh_gemma()
+            # a fake sleep takes no real time; a slow line check takes longer than monitor_s
+            await self._report_metrics_if_due(max(self.monitor_s, time.monotonic() - started))
             await asyncio.sleep(0)  # a fake sleep must still let the loop run
 
     async def refresh_gemma(self) -> bool | None:
@@ -446,6 +459,65 @@ class Service:
             log.debug("foundry serve: gemma probe failed: %s", exc)
             self.gemma_ok = False
         return self.gemma_ok
+
+    def _finished_tasks(self) -> set[str]:
+        """Ids of this repo's finished tasks (the last known set when the queue can't be read)."""
+        try:
+            return {str(t["task_id"]) for t in self.factory.queue.all_tasks()
+                    if _state(t) in _TERMINAL and self._mine(t["task_id"])}
+        except Exception as exc:  # metrics must never take the service down
+            log.debug("foundry serve: finished tasks not readable: %s", exc)
+            return self._metrics_finished
+
+    async def _report_metrics_if_due(self, elapsed: float) -> None:
+        """Report when ``metrics_s`` has passed or a task finished since the last round."""
+        self._metrics_elapsed += elapsed
+        finished = self._finished_tasks()
+        new = finished - self._metrics_finished
+        self._metrics_finished = finished
+        if new or self._metrics_elapsed >= self.metrics_s:
+            self._metrics_elapsed = 0.0
+            await self.report_metrics()
+
+    def _metrics_sender(self) -> Callable[[str, Mapping[str, Any]], Any] | None:
+        """How a board op is sent: the factory's bridge, else (``auto`` mode only) the batch board.
+
+        The bridge is found by method name (:data:`_BRIDGE_OP_METHODS`). Outside ``auto``
+        mode nothing falls through to the batch board: a dry run must not write to the real one.
+        """
+        bridge = getattr(self.factory, "bridge", None)
+        for name in _BRIDGE_OP_METHODS:
+            fn = getattr(bridge, name, None)
+            if callable(fn):
+                return fn
+        if getattr(self.config, "board_bridge_mode", "auto") != "auto":
+            return None
+        op = getattr(getattr(self.batch_watcher, "board", None), "op", None)
+        if not callable(op):
+            return None
+        return lambda type_, args: asyncio.to_thread(op, type_, args)  # a blocking HTTP call
+
+    async def report_metrics(self) -> bool:
+        """Send one ``reportFoundryMetrics``; True when sent. Never raises (except cancellation)."""
+        send = self._metrics_sender()
+        if send is None:
+            return False
+        try:
+            from foundry.metrics_report import build_metrics
+
+            # on the service loop, because a SQLite connection belongs to its thread
+            metrics = build_metrics(getattr(self.factory, "telemetry", None))
+            service = getattr(self.batch_watcher, "service_id", None) or f"foundry:{self.repo.name}"
+            await _maybe_await(send("reportFoundryMetrics", {**metrics, "service": service}))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # metrics are optional: the next report tries again
+            self.last_metrics_error = f"{type(exc).__name__}: {exc}"
+            log.info("foundry serve: metrics report not sent: %s", self.last_metrics_error)
+            return False
+        self.metrics_reports += 1
+        self.last_metrics_error = None
+        return True
 
     # ------------------------------------------------------------------ pull requests
 
