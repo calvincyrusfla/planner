@@ -1211,6 +1211,12 @@ class FloorManager:
         task_id = item.assignment.task_id
         # keyed by subtask: a re-approval after a resume replaces, never duplicates
         self.diffs.setdefault(task_id, {})[str(item.assignment.subtask_id)] = item.submission.diff
+        record = getattr(self.queue, "record_approved_diff", None)
+        if callable(record) and getattr(item, "ticket_id", None):
+            try:  # later tickets of the task build on this diff (stacked tickets)
+                record(item.ticket_id, item.submission.diff)
+            except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+                log.debug("record_approved_diff(%s) failed: %s", item.ticket_id, exc)
         self.save()
         d = self.directives.get(task_id)
         team_id = d.team_id if d else item.assignment.team_id
@@ -1305,13 +1311,48 @@ class FloorManager:
             return True
         return not any((self.patches_dir / f"{name}{ext}").is_file() for ext in (".patch", ".patch.rejected"))
 
+    def _ordered_diffs(self, task_id: str) -> list[str]:
+        """The task's approved diffs in ticket build order (``order_index``; subtask id as fallback)."""
+        parts = dict(self.diffs.get(task_id, {}))
+        if not parts:  # e.g. the manager's saved state was lost: use the diffs the queue kept
+            stored = getattr(self.queue, "approved_diffs", None)
+            got = stored(task_id) if callable(stored) else None
+            if isinstance(got, (list, tuple)):
+                parts = {str(x[0]): str(x[1]) for x in got if isinstance(x, (list, tuple)) and len(x) == 2}
+        rank: dict[str, int] = {}
+        fn = getattr(self.queue, "tickets_in_order", None)
+        if callable(fn):
+            try:
+                rank = {str(t.subtask_id): i for i, t in enumerate(fn(task_id))}
+            except Exception as exc:  # pragma: no cover - fall back to subtask order
+                log.debug("tickets_in_order(%s) failed: %s", task_id, exc)
+        keys = sorted(parts, key=lambda k: (rank.get(k, len(rank)), _subtask_order(k)))
+        return [parts[k] for k in keys if parts[k]]
+
     def _approved_diff(self, task_id: str) -> str:
-        parts = self.diffs.get(task_id, {})
-        return "".join(_with_newline(parts[k]) for k in sorted(parts, key=_subtask_order)) or self._task_diff(task_id)
+        """Concatenated approved diffs in build order (the stacked patch is made in :meth:`_combined_diff`)."""
+        return "".join(_with_newline(d) for d in self._ordered_diffs(task_id)) or self._task_diff(task_id)
+
+    async def _combined_diff(self, task_id: str) -> str:
+        """The task's combined patch on its base: the stacked approved diffs folded into one diff.
+
+        Each later diff is relative to the earlier ones, so they are applied in
+        build order in a scratch copy and the final ``git diff`` is taken
+        (:func:`stack_diffs`). When that is not possible (no git, a diff that
+        does not apply) the diffs are concatenated as before; ``_write_patch``
+        then still checks the result on the base.
+        """
+        diffs = self._ordered_diffs(task_id)
+        if len(diffs) < 2:
+            return self._approved_diff(task_id)
+        repo = self.task_repo(task_id)
+        root = Path(repo) if repo else self.repo_root
+        stacked = await asyncio.to_thread(stack_diffs, diffs, root)
+        return stacked if stacked is not None else self._approved_diff(task_id)
 
     async def _finish(self, task_id: str, diff: str | None) -> dict[str, str]:
         if diff is None:
-            diff = self._approved_diff(task_id)
+            diff = await self._combined_diff(task_id)
         known = self.pr_summaries.get(task_id)
         if known is not None:
             # repair: the summary (and the board's review/done) are already recorded
@@ -1646,7 +1687,8 @@ class FloorManager:
             if isinstance(got, str):
                 return got
             if isinstance(got, (list, tuple)):
-                return "\n".join(str(x) for x in got)
+                return "".join(_with_newline(str(x[1] if isinstance(x, (list, tuple)) and len(x) == 2 else x))
+                               for x in got)
         return ""
 
 
@@ -1737,6 +1779,92 @@ def _git_check(patch: str, repo_root: Path | None) -> str | None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+_DIFF_PATH_RE = re.compile(r"^(?:diff --git a/(\S+) b/(\S+)|--- a/(\S+)|\+\+\+ b/(\S+)|rename from (\S+)|rename to (\S+)|copy from (\S+)|copy to (\S+))\s*$")
+
+
+def diff_paths(diff: str) -> list[str]:
+    """Repo-relative paths a unified/git diff touches (old and new names), in first-seen order."""
+    out: list[str] = []
+    for line in diff.splitlines():
+        m = _DIFF_PATH_RE.match(line.rstrip("\r"))
+        if not m:
+            continue
+        for p in m.groups():
+            if p and p != "/dev/null" and p not in out:
+                out.append(p.strip('"'))
+    return out
+
+
+def stack_diffs(diffs: list[str], repo_root: Path | None) -> str | None:
+    """Fold stacked diffs (each relative to the ones before it) into one diff against the base.
+
+    Only the touched files are copied from ``repo_root`` into a scratch git
+    repository; each diff is ``git apply``-ed in order and the final tree is
+    diffed against the base tree. When the diffs touch pairwise disjoint
+    files and all apply, their concatenation is returned unchanged (it is
+    equivalent). None when git is missing or a diff does not apply in order.
+    """
+    texts = [_with_newline(d) for d in diffs if d and d.strip()]
+    if not texts:
+        return ""
+    git = shutil.which("git")
+    if git is None:
+        return None
+    paths_per = [diff_paths(d) for d in texts]
+    every: list[str] = []
+    for ps in paths_per:
+        every += [p for p in ps if p not in every]
+    tmp = Path(tempfile.mkdtemp(prefix="foundry-stack-"))
+    cfg = ["-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.quotepath=false",
+           "-c", "user.name=foundry", "-c", "user.email=foundry@localhost", "-c", "commit.gpgsign=false"]
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        # bytes, decoded without newline translation: CRLF files keep their \r on Windows
+        proc = subprocess.run([git, *cfg, *args], cwd=str(ws), capture_output=True, timeout=120)
+        return subprocess.CompletedProcess(proc.args, proc.returncode,
+                                           proc.stdout.decode("utf-8", "replace"),
+                                           proc.stderr.decode("utf-8", "replace"))
+
+    try:
+        ws = tmp / "ws"
+        ws.mkdir()
+        base = (repo_root.resolve() if repo_root is not None and repo_root.is_dir() else None)
+        for rel in every:
+            src = (base / rel) if base is not None else None
+            if src is None or not src.is_file():
+                continue
+            try:
+                src.resolve().relative_to(base)  # type: ignore[arg-type]
+            except ValueError:
+                return None  # a path leaving the repo: never copy it
+            dst = ws / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+        if run("init", "-q").returncode != 0:
+            return None
+        run("add", "-A", "-f")
+        base_tree = run("write-tree").stdout.strip()
+        for i, text in enumerate(texts):
+            patch = tmp / f"{i}.patch"
+            patch.write_text(text, encoding="utf-8", newline="\n")
+            if run("apply", "--whitespace=nowarn", str(patch)).returncode != 0:
+                return None
+        disjoint = sum(len(p) for p in paths_per) == len(every)
+        if disjoint:
+            return "".join(texts)
+        run("add", "-A", "-f")
+        final_tree = run("write-tree").stdout.strip()
+        if not base_tree or not final_tree:
+            return None
+        proc = run("diff", "--binary", "--no-color", "--no-ext-diff", base_tree, final_tree)
+        return proc.stdout if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("floor manager: could not stack the approved diffs: %s", exc)
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _get(obj: Any, name: str) -> Any:
     if isinstance(obj, Mapping):
         return obj.get(name)
@@ -1770,9 +1898,15 @@ class WorkspaceGates:
         self.base_workspace = Path(base_workspace)
         self.calls = 0
 
-    async def run(self, submission: Any, assignment: Any) -> Any:
-        """Validate ``submission`` in a scratch copy of the workspace."""
+    async def run(self, submission: Any, assignment: Any, *, base: str | Path | None = None) -> Any:
+        """Validate ``submission`` in a scratch copy of the workspace.
+
+        ``base`` (stacked tickets): copy this directory instead of
+        ``base_workspace``, i.e. the repo with the task's earlier approved
+        diffs already applied, so the diff is checked relative to them.
+        """
         self.calls += 1
+        source = Path(base) if base is not None else self.base_workspace
         try:
             tmp = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="foundry-gates-"))
         except OSError as exc:
@@ -1780,7 +1914,7 @@ class WorkspaceGates:
         try:
             ws = tmp / "ws"
             # copying a real repo is slow: keep it off the event loop
-            await asyncio.to_thread(_copy_workspace, self.base_workspace, ws)
+            await asyncio.to_thread(_copy_workspace, source, ws)
             return await self.gates.validate_async(
                 submission, ws, allowed_files=list(assignment.allowed_files) or None
             )
@@ -1927,7 +2061,8 @@ def build_factory(
     from foundry.validation_gates import ValidationGates
 
     db = str(config.db_path)
-    queue = FoundryQueue(db, clock=queue_clock)
+    queue = FoundryQueue(db, clock=queue_clock,
+                         max_retries=int(getattr(config, "max_retries", 3)))
     resumed = queue.resume()
     if resumed:
         log.info("foundry: resumed %d ticket(s) left claimed by a previous run", resumed)

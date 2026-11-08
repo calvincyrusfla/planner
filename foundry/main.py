@@ -154,6 +154,7 @@ def append_diff(path: str, original: str, new_lines: Sequence[str]) -> str:
 
 _FILES_RE = re.compile(r"## Files you may modify\n((?:- .+\n)+)")
 _BUILDER_RE = re.compile(r"You are builder (\S+) on team")
+_SUBTASK_RE = re.compile(r"subtask (\S+), attempt")
 
 
 def demo_claude(repo: Path, *, fail_first: str | None = FAILING_BUILDER) -> SimulatedClaudeClient:
@@ -170,9 +171,12 @@ def demo_claude(repo: Path, *, fail_first: str | None = FAILING_BUILDER) -> Simu
             m = _FILES_RE.search(prompt)
             files = [ln[2:].strip() for ln in m.group(1).splitlines()] if m else []
             diffs = []
+            # a stacked ticket (earlier subtasks already applied) adds its own helper name
+            sub = _SUBTASK_RE.search(prompt) if "## Already done on this piece" in prompt else None
+            suffix = "_" + re.sub(r"\W", "_", sub.group(1)).lower() if sub else ""
             for rel in files:
                 src = (repo / rel).read_text(encoding="utf-8")
-                fn = re.sub(r"\W", "_", Path(rel).stem)
+                fn = re.sub(r"\W", "_", Path(rel).stem) + suffix
                 if agent_id == fail_first and agent_id not in failed:
                     new = ["", "", f"def {fn}_helper(value:", "    return value"]
                 else:

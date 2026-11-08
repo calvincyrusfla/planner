@@ -29,6 +29,7 @@ __all__ = [
     "BUILDERS_FOR",
     "MAX_BUILDERS",
     "MAX_RETRIES",
+    "MAX_RETRIES_LIMIT",
     "MAX_SNIPPET_LINES",
     "MAX_DIAGNOSIS_SENTENCES",
     "MAX_OBJECTIVE_SENTENCES",
@@ -81,8 +82,14 @@ BUILDERS_FOR: dict[str, int] = {"S": 1, "M": 2, "L": 5, "XL": 5}
 MAX_BUILDERS: int = 5
 """Builders per team; slots are numbered 1..MAX_BUILDERS."""
 
-MAX_RETRIES: int = 2
-"""Retries after the first attempt; the third failure quarantines the task."""
+MAX_RETRIES: int = 3
+"""Default retries after the first attempt (``FoundryConfig.max_retries``,
+``FOUNDRY_MAX_RETRIES``); the failure after the last retry quarantines the
+task.  With the default 3 a ticket gets 4 attempts, so the widest context
+level (attempt 3 -> level 3) is always reached before the cap."""
+
+MAX_RETRIES_LIMIT: int = 5
+"""Upper bound for the configurable retry cap (``FoundryConfig.max_retries`` is 1..5)."""
 
 MAX_SNIPPET_LINES: int = 50
 """Maximum number of text lines in a single ``CodeSnippet``."""
@@ -382,7 +389,7 @@ class TaskAssignment(FoundryModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     allowed_files: list[str] = Field(default_factory=list)
     context: ContextSlice
-    attempt: int = Field(default=0, ge=0, le=MAX_RETRIES)
+    attempt: int = Field(default=0, ge=0, le=MAX_RETRIES_LIMIT)
     fix_hint: str | None = None
 
 
@@ -429,7 +436,7 @@ class ReviewerVerdict(FoundryModel):
     reviewer_id: str = Field(min_length=1)
     verdict: Verdict
     directives: list[LineDirective] = Field(default_factory=list)
-    retry_count: int = Field(default=0, ge=0, le=MAX_RETRIES)
+    retry_count: int = Field(default=0, ge=0, le=MAX_RETRIES_LIMIT)
 
 
 class TargetEntity(FoundryModel):

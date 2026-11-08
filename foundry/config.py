@@ -56,6 +56,10 @@ Environment variable               Field (default)
                                    infrastructure failures on one ticket
                                    (timeouts, crashes; not usage limits)
                                    before its task is quarantined
+``FOUNDRY_MAX_RETRIES``            ``max_retries`` (``3``, 1..5): retries after
+                                   a ticket's first attempt (gate failure,
+                                   REVISE, blocked reply) before its task is
+                                   quarantined; attempt 3+ gets context level 3
 ``FOUNDRY_AUTO_PR``                ``auto_pr`` (``true``): push every approved
                                    task to its own branch and open a PR
 ``FOUNDRY_PR_BASE``                ``pr_base`` (unset: the repo's default
@@ -80,6 +84,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+
+from foundry.schemas import MAX_RETRIES, MAX_RETRIES_LIMIT
 
 __all__ = [
     "AnomalyThresholds",
@@ -253,6 +259,16 @@ class FoundryConfig(BaseModel):
             "its task is quarantined."
         ),
     )
+    max_retries: int = Field(
+        default=MAX_RETRIES,
+        ge=1,
+        le=MAX_RETRIES_LIMIT,
+        description=(
+            "Retries after a ticket's first attempt (gate failure, REVISE, blocked "
+            "reply) before its task is quarantined; context widens to level 3 from "
+            "attempt 3 on."
+        ),
+    )
 
     pre_review: PreReviewMode = Field(
         default="gate",
@@ -409,6 +425,7 @@ class FoundryConfig(BaseModel):
             "ASK_TIMEOUT_S": "ask_timeout_s",
             "PATCHES_DIR": "patches_dir",
             "INFRA_FAILURE_CAP": "infra_failure_cap",
+            "MAX_RETRIES": "max_retries",
             "PRE_REVIEW": "pre_review",
             "PRE_REVIEW_MIN_CONFIDENCE": "pre_review_min_confidence",
             "AUTO_PR": "auto_pr",

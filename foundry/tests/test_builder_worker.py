@@ -200,7 +200,7 @@ def test_builder_prompt_contains_only_the_slice_and_the_contract() -> None:
     assert "- pkg/mathx.py" in prompt
     assert "### pkg/mathx.py (lines 1-3)" in prompt and "def add(a, b):\n    ..." in prompt
     assert "SyntaxError: expected ':'" in prompt
-    assert "attempt 2 of 3" in prompt
+    assert "attempt 2 of 4" in prompt  # default cap: MAX_RETRIES=3
     assert DIFF_CONTRACT in prompt
     assert "exactly one fenced code block" in prompt
 

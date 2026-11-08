@@ -65,8 +65,10 @@ __all__ = [
     "SolutionCache",
     "TypecheckMode",
     "ValidationGates",
+    "STACK_COPY_IGNORE",
     "apply_diff",
     "builtin_lint",
+    "prepare_stacked_workspace",
     "run_gates",
     "run_gates_outcome",
 ]
@@ -377,6 +379,50 @@ def apply_diff(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content.encode("utf-8"))
     return [applied for _, applied, _ in planned]
+
+
+#: Never copied into a stacked workspace (VCS data, environments, caches);
+#: the same list as ``floor_manager.SCRATCH_IGNORE``.
+STACK_COPY_IGNORE: tuple[str, ...] = (
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "*.db", "*.db-wal", "*.db-shm",
+)
+
+
+def prepare_stacked_workspace(
+    base: str | Path,
+    dst: str | Path,
+    diffs: Iterable[str | tuple[str, str]],
+) -> Path:
+    """Copy ``base`` to ``dst`` and apply ``diffs`` there, in order.
+
+    This is the workspace a stacked ticket is built in: the repository plus
+    the approved diffs of the task's earlier tickets, each relative to the
+    ones before it.  ``diffs`` items are diff texts or ``(label, diff)``
+    pairs (e.g. ``(subtask_id, diff)``); empty diffs are skipped.  No
+    allow-list applies (the diffs were already gated and approved); the
+    workspace boundary is still enforced.  ``base`` is never modified.
+
+    Raises:
+        DiffApplyError: an earlier diff does not apply on top of the ones
+            before it (the message names it).
+        OSError / shutil.Error: the copy failed.
+    """
+    src, out = Path(base), Path(dst)
+    if src.is_dir():
+        # symlinks stay links: never follow them out of the repo (or loop on them)
+        shutil.copytree(src, out, symlinks=True, ignore=shutil.ignore_patterns(*STACK_COPY_IGNORE))
+    else:
+        out.mkdir(parents=True)
+    for n, item in enumerate(diffs, 1):
+        label, diff = item if isinstance(item, tuple) else (f"#{n}", item)
+        if not str(diff or "").strip():
+            continue
+        try:
+            apply_diff(diff, out)
+        except DiffApplyError as exc:
+            raise DiffApplyError(f"earlier approved diff {label} does not apply: {exc}") from exc
+    return out
 
 
 # --------------------------------------------------------------------------
