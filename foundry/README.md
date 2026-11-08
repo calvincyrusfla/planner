@@ -500,6 +500,8 @@ When the service runs for a repository, **every approved task gets its own branc
 
 The repository you start Foundry with (`--repo`) must be a git repository with an `origin` remote on GitHub that you can push to.
 
+Forks work too: Foundry reads `owner/name` from the `origin` URL and passes it to `gh pr create --repo`, so the PR is opened in the repository `origin` points to (your fork, when you cloned a fork), never in whatever repository `gh` would guess.
+
 When the service starts it checks git, the `origin` remote and `gh` once. If something is missing it logs a clear warning, and `/api/health` reports `pr_ready: false` with the reason in `pr_reason`. Tasks still run; only the PR step is skipped or fails.
 
 ### What Foundry does for each approved task

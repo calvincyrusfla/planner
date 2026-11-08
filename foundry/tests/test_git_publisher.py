@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from foundry.git_publisher import (
+    default_runner,
+    github_repo,
     STAGES,
     GitPublisher,
     PublishResult,
@@ -31,26 +33,35 @@ POSIX = sys.platform != "win32"
 needs_sh = pytest.mark.skipif(not (HAS_GIT and POSIX), reason="needs git and a POSIX shell for the fake gh")
 
 FAKE_GH = """#!/bin/sh
-# fake GitHub CLI: logs every call as JSON lines, copies the --body-file
+# fake GitHub CLI: logs calls, copies the --body-file, remembers created PRs per head branch
 log="$FAKE_GH_LOG"
+echo "$*" >> "$log.calls"
 if [ "$1" = "auth" ]; then
-  echo "auth $*" >> "$log.auth"
   [ "${FAKE_GH_AUTH:-ok}" = "ok" ] && exit 0
   echo "You are not logged into any GitHub hosts." >&2
   exit 1
 fi
+head=""; body=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "--head" ] && head="$a"
+  [ "$prev" = "--body-file" ] && body="$a"
+  prev="$a"
+done
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  url=$(grep "^$head " "$log.prs" 2>/dev/null | head -n 1 | cut -d' ' -f2)
+  if [ -n "$url" ]; then echo "[{\\"url\\":\\"$url\\",\\"number\\":12}]"; else echo "[]"; fi
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  if [ "${FAKE_GH_PR:-ok}" = "exists" ]; then
+    echo "a pull request for branch \\"$head\\" into branch \\"main\\" already exists:" >&2
+    echo "https://github.com/acme/widget/pull/9" >&2
+    exit 1
+  fi
   if [ "${FAKE_GH_PR:-ok}" != "ok" ]; then echo "pull request create failed: boom" >&2; exit 1; fi
-  body=""
-  prev=""
-  for a in "$@"; do
-    if [ "$prev" = "--body-file" ]; then body="$a"; fi
-    prev="$a"
-  done
-  {
-    printf '%s\\n' "$@" > "$log.argv"
-    cat "$body" > "$log.body"
-  }
+  printf '%s\\n' "$@" > "$log.argv"
+  cat "$body" > "$log.body"
+  echo "$head https://github.com/acme/widget/pull/12" >> "$log.prs"
   echo "Creating pull request..." >&2
   echo "https://github.com/acme/widget/pull/12"
   exit 0
@@ -120,9 +131,13 @@ def test_helpers() -> None:
 @needs_sh
 def test_publish_happy_path(world) -> None:
     repo, origin = world["repo"], world["origin"]
-    res = asyncio.run(world["pub"].publish("F-012", "Add world", world["patch"], PR))
+    pushed: list = []
+    res = asyncio.run(world["pub"].publish("F-012", "Add world", world["patch"], PR,
+                                           on_pushed=lambda b, c: pushed.append((b, c))))
     assert res.ok, res
     assert res.branch == "foundry/f-012-add-world"
+    assert pushed == [(res.branch, res.commit)]
+    assert "--repo" not in Path(str(world["log"]) + ".argv").read_text(encoding="utf-8").split()
     assert res.pr_url == "https://github.com/acme/widget/pull/12"
     assert res.base == "main" and res.stage is None
     # pushed to the bare remote with the patch commit, authored from repo config
@@ -151,18 +166,96 @@ def test_publish_happy_path(world) -> None:
     assert len(_git(repo, "worktree", "list").splitlines()) == 1
 
 
+def _creates(world) -> int:
+    calls = Path(str(world["log"]) + ".calls")
+    return sum(1 for line in calls.read_text(encoding="utf-8").splitlines() if line.startswith("pr create")) \
+        if calls.exists() else 0
+
+
 @needs_sh
-def test_branch_suffix_and_never_force(world) -> None:
+def test_publish_twice_is_idempotent(world) -> None:
     pub = world["pub"]
     first = asyncio.run(pub.publish("F-012", "Add world", world["patch"], PR))
+    # crash before the caller saved the result: the resume calls publish again
     second = asyncio.run(pub.publish("F-012", "Add world", world["patch"], PR))
     assert first.ok and second.ok
-    assert second.branch == first.branch + "-2"
-    # a branch only on the remote also counts as taken
-    _git(world["repo"], "branch", "-D", first.branch, second.branch)
-    third = asyncio.run(pub.publish("F-012", "Add world", world["patch"], PR))
-    assert third.branch == first.branch + "-3"
-    assert _git(world["origin"], "rev-parse", first.branch) == first.commit
+    assert second.branch == first.branch and second.pr_url == first.pr_url and second.commit == first.commit
+    assert _git(world["origin"], "branch", "--format=%(refname:short)").splitlines() == [first.branch, "main"]
+    assert _creates(world) == 1
+
+
+@needs_sh
+def test_pushed_branch_without_pr_gets_its_pr(world) -> None:
+    pushed: list[tuple[str, str | None]] = []
+    pub = world["pub"]
+    world_pr = dict(PR)
+    os.environ["FAKE_GH_PR"] = "fail"
+    try:
+        r1 = asyncio.run(pub.publish("F-012", "Add world", world["patch"], world_pr,
+                                     on_pushed=lambda b, c: pushed.append((b, c))))
+    finally:
+        os.environ.pop("FAKE_GH_PR", None)
+    assert r1.stage == "pr_failed" and pushed == [(r1.branch, r1.commit)]
+
+    async def record(b, c):
+        pushed.append((b, c))
+
+    r2 = asyncio.run(pub.publish("F-012", "Add world", world["patch"], PR, on_pushed=record))
+    assert r2.ok and r2.branch == r1.branch and r2.commit == r1.commit and r2.pr_url.endswith("/pull/12")
+    assert pushed[-1] == (r1.branch, r1.commit)
+    assert _git(world["origin"], "branch", "--format=%(refname:short)").splitlines() == [r1.branch, "main"]
+
+
+@needs_sh
+def test_suffix_when_name_is_held_and_never_force(world) -> None:
+    repo = world["repo"]
+    # a branch of that name exists locally and is checked out in another worktree: it can't be dropped
+    other = world["tmp"] / "other-wt"
+    _git(repo, "worktree", "add", "-q", "-b", "foundry/f-012-add-world", str(other), "main")
+    res = asyncio.run(world["pub"].publish("F-012", "Add world", world["patch"], PR))
+    assert res.ok and res.branch == "foundry/f-012-add-world-2"
+    assert _git(world["origin"], "rev-parse", res.branch) == res.commit
+
+
+@needs_sh
+def test_stale_worktrees_removed(world) -> None:
+    pub = world["pub"]
+    stale_dir = pub._wt_dir
+    stale_dir.mkdir(parents=True)
+    _git(world["repo"], "worktree", "add", "-q", "--detach", str(stale_dir / "f-1-dead"), "main")
+    (stale_dir / "junk").mkdir()
+    (stale_dir / "f-1-dead.msg").write_text("x", encoding="utf-8")
+    res = asyncio.run(pub.publish("F-012", "Add world", world["patch"], PR))
+    assert res.ok
+    assert list(world["wts"].iterdir()) == []
+    assert len(_git(world["repo"], "worktree", "list").splitlines()) == 1
+
+
+@needs_sh
+def test_open_pr_reuses_existing_and_already_exists(world, monkeypatch) -> None:
+    pub = world["pub"]
+    first = asyncio.run(pub.publish("F-012", "Add world", world["patch"], PR))
+    again = asyncio.run(pub.open_pr(first.branch, PR))
+    assert again.ok and again.pr_url == first.pr_url and _creates(world) == 1
+    # gh says the PR already exists (pr list could not see it): success with that URL
+    monkeypatch.setenv("FAKE_GH_PR", "exists")
+    _git(world["repo"], "push", "-q", "origin", "main:foundry/f-077-other")
+    res = asyncio.run(pub.open_pr("foundry/f-077-other", PR))
+    assert res.ok and res.pr_url == "https://github.com/acme/widget/pull/9"
+
+
+@needs_sh
+def test_inherited_git_dir_is_ignored(world, monkeypatch, tmp_path) -> None:
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _git(decoy, "init", "-q")
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+    res = asyncio.run(world["pub"].publish("F-012", "Add world", world["patch"], PR))
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_WORK_TREE")
+    assert res.ok, res
+    assert _git(world["origin"], "rev-parse", res.branch) == res.commit
 
 
 @needs_sh
@@ -347,3 +440,66 @@ def test_runner_exception_never_raises(tmp_path: Path) -> None:
     assert not res.ok and res.stage == "error" and "kaput" in res.error
     json.dumps(res.to_dict())
     assert os.path.isdir(tmp_path)
+
+
+def test_github_repo_parsing() -> None:
+    assert github_repo("https://github.com/acme/widget.git") == "acme/widget"
+    assert github_repo("https://user@github.com/acme/widget") == "acme/widget"
+    assert github_repo("git@github.com:acme/widget.git") == "acme/widget"
+    assert github_repo("ssh://git@github.com:22/acme/widget.git") == "acme/widget"
+    assert github_repo("https://ghe.corp.example/team/app.git") == "ghe.corp.example/team/app"
+    assert github_repo("/srv/git/origin.git") is None
+    assert github_repo("C:\\repos\\origin.git") is None
+    assert github_repo("") is None
+
+
+def test_injected_runner_passes_repo_and_finds_existing_pr(tmp_path: Path) -> None:
+    patch = tmp_path / "p.patch"
+    patch.write_text("diff\n", encoding="utf-8")
+
+    class R(FakeRunner):
+        async def __call__(self, argv, **kw):
+            if argv[1:3] == ["remote", "get-url"]:
+                self.calls.append(list(argv))
+                return 0, "git@github.com:acme/widget.git\n", ""
+            if argv[1:3] == ["pr", "list"]:
+                self.calls.append(list(argv))
+                return 0, "[]", ""
+            return await super().__call__(argv, **kw)
+
+    runner = R()
+    pub = GitPublisher(tmp_path, runner=runner, gh="g", git="git-fake", worktree_root=tmp_path / "wt")
+    res = asyncio.run(pub.publish("F-3", "Do it", patch, {"title": "T", "body": "B"}, draft=True))
+    assert res.ok
+    pr = next(c for c in runner.calls if c[1:3] == ["pr", "create"])
+    assert pr[pr.index("--repo") + 1] == "acme/widget" and "--draft" in pr
+
+
+def test_default_runner_kills_child_on_cancel(monkeypatch) -> None:
+    procs: list = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*a, **kw):
+        p = await real(*a, **kw)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+
+    async def go():
+        t = asyncio.ensure_future(default_runner([sys.executable, "-c", "import time; time.sleep(60)"], timeout=120))
+        while not procs:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        await asyncio.wait_for(procs[0].wait(), 10)
+        return procs[0].returncode
+
+    assert asyncio.run(go()) is not None
+
+
+def test_default_runner_timeout() -> None:
+    rc, _, err = asyncio.run(default_runner([sys.executable, "-c", "import time; time.sleep(60)"], timeout=0.5))
+    assert rc is None and "timed out" in err

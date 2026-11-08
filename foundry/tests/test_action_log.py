@@ -317,3 +317,84 @@ def test_foreman_reads_the_action_log(tmp_path: Path) -> None:
     f = _factory(tmp_path)
     assert f.foreman.actions_provider == f.manager.actions
     f.close()
+
+
+def _board_statuses(bridge: Any, task_id: str) -> list[str]:
+    return [
+        op["args"]["patch"]["status"] for op in bridge.ops
+        if op["type"] == "updateTask" and op.get("foundry_task", task_id) == task_id
+    ]
+
+
+def test_retry_and_undo_quarantine_set_the_board_task_active(tmp_path: Path) -> None:
+    f = _factory(tmp_path)
+    m, q = f.manager, f.queue
+
+    async def go() -> tuple[str, str]:
+        t1 = await m.submit(_order("undo me"))
+        await m.apply_escalation(_alert("QUARANTINE_TASK", task_id=t1))
+        t2 = await m.submit(_order("retry me", team="bravo"))
+        q.quarantine(t2, "timeout")
+        await m.apply_escalation(_alert("RETRY_TASK", task_id=t2))
+        return t1, t2
+
+    t1, t2 = _run(go())
+    assert m.undo_action(m.actions()[-1]["action_id"])["ok"]  # undo the quarantine of t1
+    statuses = [op["args"]["patch"]["status"] for op in f.bridge.ops if op["type"] == "updateTask"]
+    assert statuses.count("active") == 2 and "paused" in statuses
+    notes = [op["args"]["message"] for op in f.bridge.ops if op["type"] == "reportProgress"]
+    assert any("retried with fresh attempts" in n for n in notes)
+    assert any("quarantine undone" in n for n in notes)
+    kinds = [e["kind"] for e in q.events(task_id=t2)] if "task_id" in q.events.__code__.co_varnames else []
+    assert not kinds or "unquarantined" in kinds
+    f.close()
+
+
+def test_reassign_uses_named_ticket_ids_and_partial_undo_says_so(tmp_path: Path) -> None:
+    f = _factory(tmp_path)
+    m, q = f.manager, f.queue
+
+    async def go() -> tuple[str, list[str]]:
+        tid = await m.submit(_order("three", ["shop/strings.py", "shop/slug.py", "shop/pricing.py"]))
+        ids = [t.ticket_id for t in q.tickets_for_task(tid)]
+        assert len(ids) >= 2
+        out = await m.apply_escalation(_alert("REASSIGN_TEAM", task_id=tid, params={"to_team": "bravo", "ticket_ids": ids[:2]}))
+        assert out.applied and out.parameters["tickets"] == ids[:2]
+        return tid, ids
+
+    tid, ids = _run(go())
+    teams = {t.ticket_id: t.team_id for t in q.tickets_for_task(tid)}
+    assert [teams[i] for i in ids[:2]] == ["bravo", "bravo"]
+    assert all(teams[i] == "alpha" for i in ids[2:])
+    # bravo starts one of the two -> undo moves the other back and says "partly"
+    slot = q.get_ticket(ids[0]).slot
+    claimed = q.claim_ticket("bravo", slot)
+    assert claimed is not None and claimed.ticket_id in ids[:2]
+    res = m.undo_action(m.actions()[0]["action_id"])
+    assert res["ok"] and "partly" in res["detail"]
+    f.close()
+
+
+def test_still_owned_rejects_a_later_claim_with_the_same_attempt(tmp_path: Path) -> None:
+    from foundry.builder_worker import BuilderWorker  # noqa: F401  (the check lives on the worker base)
+
+    f = _factory(tmp_path, teams=["alpha"])
+    m, q = f.manager, f.queue
+
+    async def go() -> str:
+        return await m.submit(_order("race"))
+
+    tid = _run(go())
+    pool = f.pools["alpha"]
+    worker = pool.builder(1)
+    first = q.claim_ticket("alpha", 1)
+    assert first is not None and worker._still_owned(first)
+    # an undo/reset releases it (attempt unchanged) and it is claimed again later
+    q.release_ticket(first.ticket_id)
+    second = q.claim_ticket("alpha", 1)
+    assert second is not None and second.attempt == first.attempt
+    assert second.claimed_at != first.claimed_at
+    assert not worker._still_owned(first)  # the stale review must not complete it
+    assert worker._still_owned(second)
+    assert tid
+    f.close()

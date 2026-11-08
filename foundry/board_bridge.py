@@ -403,6 +403,14 @@ class BoardBridge:
         )
         self.progress(task_id, f"[Foundry] quarantined: {reason}")
 
+    def resumed(self, task_id: str, note: str = "") -> None:
+        """Report a task back on the line (quarantine undone or retried) as active on the board."""
+        self._emit(
+            BoardOp("updateTask", {"id": None, "patch": {"status": "active"}, "by": "foundry"}, foundry_task=task_id, task_key="id")
+        )
+        if note:
+            self.progress(task_id, note)
+
     # --------------------------------------------------------------- plumbing
 
     def _cli_timeout(self) -> float:

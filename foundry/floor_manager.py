@@ -903,6 +903,9 @@ class FloorManager:
                 return False, f"no idle team to take {task_id} from {current}", {}
             target = idle[0]
         open_ids = [t.ticket_id for t in self.queue.tickets(task_id=task_id, status="open") if t.team_id == current]
+        named = {str(x) for x in p.get("ticket_ids") or []}
+        if named:  # only the stuck tickets the Foreman named (those still open)
+            open_ids = [t for t in open_ids if t in named]
         if not open_ids:
             return False, f"{task_id} has no open tickets to move", {}
         moved = self.queue.move_tickets(task_id, target, open_ids)
@@ -954,13 +957,17 @@ class FloorManager:
         reopened = self.queue.reopen_quarantined(
             task_id, {t.ticket_id: {"attempt": 0, "infra_failures": 0} for t in blocked}, "retry (Foreman)"
         )
-        self._back_on_line(task_id)
-        self.bridge.progress(task_id, f"[Foundry] {task_id} retried with fresh attempts", team_id=task.get("team_id"))
+        self._back_on_line(task_id, f"[Foundry] {task_id} retried with fresh attempts")
         return True, f"{task_id} retried ({len(reopened)} ticket(s) reopened)", {"tickets": reopened}, before
 
-    def _back_on_line(self, task_id: str) -> None:
-        """A quarantine was lifted: report the next one again and forget the recorded outcome."""
+    def _back_on_line(self, task_id: str, note: str) -> None:
+        """A quarantine was lifted: board task active again, report the next quarantine, forget the outcome."""
         self._reported_quarantine.discard(task_id)
+        resumed = getattr(self.bridge, "resumed", None)
+        if callable(resumed):
+            resumed(task_id, note)
+        else:  # an older bridge: at least leave a note
+            self.bridge.progress(task_id, note)
         fn = getattr(self.queue, "delete_sizing_outcome", None)
         if callable(fn):
             try:
@@ -1139,9 +1146,7 @@ class FloorManager:
             return False, f"{task_id}'s tickets changed since the quarantine."
         specs = {tid: {"attempt": spec.get("attempt", current[tid].attempt)} for tid, spec in tickets.items()}
         reopened = self.queue.reopen_quarantined(task_id, specs, "quarantine undone")
-        self._back_on_line(task_id)
-        self.bridge.progress(task_id, f"[Foundry] {task_id} back on the line (quarantine undone)",
-                             team_id=task.get("team_id"))
+        self._back_on_line(task_id, f"[Foundry] {task_id} back on the line (quarantine undone)")
         return True, f"{task_id} back on the line ({len(reopened)} ticket(s) open)"
 
     def _undo_reassign(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
@@ -1160,6 +1165,9 @@ class FloorManager:
         self.queue.move_tickets(task_id, str(back), still)
         self._set_directive_team(task_id, str(back))
         self.bridge.progress(task_id, f"[Foundry] {task_id} moved back to {back} (undo)", team_id=back)
+        if len(still) < len(moved):
+            return True, (f"{task_id} partly moved back to {back} ({len(still)} of {len(moved)} ticket(s);"
+                          f" {there} already started the rest)")
         return True, f"{task_id} moved back to {back} ({len(still)} ticket(s))"
 
     def _undo_retry(self, entry: Mapping[str, Any]) -> tuple[bool, str]:

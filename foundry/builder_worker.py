@@ -775,7 +775,15 @@ class _WorkerBase:
             return False
         if _get(current, "status") != "claimed":
             return False
-        return int(_get(current, "attempt", 0) or 0) == int(_get(ticket, "attempt", 0) or 0)
+        if int(_get(current, "attempt", 0) or 0) != int(_get(ticket, "attempt", 0) or 0):
+            return False
+        # the same claim, not a later one (an undo/retry/reset can reopen a ticket with the
+        # same attempt and another builder claim it): compare the claim's time and holder
+        for key in ("claimed_at", "claimed_by"):
+            mine = _get(ticket, key, None)
+            if mine is not None and _get(current, key, None) != mine:
+                return False
+        return True
 
     def _send_back(self, ticket: Any, hint: str, *, reason: str) -> str:
         """Reopen ``ticket`` with ``hint`` (attempt + 1) or quarantine at the cap.
