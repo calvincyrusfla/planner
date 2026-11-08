@@ -112,6 +112,8 @@ PRE_REVIEW_MAX_SEND_BACKS = 1
 PRE_REVIEW_KV_PREFIX = "pre_review_sent_back:"
 #: Queue kv key prefix holding the symbols a ticket's builder asked to see in full.
 EXTRA_SYMBOLS_KV_PREFIX = "extra_symbols:"
+#: Queue kv key prefix holding the context level a ticket's latest slice was built at.
+CONTEXT_LEVEL_USED_KV_PREFIX = "context_level_used:"
 #: Widest context level (``ContextEngine.build_slice(level=...)``); retries step up to it.
 MAX_CONTEXT_LEVEL = 3
 
@@ -1677,6 +1679,35 @@ class BuilderWorker(_WorkerBase):
         info["focus_files"] = focus or list(allowed)
         return info
 
+    def _context_level(self, ticket: Any, attempt: int) -> int:
+        """The level for this attempt: the task's level from the queue, widened by retries.
+
+        Falls back to the attempt-based level when the queue has no
+        ``task_context_level`` or the call fails; context must never cost a build.
+        """
+        by_attempt = min(attempt + 1, MAX_CONTEXT_LEVEL)
+        getter = getattr(self.queue, "task_context_level", None)
+        if getter is None:
+            return by_attempt
+        task_id = str(_get(ticket, "task_id"))
+        try:
+            task_level = int(getter(task_id))
+        except Exception as exc:
+            log.warning("task_context_level failed for %s: %s; using attempt-based level", task_id, exc)
+            return by_attempt
+        return min(max(task_level, by_attempt), MAX_CONTEXT_LEVEL)
+
+    def _record_context_level(self, ticket: Any, level: int) -> None:
+        """Best effort: store the level ``ticket``'s slice was built at (queue kv)."""
+        setter = getattr(self.queue, "kv_set", None)
+        if setter is None:
+            return
+        ticket_id = _get(ticket, "ticket_id")
+        try:
+            setter(f"{CONTEXT_LEVEL_USED_KV_PREFIX}{ticket_id}", level)
+        except Exception as exc:
+            log.warning("could not record context level for ticket %s: %s", ticket_id, exc)
+
     async def _context_for(self, ticket: Any, info: dict[str, Any]) -> tuple[ContextSlice, int]:
         """Ask the context engine for the pruned slice; returns ``(slice, tokens_saved)``.
 
@@ -1703,10 +1734,11 @@ class BuilderWorker(_WorkerBase):
         # only when named (in the subtask text or by an earlier ticket's work), else outlines.
         focus = list(info.get("focus_files") or info["allowed_files"])
         others = [f for f in info["allowed_files"] if f not in focus]
-        # Retries widen the context: attempt 1 -> level 1, attempt 2 -> 2, attempt 3+ -> 3;
-        # symbols a builder asked for (BLOCKED note) are always shown in full.
+        # The task's level is the floor and retries widen past it (attempt 1 -> level 1,
+        # attempt 2 -> 2, attempt 3+ -> 3); symbols a builder asked for (BLOCKED note) are
+        # always shown in full.
         attempt = max(0, int(_get(ticket, "attempt", 0) or 0))
-        widen: dict[str, Any] = {"level": min(attempt + 1, MAX_CONTEXT_LEVEL)}
+        widen: dict[str, Any] = {"level": self._context_level(ticket, attempt)}
         # Names in the subtask's description pick edit targets too (the ticket's own
         # description when it has one, else the task's work-order description).
         description = str(_get(ticket, "description", "") or "") or self._work_order(
@@ -1737,6 +1769,7 @@ class BuilderWorker(_WorkerBase):
         else:
             bfn = engine.build_slice
             result = await _maybe_await(bfn(subtask, objective, **kwargs, **_supported_kwargs(bfn, widen)))
+        self._record_context_level(ticket, widen["level"])
         stats = getattr(engine, "last_stats", None)
         saved = int(getattr(stats, "tokens_saved", 0) or 0)
         if isinstance(result, Mapping):
