@@ -1569,6 +1569,26 @@ class FoundryQueue:
         clamped = max(self.MIN_CONTEXT_LEVEL, min(int(level), self.MAX_CONTEXT_LEVEL))
         self.kv_set(f"{self.CONTEXT_LEVEL_KV_PREFIX}{task_id}", clamped)
 
+    def restore_task_context_level(self, task_id: str, expected: int, level: int) -> str | None:
+        """Atomically put the task's context level back to ``level`` (undo of a widen).
+
+        Check and write share one transaction, so neither a finishing task nor
+        a new level can slip in between. Returns None when restored, otherwise
+        the reason it was refused (nothing is written then).
+        """
+        with self.transaction() as conn:
+            row = conn.execute("SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                return f"Task {task_id} no longer exists."
+            state = TaskState(row["state"])
+            if state in TERMINAL_STATES:
+                return f"{task_id} is already {state.value}."
+            current = self.task_context_level(task_id)
+            if current != expected:
+                return f"{task_id} context level has changed since (now {current})."
+            self.set_task_context_level(task_id, level)
+        return None
+
     # -------------------------------------------------------- sizing outcomes
 
     #: Fix-hint prefix of a Gemma pre-review send-back (counted per outcome).

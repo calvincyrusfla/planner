@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from foundry.context_text import request_terms, spread_hits
 from foundry.schemas import (
     MAX_OBJECTIVE_SENTENCES,
     MAX_SNIPPET_LINES,
@@ -779,6 +780,43 @@ def _query_names(text: str) -> tuple[list[tuple[str, str]], list[str], list[str]
     return dotted, code, plain
 
 
+_TEXT_WINDOW = 12  # lines shown each side of a named-text hit in a file too big to show whole
+_MAX_TEXT_HITS = 4  # hits kept per name
+_MAX_TEXT_WINDOWS = 8  # named-text windows per file
+_TEXT_QUOTED = re.compile(r"`([^`\n]+)`")
+_TEXT_WORD = re.compile(r"[A-Za-z_]\w*")
+_TEXT_CAMEL = re.compile(r"[a-z0-9][A-Z]")
+_TEXT_DEFINES = re.compile(r"\b(?:case|function|class|const|let|var|def)\b|\bid\s*=")
+
+
+def _text_names(query_text: str) -> list[str]:
+    """Literal strings worth finding in a file: backticked text plus snake_case/camelCase words."""
+    names = [q.strip() for q in _TEXT_QUOTED.findall(query_text) if len(q.strip()) >= 3]
+    for word in _TEXT_WORD.findall(query_text):
+        core = word.strip("_")
+        if len(core) >= 3 and ("_" in word or _TEXT_CAMEL.search(core)):
+            names.append(word)
+    return list(dict.fromkeys(names))
+
+
+def _text_hits(names: Sequence[str], lines: Sequence[str]) -> list[tuple[str, int]]:
+    """``(name, line number)`` hits, rarest names first and defining lines before mere uses."""
+    found: list[tuple[str, list[int]]] = []
+    for name in names:
+        head = r"(?<!\w)" if name[0].isalnum() or name[0] == "_" else ""
+        tail = r"(?!\w)" if name[-1].isalnum() or name[-1] == "_" else ""
+        pattern = re.compile(head + re.escape(name) + tail)
+        hits = [k for k, line in enumerate(lines, 1) if pattern.search(line)]
+        if hits:
+            found.append((name, hits))
+    found.sort(key=lambda item: len(item[1]))
+    out: list[tuple[str, int]] = []
+    for name, hits in found:
+        hits.sort(key=lambda k: _TEXT_DEFINES.search(lines[k - 1]) is None)
+        out += [(name, k) for k in hits[:_MAX_TEXT_HITS]]
+    return out
+
+
 def _clip_full(line: str) -> str:
     """A source line for a full view: verbatim unless absurdly long."""
     return line if len(line) <= _FULL_LINE_CHARS else line[: _FULL_LINE_CHARS - 4] + " ..."
@@ -997,7 +1035,8 @@ class ContextEngine:
             plan.targets.append(EditTarget(p, symbol, kind, start, min(end, n), reason))
             return True
 
-        # 1. extra symbols: always in full.
+        # 1. extra symbols: always in full (non-Python names no symbol matches are searched as text).
+        requested_text: dict[str, list[str]] = {}
         for spec in extra_symbols or ():
             want_path, name = _symbol_spec(str(spec))
             if not name:
@@ -1011,6 +1050,16 @@ class ContextEngine:
                 ) or ([u for u in units if u.name == name.rsplit(".", 1)[-1]] if "." in name else [])
                 for u in hits:
                     add(p, u.qualname, u.kind, u.start, u.end, "extra", force=True)
+                if not hits and Path(p).suffix.lower() not in PYTHON_SUFFIXES:
+                    requested_text.setdefault(p, []).append(name)
+        for p, names in requested_text.items():
+            shown = 0
+            for name, k in spread_hits(_text_hits(request_terms(names, sources[p]), sources[p].splitlines())):
+                if shown >= _MAX_TEXT_WINDOWS:
+                    break
+                if k not in plan.covered[p]:
+                    add(p, name, "text", max(1, k - _TEXT_WINDOW), k + _TEXT_WINDOW, "extra", force=True)
+                    shown += 1
         if budget <= 0:
             return plan
 
@@ -1029,6 +1078,22 @@ class ContextEngine:
                     continue
                 done.add(id(u))
                 add(p, u.qualname, u.kind, u.start, u.end, "named")
+
+        # 2b. non-Python files too big to show whole: the lines around text the subtask names.
+        text_names = _text_names(query_text)
+        for p in allowed:
+            if plan.line_counts[p] <= budget or Path(p).suffix.lower() in PYTHON_SUFFIXES:
+                continue
+            windows = 0
+            for name, k in _text_hits(text_names, sources[p].splitlines()):
+                if windows >= _MAX_TEXT_WINDOWS:
+                    break
+                if k in plan.covered[p]:
+                    continue
+                if add(p, name, "text", max(1, k - _TEXT_WINDOW), k + _TEXT_WINDOW, "text") or add(
+                    p, name, "text", k, k, "text"
+                ):
+                    windows += 1
 
         # 3. small files whole.
         for p in allowed:
