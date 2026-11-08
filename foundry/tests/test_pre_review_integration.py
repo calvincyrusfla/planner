@@ -15,11 +15,13 @@ import pytest
 from foundry.builder_worker import (
     PRE_REVIEW_KV_PREFIX,
     BuilderSubmission,
+    PreReviewBreaker,
     TeamPool,
     build_reviewer_prompt,
     format_pre_review_notes,
 )
 from foundry.orchestrator_queue import FoundryQueue
+from foundry.schemas import MAX_RETRIES
 from foundry.telemetry import Telemetry
 from foundry.tests.test_builder_worker import (
     APPROVE,
@@ -179,19 +181,118 @@ def test_clean_pass_adds_no_notes(tmp_path: Path) -> None:
     assert diff == GOOD_DIFF and gates and all(g.passed for g in gates)
 
 
-def test_pre_review_send_back_counts_toward_quarantine(tmp_path: Path) -> None:
+def _burn_attempts(rig: Rig, task_id: str, n: int) -> str:
+    ticket_id = rig.queue.tickets_for_task(task_id)[0].ticket_id
+    for _ in range(n):
+        assert rig.queue.claim_ticket(TEAM, 1) is not None
+        assert rig.queue.reopen_ticket(ticket_id, "earlier gate failure")
+    return ticket_id
+
+
+def test_last_attempt_is_never_sent_back_by_pre_review(tmp_path: Path) -> None:
     rig = make_rig(tmp_path, [BLOCKING])
     rig.submit("T-Q", "S")
-    ticket_id = rig.queue.tickets_for_task("T-Q")[0].ticket_id
-    # Burn the earlier attempts: this submission is the last one allowed.
-    assert rig.queue.claim_ticket(TEAM, 1) is not None
-    assert rig.queue.reopen_ticket(ticket_id, "earlier gate failure")
-    assert rig.queue.claim_ticket(TEAM, 1) is not None
-    assert rig.queue.reopen_ticket(ticket_id, "earlier gate failure")
+    _burn_attempts(rig, "T-Q", MAX_RETRIES)  # this submission is the last one allowed
     states = asyncio.run(run(rig, ["T-Q"]))
-    assert states == {"T-Q": "quarantined"}
+    assert states == {"T-Q": "complete"}  # good work is not quarantined unseen
+    assert rig.client.calls[BUILDER] == 1 and rig.client.calls[REVIEWER] == 1
+    assert "Gemma pre-review notes (may be wrong): blocking: TODO left" in rig.client.prompts_for(REVIEWER)[0]
+    events = [e["payload"] for e in rig.queue.events(task_id="T-Q", kind="pre_review")]
+    assert [e["outcome"] for e in events] == ["passed"] and events[0]["last_attempt"] is True
+    assert rig.telemetry.pre_review_counts()["sent_back"] == 0
+
+
+def test_pre_review_send_back_spends_an_attempt(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path, [BLOCKING])
+    rig.submit("T-S", "S")
+    ticket_id = _burn_attempts(rig, "T-S", MAX_RETRIES - 1)
+    states = asyncio.run(run(rig, ["T-S"]))
+    assert states == {"T-S": "complete"}
+    assert rig.client.calls[BUILDER] == 2 and rig.client.calls[REVIEWER] == 1
+    assert rig.queue.get_ticket(ticket_id).attempt == MAX_RETRIES  # the send-back used one attempt
+    assert rig.telemetry.pre_review_counts()["sent_back"] == 1
+
+
+def test_superseded_send_back_is_not_counted(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path, [BLOCKING])
+    rig.submit("T-X", "S")
+    pool = rig.pool(1)
+    builder = pool.builders[0]
+    builder._send_back = lambda *a, **k: "superseded"  # someone else reopened the ticket meanwhile
+    ticket = rig.queue.claim_ticket(TEAM, 1)
+    assert asyncio.run(builder.process_ticket(ticket)) == "superseded"
     assert rig.client.calls[REVIEWER] == 0
-    assert (rig.ws / "pkg" / "mathx.py").read_text() == ORIGINAL  # rolled back
+    counts = rig.telemetry.pre_review_counts()
+    assert counts["sent_back"] == 0 and counts["claude_reviews_avoided"] == 0
+    assert rig.queue.kv_get(PRE_REVIEW_KV_PREFIX + ticket.ticket_id) is None
+    outcomes = [e["payload"]["outcome"] for e in rig.queue.events(task_id="T-X", kind="pre_review")]
+    assert outcomes == ["superseded"]
+
+
+def test_breaker_skips_pre_review_after_three_gemma_errors(tmp_path: Path) -> None:
+    now = [1000.0]
+    rig = make_rig(tmp_path, [RuntimeError("timeout")])
+    breaker = PreReviewBreaker(clock=lambda: now[0])
+    rig.submit("T-K", "S")
+    pool = rig.pool(1, pre_review_breaker=breaker)
+    builder = pool.builders[0]
+    assert builder.pre_review_breaker is breaker
+    ticket = rig.queue.claim_ticket(TEAM, 1)
+
+    async def once() -> None:
+        assignment = await builder.build_assignment(ticket)
+        assert await builder._pre_review(ticket, assignment, _sub(), []) == (None, None, None)
+
+    for _ in range(4):
+        asyncio.run(once())
+    assert len(rig.foreman.calls) == 3  # the 4th call was skipped
+    counts = rig.telemetry.pre_review_counts()
+    assert counts["fallback"] == 3 and counts["skipped"] == 1
+    skipped = [e["payload"] for e in rig.queue.events(task_id="T-K", kind="pre_review")][-1]
+    assert skipped["reason"] == "gemma unavailable"
+    now[0] += 599
+    asyncio.run(once())
+    assert len(rig.foreman.calls) == 3
+    now[0] += 2  # 10 minutes later Gemma is asked again
+    rig.foreman.results = [PASS]
+    asyncio.run(once())
+    assert len(rig.foreman.calls) == 4 and breaker.failures == 0
+
+
+def test_breaker_ignores_cheap_fallbacks_and_resets_on_success() -> None:
+    breaker = PreReviewBreaker(clock=lambda: 0.0)
+    breaker.record_failure()
+    breaker.record_failure()
+    breaker.record_success()
+    breaker.record_failure()
+    assert not breaker.is_open()
+    breaker.record_failure()
+    breaker.record_failure()
+    assert breaker.is_open()
+
+
+def test_gemma_off_fallback_does_not_trip_breaker(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    off = SimpleNamespace(verdict="pass", issues=(), confidence=0.0, source="fallback", error="gemma off")
+    rig = make_rig(tmp_path, [off])
+    rig.submit("T-Z", "S")
+    pool = rig.pool(1)
+    builder = pool.builders[0]
+    ticket = rig.queue.claim_ticket(TEAM, 1)
+
+    async def go() -> None:
+        assignment = await builder.build_assignment(ticket)
+        for _ in range(5):
+            await builder._pre_review(ticket, assignment, _sub(), [])
+
+    asyncio.run(go())
+    assert len(rig.foreman.calls) == 5 and not builder.pre_review_breaker.is_open()
+
+
+def _sub() -> BuilderSubmission:
+    return BuilderSubmission(task_id="T-K", subtask_id="T-K.1", builder_id=BUILDER, status="ready_for_review",
+                             modified_files=["pkg/mathx.py"], diff=GOOD_DIFF)
 
 
 # ---------------------------------------------------------------------------

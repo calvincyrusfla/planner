@@ -255,3 +255,20 @@ def test_sizing_passes_the_task_repo_to_the_outcomes_provider(tmp_path: Path) ->
     assert [r["task_id"] for r in rows] == [f"H-{i:03d}" for i in range(16, 8, -1)]
     assert f.manager.directives[tid]
     f.close()
+
+
+def test_pre_review_sendback_that_hits_the_retry_cap_is_counted(tmp_path: Path) -> None:
+    from foundry.schemas import MAX_RETRIES
+
+    q = FoundryQueue(":memory:")
+    q.add_task("F-001", "t", "", "alpha")
+    (t,) = q.apply_sizing(_directive("F-001", 1, "S"))
+    for _ in range(MAX_RETRIES):
+        q.claim_ticket("alpha", 1, "alpha-1")
+        assert q.reopen_ticket(t.ticket_id, "gate failed: syntax")
+    q.claim_ticket("alpha", 1, "alpha-1")
+    assert not q.reopen_ticket(t.ticket_id, "[pre-review] TODO left")  # retry_exhausted -> quarantined
+    row = q.record_sizing_outcome("F-001")
+    assert row["final_state"] == "quarantined"
+    assert row["pre_review_sendbacks"] == 1
+    q.close()

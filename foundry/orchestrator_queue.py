@@ -1263,7 +1263,8 @@ class FoundryQueue:
         Counts are taken from the queue's own tables: attempts (``attempt + 1``
         per ticket), gate failures (Telemetry's ``telemetry_gates``, else failed
         ``gate_results`` submissions), pre-review send-backs (reopens whose fix
-        hint starts with ``[pre-review]``), reviewer rejections (non-APPROVED
+        hint starts with ``[pre-review]``, including the one that hit the retry
+        cap and quarantined the task), reviewer rejections (non-APPROVED
         verdicts), Claude calls and tokens (``telemetry_tokens``, when the
         Telemetry shares this db) and wall time (task creation to now).
         ``overrides`` may replace any of those counts (tests, callers that know
@@ -1379,7 +1380,8 @@ class FoundryQueue:
 
     def _pre_review_sendbacks(self, conn: sqlite3.Connection, task_id: str) -> int:
         n = 0
-        for r in conn.execute("SELECT payload FROM events WHERE task_id=? AND kind='ticket_reopened'",
+        for r in conn.execute("SELECT payload FROM events WHERE task_id=?"
+                              " AND kind IN ('ticket_reopened','retry_exhausted')",
                               (task_id,)):
             hint = str(json.loads(r["payload"] or "{}").get("fix_hint") or "")
             if hint.lstrip().lower().startswith(self.PRE_REVIEW_HINT_PREFIX):

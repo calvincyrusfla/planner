@@ -79,6 +79,7 @@ __all__ = [
     "directives_to_hint",
     "format_pre_review_notes",
     "PRE_REVIEW_MODES",
+    "PreReviewBreaker",
     "is_infrastructure_error",
     "GateSummary",
     "ReviewItem",
@@ -565,6 +566,41 @@ def is_infrastructure_error(result: ClaudeResult) -> bool:
     return not (result.text or "").strip() and result.output_tokens == 0
 
 
+#: Fallback reasons that cost no Gemma time (do not trip the breaker).
+_PRE_REVIEW_CHEAP_FALLBACKS = frozenset({"gemma off", "unusable reply"})
+
+
+class PreReviewBreaker:
+    """Circuit breaker for the Gemma pre-review, shared by a team's builders.
+
+    After ``threshold`` consecutive fallbacks caused by Gemma timeouts/errors,
+    the pre-review is skipped for ``cooldown_s`` seconds (``clock`` is
+    monotonic and injectable).  A usable Gemma reply resets the count.
+    """
+
+    def __init__(self, threshold: int = 3, cooldown_s: float = 600.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.threshold = int(threshold)
+        self.cooldown_s = float(cooldown_s)
+        self.clock = clock
+        self.failures = 0
+        self.open_until = 0.0
+
+    def is_open(self) -> bool:
+        return self.clock() < self.open_until
+
+    def record_failure(self) -> None:
+        self.failures += 1
+        if self.failures >= self.threshold:
+            self.open_until = self.clock() + self.cooldown_s
+            self.failures = 0
+            log.warning("Gemma pre-review: %d consecutive failures; skipping it for %.0f s",
+                        self.threshold, self.cooldown_s)
+
+    def record_success(self) -> None:
+        self.failures = 0
+
+
 def format_pre_review_notes(issues: Iterable[Any], limit: int = 600) -> str | None:
     """``"blocking: x; minor: y"`` from pre-review issues (dicts or objects); None when empty."""
     parts: list[str] = []
@@ -1033,6 +1069,7 @@ class BuilderWorker(_WorkerBase):
         infra_failure_cap: int = 3,
         pre_review: str = "gate",
         pre_review_min_confidence: float = 0.7,
+        pre_review_breaker: PreReviewBreaker | None = None,
     ) -> None:
         super().__init__(
             team_id,
@@ -1056,6 +1093,8 @@ class BuilderWorker(_WorkerBase):
         self.pre_review_min_confidence = float(pre_review_min_confidence)
         #: Stand-in for queues without ``kv_get``/``kv_set`` (per-ticket send-back count).
         self._local_pre_review: dict[str, int] = {}
+        #: Skips the pre-review for a while after repeated Gemma errors (TeamPool shares one).
+        self.pre_review_breaker = pre_review_breaker if pre_review_breaker is not None else PreReviewBreaker()
         self.workspace: Path | None = Path(workspace) if workspace is not None else None
         #: Only tickets of tasks for this repo are claimed (G1); None = any repo.
         self.repo_root: str | None = str(repo_root) if repo_root is not None else None  # queue normalizes
@@ -1376,10 +1415,16 @@ class BuilderWorker(_WorkerBase):
             return self._send_back(ticket, f"[{check}] {hint}", reason=f"gate_{check}")
 
         # 5. Gemma pre-review: may send obvious problems back once per ticket (gate mode).
-        send_back, notes = await self._pre_review(ticket, assignment, submission, gates.results)
+        send_back, notes, review = await self._pre_review(ticket, assignment, submission, gates.results)
         if send_back is not None:
             _restore_files(self.workspace, snapshot)
-            return self._send_back(ticket, f"[pre-review] {send_back}", reason="pre_review")
+            outcome = self._send_back(ticket, f"[pre-review] {send_back}", reason="pre_review")
+            if outcome == "retry":
+                # Only a real reopen uses the once-per-ticket cap and counts as a review avoided.
+                self._mark_pre_review_sent_back(ticket)
+                self._tm("record_pre_review", task_id, "sent_back")
+            self._pre_review_event(ticket, "sent_back" if outcome == "retry" else outcome, review)
+            return outcome
 
         await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta, notes)
         return "review"
@@ -1416,20 +1461,27 @@ class BuilderWorker(_WorkerBase):
         assignment: TaskAssignment,
         submission: BuilderSubmission,
         results: Sequence[DeterministicGateResult],
-    ) -> tuple[str | None, str | None]:
-        """Run the Gemma pre-review; returns ``(send_back_hint, reviewer_notes)``.
+    ) -> tuple[str | None, str | None, Any]:
+        """Run the Gemma pre-review; returns ``(send_back_hint, reviewer_notes, review)``.
 
         ``send_back_hint`` is set only in gate mode, for a confident
-        ``send_back`` verdict with at least one blocking issue, and only on
-        the ticket's first pre-review send-back (persisted, so restarts
-        respect it).  Gemma being off, slow or unusable never blocks: it
-        counts as ``fallback`` and the submission goes on to the reviewer.
+        ``send_back`` verdict with at least one blocking issue, only on the
+        ticket's first pre-review send-back (persisted, so restarts respect
+        it) and never on the ticket's last allowed attempt (a send-back there
+        would quarantine work no Claude reviewer saw).  The caller sends the
+        ticket back and does the counting.  Gemma being off, slow or unusable
+        never blocks: it counts as ``fallback`` and the submission goes on to
+        the reviewer; repeated Gemma errors trip :class:`PreReviewBreaker`.
         """
         task_id = assignment.task_id
         fn = getattr(self.foreman, "pre_review_diff", None) if self.foreman is not None else None
         if self.pre_review == "off" or fn is None or not callable(fn):
             self._tm("record_pre_review", task_id, "skipped")
-            return None, None
+            return None, None, None
+        if self.pre_review_breaker.is_open():
+            self._tm("record_pre_review", task_id, "skipped")
+            self._pre_review_event(ticket, "skipped", None, reason="gemma unavailable")
+            return None, None, None
         task = None
         getter = getattr(self.queue, "get_task", None)
         if getter is not None:
@@ -1451,9 +1503,14 @@ class BuilderWorker(_WorkerBase):
             sources = getattr(self.foreman, "last_source", None) or {}
             source = sources.get("pre_review_diff") if hasattr(sources, "get") else None
         if review is None or (source is not None and source != "gemma"):
+            error = None if review is None else _get(review, "error", None)
+            # Timeouts/exceptions trip the breaker; "Gemma off" and a bad-JSON reply cost nothing.
+            if review is None or str(error or "") not in _PRE_REVIEW_CHEAP_FALLBACKS:
+                self.pre_review_breaker.record_failure()
             self._tm("record_pre_review", task_id, "fallback")
             self._pre_review_event(ticket, "fallback", review)
-            return None, None
+            return None, None, None
+        self.pre_review_breaker.record_success()
         verdict = str(_get(review, "verdict", "pass") or "pass")
         issues = list(_get(review, "issues", None) or [])
         try:
@@ -1467,19 +1524,20 @@ class BuilderWorker(_WorkerBase):
             outcome = "advised" if (notes or verdict == "send_back") else "passed"
             self._tm("record_pre_review", task_id, outcome)
             self._pre_review_event(ticket, outcome, review)
-            return None, notes
-        if wants_back and self._pre_review_sent_back(ticket) < PRE_REVIEW_MAX_SEND_BACKS:
-            self._mark_pre_review_sent_back(ticket)
-            self._tm("record_pre_review", task_id, "sent_back")
-            self._pre_review_event(ticket, "sent_back", review)
+            return None, notes, review
+        last_attempt = int(_get(ticket, "attempt", 0) or 0) >= MAX_RETRIES
+        capped = wants_back and self._pre_review_sent_back(ticket) >= PRE_REVIEW_MAX_SEND_BACKS
+        if wants_back and not capped and not last_attempt:
             hint = format_pre_review_notes(blocking) or "Gemma pre-review flagged a blocking problem"
-            return hint, None
-        # Pass, or the once-per-ticket cap is used up: the Claude reviewer decides (with the notes).
+            return hint, None, review
+        # Pass, cap used up, or last attempt: the Claude reviewer decides (with the notes).
         self._tm("record_pre_review", task_id, "passed")
-        self._pre_review_event(ticket, "passed", review, capped=wants_back)
-        return None, notes
+        self._pre_review_event(ticket, "passed", review, capped=capped,
+                               last_attempt=wants_back and not capped and last_attempt)
+        return None, notes, review
 
-    def _pre_review_event(self, ticket: Any, outcome: str, review: Any, *, capped: bool = False) -> None:
+    def _pre_review_event(self, ticket: Any, outcome: str, review: Any, *, capped: bool = False,
+                          last_attempt: bool = False, reason: str | None = None) -> None:
         payload: dict[str, Any] = {
             "ticket_id": _get(ticket, "ticket_id"),
             "builder_id": self.agent_id,
@@ -1492,6 +1550,10 @@ class BuilderWorker(_WorkerBase):
             payload["issues"] = len(list(_get(review, "issues", None) or []))
         if capped:
             payload["capped"] = True
+        if last_attempt:
+            payload["last_attempt"] = True
+        if reason:
+            payload["reason"] = reason
         self._event("pre_review", _get(ticket, "task_id"), payload)
 
     async def _try_cached(
@@ -1871,6 +1933,7 @@ class TeamPool:
         infra_failure_cap: int | None = None,
         pre_review: str | None = None,
         pre_review_min_confidence: float | None = None,
+        pre_review_breaker: PreReviewBreaker | None = None,
     ) -> None:
         if not 1 <= builders <= 5:
             raise ValueError("a team has 1..5 builder slots")
@@ -1881,6 +1944,8 @@ class TeamPool:
             pre_review = str(getattr(config, "pre_review", "gate") or "gate")
         if pre_review_min_confidence is None:
             pre_review_min_confidence = float(getattr(config, "pre_review_min_confidence", 0.7))
+        #: One breaker for the whole pool: Gemma is shared, so are its outages.
+        self.pre_review_breaker = pre_review_breaker if pre_review_breaker is not None else PreReviewBreaker()
         if trust_cache is None:
             trust_cache = bool(getattr(config, "trust_cache", False))
         if limit_cooldown_s is None:
@@ -1928,6 +1993,7 @@ class TeamPool:
                 infra_failure_cap=infra_failure_cap,
                 pre_review=pre_review,
                 pre_review_min_confidence=pre_review_min_confidence,
+                pre_review_breaker=self.pre_review_breaker,
             )
             for slot in range(1, builders + 1)
         ]
