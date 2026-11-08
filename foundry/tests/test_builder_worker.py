@@ -34,6 +34,8 @@ from foundry.orchestrator_queue import FoundryQueue
 from foundry.rate_limiter import RateLimiter
 from foundry.schemas import (
     BUILDERS_FOR,
+    MAX_RETRIES,
+    MAX_RETRIES_LIMIT,
     BuilderSubmission,
     CodeSnippet,
     ContextSlice,
@@ -200,7 +202,7 @@ def test_builder_prompt_contains_only_the_slice_and_the_contract() -> None:
     assert "- pkg/mathx.py" in prompt
     assert "### pkg/mathx.py (lines 1-3)" in prompt and "def add(a, b):\n    ..." in prompt
     assert "SyntaxError: expected ':'" in prompt
-    assert "attempt 2 of 4" in prompt  # default cap: MAX_RETRIES=3
+    assert f"attempt 2 of {MAX_RETRIES + 1}" in prompt
     assert DIFF_CONTRACT in prompt
     assert "exactly one fenced code block" in prompt
 
@@ -208,7 +210,7 @@ def test_builder_prompt_contains_only_the_slice_and_the_contract() -> None:
 def test_builder_prompt_without_fix_hint_has_no_fix_section() -> None:
     prompt = build_builder_prompt(assignment())
     assert "Fix required" not in prompt
-    assert "attempt 1 of 3" in prompt
+    assert f"attempt 1 of {MAX_RETRIES + 1}" in prompt
 
 
 def test_builder_prompt_fences_snippets_that_contain_backticks() -> None:
@@ -299,7 +301,7 @@ def test_parse_reviewer_reply_valid_json_and_ids_from_caller() -> None:
     v = parse_reviewer_reply(text, task_id="T-1", reviewer_id=REVIEWER, retry_count=7)
     assert v.verdict == "REVISE"
     assert v.task_id == "T-1" and v.reviewer_id == REVIEWER
-    assert v.retry_count == 2  # clamped
+    assert v.retry_count == MAX_RETRIES_LIMIT  # clamped
     assert v.directives == [LineDirective(path="pkg/mathx.py", line=5, instruction="add type hints")]
 
 
@@ -399,7 +401,8 @@ def test_broken_diff_never_reaches_reviewer_and_retry_cap_quarantines(tmp_path: 
     rig.submit("T-B", "S")
     states = asyncio.run(run_pool(rig, ["T-B"]))
     assert states == {"T-B": "quarantined"}
-    assert rig.client.calls[f"{TEAM}-1"] == 3  # first try + 2 retries, no 4th build
+    attempts = MAX_RETRIES + 1
+    assert rig.client.calls[f"{TEAM}-1"] == attempts  # first try + MAX_RETRIES retries, no extra build
     assert rig.client.calls[REVIEWER] == 0
     prompts = rig.client.prompts_for(f"{TEAM}-1")
     assert "Fix required" not in prompts[0]
@@ -407,10 +410,10 @@ def test_broken_diff_never_reaches_reviewer_and_retry_cap_quarantines(tmp_path: 
         assert "[syntax]" in p and "Fix required" in p
         hint = p.split("## Fix required (your previous attempt was sent back)\n", 1)[1].split("\n", 1)[0]
         assert "\n" not in hint and len(hint) < 200
-    assert len(rig.foreman.traces) == 3
-    assert rig.telemetry.gate_failures("T-B") == 3
-    assert rig.telemetry.retries("T-B") == 2
-    assert rig.queue.gate_failure_count("T-B") == 3
+    assert len(rig.foreman.traces) == attempts
+    assert rig.telemetry.gate_failures("T-B") == attempts
+    assert rig.telemetry.retries("T-B") == MAX_RETRIES
+    assert rig.queue.gate_failure_count("T-B") == attempts
     assert (rig.ws / "pkg" / "mathx.py").read_text() == ORIGINAL  # broken diff rolled back
 
 
@@ -447,7 +450,7 @@ def test_revise_loops_back_with_directives_then_approves(tmp_path: Path) -> None
     assert states == {"T-V": "complete"}
     second = rig.client.prompts_for(f"{TEAM}-1")[1]
     assert "pkg/mathx.py:6 add int type hints to mul" in second
-    assert "attempt 2 of 3" in second
+    assert f"attempt 2 of {MAX_RETRIES + 1}" in second
     # the REVISE'd diff was rolled back, so the second diff applied cleanly
     assert (rig.ws / "pkg" / "mathx.py").read_text() == BETTER_NEW
     assert [v["verdict"] for v in rig.queue.verdicts("T-V")] == ["REVISE", "APPROVED"]
@@ -461,7 +464,7 @@ def test_revise_counts_toward_retry_cap(tmp_path: Path) -> None:
     rig.submit("T-X", "S")
     states = asyncio.run(run_pool(rig, ["T-X"]))
     assert states == {"T-X": "quarantined"}
-    assert rig.client.calls[f"{TEAM}-1"] == 3 and rig.client.calls[REVIEWER] == 3
+    assert rig.client.calls[f"{TEAM}-1"] == MAX_RETRIES + 1 and rig.client.calls[REVIEWER] == MAX_RETRIES + 1
     assert rig.cache.stats()["entries"] == 0  # never cached without APPROVED
     assert (rig.ws / "pkg" / "mathx.py").read_text() == ORIGINAL
 
@@ -634,7 +637,7 @@ def test_async_foreman_condenser_with_task_id(tmp_path: Path) -> None:
     rig.foreman = AsyncForeman()  # type: ignore[assignment]
     rig.submit("T-G", "S")
     asyncio.run(run_pool(rig, ["T-G"]))
-    assert seen == ["T-G", "T-G", "T-G"]
+    assert seen == ["T-G"] * (MAX_RETRIES + 1)
     prompts = rig.client.prompts_for(f"{TEAM}-1")
     assert "[syntax] pkg/mathx.py:6 SyntaxError: expected ':'" in prompts[1]
     assert "[syntax]" in prompts[2]  # fallback hint (GateOutcome.summary) after the foreman failed
@@ -994,7 +997,7 @@ def test_builder_error_with_reply_uses_attempts(tmp_path: Path) -> None:
     _run_to_end(rig, "T-LM")
     task = rig.queue.get_task("T-LM")
     assert task["state"] == TaskState.QUARANTINED
-    assert rig.client.calls[f"{TEAM}-1"] == 3
+    assert rig.client.calls[f"{TEAM}-1"] == MAX_RETRIES + 1
     assert not task["quarantine_reason"].startswith("infrastructure")  # normal retry limit
 
 

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 from foundry import schemas
 from foundry.schemas import (
     BUILDERS_FOR,
+    MAX_RETRIES_LIMIT,
     BuilderSubmission,
     ClaudeResult,
     CodeSnippet,
@@ -449,7 +450,7 @@ def test_assignment_attempt_ok(attempt: int) -> None:
     assert TaskAssignment.model_validate(_assignment(attempt=attempt)).attempt == attempt
 
 
-@pytest.mark.parametrize("attempt", [-1, 3])
+@pytest.mark.parametrize("attempt", [-1, MAX_RETRIES_LIMIT + 1])
 def test_assignment_attempt_out_of_range(attempt: int) -> None:
     with pytest.raises(ValidationError):
         TaskAssignment.model_validate(_assignment(attempt=attempt))
@@ -470,7 +471,7 @@ def test_verdict_retry_count_ok(n: int) -> None:
     assert ReviewerVerdict.model_validate(_verdict(retry_count=n)).retry_count == n
 
 
-@pytest.mark.parametrize("n", [-1, 3, 10])
+@pytest.mark.parametrize("n", [-1, MAX_RETRIES_LIMIT + 1, 10])
 def test_verdict_retry_count_over_cap(n: int) -> None:
     with pytest.raises(ValidationError):
         ReviewerVerdict.model_validate(_verdict(retry_count=n))
@@ -674,3 +675,21 @@ def test_claude_result_cache_read_tokens() -> None:
 def test_claude_result_cache_read_tokens_invalid(bad: Any) -> None:
     with pytest.raises(ValidationError):
         ClaudeResult.model_validate(_claude_result(cache_read_tokens=bad))
+
+
+def test_subtask_depends_on_defaults_empty_and_old_data_loads() -> None:
+    old = SubtaskAllocation.model_validate({"subtask_id": "T-1.1", "title": "impl"})
+    assert old.depends_on == []
+    assert SubtaskAllocation.model_validate(
+        {"subtask_id": "T-1.2", "title": "tests", "depends_on": None}).depends_on == []
+
+
+def test_subtask_depends_on_is_cleaned() -> None:
+    sub = SubtaskAllocation(subtask_id="T-1.3", title="x",
+                            depends_on=["T-1.1", " T-1.2 ", "T-1.1", "", "T-1.3"])
+    assert sub.depends_on == ["T-1.1", "T-1.2"]  # blanks, duplicates and self dropped
+
+
+@pytest.mark.parametrize("attempt", [0, MAX_RETRIES_LIMIT])
+def test_assignment_attempt_within_configurable_cap(attempt: int) -> None:
+    assert TaskAssignment.model_validate(_assignment(attempt=attempt)).attempt == attempt
