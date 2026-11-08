@@ -33,6 +33,7 @@ from __future__ import annotations
 import ast
 import json
 import math
+import os
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -57,6 +58,10 @@ __all__ = [
     "ContextEngine",
     "SliceStats",
     "SourceSymbol",
+    "EditTarget",
+    "DEFAULT_FULL_LINES",
+    "FULL_LINES_ENV",
+    "OUTLINE_MARKER",
     "condense_error_trace",
     "estimate_tokens",
     "skeletonize_python",
@@ -74,6 +79,22 @@ _MAX_LINE_CHARS = 200  # a single kept source line is clipped to this width
 _MAX_FIELD_LINES = 3  # multi-line field/constant statements keep at most this many lines
 _MAX_TYPE_BODY_LINES = 30  # TS interface/type bodies are clipped to this many lines
 _MAX_FILES = 40  # glob expansion of allowed_files is capped
+
+FULL_LINES_ENV: str = "FOUNDRY_CONTEXT_FULL_LINES"
+"""Environment variable overriding the level-1 full-body line budget."""
+
+DEFAULT_FULL_LINES: int = 400
+"""Lines of edit-target source shown in full at level 1 (level 2 doubles, level 3 triples)."""
+
+OUTLINE_MARKER: str = "outline only \u2014 body hidden; do not redefine, ask for it"
+"""Marker put on every elided body in outline snippets."""
+
+_CONTEXT_PAD = 3  # lines of surrounding context shown before/after a full target
+_GAP_FILL = 2  # gaps this small between two full ranges are shown too (one snippet run)
+_MIN_TARGET_SCORE = 2.0  # top-ranked (not named) symbols need at least this relevance
+_MAX_RANKED_CLASS_LINES = 80  # larger classes are only shown in full when named
+_INVENTORY_WIDTH = 150
+_FULL_LINE_CHARS = 2000  # full views keep lines verbatim (diff/edit anchors) up to this width
 
 _SENTENCE_END = re.compile(r"[.!?]+(?=\s|$)")
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -180,6 +201,12 @@ class SliceStats:
     candidates: int = 0
     selected: int = 0
     ranked_by_gemma: bool = False
+    level: int = 1
+    full_budget: int = 0
+    full_lines_shown: int = 0
+    targets: list[dict[str, Any]] = field(default_factory=list)
+    inventory_files: list[str] = field(default_factory=list)
+    import_outline_files: list[str] = field(default_factory=list)
 
     @property
     def tokens_saved(self) -> int:
@@ -526,6 +553,248 @@ def _skeletonize_other(path: str, source: str) -> list[SourceSymbol]:
     return [SourceSymbol(path, Path(path).name, "text", 1, len(lines), kept)]
 
 
+# --------------------------------------------------------------------------- edit targets
+
+
+@dataclass
+class EditTarget:
+    """A symbol (or whole small file) shown to the builder in full.
+
+    ``reason`` is ``"extra"`` (asked for, e.g. after a BLOCKED reply),
+    ``"named"`` (named in the subtask text), ``"file"`` (small file shown
+    whole) or ``"ranked"`` (top relevance). Lines are 1-based inclusive and
+    exclude the surrounding context lines.
+    """
+
+    path: str
+    symbol: str
+    kind: str
+    start_line: int
+    end_line: int
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        """Plain dict form (for :class:`SliceStats` / telemetry)."""
+        return {
+            "path": self.path,
+            "symbol": self.symbol,
+            "kind": self.kind,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class _Unit:
+    """A definition with its full line range (decorators included)."""
+
+    name: str
+    qualname: str
+    kind: str  # function | class | method | constant | interface | type | ...
+    start: int
+    end: int
+    parent: str | None = None
+
+
+def _py_units(source: str) -> list[_Unit]:
+    """Top-level definitions plus class members (``Class.method``) of a Python module."""
+    tree = ast.parse(source)
+    out: list[_Unit] = []
+
+    def start_of(node: ast.AST) -> int:
+        decos = getattr(node, "decorator_list", None) or []
+        return min([d.lineno for d in decos] + [node.lineno])  # type: ignore[attr-defined]
+
+    for node in tree.body:
+        end = getattr(node, "end_lineno", None) or node.lineno
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append(_Unit(node.name, node.name, "function", start_of(node), end))
+        elif isinstance(node, ast.ClassDef):
+            out.append(_Unit(node.name, node.name, "class", start_of(node), end))
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    kind = "class" if isinstance(child, ast.ClassDef) else "method"
+                    c_end = child.end_lineno or child.lineno
+                    out.append(_Unit(child.name, f"{node.name}.{child.name}", kind, start_of(child), c_end, node.name))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for tgt in targets:
+                if isinstance(tgt, ast.Name):
+                    out.append(_Unit(tgt.id, tgt.id, "constant", node.lineno, end))
+        elif type(node).__name__ == "TypeAlias":
+            name = getattr(getattr(node, "name", None), "id", None)
+            if name:
+                out.append(_Unit(name, name, "constant", node.lineno, end))
+    return out
+
+
+def _units_for(path: str, source: str) -> list[_Unit]:
+    """Definitions with full line ranges (Python via ``ast``, TS/JS via the regex scanner)."""
+    suffix = Path(path).suffix.lower()
+    if suffix in PYTHON_SUFFIXES:
+        try:
+            return _py_units(source)
+        except (SyntaxError, ValueError):
+            return []
+    if suffix in SCRIPT_SUFFIXES:
+        return [
+            _Unit(s.name, s.name, s.kind, s.start_line, s.end_line)
+            for s in skeletonize_script(path, source)
+            if s.kind != "imports"
+        ]
+    return []
+
+
+def _inventory_lines(path: str, units: list[_Unit], line_count: int) -> list[str]:
+    """Compact ``name start-end`` listing of everything defined in ``path``."""
+    if not units:
+        return []
+    head = (
+        f"# inventory of {path} ({line_count} lines): existing symbols as name start-end. "
+        "Do not define any of these again; change one in place (replace it)."
+    )
+    rows: list[str] = [head]
+    members: dict[str, list[_Unit]] = {}
+    for u in units:
+        if u.parent is not None:
+            members.setdefault(u.parent, []).append(u)
+
+    def rng(u: _Unit) -> str:
+        return f"{u.start}" if u.start == u.end else f"{u.start}-{u.end}"
+
+    def pack(prefix: str, items: list[str], indent: str = "    ") -> None:
+        line = prefix
+        for k, item in enumerate(items):
+            piece = item if k == 0 or line == prefix else f", {item}"
+            if len(line) + len(piece) > _INVENTORY_WIDTH and line.strip():
+                rows.append(line.rstrip(", "))
+                line = indent + item
+            else:
+                line += piece
+        if line.strip():
+            rows.append(line)
+
+    loose: list[str] = []
+    for u in units:
+        if u.parent is not None:
+            continue
+        if u.kind == "class":
+            if loose:
+                pack("", loose, "")
+                loose = []
+            kids = [f"{m.name} {rng(m)}" for m in members.get(u.name, [])]
+            if kids:
+                pack(f"class {u.name} {rng(u)}: ", kids)
+            else:
+                rows.append(f"class {u.name} {rng(u)}")
+        else:
+            label = {"function": "def", "constant": "const"}.get(u.kind, u.kind)
+            loose.append(f"{label} {u.name} {rng(u)}")
+    if loose:
+        pack("", loose, "")
+    return rows
+
+
+def _mark_outline(lines: list[tuple[int | None, str]], path: str) -> list[tuple[int | None, str]]:
+    """Tag elided bodies in an outline with :data:`OUTLINE_MARKER`."""
+    script = Path(path).suffix.lower() in SCRIPT_SUFFIXES
+    out: list[tuple[int | None, str]] = []
+    for n, text in lines:
+        stripped = text.rstrip()
+        if n is None and stripped.strip() == "...":
+            out.append((n, f"{stripped}  # {OUTLINE_MARKER}"))
+        elif script and (stripped.endswith("{ ... }") or stripped.endswith("=> ...")):
+            out.append((n, f"{stripped}  // {OUTLINE_MARKER}"))
+        else:
+            out.append((n, text))
+    return out
+
+
+def _runs(numbers: set[int]) -> list[tuple[int, int]]:
+    """Contiguous ``(start, end)`` runs of ``numbers`` (small gaps already filled by the caller)."""
+    out: list[tuple[int, int]] = []
+    for n in sorted(numbers):
+        if out and n == out[-1][1] + 1:
+            out[-1] = (out[-1][0], n)
+        else:
+            out.append((n, n))
+    return out
+
+
+def _module_file(root: Path, module: str) -> str | None:
+    """Repo-relative path of a dotted in-repo module (``pkg/mod.py`` or ``pkg/mod/__init__.py``)."""
+    if not module:
+        return None
+    base = Path(*module.split("."))
+    for cand in (base.with_suffix(".py"), base / "__init__.py"):
+        full = (root / cand).resolve()
+        try:
+            full.relative_to(root)
+        except ValueError:
+            continue
+        if full.is_file():
+            return cand.as_posix()
+    return None
+
+
+def _imported_names(path: str, source: str, root: Path) -> dict[str, set[str]]:
+    """``{repo_module_path: {names}}`` for ``from X import a, b`` lines that resolve inside the repo."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    out: dict[str, set[str]] = {}
+    pkg_parts = list(Path(path).parent.parts)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            keep = pkg_parts[: len(pkg_parts) - (node.level - 1)] if node.level > 1 else pkg_parts
+            module = ".".join([*keep, *(node.module.split(".") if node.module else [])])
+        else:
+            module = node.module or ""
+        rel = _module_file(root, module)
+        if rel is None or rel == path:
+            continue
+        out.setdefault(rel, set()).update(a.name for a in node.names if a.name != "*")
+    return out
+
+
+def _query_names(text: str) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+    """Names in subtask text: dotted ``A.b`` pairs, code-like identifiers, then plain words."""
+    dotted: list[tuple[str, str]] = []
+    for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", text):
+        pair = (m.group(1), m.group(2))
+        if pair not in dotted:
+            dotted.append(pair)
+    code = sorted(_identifiers(text), key=text.find)
+    plain: list[str] = []
+    for tok in _IDENT.findall(text):
+        if len(tok) >= 3 and tok.lower() not in _STOPWORDS and tok not in code and tok not in plain:
+            plain.append(tok)
+    return dotted, code, plain
+
+
+def _clip_full(line: str) -> str:
+    """A source line for a full view: verbatim unless absurdly long."""
+    return line if len(line) <= _FULL_LINE_CHARS else line[: _FULL_LINE_CHARS - 4] + " ..."
+
+
+def _symbol_spec(spec: str) -> tuple[str | None, str]:
+    """Split an ``extra_symbols`` entry into ``(path or None, name)``; strips backticks and ``()``."""
+    spec = spec.strip().strip("`").strip()
+    path: str | None = None
+    if "::" in spec:
+        path, spec = spec.split("::", 1)
+    else:
+        m = re.match(r"^([\w./\\-]+\.\w{1,5}):(.+)$", spec)
+        if m:
+            path, spec = m.group(1), m.group(2)
+    spec = re.sub(r"\(.*\)$", "", spec.strip()).strip()
+    return (path.replace("\\", "/").strip() if path else None), spec
+
+
 # --------------------------------------------------------------------------- engine
 
 
@@ -542,8 +811,34 @@ def _chunks(symbol: SourceSymbol, max_lines: int) -> list[list[tuple[int | None,
     return [symbol.lines[k : k + max_lines] for k in range(0, len(symbol.lines), max_lines)] or [[]]
 
 
+@dataclass
+class _Plan:
+    """Which lines of which allowed file are shown in full, and why."""
+
+    covered: dict[str, set[int]] = field(default_factory=dict)
+    targets: list[EditTarget] = field(default_factory=list)
+    units: dict[str, list[_Unit]] = field(default_factory=dict)
+    line_counts: dict[str, int] = field(default_factory=dict)
+    budget: int = 0
+    used: int = 0
+    level: int = 1
+
+
 class ContextEngine:
     """Builds :class:`~foundry.schemas.ContextSlice` objects for builder subtasks.
+
+    A slice has three kinds of snippet:
+
+    * **edit targets in full** -- the symbols the subtask will most likely
+      change (named in the subtask text, asked for via ``extra_symbols``, or
+      the most relevant ones), verbatim with original line numbers and
+      :data:`_CONTEXT_PAD` lines of context, up to a line budget
+      (:data:`DEFAULT_FULL_LINES`, env :data:`FULL_LINES_ENV`, times the
+      ``level``). A small allowed file (at most the budget) may be shown whole;
+    * an **inventory** per allowed file: every existing top-level symbol and
+      method with its line range, so builders do not define things twice;
+    * **outlines** of the other relevant symbols, bodies elided and marked
+      with :data:`OUTLINE_MARKER`.
 
     Args:
         repo_root: directory that ``allowed_files`` are relative to. Paths that
@@ -551,8 +846,12 @@ class ContextEngine:
         gemma: optional Shop Foreman client; only :meth:`abuild_slice` uses it
             (to re-rank candidate snippets). Everything works with ``None``.
         numbered: prefix snippet lines with their original line number.
-        max_snippets: default cap on snippets per slice.
-        max_total_lines: default cap on snippet text lines per slice.
+        max_snippets: default cap on outline snippets per slice.
+        max_total_lines: default cap on outline text lines per slice.
+        full_lines: level-1 full-body budget; ``None`` reads
+            :data:`FULL_LINES_ENV` (default :data:`DEFAULT_FULL_LINES`); ``0``
+            gives the old outline-only slices (``extra_symbols`` still shown).
+        inventory: add the per-file symbol inventory.
     """
 
     def __init__(
@@ -563,12 +862,16 @@ class ContextEngine:
         numbered: bool = True,
         max_snippets: int = 12,
         max_total_lines: int = 240,
+        full_lines: int | None = None,
+        inventory: bool = True,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.gemma = gemma
         self.numbered = numbered
         self.max_snippets = max_snippets
         self.max_total_lines = max_total_lines
+        self.full_lines = full_lines
+        self.inventory = inventory
         self.last_stats: SliceStats | None = None
 
     # files ------------------------------------------------------------------------
@@ -646,6 +949,140 @@ class ContextEngine:
         ranked.sort(key=lambda item: (-item[0], item[1]))
         return ranked
 
+    # edit targets ----------------------------------------------------------------------
+    def full_budget(self, level: int = 1) -> int:
+        """Full-body line budget for ``level`` (1 = base, 2 = double, 3 = triple)."""
+        base = self.full_lines
+        if base is None:
+            try:
+                base = int(os.environ.get(FULL_LINES_ENV, "") or DEFAULT_FULL_LINES)
+            except ValueError:
+                base = DEFAULT_FULL_LINES
+        return max(0, base) * max(1, min(3, int(level or 1)))
+
+    def _plan(
+        self,
+        query_text: str,
+        criteria_text: str,
+        sources: dict[str, str],
+        allowed: list[str],
+        extra_symbols: Sequence[str],
+        level: int,
+    ) -> _Plan:
+        """Pick the edit targets shown in full (see the class docstring for the order)."""
+        budget = self.full_budget(level)
+        plan = _Plan(budget=budget, level=level)
+        for p in allowed:
+            plan.units[p] = _units_for(p, sources[p])
+            plan.line_counts[p] = len(sources[p].splitlines())
+            plan.covered[p] = set()
+
+        def add(p: str, symbol: str, kind: str, start: int, end: int, reason: str, force: bool = False) -> bool:
+            n = plan.line_counts[p]
+            if n == 0:
+                return False
+            lo, hi = max(1, start - _CONTEXT_PAD), min(n, end + _CONTEXT_PAD)
+            new = set(range(lo, hi + 1)) - plan.covered[p]
+            if not new:
+                return True
+            if not force and plan.used + len(new) > budget:
+                return False
+            plan.covered[p] |= new
+            plan.used += len(new)
+            plan.targets.append(EditTarget(p, symbol, kind, start, min(end, n), reason))
+            return True
+
+        # 1. extra symbols: always in full.
+        for spec in extra_symbols or ():
+            want_path, name = _symbol_spec(str(spec))
+            if not name:
+                continue
+            for p in allowed:
+                if want_path and not (p == want_path or p.endswith("/" + want_path)):
+                    continue
+                units = plan.units[p]
+                hits = [u for u in units if u.qualname == name] or (
+                    [u for u in units if u.name == name] if "." not in name else []
+                ) or ([u for u in units if u.name == name.rsplit(".", 1)[-1]] if "." in name else [])
+                for u in hits:
+                    add(p, u.qualname, u.kind, u.start, u.end, "extra", force=True)
+        if budget <= 0:
+            return plan
+
+        # 2. symbols named in the subtask text.
+        dotted, code, plain = _query_names(query_text)
+        for p in allowed:
+            units = plan.units[p]
+            named: list[_Unit] = []
+            for a, b in dotted:
+                named += [u for u in units if u.qualname == f"{a}.{b}"]
+            for name in [*code, *plain]:
+                named += [u for u in units if u.name == name or u.qualname == name]
+            done: set[int] = set()
+            for u in named:
+                if id(u) in done:
+                    continue
+                done.add(id(u))
+                add(p, u.qualname, u.kind, u.start, u.end, "named")
+
+        # 3. small files whole.
+        for p in allowed:
+            n = plan.line_counts[p]
+            if 0 < n <= budget:
+                add(p, "<file>", "file", 1, n, "file")
+
+        # 4. top-ranked symbols while the budget lasts.
+        words, idents = _words(criteria_text), _identifiers(criteria_text)
+        scored: list[tuple[float, int, str, _Unit]] = []
+        order = 0
+        for p in allowed:
+            src = sources[p].splitlines()
+            members = {u.parent for u in plan.units[p] if u.parent}
+            for u in plan.units[p]:
+                if u.kind in {"constant", "imports", "interface", "type", "enum"}:
+                    continue
+                if u.kind == "class" and u.name in members and u.end - u.start + 1 > _MAX_RANKED_CLASS_LINES:
+                    continue
+                sym = SourceSymbol(p, u.name, u.kind, u.start, u.end, [(k, src[k - 1]) for k in range(u.start, min(u.end, len(src)) + 1)])
+                s = self.score(sym, words, idents)
+                order += 1
+                if s >= _MIN_TARGET_SCORE:
+                    scored.append((s, order, p, u))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        for _, _, p, u in scored:
+            if plan.used >= budget:
+                break
+            add(p, u.qualname, u.kind, u.start, u.end, "ranked")
+
+        # Fill tiny gaps between full ranges so they read as one excerpt.
+        for p, cov in plan.covered.items():
+            runs = _runs(cov)
+            for (_, e1), (s2, _) in zip(runs, runs[1:]):
+                if s2 - e1 - 1 <= _GAP_FILL:
+                    cov.update(range(e1 + 1, s2))
+        return plan
+
+    def _import_outlines(self, plan: _Plan, sources: dict[str, str], max_lines: int) -> list[SourceSymbol]:
+        """Level 2+: outlines of in-repo modules the targets import from (imported names only)."""
+        out: list[SourceSymbol] = []
+        total = 0
+        seen: set[str] = set()
+        for p in {t.path for t in plan.targets}:
+            if Path(p).suffix.lower() not in PYTHON_SUFFIXES:
+                continue
+            for mod, names in sorted(_imported_names(p, sources[p], self.repo_root).items()):
+                if mod in sources or mod in seen or not names:
+                    continue
+                seen.add(mod)
+                for sym in self.symbols_for(mod):
+                    if sym.kind == "imports" or sym.name not in names:
+                        continue
+                    if total + len(sym.lines) > max_lines:
+                        continue
+                    out.append(sym)
+                    total += len(sym.lines)
+        return out
+
     # slicing --------------------------------------------------------------------------
     def _collect(
         self,
@@ -667,6 +1104,28 @@ class ContextEngine:
                 sources[rel] = resolved.read_text(encoding="utf-8", errors="replace")
         return title, objective, criteria, paths, sources
 
+    def _visible(self, sym: SourceSymbol, plan: _Plan | None) -> list[tuple[int | None, str]]:
+        """Outline lines of ``sym`` not already shown in full, elided bodies marked."""
+        cov = plan.covered.get(sym.path) if plan is not None else None
+        lines = sym.lines
+        if cov:
+            kept: list[tuple[int | None, str]] = []
+            dropped = False
+            for n, t in lines:
+                if n is not None and n in cov:
+                    dropped = True
+                    continue
+                if n is None and dropped:
+                    continue
+                dropped = False
+                kept.append((n, t))
+            if not any(n is not None for n, _ in kept):
+                return []
+            lines = kept
+        if sym.kind in {"imports", "text"}:
+            return list(lines)
+        return _mark_outline(list(lines), sym.path)
+
     def _assemble(
         self,
         objective: str,
@@ -678,33 +1137,94 @@ class ContextEngine:
         max_total_lines: int,
         ranked_by_gemma: bool,
         candidates: int,
+        plan: _Plan | None = None,
+        import_outlines: Sequence[SourceSymbol] = (),
     ) -> ContextSlice:
-        snippets: list[CodeSnippet] = []
+        visible: dict[int, list[tuple[int | None, str]]] = {}
+
+        def view(sym: SourceSymbol) -> list[tuple[int | None, str]]:
+            if id(sym) not in visible:
+                visible[id(sym)] = self._visible(sym, plan)
+            return visible[id(sym)]
+
         total = 0
         used_imports: set[str] = set()
         chosen: list[SourceSymbol] = []
         for sym in ordered:
             if len(chosen) >= max_snippets:
                 break
-            need = len(sym.lines) + (0 if sym.path in used_imports or sym.path not in imports else len(imports[sym.path].lines))
+            lines = view(sym)
+            if not lines:
+                continue
+            imp = imports.get(sym.path)
+            need = len(lines) + (0 if imp is None or sym.path in used_imports else len(view(imp)))
             if total + need > max_total_lines and chosen:
                 continue
             chosen.append(sym)
-            if sym.path in imports and sym.path not in used_imports:
+            if imp is not None:
                 used_imports.add(sym.path)
             total += need
-        # Emit per file (imports first), symbols in file order, so line numbers read naturally.
+        full_paths = [p for p, cov in (plan.covered.items() if plan else []) if cov]
+        used_imports.update(p for p in full_paths if p in imports)
+
+        # (path order, sort line, tie-break, path, start, end, lines, numbered)
         order = {p: k for k, p in enumerate(sources)}
-        emit: list[SourceSymbol] = [imports[p] for p in used_imports] + chosen
-        emit.sort(key=lambda s: (order.get(s.path, 0), s.start_line))
-        for sym in emit:
-            pieces = [p for p in _chunks(sym, MAX_SNIPPET_LINES) if p]
-            for k, piece in enumerate(pieces):
+        extra_order = len(order)
+        pieces_out: list[tuple[int, int, int, str, int, int, list[tuple[int | None, str]], bool]] = []
+
+        def emit_symbol(sym: SourceSymbol, lines: list[tuple[int | None, str]], rank: int) -> None:
+            cov = plan.covered.get(sym.path, set()) if plan else set()
+            chunks = [lines[k : k + MAX_SNIPPET_LINES] for k in range(0, len(lines), MAX_SNIPPET_LINES)]
+            for k, piece in enumerate(chunks):
                 numbers = [n for n, _ in piece if n is not None]
-                start = sym.start_line if k == 0 else (min(numbers) if numbers else sym.start_line)
-                end = sym.end_line if k == len(pieces) - 1 else max(numbers or [start])
+                if k == 0 and sym.start_line not in cov:
+                    start = sym.start_line
+                else:
+                    start = min(numbers) if numbers else sym.start_line
+                if k == len(chunks) - 1 and sym.end_line not in cov:
+                    end = sym.end_line
+                else:
+                    end = max(numbers or [start])
                 end = max(end, start)
-                snippets.append(CodeSnippet(path=sym.path, start_line=start, end_line=end, text=_render(piece, self.numbered)))
+                pieces_out.append((rank, start, 1, sym.path, start, end, piece, self.numbered))
+
+        for sym in [imports[p] for p in used_imports] + chosen:
+            lines = view(sym)
+            if lines:
+                emit_symbol(sym, lines, order.get(sym.path, 0))
+        for sym in import_outlines:
+            lines = _mark_outline(list(sym.lines), sym.path)
+            emit_symbol(sym, lines, extra_order)
+
+        full_shown = 0
+        targets: list[dict[str, Any]] = []
+        inventory_files: list[str] = []
+        if plan is not None:
+            targets = [t.as_dict() for t in plan.targets]
+            for p, cov in plan.covered.items():
+                src = sources[p].splitlines()
+                for s, e in _runs(cov):
+                    run = [(n, _clip_full(src[n - 1])) for n in range(s, e + 1) if n <= len(src)]
+                    full_shown += len(run)
+                    for k in range(0, len(run), MAX_SNIPPET_LINES):
+                        piece = run[k : k + MAX_SNIPPET_LINES]
+                        pieces_out.append((order.get(p, 0), piece[0][0] or s, 1, p, piece[0][0] or s, piece[-1][0] or e, piece, self.numbered))
+            if self.inventory:
+                for p in plan.units:
+                    rows = _inventory_lines(p, plan.units[p], plan.line_counts[p])
+                    if not rows:
+                        continue
+                    inventory_files.append(p)
+                    last = max(1, plan.line_counts[p])
+                    for k in range(0, len(rows), MAX_SNIPPET_LINES):
+                        piece = [(None, r) for r in rows[k : k + MAX_SNIPPET_LINES]]
+                        pieces_out.append((order.get(p, 0), 0, k, p, 1, last, piece, False))
+
+        pieces_out.sort(key=lambda item: (item[0], item[1], item[2]))
+        snippets = [
+            CodeSnippet(path=path, start_line=start, end_line=max(start, end), text=_render(piece, numbered))
+            for _, _, _, path, start, end, piece, numbered in pieces_out
+        ]
         source_lines = sum(len(s.splitlines()) for s in sources.values())
         sliced = ContextSlice(
             objective=objective,
@@ -721,6 +1241,12 @@ class ContextEngine:
             candidates=candidates,
             selected=len(chosen),
             ranked_by_gemma=ranked_by_gemma,
+            level=plan.level if plan is not None else 1,
+            full_budget=plan.budget if plan is not None else 0,
+            full_lines_shown=full_shown,
+            targets=targets,
+            inventory_files=inventory_files,
+            import_outline_files=sorted({s.path for s in import_outlines}),
         )
         return sliced
 
@@ -746,6 +1272,31 @@ class ContextEngine:
             return relevant
         return [s for _, _, s in sorted(ranked, key=lambda item: item[1])]
 
+    def _setup(
+        self,
+        subtask: SubtaskAllocation | None,
+        objective: str,
+        acceptance_criteria: Sequence[str] | None,
+        allowed_files: Sequence[str] | None,
+        extra_files: Sequence[str],
+        description: str,
+        extra_symbols: Sequence[str],
+        level: int,
+    ) -> tuple[str, str, list[str], dict[str, str], list[tuple[float, int, SourceSymbol]], dict[str, SourceSymbol], _Plan]:
+        """Shared first half of :meth:`build_slice` / :meth:`abuild_slice`."""
+        raw_objective = objective
+        title, objective, criteria, _paths, sources = self._collect(
+            subtask, objective, acceptance_criteria, allowed_files, extra_files
+        )
+        ranked, imports = self._prepare(title, objective, criteria, sources)
+        files = list(allowed_files if allowed_files is not None else (subtask.allowed_files if subtask else []))
+        allowed = [p for p in self.expand_files(files) if p in sources]
+        description = description or str(getattr(subtask, "description", "") or "")
+        query_text = "\n".join([title, raw_objective or "", description, *criteria])
+        level = max(1, min(3, int(level or 1)))
+        plan = self._plan(query_text, query_text, sources, allowed, extra_symbols, level)
+        return title, objective, criteria, sources, ranked, imports, plan
+
     def build_slice(
         self,
         subtask: SubtaskAllocation | None = None,
@@ -756,6 +1307,9 @@ class ContextEngine:
         extra_files: Sequence[str] = (),
         max_snippets: int | None = None,
         max_total_lines: int | None = None,
+        level: int = 1,
+        extra_symbols: Sequence[str] = (),
+        description: str = "",
     ) -> ContextSlice:
         """Build a deterministic :class:`ContextSlice` for one subtask (no Gemma).
 
@@ -767,17 +1321,24 @@ class ContextEngine:
             acceptance_criteria: overrides ``subtask.acceptance_criteria``.
             allowed_files: overrides ``subtask.allowed_files`` (globs allowed;
                 files that do not exist yet are skipped).
-            extra_files: read-only reference files to consider as well.
-            max_snippets / max_total_lines: per-call caps.
+            extra_files: read-only reference files to consider as well (outlines only).
+            max_snippets / max_total_lines: per-call caps on outline snippets.
+            level: context level, ``1`` (default), ``2`` (double full-body
+                budget plus outlines of in-repo modules the targets import
+                from) or ``3`` (triple budget plus those outlines).
+            extra_symbols: names (``foo``, ``Class.method``, optionally
+                ``path::name``) always shown in full, e.g. from a BLOCKED reply.
+            description: longer subtask description; only used to find
+                named edit targets.
 
         Returns:
-            The slice. Size accounting is left in :attr:`last_stats`
-            (``tokens_saved`` for telemetry).
+            The slice. Size accounting and the chosen edit targets are left in
+            :attr:`last_stats`.
         """
-        title, objective, criteria, _paths, sources = self._collect(
-            subtask, objective, acceptance_criteria, allowed_files, extra_files
+        _title, objective, criteria, sources, ranked, imports, plan = self._setup(
+            subtask, objective, acceptance_criteria, allowed_files, extra_files, description, extra_symbols, level
         )
-        ranked, imports = self._prepare(title, objective, criteria, sources)
+        caps_lines = max_total_lines or self.max_total_lines
         return self._assemble(
             objective,
             criteria,
@@ -785,9 +1346,11 @@ class ContextEngine:
             self._default_order(ranked),
             imports,
             max_snippets or self.max_snippets,
-            max_total_lines or self.max_total_lines,
+            caps_lines,
             False,
             len(ranked),
+            plan,
+            self._import_outlines(plan, sources, caps_lines) if plan.level >= 2 else (),
         )
 
     def build_slice_with_stats(self, *args: Any, **kwargs: Any) -> tuple[ContextSlice, SliceStats]:
@@ -806,18 +1369,21 @@ class ContextEngine:
         extra_files: Sequence[str] = (),
         max_snippets: int | None = None,
         max_total_lines: int | None = None,
+        level: int = 1,
+        extra_symbols: Sequence[str] = (),
+        description: str = "",
     ) -> ContextSlice:
-        """Like :meth:`build_slice`, but lets Gemma rank the candidates when available.
+        """Like :meth:`build_slice`, but lets Gemma rank the outline candidates when available.
 
         Gemma receives only symbol ids and their first signature line and must
         reply with JSON ``{"ranked": [id, ...]}``. Unknown ids are ignored,
         unranked relevant symbols are appended, and any error (no Gemma,
-        unreachable, bad JSON) falls back to the deterministic order.
+        unreachable, bad JSON) falls back to the deterministic order. Edit
+        targets shown in full are always chosen deterministically.
         """
-        title, objective, criteria, _paths, sources = self._collect(
-            subtask, objective, acceptance_criteria, allowed_files, extra_files
+        title, objective, criteria, sources, ranked, imports, plan = self._setup(
+            subtask, objective, acceptance_criteria, allowed_files, extra_files, description, extra_symbols, level
         )
-        ranked, imports = self._prepare(title, objective, criteria, sources)
         ordered = self._default_order(ranked)
         used_gemma = False
         if self.gemma is not None and len(ranked) > 1:
@@ -826,6 +1392,7 @@ class ContextEngine:
                 rest = [s for s in ordered if all(s is not g for g in gemma_order)]
                 ordered = gemma_order + rest
                 used_gemma = True
+        caps_lines = max_total_lines or self.max_total_lines
         return self._assemble(
             objective,
             criteria,
@@ -833,9 +1400,11 @@ class ContextEngine:
             ordered,
             imports,
             max_snippets or self.max_snippets,
-            max_total_lines or self.max_total_lines,
+            caps_lines,
             used_gemma,
             len(ranked),
+            plan,
+            self._import_outlines(plan, sources, caps_lines) if plan.level >= 2 else (),
         )
 
     async def _gemma_rank(

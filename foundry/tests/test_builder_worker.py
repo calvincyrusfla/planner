@@ -254,7 +254,7 @@ def test_parse_builder_reply_single_block_is_ready() -> None:
 @pytest.mark.parametrize(
     "reply, fragment",
     [
-        ("I changed it, trust me.", "no ```diff block"),
+        ("I changed it, trust me.", "no ```edits or ```diff block"),
         ("BLOCKED: the file does not exist", "BLOCKED: the file does not exist"),
         (fenced(GOOD_DIFF) + fenced(GOOD_DIFF), "2 ```diff blocks"),
         ("```diff\n" + GOOD_DIFF, "not closed"),
@@ -427,7 +427,7 @@ def test_bad_reply_format_is_sent_back_without_review(tmp_path: Path) -> None:
     rig.submit("T-R", "S")
     asyncio.run(run_pool(rig, ["T-R"]))
     second = rig.client.prompts_for(f"{TEAM}-1")[1]
-    assert "no ```diff block" in second
+    assert "no ```edits or ```diff block" in second
     assert rig.client.calls[REVIEWER] == 1
 
 

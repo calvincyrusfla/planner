@@ -69,6 +69,7 @@ from foundry.schemas import (
 
 __all__ = [
     "DIFF_CONTRACT",
+    "BUILDER_CONTRACT",
     "REVIEWER_CONTRACT",
     "MAX_FIX_HINT_CHARS",
     "build_builder_prompt",
@@ -76,6 +77,7 @@ __all__ = [
     "parse_builder_reply",
     "parse_reviewer_reply",
     "extract_diff_paths",
+    "extract_requested_symbols",
     "directives_to_hint",
     "format_pre_review_notes",
     "PRE_REVIEW_MODES",
@@ -99,18 +101,42 @@ PRE_REVIEW_MODES: tuple[str, ...] = ("off", "advise", "gate")
 PRE_REVIEW_MAX_SEND_BACKS = 1
 #: Queue kv key prefix holding a ticket's pre-review send-back count (survives restarts).
 PRE_REVIEW_KV_PREFIX = "pre_review_sent_back:"
+#: Queue kv key prefix holding the symbols a ticket's builder asked to see in full.
+EXTRA_SYMBOLS_KV_PREFIX = "extra_symbols:"
+#: Widest context level (``ContextEngine.build_slice(level=...)``); retries step up to it.
+MAX_CONTEXT_LEVEL = 3
 
 #: Longest one-line hint produced by the local fallback condenser.
 _ONE_LINE_CHARS = 160
 
-DIFF_CONTRACT = (
-    "Reply with exactly one fenced code block that starts with ```diff and contains a "
-    "unified diff (`--- a/<path>` / `+++ b/<path>` headers and `@@` hunks; use "
-    "`--- /dev/null` for a new file). Only touch the files listed under 'Files you may "
-    "modify'. Put no other code blocks in the reply and do not paste whole files. If you "
-    "cannot do the work, reply with a single line starting with `BLOCKED:` and the "
-    "reason, and no diff block."
+EDITS_EXAMPLE = (
+    '```edits\n'
+    '{"edits": [{"op": "replace_symbol", "file": "pkg/mod.py", "symbol": "Shop.total",\n'
+    '  "code": "    def total(self):\\n        return sum(self.items)\\n"}]}\n'
+    '```'
 )
+"""A tiny ```edits example quoted in the builder contract."""
+
+BUILDER_CONTRACT = (
+    "Reply with exactly one fenced code block: either ```edits (preferred for changes to "
+    "existing code) or ```diff. Only touch the files listed under 'Files you may modify'. "
+    "Put no other code blocks in the reply and do not paste whole files.\n"
+    "- ```edits holds JSON {\"edits\": [...]}; Foundry applies the edits and builds the diff "
+    "itself, so you need no surrounding lines. Ops (each names its \"file\"): "
+    "`replace_symbol` {file, symbol, code} replaces a whole top-level function/class or "
+    "`Class.method` (code must define exactly that symbol, decorators included); "
+    "`insert_after_symbol` / `insert_before_symbol` {file, symbol, code}; `append` {file, code}; "
+    "`search_replace` {file, old, new} (`old` must occur exactly once, whitespace-exact); "
+    "`create_file` {file, code} (new files only); `delete_symbol` {file, symbol}. Never "
+    "re-define a symbol that already exists (see the inventory): use `replace_symbol`. "
+    "Example:\n" + EDITS_EXAMPLE + "\n"
+    "- ```diff holds a unified diff (`--- a/<path>` / `+++ b/<path>` headers and `@@` hunks "
+    "with exact context lines; `--- /dev/null` for a new file).\n"
+    "If a body you must change is hidden (outline only), or you cannot do the work, reply with "
+    "a single line starting with `BLOCKED:` naming the symbols you need in backticks "
+    "(e.g. BLOCKED: need the body of `evaluate_line_anomaly`), and no code block."
+)
+DIFF_CONTRACT = BUILDER_CONTRACT  # backwards-compatible name
 """The builder output contract quoted verbatim in every builder prompt."""
 
 REVIEWER_CONTRACT = (
@@ -267,9 +293,10 @@ def build_builder_prompt(assignment: TaskAssignment) -> str:
     """Return the exact prompt a builder sends to Claude for ``assignment``.
 
     Contains only: who/what (ids, attempt), the objective, acceptance criteria,
-    allowed files, the pruned ``ContextSlice`` snippets, the fix hint from the
-    previous attempt (if any) and the diff-only output contract.  Never whole
-    files: the context engine already capped every snippet at 50 lines.
+    allowed files, the pruned ``ContextSlice`` snippets (edit targets in full,
+    the rest as outlines, plus a symbol inventory), the fix hint from the
+    previous attempt (if any) and the ```edits / ```diff output contract.  Never
+    whole files beyond the context engine's line budget.
     """
     ctx = assignment.context
     criteria = assignment.acceptance_criteria or ctx.acceptance_criteria
@@ -287,7 +314,11 @@ def build_builder_prompt(assignment: TaskAssignment) -> str:
     parts += ["", "## Files you may modify"]
     parts += [f"- {f}" for f in assignment.allowed_files] or ["- (no restriction given)"]
     if ctx.snippets:
-        parts += ["", "## Context (pruned excerpts; elided bodies are shown as `...`)"]
+        parts += [
+            "",
+            "## Context (pruned excerpts; symbols you must change are shown in full with line "
+            "numbers, others as outlines whose elided bodies are `...`)",
+        ]
         for snip in ctx.snippets:
             fence = _fence_for(snip.text)
             parts += [
@@ -302,7 +333,7 @@ def build_builder_prompt(assignment: TaskAssignment) -> str:
             "## Fix required (your previous attempt was sent back)",
             assignment.fix_hint.strip(),
         ]
-    parts += ["", "## Output contract", DIFF_CONTRACT]
+    parts += ["", "## Output contract", BUILDER_CONTRACT]
     return "\n".join(parts) + "\n"
 
 
@@ -364,6 +395,8 @@ def build_reviewer_prompt(
 _DIFF_OPEN_RE = re.compile(r"^[ \t]*```diff[^\n`]*$", re.M)
 _DIFF_BLOCK_RE = re.compile(r"^[ \t]*```diff[^\n`]*\n(.*?)^[ \t]*```[ \t]*$", re.M | re.S)
 _BLOCKED_RE = re.compile(r"^\s*BLOCKED:\s*(.+)$", re.M)
+_EDITS_OPEN_RE = re.compile(r"^[ \t]*```edits[^\n`]*$", re.M)
+_EDITS_BLOCK_RE = re.compile(r"^[ \t]*```edits[^\n`]*\n(.*?)^[ \t]*```[ \t]*$", re.M | re.S)
 
 
 def extract_diff_paths(diff: str) -> list[str]:
@@ -389,16 +422,25 @@ def extract_diff_paths(diff: str) -> list[str]:
     return paths
 
 
-def parse_builder_reply(text: str, assignment: TaskAssignment) -> BuilderSubmission:
+def parse_builder_reply(
+    text: str,
+    assignment: TaskAssignment,
+    *,
+    workspace: str | Path | None = None,
+) -> BuilderSubmission:
     """Turn a builder's Claude reply into a :class:`BuilderSubmission`.
 
     ``ready_for_review`` only when the reply has exactly one closed ```diff block
     holding a non-empty unified diff whose files are all in
-    ``assignment.allowed_files`` (no restriction when that list is empty).
+    ``assignment.allowed_files`` (no restriction when that list is empty), or
+    exactly one ```edits block (JSON ``{"edits": [...]}``) that
+    :func:`foundry.edits.apply_edits` applies cleanly to ``workspace`` (the
+    workspace is not modified; the generated unified diff becomes
+    ``submission.diff``, so gates, review and publishing are unchanged).
     Anything else (no block, several blocks, unterminated block, no headers or
-    hunks, files outside the allowance, an explicit ``BLOCKED:``) gives a
-    ``blocked`` submission with ``blocker_notes`` saying why, so it never
-    reaches the reviewer.
+    hunks, files outside the allowance, invalid edits, an explicit
+    ``BLOCKED:``) gives a ``blocked`` submission with ``blocker_notes`` saying
+    why, so it never reaches the reviewer.
     """
     base = {
         "task_id": assignment.task_id,
@@ -417,10 +459,18 @@ def parse_builder_reply(text: str, assignment: TaskAssignment) -> BuilderSubmiss
         )
 
     openers = len(_DIFF_OPEN_RE.findall(text))
+    edit_openers = len(_EDITS_OPEN_RE.findall(text))
+    if openers and edit_openers:
+        return blocked(
+            "reply contained both an ```edits and a ```diff block; send exactly one",
+            checks={"single_diff_block": False},
+        )
+    if edit_openers:
+        return _parse_edits_reply(text, edit_openers, assignment, workspace, blocked, base)
     blocks = _DIFF_BLOCK_RE.findall(text)
     if openers == 0:
         m = _BLOCKED_RE.search(text)
-        note = f"builder reported BLOCKED: {m.group(1).strip()}" if m else "reply contained no ```diff block"
+        note = f"builder reported BLOCKED: {m.group(1).strip()}" if m else "reply contained no ```edits or ```diff block"
         return blocked(note, checks={"single_diff_block": False})
     if openers > 1 or len(blocks) > 1:
         return blocked(
@@ -465,6 +515,122 @@ def parse_builder_reply(text: str, assignment: TaskAssignment) -> BuilderSubmiss
         self_check=checks,
         blocker_notes=None,
     )
+
+
+def _parse_edits_reply(
+    text: str,
+    openers: int,
+    assignment: TaskAssignment,
+    workspace: str | Path | None,
+    blocked: Callable[..., BuilderSubmission],
+    base: dict[str, Any],
+) -> BuilderSubmission:
+    """The ```edits half of :func:`parse_builder_reply`."""
+    blocks = _EDITS_BLOCK_RE.findall(text)
+    if openers > 1 or len(blocks) > 1:
+        return blocked(
+            f"reply contained {max(openers, len(blocks))} ```edits blocks; exactly one is required",
+            checks={"single_edits_block": False},
+        )
+    if not blocks:
+        return blocked("the ```edits block was not closed", checks={"single_edits_block": False})
+    checks: dict[str, bool] = {"single_edits_block": True}
+    raw = blocks[0].strip()
+    if not raw:
+        return blocked("the ```edits block was empty", checks={**checks, "edits_json": False})
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return blocked(
+            f"the ```edits block is not valid JSON ({exc.msg} at line {exc.lineno} col {exc.colno})",
+            checks={**checks, "edits_json": False},
+        )
+    edits = data.get("edits") if isinstance(data, dict) else data
+    if not isinstance(edits, list) or not edits:
+        return blocked(
+            'the ```edits block must be {"edits": [ ... ]} with at least one edit',
+            checks={**checks, "edits_json": False},
+        )
+    checks["edits_json"] = True
+    if workspace is None:
+        return blocked(
+            "```edits replies cannot be applied here (no workspace); send a ```diff block",
+            checks={**checks, "edits_applied": False},
+        )
+    from foundry.edits import apply_edits  # local: keeps the pure parsers importable alone
+
+    allowed = [_normalize_path(f) for f in assignment.allowed_files]
+    try:
+        diff, errors = apply_edits(Path(workspace), edits, allowed or None)
+    except Exception as exc:  # a malformed edit must never crash the worker
+        diff, errors = "", [f"{type(exc).__name__}: {exc}"]
+    if errors:
+        shown = "; ".join(_one_line(str(e), 200) for e in list(errors)[:3])
+        more = f" (+{len(errors) - 3} more)" if len(errors) > 3 else ""
+        return blocked(f"edits rejected: {shown}{more}", checks={**checks, "edits_applied": False})
+    if not diff or not diff.strip():
+        return blocked("the edits changed nothing", checks={**checks, "edits_applied": False})
+    if not diff.endswith("\n"):
+        diff += "\n"
+    files = extract_diff_paths(diff)
+    allowed_set = set(allowed)
+    outside = [f for f in files if allowed_set and f not in allowed_set]
+    checks["edits_applied"] = True
+    checks["files_allowed"] = not outside
+    if outside:
+        return blocked("edits touch files outside the allowance: " + ", ".join(outside),
+                       diff=diff, files=files, checks=checks)
+    return BuilderSubmission(
+        **base,
+        status="ready_for_review",
+        modified_files=files,
+        diff=diff,
+        self_check=checks,
+        blocker_notes=None,
+    )
+
+
+#: Backticked identifiers (``foo``, ``Class.method``) in a BLOCKED note.
+_BACKTICK_SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\(\))?`")
+#: "body of X" / "bodies of X" / "definition of X" in a BLOCKED note.
+_BODY_OF_RE = re.compile(
+    r"\b(?:body|bodies|definition|implementation|source)\s+of\s+`?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)",
+    re.I,
+)
+_FILE_SUFFIXES = (".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md",
+                  ".toml", ".yaml", ".yml", ".txt", ".cfg", ".ini", ".html", ".css")
+_NOT_SYMBOLS = {"git", "apply", "diff", "edits", "blocked", "none", "true", "false", "self", "cls",
+                "replace_symbol", "insert_after_symbol", "insert_before_symbol", "append",
+                "search_replace", "create_file", "delete_symbol"}
+#: Most symbols carried from a BLOCKED note into the next attempt's slice.
+MAX_EXTRA_SYMBOLS = 12
+
+
+def extract_requested_symbols(note: str | None) -> list[str]:
+    """Symbols a builder asked for in a BLOCKED / blocker note, in order, de-duplicated.
+
+    Picks backticked identifiers (``foo``, ``Class.method``, ``foo()``) and
+    names after "body of" / "definition of".  File names, ops and short
+    words are skipped.
+    """
+    if not note:
+        return []
+    found: list[str] = []
+    candidates = [m.group(1) for m in _BACKTICK_SYMBOL_RE.finditer(note)]
+    candidates += [m.group(1) for m in _BODY_OF_RE.finditer(note)]
+    for name in candidates:
+        name = name.strip(".")
+        if (
+            len(name) < 2
+            or name.lower() in _NOT_SYMBOLS
+            or name.lower().endswith(_FILE_SUFFIXES)
+            or name in found
+        ):
+            continue
+        found.append(name)
+        if len(found) >= MAX_EXTRA_SYMBOLS:
+            break
+    return found
 
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?[ \t]*\n(.*?)\n?```$", re.S)
@@ -1101,6 +1267,8 @@ class BuilderWorker(_WorkerBase):
         self.pre_review_min_confidence = float(pre_review_min_confidence)
         #: Stand-in for queues without ``kv_get``/``kv_set`` (per-ticket send-back count).
         self._local_pre_review: dict[str, int] = {}
+        #: Stand-in for queues without kv: per-ticket symbols requested in BLOCKED notes.
+        self._local_symbols: dict[str, list[str]] = {}
         #: Skips the pre-review for a while after repeated Gemma errors (TeamPool shares one).
         self.pre_review_breaker = pre_review_breaker if pre_review_breaker is not None else PreReviewBreaker()
         self.workspace: Path | None = Path(workspace) if workspace is not None else None
@@ -1242,15 +1410,23 @@ class BuilderWorker(_WorkerBase):
             acceptance_criteria=info["acceptance_criteria"],
             allowed_files=info["allowed_files"],
         )
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "acceptance_criteria": info["acceptance_criteria"],
             "allowed_files": info["allowed_files"],
         }
+        # Retries widen the context: attempt 1 -> level 1, attempt 2 -> 2, attempt 3+ -> 3;
+        # symbols a builder asked for (BLOCKED note) are always shown in full.
+        attempt = max(0, int(_get(ticket, "attempt", 0) or 0))
+        widen = {"level": min(attempt + 1, MAX_CONTEXT_LEVEL)}
+        extra = self._requested_symbols(ticket)
+        if extra:
+            widen["extra_symbols"] = extra
         afn = getattr(engine, "abuild_slice", None)
         if afn is not None and getattr(engine, "gemma", None) is not None:
-            result = await afn(subtask, objective, **kwargs)
+            result = await afn(subtask, objective, **kwargs, **_supported_kwargs(afn, widen))
         else:
-            result = await _maybe_await(engine.build_slice(subtask, objective, **kwargs))
+            bfn = engine.build_slice
+            result = await _maybe_await(bfn(subtask, objective, **kwargs, **_supported_kwargs(bfn, widen)))
         stats = getattr(engine, "last_stats", None)
         saved = int(getattr(stats, "tokens_saved", 0) or 0)
         if isinstance(result, Mapping):
@@ -1386,7 +1562,7 @@ class BuilderWorker(_WorkerBase):
             )
 
         # 3. parse the reply (diff-only contract); a bad reply never reaches gates or reviewer
-        submission = parse_builder_reply(result.text, assignment)
+        submission = parse_builder_reply(result.text, assignment, workspace=self._edits_root())
         self._event(
             "submission",
             task_id,
@@ -1397,7 +1573,8 @@ class BuilderWorker(_WorkerBase):
             self._reset_infra(ticket)  # a parsed reply (E1)
             self._tm("record_gate_failure", task_id)
             note = submission.blocker_notes or "submission blocked"
-            return self._send_back(ticket, _one_line(f"Fix the reply: {note}. {_SHORT_CONTRACT}", 300), reason="blocked")
+            self._remember_requested_symbols(ticket, note)
+            return self._send_back(ticket, _one_line(f"Fix the reply: {note}. {_SHORT_CONTRACT}", 700), reason="blocked")
 
         # 4. deterministic gates, short-circuit before any reviewer
         self._set_state(task_id, TaskState.VALIDATING)
@@ -1436,6 +1613,51 @@ class BuilderWorker(_WorkerBase):
 
         await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta, notes)
         return "review"
+
+    # -- edits / requested symbols ----------------------------------------------
+    def _edits_root(self) -> Path | None:
+        """Where ```edits replies are resolved: the gate workspace, else the engine's repo."""
+        if self.workspace is not None:
+            return self.workspace
+        root = getattr(self.context_engine, "repo_root", None)
+        return Path(root) if root is not None else None
+
+    def _symbols_key(self, ticket: Any) -> str:
+        return f"{EXTRA_SYMBOLS_KV_PREFIX}{_get(ticket, 'ticket_id')}"
+
+    def _requested_symbols(self, ticket: Any) -> list[str]:
+        """Symbols earlier attempts of ``ticket`` asked to see in full (queue kv, survives restarts)."""
+        key = self._symbols_key(ticket)
+        value: Any = None
+        getter = getattr(self.queue, "kv_get", None)
+        if getter is not None:
+            try:
+                value = getter(key, None)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("kv_get(%s) failed", key)
+        if value is None:
+            value = self._local_symbols.get(key)
+        return [str(v) for v in (value or []) if isinstance(v, str) and v]
+
+    def _remember_requested_symbols(self, ticket: Any, note: str) -> list[str]:
+        """Add the symbols named in a blocker ``note`` to the ticket's extra_symbols."""
+        names = extract_requested_symbols(note)
+        if not names:
+            return []
+        merged = self._requested_symbols(ticket)
+        merged += [n for n in names if n not in merged]
+        merged = merged[-MAX_EXTRA_SYMBOLS:]
+        key = self._symbols_key(ticket)
+        self._local_symbols[key] = merged
+        setter = getattr(self.queue, "kv_set", None)
+        if setter is not None:
+            try:
+                setter(key, merged)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("kv_set(%s) failed", key)
+        self._event("extra_symbols", _get(ticket, "task_id"),
+                    {"ticket_id": _get(ticket, "ticket_id"), "symbols": merged})
+        return merged
 
     # -- Gemma pre-review -----------------------------------------------------
     def _pre_review_key(self, ticket: Any) -> str:
@@ -1642,7 +1864,10 @@ class BuilderWorker(_WorkerBase):
         )
 
 
-_SHORT_CONTRACT = "Reply with exactly one ```diff block holding a unified diff of the allowed files."
+_SHORT_CONTRACT = (
+    "Reply with exactly one ```edits block (JSON ops such as replace_symbol) or one ```diff "
+    "block, touching only the allowed files."
+)
 
 
 def _is_counted_infra(exc: BaseException) -> bool:
