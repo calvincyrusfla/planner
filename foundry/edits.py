@@ -21,14 +21,21 @@ Operations (``file`` is a workspace-relative POSIX path):
 
 * ``replace_symbol {file, symbol, code}`` - replace a top-level function or
   class, or ``Class.method`` (decorators included). ``code`` must define
-  exactly that symbol. Python only.
+  exactly that symbol. Python and plain JavaScript.
 * ``insert_after_symbol`` / ``insert_before_symbol {file, symbol, code}`` -
-  insert ``code`` next to a symbol, at the symbol's indentation. Python only.
+  insert ``code`` next to a symbol, at the symbol's indentation. Python and plain
+  JavaScript.
 * ``append {file, code}`` - add ``code`` at the end of the file.
 * ``search_replace {file, old, new}`` - ``old`` must occur exactly once
   (whitespace-exact).
 * ``create_file {file, code}`` - the file must not exist yet.
-* ``delete_symbol {file, symbol}`` - remove a symbol. Python only.
+* ``delete_symbol {file, symbol}`` - remove a symbol. Python and plain JavaScript.
+
+In ``.js``, ``.mjs`` and ``.cjs`` files a symbol is a top-level function, class
+or ``const``/``let``/``var``, or ``Class.method``. When a class has several
+members of one name, qualify it: ``Cls.get x``, ``Cls.set x``, ``Cls.static x``
+or ``Cls.static get x``. A ``replace_symbol`` may also leave it unqualified when
+its ``code`` shows which member is meant.
 
 :func:`apply_edits` validates every edit (allowed paths, the result parses,
 no duplicate definitions introduced) and returns ``(diff_text, errors)``.
@@ -43,6 +50,7 @@ import difflib
 import json
 import re
 import textwrap
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -329,6 +337,427 @@ def _duplicates(text: str) -> dict[str, list[int]]:
 
 
 # --------------------------------------------------------------------------
+# JavaScript symbol helpers (plain JavaScript only: no JSX/TSX, and regex
+# literals are not recognised, so a file they confuse is refused, not guessed)
+# --------------------------------------------------------------------------
+
+_JS_SUFFIXES = (".js", ".mjs", ".cjs")
+_JS_NAME = r"[A-Za-z_$][\w$]*"
+_JS_DECL_RE = re.compile(
+    r"(?:export\s+(?:default\s+)?)?(?:"
+    rf"(?:async\s+)?function\b\s*\*?\s*(?P<function>{_JS_NAME})"
+    rf"|class\s+(?!extends\b)(?P<class>{_JS_NAME})"
+    rf"|(?:const|let|var)\s+(?P<variable>{_JS_NAME})"
+    r")"
+)
+_JS_MEMBER_RE = re.compile(
+    r"(?P<static>static\s+)?(?:async\s+)?(?:\*\s*)?(?:(?P<accessor>get|set)\s+)?"
+    rf"(?P<name>#?{_JS_NAME})\s*\("
+)
+_JS_WORD_RE = re.compile(r"[\w$]+")
+_JS_CONTINUATION_WORD_RE = re.compile(r"(?:in|instanceof)\b")
+_JS_QUOTES = "'\"`"
+_JS_PAIRS = {"(": ")", "[": "]", "{": "}"}
+_JS_CLOSERS = ")]}"
+_JS_OPERATOR_END = "=,+-*/%&|^<>?:!~."
+_JS_CONTINUATION_START = ",.=+-*/%&|^<>?:([`"
+_JS_MEMBER_KINDS = ("method", "get", "set")
+
+
+@dataclass(frozen=True)
+class _JsSymbol:
+    """One JavaScript symbol; ``start`` and ``end`` are offsets of its first and last character."""
+
+    name: str
+    start: int
+    end: int
+    kind: str
+    static: bool = False
+
+    @property
+    def qualifiers(self) -> set[str]:
+        """Words that may precede the member name in a symbol reference."""
+        found = {"static"} if self.static else set()
+        if self.kind in ("get", "set"):
+            found.add(self.kind)
+        return found
+
+    @property
+    def label(self) -> str:
+        """The reference naming this symbol, e.g. ``Cls.static get x``."""
+        owner, dot, base = self.name.rpartition(".")
+        words = ["static"] if self.static else []
+        if self.kind in ("get", "set"):
+            words.append(self.kind)
+        return f"{owner}{dot}{' '.join([*words, base])}"
+
+    @property
+    def key(self) -> tuple[str, str, bool]:
+        """Identity used to spot duplicates (a getter and a setter do not clash)."""
+        return (self.name, self.kind if self.kind in _JS_MEMBER_KINDS else "", self.static)
+
+
+def _js_error(what: str, text: str, pos: int) -> ValueError:
+    line = text.count("\n", 0, pos) + 1
+    return ValueError(f"cannot scan JavaScript: {what} at line {line} (use search_replace)")
+
+
+def _js_string_end(text: str, start: int) -> int:
+    """Return the offset just after the quoted string opening at ``start``."""
+    quote = text[start]
+    i = start + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+        elif text[i] == quote:
+            return i + 1
+        elif text[i] == "\n":
+            break
+        else:
+            i += 1
+    raise _js_error("unterminated string", text, start)
+
+
+def _js_substitution_end(text: str, start: int) -> int:
+    """Return the offset just after a template substitution whose body begins at ``start``."""
+    depth = 1
+    i = start
+    while i < len(text):
+        end = _js_skip_literal(text, i)
+        if end is not None:
+            i = end
+            continue
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if not depth:
+                return i + 1
+        i += 1
+    raise _js_error("unterminated template substitution", text, start)
+
+
+def _js_template_end(text: str, start: int) -> int:
+    """Return the offset just after the template literal opening at ``start``."""
+    i = start + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+        elif text[i] == "`":
+            return i + 1
+        elif text.startswith("${", i):
+            i = _js_substitution_end(text, i + 2)
+        else:
+            i += 1
+    raise _js_error("unterminated template literal", text, start)
+
+
+def _js_skip_literal(text: str, i: int) -> int | None:
+    """Return the end of the comment, string or template at ``i`` (None if there is none)."""
+    if text.startswith("//", i):
+        end = text.find("\n", i)
+        return len(text) if end < 0 else end
+    if text.startswith("/*", i):
+        end = text.find("*/", i + 2)
+        if end < 0:
+            raise _js_error("unterminated comment", text, i)
+        return end + 2
+    if text[i] == "`":
+        return _js_template_end(text, i)
+    if text[i] in _JS_QUOTES:
+        return _js_string_end(text, i)
+    return None
+
+
+def _js_mask(text: str) -> str:
+    """Blank comments and literal contents, keeping every offset and newline."""
+    out = list(text)
+    i = 0
+    while i < len(text):
+        end = _js_skip_literal(text, i)
+        if end is None:
+            i += 1
+            continue
+        quoted = text[i] in _JS_QUOTES
+        for k in range(i + 1 if quoted else i, end - 1 if quoted else end):
+            if out[k] != "\n":
+                out[k] = " "
+        i = end
+    return "".join(out)
+
+
+def _js_skip_space(mask: str, i: int, limit: int) -> int:
+    while i < limit and mask[i].isspace():
+        i += 1
+    return i
+
+
+def _js_close(mask: str, start: int) -> int:
+    """Return the offset of the bracket closing the one at ``start``."""
+    stack: list[str] = []
+    for i in range(start, len(mask)):
+        char = mask[i]
+        if char in _JS_PAIRS:
+            stack.append(_JS_PAIRS[char])
+        elif char in _JS_CLOSERS:
+            if char != stack[-1]:
+                raise _js_error(f"mismatched {char!r}", mask, i)
+            stack.pop()
+            if not stack:
+                return i
+    raise _js_error(f"unbalanced {mask[start]!r}", mask, start)
+
+
+def _js_function_end(mask: str, paren: int) -> int | None:
+    """Return the end of the body after the parameters at ``paren`` (None if no body)."""
+    brace = _js_skip_space(mask, _js_close(mask, paren) + 1, len(mask))
+    if brace >= len(mask) or mask[brace] != "{":
+        return None
+    return _js_close(mask, brace)
+
+
+def _js_continues(mask: str, last: int, i: int) -> bool:
+    """True when the token at ``i`` carries on the statement ending at ``last``."""
+    if mask.startswith(("++", "--"), i):
+        return False
+    if mask[last] in _JS_OPERATOR_END and mask[last - 1 : last + 1] not in ("++", "--"):
+        return True
+    return mask[i] in _JS_CONTINUATION_START or bool(_JS_CONTINUATION_WORD_RE.match(mask, i))
+
+
+def _js_statement_end(mask: str, pos: int, limit: int) -> int:
+    """Return the last offset of the statement at ``pos``, its semicolon when it has one."""
+    last = pos - 1
+    i = pos
+    while True:
+        i = _js_skip_space(mask, i, limit)
+        if i >= limit:
+            return last
+        char = mask[i]
+        if char == ";":
+            return i
+        if "\n" in mask[last + 1 : i] and not _js_continues(mask, last, i):
+            return last
+        if char in _JS_CLOSERS:
+            raise _js_error(f"stray {char!r}", mask, i)
+        if char in _JS_PAIRS:
+            i = _js_close(mask, i)
+        last = i
+        i += 1
+
+
+def _js_members(mask: str, brace: int, close: int, prefix: str) -> list[_JsSymbol]:
+    """Return the methods and accessors between the class braces ``brace`` and ``close``."""
+    out: list[_JsSymbol] = []
+    i = brace + 1
+    while i < close:
+        if mask[i].isspace() or mask[i] == ";":
+            i += 1
+            continue
+        match = _JS_MEMBER_RE.match(mask, i, close)
+        end = _js_function_end(mask, match.end() - 1) if match else None
+        if match is None or end is None:
+            i = _js_statement_end(mask, i, close) + 1
+            continue
+        kind = match["accessor"] or "method"
+        out.append(_JsSymbol(prefix + match["name"], i, end, kind, bool(match["static"])))
+        i = end + 1
+    return out
+
+
+def _js_class_brace(mask: str, pos: int) -> int | None:
+    """Return the offset of the class body's opening brace, skipping any ``extends`` call."""
+    i = pos
+    while i < len(mask):
+        char = mask[i]
+        if char == "{":
+            return i
+        if char == ";":
+            return None
+        i = _js_close(mask, i) + 1 if char in "([" else i + 1
+    return None
+
+
+def _js_declared(mask: str, match: re.Match[str]) -> list[_JsSymbol]:
+    """Return the symbol a declaration match introduces, then its members (empty if none)."""
+    kind = match.lastgroup
+    assert kind is not None
+    name = match[kind]
+    start, pos = match.start(), match.end()
+    if kind == "variable":
+        return [_JsSymbol(name, start, _js_statement_end(mask, pos, len(mask)), kind)]
+    if kind == "function":
+        paren = _js_skip_space(mask, pos, len(mask))
+        if paren >= len(mask) or mask[paren] != "(":
+            return []
+        end = _js_function_end(mask, paren)
+        return [] if end is None else [_JsSymbol(name, start, end, kind)]
+    brace = _js_class_brace(mask, pos)
+    if brace is None:
+        return []
+    close = _js_close(mask, brace)
+    return [_JsSymbol(name, start, close, kind), *_js_members(mask, brace, close, name + ".")]
+
+
+def _js_symbols(mask: str) -> list[_JsSymbol]:
+    """Return the top-level symbols of a masked file and the members of its classes."""
+    out: list[_JsSymbol] = []
+    prev = ";"
+    i = 0
+    while True:
+        i = _js_skip_space(mask, i, len(mask))
+        if i >= len(mask):
+            return out
+        match = None
+        if prev not in _JS_OPERATOR_END and not mask[mask.rfind("\n", 0, i) + 1 : i].strip():
+            match = _JS_DECL_RE.match(mask, i)
+        declared = _js_declared(mask, match) if match else []
+        if declared:
+            out.extend(declared)
+            i = declared[0].end
+        elif mask[i] in _JS_CLOSERS:
+            raise _js_error(f"stray {mask[i]!r}", mask, i)
+        elif mask[i] in _JS_PAIRS:
+            i = _js_close(mask, i)
+        else:
+            word = _JS_WORD_RE.match(mask, i)
+            i = word.end() - 1 if word else i
+        prev = mask[i]
+        i += 1
+
+
+def _js_symbol_hint(symbols: Sequence[_JsSymbol], full: str) -> str:
+    parent, _, base = full.rpartition(".")
+    if parent and not any(s.name == parent for s in symbols):
+        return f"{parent!r} not found"
+    names = list(
+        dict.fromkeys(
+            s.name.rpartition(".")[2] for s in symbols if s.name.rpartition(".")[0] == parent
+        )
+    )
+    close = difflib.get_close_matches(base, names, n=3)
+    if close:
+        return f"did you mean {', '.join(close)}?"
+    scope = f"{parent} members" if parent else "top-level symbols"
+    shown = ", ".join(names[:15]) + (", ..." if len(names) > 15 else "")
+    return f"{scope}: {shown or '(none)'}"
+
+
+def _js_select(
+    symbols: Sequence[_JsSymbol], symbol: str, wanted: tuple[str, bool] | None = None
+) -> _JsSymbol:
+    """Return the one symbol ``symbol`` names; refuse to guess between several.
+
+    ``wanted`` is the ``(kind, static)`` of the replacement code. It settles a
+    reference like ``Cls.x`` when that name covers, say, a getter and a setter.
+    """
+    owner, dot, member = symbol.rpartition(".")
+    words = member.split()
+    full = f"{owner}{dot}{words[-1] if words else ''}"
+    qualifiers = set(words[:-1])
+    matches = [s for s in symbols if s.name == full and qualifiers <= s.qualifiers]
+    if len(matches) > 1 and wanted is not None:
+        matches = [s for s in matches if (s.kind, s.static) == wanted] or matches
+    if not matches:
+        raise ValueError(f"symbol {symbol!r} not found ({_js_symbol_hint(symbols, full)})")
+    if len(matches) > 1:
+        labels = ", ".join(dict.fromkeys(s.label for s in matches))
+        raise ValueError(
+            f"symbol {symbol!r} is ambiguous ({labels}): name one of them or use search_replace"
+        )
+    return matches[0]
+
+
+def _js_check_defines(code: str, symbol: str) -> tuple[str, bool]:
+    """Return ``(kind, static)`` of the only symbol ``code`` defines; raise if it is not ``symbol``."""
+    _, dot, member = symbol.rpartition(".")
+    words = member.split()
+    name = words[-1] if words else member
+    mask = _js_mask(textwrap.dedent(code.replace("\r\n", "\n")))
+    if dot:
+        found = _js_members(mask, -1, len(mask), "")
+    else:
+        found = [s for s in _js_symbols(mask) if "." not in s.name]
+    if len(found) != 1:
+        raise ValueError(
+            f"code must define exactly {name!r} and nothing else (found {len(found)} symbols)"
+        )
+    only = found[0]
+    if only.name != name:
+        raise ValueError(f"code defines {only.name!r} but the symbol is {name!r}")
+    if (mask[: only.start] + mask[only.end + 1 :]).strip(" \t\n;"):
+        raise ValueError(f"code must define exactly {name!r} and nothing else")
+    return only.kind, only.static
+
+
+def _js_line_span(mask: str, sym: _JsSymbol) -> tuple[int, int]:
+    """Return the 0-based ``[first, stop)`` lines of ``sym``, which must be alone on them."""
+    head = mask.rfind("\n", 0, sym.start) + 1
+    tail = mask.find("\n", sym.end)
+    tail = len(mask) if tail < 0 else tail
+    if mask[head : sym.start].strip() or mask[sym.end + 1 : tail].strip(" \t;"):
+        raise ValueError(f"{sym.label} shares a line with other code; use search_replace")
+    return mask.count("\n", 0, sym.start), mask.count("\n", 0, sym.end) + 1
+
+
+def _js_reject_duplicates(
+    before: Sequence[_JsSymbol], after: Sequence[_JsSymbol], mask: str
+) -> None:
+    """Raise when ``after`` defines a symbol more often than ``before`` did."""
+    old = Counter(s.key for s in before)
+    new = Counter(s.key for s in after)
+    for sym in after:
+        count = new[sym.key]
+        if count > 1 and count > old[sym.key]:
+            line = mask.count("\n", 0, sym.start) + 1
+            raise ValueError(f"{sym.name!r} already defined at line {line} - use replace_symbol")
+
+
+def _js_reject_appended_duplicates(before: str, after: str) -> None:
+    """Raise when appending to ``before`` redefines a symbol; unscannable files are left alone."""
+    try:
+        old_symbols = _js_symbols(_js_mask(before.replace("\r\n", "\n")))
+        new_mask = _js_mask(after.replace("\r\n", "\n"))
+        new_symbols = _js_symbols(new_mask)
+    except ValueError:
+        return
+    _js_reject_duplicates(old_symbols, new_symbols, new_mask)
+
+
+def _apply_js_symbol(state: _FileState, edit: Edit, lines: list[str], ends: bool) -> None:
+    """Apply a symbol edit to a JavaScript file. Raises ``ValueError`` with a message."""
+    assert edit.symbol is not None
+    mask = _js_mask("\n".join(lines))
+    symbols = _js_symbols(mask)
+    code = edit.code or ""
+    wanted = _js_check_defines(code, edit.symbol) if edit.op == "replace_symbol" else None
+    target = _js_select(symbols, edit.symbol, wanted)
+    first, stop = _js_line_span(mask, target)
+    block = _prepare_code(code, _indent_of(lines[first]))
+
+    if edit.op == "replace_symbol":
+        lines[first:stop] = block
+    elif edit.op == "delete_symbol":
+        del lines[first:stop]
+        _collapse_blanks(lines, min(first, len(lines)), 1)
+    elif edit.op == "insert_after_symbol":
+        lines[stop:stop] = ["", *block]
+        after = stop + 1 + len(block)
+        if after < len(lines) and lines[after].strip() and not lines[after].lstrip().startswith("}"):
+            lines[after:after] = [""]
+    else:
+        lines[first:first] = [*block, ""]
+
+    try:
+        new_mask = _js_mask("\n".join(lines))
+        new_symbols = _js_symbols(new_mask)
+    except ValueError as exc:
+        raise ValueError(f"result does not parse: {exc}") from None
+    _js_reject_duplicates(symbols, new_symbols, new_mask)
+    state.text = _join(lines, state.newline, ends)
+
+
+# --------------------------------------------------------------------------
 # Applying
 # --------------------------------------------------------------------------
 
@@ -407,12 +836,20 @@ def _apply_one(state: _FileState, edit: Edit) -> None:
                 lines.pop()
             lines.extend([""] * (2 if is_py else 1))
         lines.extend(new_lines)
-        state.text = _join(lines, state.newline)
+        joined = _join(lines, state.newline)
+        if edit.op == "append" and state.rel.endswith(_JS_SUFFIXES):
+            _js_reject_appended_duplicates(text, joined)
+        state.text = joined
         return
 
-    # Symbol operations (Python only).
+    # Symbol operations (Python and plain JavaScript).
+    if state.rel.endswith(_JS_SUFFIXES):
+        _apply_js_symbol(state, edit, lines, ends)
+        return
     if not is_py:
-        raise ValueError(f"{edit.op} only works on .py files; use search_replace")
+        raise ValueError(
+            f"{edit.op} only works on .py files and plain JavaScript; use search_replace"
+        )
     assert edit.symbol is not None
     tree = ast.parse(text)
     node = _find_symbol(tree, edit.symbol)
