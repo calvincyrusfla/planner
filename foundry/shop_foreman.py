@@ -542,6 +542,15 @@ def _outcome_actual(outcome: Any) -> str | None:
     return value if value in SIZE_ORDER else None
 
 
+def _size_delta(predicted: str, actual: str) -> int:
+    """``actual - predicted`` in steps; L and XL count as the same size (same crew, same clean effort)."""
+    try:
+        from foundry.sizing_outcomes import size_delta
+    except ImportError:  # pragma: no cover - module missing on an old checkout
+        return 0 if {predicted, actual} <= {"L", "XL"} else SIZE_ORDER.index(actual) - SIZE_ORDER.index(predicted)
+    return size_delta(predicted, actual)
+
+
 def _title_words(title: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", (title or "").lower()) if len(w) >= 3 and w not in _TITLE_STOP}
 
@@ -610,8 +619,8 @@ def calibration_shifts(outcomes: Sequence[Any]) -> dict[str, dict[str, Any]]:
         if n < CALIBRATION_MIN_OUTCOMES:
             continue
         idx = SIZE_ORDER.index(pred)
-        bigger = sum(1 for a in actuals if SIZE_ORDER.index(a) > idx)
-        smaller = sum(1 for a in actuals if SIZE_ORDER.index(a) < idx)
+        bigger = sum(1 for a in actuals if _size_delta(pred, a) > 0)
+        smaller = sum(1 for a in actuals if _size_delta(pred, a) < 0)
         if bigger / n >= CALIBRATION_SHIFT_SHARE and idx < len(SIZE_ORDER) - 1:
             to, direction, share = SIZE_ORDER[idx + 1], "up", bigger / n
         elif smaller / n >= CALIBRATION_SHIFT_SHARE and idx > 0:
@@ -1324,7 +1333,7 @@ class ShopForeman:
             if pred is None or actual is None:
                 continue
             n += 1
-            diff = SIZE_ORDER.index(actual) - SIZE_ORDER.index(pred)
+            diff = _size_delta(pred, actual)
             exact += diff == 0
             under += diff > 0
             over += diff < 0

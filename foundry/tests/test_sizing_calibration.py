@@ -62,7 +62,7 @@ def test_shift_rule_needs_eight_outcomes_and_sixty_percent() -> None:
     assert calibration_shifts(smaller)["L"]["to"] == "M"  # one step only, even though actual was S
     assert calibration_shifts([outcome(f"P-{k}", "XL", "XL") for k in range(10)]) == {}
     assert calibration_shifts([outcome(f"P-{k}", "S", "S") for k in range(3)] + [
-        outcome(f"Q-{k}", "XL", "L") for k in range(8)])["XL"]["to"] == "L"
+        outcome(f"Q-{k}", "XL", "M") for k in range(8)])["XL"]["to"] == "L"
 
 
 def test_heuristic_result_is_calibrated(queue: FoundryQueue) -> None:
@@ -249,3 +249,12 @@ def test_shift_down_with_gemma_subtasks_for_old_size(queue: FoundryQueue) -> Non
     assert f.last_raw_complexity == "L"
     _check(directive, FIVE)
     assert {c for s in directive.subtasks for c in s.acceptance_criteria} >= {f"c{k}" for k in range(5)}
+
+
+def test_l_and_xl_count_as_the_same_size(queue: FoundryQueue) -> None:
+    clean_xl = [outcome(f"X-{k}", "XL", "L") for k in range(10)]
+    assert calibration_shifts(clean_xl) == {}  # no XL->L shift from clean XL runs
+    assert calibration_shifts([outcome(f"L-{k}", "L", "XL") for k in range(10)]) == {}
+    f = ShopForeman(None, queue, None, None, FoundryConfig(), outcomes_provider=Provider(clean_xl))
+    summary = f.calibration_summary()
+    assert summary["exact"] == 10 and summary["accuracy_pct"] == 100
