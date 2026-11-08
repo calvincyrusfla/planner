@@ -287,6 +287,10 @@ class SubtaskAllocation(FoundryModel):
             "(and only with separate files). Default: sequential."
         ),
     )
+    description: str | None = Field(
+        default=None,
+        description="This ticket's own instructions, shown to its builder and reviewer; None = none given.",
+    )
 
     @field_validator("depends_on", mode="before")
     @classmethod
@@ -426,6 +430,7 @@ class TaskAssignment(FoundryModel):
     context: ContextSlice
     attempt: int = Field(default=0, ge=0, le=MAX_RETRIES_LIMIT)
     fix_hint: str | None = None
+    ticket_description: str | None = Field(default=None, description="The ticket's own instructions, if any.")
 
 
 class BuilderSubmission(FoundryModel):
