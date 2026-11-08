@@ -24,6 +24,8 @@ from foundry.validation_gates import (
 
 HAS_NODE = shutil.which("node") is not None
 HAS_RUFF = shutil.which("ruff") is not None
+HAS_MYPY = vg._mypy_command() is not None
+needs_mypy = pytest.mark.skipif(not HAS_MYPY, reason="mypy not installed")
 
 
 def submission(files: list[str], diff: str = "") -> BuilderSubmission:
@@ -441,7 +443,9 @@ def test_run_gates_all_pass(tmp_path: Path) -> None:
         linter="builtin",
     )
     assert outcome.passed and outcome.first_failure is None
-    assert [r.check_type for r in outcome.results] == ["syntax", "linter", "tests", "schema"]
+    assert [r.check_type for r in outcome.results] == [
+        "syntax", "linter", "typecheck", "tests", "schema"
+    ]
     assert outcome.summary().startswith("all gates passed")
 
 
@@ -471,7 +475,7 @@ def test_run_gates_without_short_circuit_runs_everything(tmp_path: Path) -> None
         linter="builtin",
         short_circuit=False,
     )
-    assert [r.passed for r in results] == [True, False, True, False]
+    assert [r.passed for r in results] == [True, False, True, True, False]
     outcome = GateOutcome.from_results(results)
     assert outcome.failed_check == "linter"
 
@@ -511,3 +515,163 @@ def test_reexports_cache_and_retry_policy() -> None:
 
     assert vg.SolutionCache is solution_cache.SolutionCache
     assert vg.RetryPolicy is solution_cache.RetryPolicy
+
+
+# --------------------------------------------------------------------------
+# typecheck gate (mypy)
+# --------------------------------------------------------------------------
+
+TYPE_BAD = 'def f(x: int) -> str:\n    return x\n'
+TYPE_OK = 'def f(x: int) -> str:\n    return str(x)\n'
+
+
+@needs_mypy
+def test_typecheck_gate_fails_on_type_error_in_changed_file(tmp_path: Path) -> None:
+    write(tmp_path, "pkg/bad.py", TYPE_BAD)
+    [res] = run_gates(submission(["pkg/bad.py"]), tmp_path, checks=["typecheck"])
+    assert res.check_type == "typecheck" and not res.passed
+    assert "pkg/bad.py:2" in res.stdout.replace("\\", "/")
+    assert "type error" in res.stderr
+    outcome = GateOutcome.from_results([res])
+    assert outcome.failed_check == "typecheck"
+    assert outcome.summary().startswith("typecheck gate failed")
+
+
+@needs_mypy
+def test_typecheck_gate_passes_clean_file_and_ignores_other_files(tmp_path: Path) -> None:
+    # an untouched module with type errors (and a missing third-party import)
+    write(tmp_path, "legacy.py", "import not_a_real_pkg\nx: int = 'nope'\n")
+    write(tmp_path, "new.py", "import legacy\nimport not_a_real_pkg\n" + TYPE_OK)
+    write(tmp_path, "mypy.ini", "[mypy]\nstrict = True\ndisallow_any_unimported = True\n")
+    [res] = run_gates(submission(["new.py", "notes.txt"]), tmp_path, checks=["typecheck"])
+    assert res.passed, res.stdout + res.stderr
+    assert "mypy: clean" in res.stdout
+    assert not (tmp_path / ".mypy_cache").exists()
+
+
+@needs_mypy
+def test_typecheck_gate_handles_duplicate_module_names(tmp_path: Path) -> None:
+    write(tmp_path, "a/m.py", TYPE_OK)
+    write(tmp_path, "b/m.py", TYPE_BAD)
+    [res] = run_gates(submission(["a/m.py", "b/m.py"]), tmp_path, checks=["typecheck"])
+    assert not res.passed
+    assert "b/m.py:2" in res.stdout.replace("\\", "/") and "a/m.py" not in res.stdout
+
+
+@needs_mypy
+def test_typecheck_runs_after_linter_and_short_circuits(tmp_path: Path) -> None:
+    write(tmp_path, "bad.py", TYPE_BAD)
+    results = run_gates(
+        submission(["bad.py"]),
+        tmp_path,
+        test_cmd=[sys.executable, "-c", "raise SystemExit('tests must not run')"],
+        linter="builtin",
+    )
+    assert [r.check_type for r in results] == ["syntax", "linter", "typecheck"]
+    assert [r.passed for r in results] == [True, True, False]
+
+
+def test_typecheck_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vg, "_mypy_command", lambda: None)
+    write(tmp_path, "bad.py", TYPE_BAD)
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"])
+    assert res.passed and res.note and "mypy not installed" in res.note
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"], typecheck="mypy")
+    assert not res.passed and "mypy requested but not installed" in res.stderr
+
+
+def test_typecheck_off_and_no_python_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom() -> list[str]:
+        raise AssertionError("mypy must not be looked up")
+
+    monkeypatch.setattr(vg, "_mypy_command", boom)
+    write(tmp_path, "bad.py", TYPE_BAD)
+    write(tmp_path, "notes.txt", "text")
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"], typecheck="off")
+    assert res.passed and res.note and "FOUNDRY_TYPECHECK=off" in res.note
+    [res] = run_gates(submission(["notes.txt"]), tmp_path, checks=["typecheck"])
+    assert res.passed and "no Python files" in res.stdout
+
+
+def test_typecheck_crash_or_timeout_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write(tmp_path, "bad.py", TYPE_BAD)
+    crash = [sys.executable, "-c", "import sys; print('mypy internal error'); sys.exit(2)"]
+    monkeypatch.setattr(vg, "_mypy_command", lambda: crash)
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"])
+    assert res.passed and res.note and "could not run" in res.note
+    slow = [sys.executable, "-c", "import time; time.sleep(30)"]
+    monkeypatch.setattr(vg, "_mypy_command", lambda: slow)
+    [res] = run_gates(
+        submission(["bad.py"]), tmp_path, checks=["typecheck"], typecheck_timeout=0.5
+    )
+    assert res.passed and res.note and "timed out" in res.note
+
+
+def test_typecheck_only_counts_errors_in_changed_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = (
+        "import sys\n"
+        "print('other.py:3: error: Bad thing  [misc]')\n"
+        "print('mine.py:1:5: note: just a note')\n"
+        "sys.exit(1)\n"
+    )
+    monkeypatch.setattr(vg, "_mypy_command", lambda: [sys.executable, "-c", script])
+    write(tmp_path, "mine.py", TYPE_OK)
+    [res] = run_gates(submission(["mine.py"]), tmp_path, checks=["typecheck"])
+    assert res.passed, res.stdout + res.stderr
+    script2 = script.replace("other.py:3", "mine.py:2")
+    monkeypatch.setattr(vg, "_mypy_command", lambda: [sys.executable, "-c", script2])
+    [res] = run_gates(submission(["mine.py"]), tmp_path, checks=["typecheck"])
+    assert not res.passed and res.stdout == "mine.py:2: error: Bad thing  [misc]"
+
+
+def test_validation_gates_passes_typecheck_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vg, "_mypy_command", lambda: None)
+    write(tmp_path, "bad.py", TYPE_BAD)
+    gates = ValidationGates(checks=("typecheck",), typecheck="mypy")
+    outcome = gates.check(submission(["bad.py"]), tmp_path)
+    assert not outcome.passed and outcome.failed_check == "typecheck"
+
+
+def test_config_typecheck_mode_from_env() -> None:
+    from foundry.config import FoundryConfig
+
+    assert FoundryConfig().typecheck == "auto"
+    assert FoundryConfig.from_env({"FOUNDRY_TYPECHECK": "OFF"}).typecheck == "off"
+    assert FoundryConfig.from_env({"FOUNDRY_TYPECHECK": "mypy"}).typecheck == "mypy"
+    with pytest.raises(ValueError):
+        FoundryConfig.from_env({"FOUNDRY_TYPECHECK": "pyright"})
+
+
+@needs_mypy
+def test_typecheck_never_runs_workspace_mypy(tmp_path: Path) -> None:
+    marker = tmp_path / "PWNED"
+    hijack = f"open({str(marker)!r}, 'w').write('x')\nraise SystemExit(0)\n"
+    write(tmp_path, "mypy.py", hijack)
+    write(tmp_path, "mypy/__init__.py", hijack)
+    write(tmp_path, "mypy/__main__.py", hijack)
+    write(tmp_path, "bad.py", TYPE_BAD)
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"])
+    assert not marker.exists()
+    assert not res.passed and "bad.py:2" in res.stdout
+
+
+def test_typecheck_ignores_mypy_executable_inside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = write(tmp_path, "bin/mypy", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(vg, "_mypy_command", lambda: [str(fake)])
+    write(tmp_path, "bad.py", TYPE_BAD)
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"])
+    assert res.passed and res.note and "mypy not installed" in res.note
+    monkeypatch.setattr(vg, "_mypy_command", lambda: ["mypy"])  # relative: refused too
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"], typecheck="mypy")
+    assert not res.passed and "not installed" in res.stderr
+
+
+@needs_mypy
+def test_typecheck_dash_file_name_is_a_file(tmp_path: Path) -> None:
+    write(tmp_path, "-x.py", TYPE_BAD)
+    [res] = run_gates(submission(["-x.py"]), tmp_path, checks=["typecheck"])
+    assert not res.passed and "-x.py:2" in res.stdout, res.stdout + res.stderr

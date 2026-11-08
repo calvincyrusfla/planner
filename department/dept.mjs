@@ -64,6 +64,14 @@ const HELP = `Agent Department CLI
                                                        Code's saved login on this PC (unofficial
                                                        endpoint; at most every 30 s via the dashboard;
                                                        env DEPT_USAGE_DIRECT=off disables it)
+  node department/dept.mjs foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."]
+                       --subtask "Title::description::file1,file2::S" (repeatable; "::" separates
+                       the fields, so use --json batch.json for text containing "::")
+                                                       Hand a batch of work to Foundry (S-###);
+                                                       Foundry on the PC claims batches for its repo
+  node department/dept.mjs foundry poll <S-id> [--json] Batch status: each subtask's F-id, state, PR
+  node department/dept.mjs foundry list [--open]       Foundry batches, newest first
+  node department/dept.mjs foundry cancel <S-id>       Cancel a batch that hasn't finished
   node department/dept.mjs json                        Dump the full state
   node department/dept.mjs reset                       Wipe all tasks and reset the teams
 
@@ -76,16 +84,27 @@ Shared board (one board for this PC and Claude sessions, stored on the Netlify s
   Env DEPT_HUB_URL (+ DEPT_HUB_KEY) selects a shared board without hub connect.
 `;
 
+// Options that never take a value (so `poll --json S-001` keeps S-001 positional).
+const FLAGS = new Set(['open']);
 function parse(argv) {
   const pos = [];
   const opt = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    const eq = a.startsWith('--') ? a.indexOf('=') : -1;
     if (a === '-m') opt.message = argv[++i];
-    else if (a.startsWith('--')) {
+    else if (a === '--subtask') (opt.subtask ||= []).push(argv[++i]); // repeatable
+    else if (eq > 2) {
+      // --key=value
+      const key = a.slice(2, eq);
+      const value = a.slice(eq + 1);
+      if (FLAGS.has(key)) throw new core.DeptError(`--${key} takes no value`);
+      if (key === 'subtask') (opt.subtask ||= []).push(value);
+      else opt[key] = value;
+    } else if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith('--') || next === '-m') opt[key] = true;
+      if (next === undefined || next.startsWith('--') || next === '-m' || FLAGS.has(key)) opt[key] = true;
       else opt[key] = argv[++i];
     } else pos.push(a);
   }
@@ -540,6 +559,122 @@ function printTimes(s, taskId) {
   }
 }
 
+// ---------------------------------------------------------------- foundry batches
+
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S" ... | --json file.json\n         ("::" separates --subtask fields; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id>';
+const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
+
+// "Title::description::file1,file2::S" → subtask. Empty parts are skipped.
+function subtaskArg(spec, i) {
+  if (typeof spec !== 'string' || !spec.trim()) throw new core.DeptError(`--subtask ${i + 1} is empty\n${FOUNDRY_HELP}`);
+  const [title, description = '', files = '', size = ''] = spec.split('::');
+  const st = { title: title.trim() };
+  if (description.trim()) st.description = description.trim();
+  const list = files.split(',').map((f) => f.trim()).filter(Boolean);
+  if (list.length) st.files = list;
+  if (size.trim()) st.size = size.trim();
+  return st;
+}
+
+// An older dashboard or shared board doesn't know the batch ops yet.
+async function batchOp(type, args) {
+  try {
+    return await run('POST', '/api/op', { type, args }, { type, args });
+  } catch (err) {
+    if (/Unknown operation/i.test(err.message)) {
+      throw new core.DeptError(`${err.message}: the dashboard or shared board runs older code without Foundry batches; restart the dashboard / redeploy the site`);
+    }
+    throw err;
+  }
+}
+
+const ago = (iso, at) => (Number.isFinite(ts(iso)) ? `${dur(Math.max(0, at - ts(iso)))} ago` : 'never');
+
+function batchCounts(b) {
+  const r = b.results || {};
+  const states = (b.subtasks || []).map((st) => r[st.key]?.state);
+  return { total: states.length, complete: states.filter((x) => x === 'complete').length };
+}
+
+function claimLine(b, at) {
+  if (b.claimedBy && (b.status === 'claimed' || b.status === 'running')) return `Foundry on ${b.claimedBy.host || '?'} (${b.claimedBy.service || '?'}), heartbeat ${ago(b.heartbeatAt || b.claimedBy.at, at)}`;
+  if (b.status === 'queued') return 'waiting for Foundry';
+  return b.claimedBy ? `ran on Foundry on ${b.claimedBy.host || '?'} (${b.claimedBy.service || '?'})` : '—';
+}
+
+function printBatch(b) {
+  const at = core.clockNow();
+  const c = batchCounts(b);
+  console.log(`${b.id} [${b.status}] ${b.title}`);
+  console.log(`  repo      ${b.repo}${b.base ? ` → ${b.base}` : ''}`);
+  console.log(`  claimed   ${claimLine(b, at)}`);
+  console.log(`  progress  ${c.complete}/${c.total} complete`);
+  if (b.note) console.log(`  note      ${b.note}`);
+  for (const st of b.subtasks || []) {
+    const r = (b.results || {})[st.key] || {};
+    const pr = r.pr?.url ? `  PR ${r.pr.url}${r.pr.state ? ` (${r.pr.state})` : ''}` : r.pr?.error ? `  PR error: ${r.pr.error}` : '';
+    console.log(`  #${st.key.padEnd(3)} ${(r.foundryTask || '—').padEnd(6)} ${(r.state || 'queued').padEnd(11)} ${st.title}${pr}`);
+    if (r.error) console.log(`        error: ${r.error}`);
+  }
+}
+
+async function foundryCommand(sub, args, opt) {
+  switch (sub) {
+    case 'dispatch': {
+      let batch;
+      if (opt.json !== undefined) {
+        if (typeof opt.json !== 'string') throw new core.DeptError(FOUNDRY_HELP);
+        try {
+          batch = JSON.parse(fs.readFileSync(opt.json === '-' ? 0 : opt.json, 'utf8'));
+        } catch (err) {
+          throw new core.DeptError(`Could not read batch JSON from ${opt.json}: ${err.message}`);
+        }
+        if (!batch || typeof batch !== 'object') throw new core.DeptError('Batch JSON must be an object');
+      } else batch = {};
+      for (const k of ['title', 'repo', 'base', 'goal']) if (typeof opt[k] === 'string') batch[k] = opt[k];
+      if (opt.subtask) batch.subtasks = [...(Array.isArray(batch.subtasks) ? batch.subtasks : []), ...opt.subtask.map(subtaskArg)];
+      if (!batch.title || !batch.repo || !Array.isArray(batch.subtasks) || !batch.subtasks.length) throw new core.DeptError(FOUNDRY_HELP);
+      const b = await batchOp('dispatchBatch', { ...batch, by: typeof opt.by === 'string' ? opt.by : batch.by || 'cli' });
+      console.log(`${b.id} dispatched to Foundry (${b.repo}, ${plural(b.subtasks.length, 'subtask')}): ${b.title}`);
+      console.log(`  Poll with: node department/dept.mjs foundry poll ${b.id}`);
+      return;
+    }
+    case 'poll': {
+      // `poll --json S-001`: --json is a plain flag here, so its "value" is the id.
+      if (typeof opt.json === 'string') {
+        args = [opt.json, ...args];
+        opt.json = true;
+      }
+      if (!args[0]) throw new core.DeptError(FOUNDRY_HELP);
+      const s = await currentState();
+      const id = String(args[0]).toUpperCase();
+      const b = (s.foundryBatches || []).find((x) => x.id === id);
+      if (!b) throw new core.DeptError(`No Foundry batch ${args[0]}`, 404);
+      if (opt.json) return console.log(JSON.stringify(b, null, 2));
+      return printBatch(b);
+    }
+    case 'list': {
+      const s = await currentState();
+      const at = core.clockNow();
+      const list = [...(s.foundryBatches || [])].reverse().filter((b) => !opt.open || OPEN_BATCH.has(b.status));
+      if (!list.length) return console.log(opt.open ? 'No open Foundry batches' : 'No Foundry batches');
+      for (const b of list) {
+        const c = batchCounts(b);
+        console.log(`${b.id} [${b.status}] ${b.title} · ${b.repo} · ${c.complete}/${c.total} complete · ${claimLine(b, at)}`);
+      }
+      return;
+    }
+    case 'cancel': {
+      if (!args[0]) throw new core.DeptError(FOUNDRY_HELP);
+      const r = await batchOp('cancelBatch', { id: args[0], by: 'cli' });
+      console.log(`${r.batch.id} cancelled`);
+      return;
+    }
+    default:
+      throw new core.DeptError(FOUNDRY_HELP);
+  }
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { pos, opt } = parse(rest);
@@ -556,6 +691,8 @@ async function main() {
       return hubCommand(pos[0], pos.slice(1), opt);
     case 'usage':
       return usageCommand(pos[0], opt);
+    case 'foundry':
+      return foundryCommand(pos[0], pos.slice(1), opt);
     case 'json':
       return console.log(JSON.stringify(await currentState(), null, 2));
     case 'add': {

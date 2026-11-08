@@ -286,7 +286,7 @@ def test_submission_status_invalid() -> None:
         BuilderSubmission.model_validate(_submission(status="done"))
 
 
-@pytest.mark.parametrize("check", ["syntax", "linter", "tests", "schema"])
+@pytest.mark.parametrize("check", ["syntax", "linter", "typecheck", "tests", "schema"])
 def test_gate_check_values(check: str) -> None:
     assert DeterministicGateResult.model_validate(_gate(check_type=check)).check_type == check
 

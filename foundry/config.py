@@ -61,6 +61,9 @@ Environment variable               Field (default)
 ``FOUNDRY_PR_BASE``                ``pr_base`` (unset: the repo's default
                                    branch, else the current branch)
 ``FOUNDRY_PR_DRAFT``               ``pr_draft`` (``false``): open PRs as drafts
+``FOUNDRY_TYPECHECK``              ``typecheck`` (``auto``; ``auto|mypy|off``):
+                                   the mypy gate after the linter; ``auto``
+                                   runs it when mypy is installed
 =================================  ==========================================
 
 Empty environment values are treated as unset.  The rate-limit defaults are
@@ -82,6 +85,7 @@ __all__ = [
     "AnomalyThresholds",
     "BoardBridgeMode",
     "PreReviewMode",
+    "TypecheckMode",
     "DEFAULT_CLAUDE_APPEND_PROMPT",
     "DEFAULT_CLAUDE_EXTRA_ARGS",
     "DEFAULT_DATA_DIR",
@@ -133,6 +137,7 @@ DEFAULT_CLAUDE_APPEND_PROMPT: str = (
 _NONE_WORD = "none"
 
 BoardBridgeMode = Literal["auto", "off", "dry"]
+TypecheckMode = Literal["auto", "mypy", "off"]
 PreReviewMode = Literal["off", "advise", "gate"]
 
 _BOOL = TypeAdapter(bool)
@@ -275,6 +280,13 @@ class FoundryConfig(BaseModel):
         description="Base branch for Foundry PRs (None: the repo's default branch).",
     )
     pr_draft: bool = Field(default=False, description="Open Foundry PRs as drafts.")
+    typecheck: TypecheckMode = Field(
+        default="auto",
+        description=(
+            "mypy gate on changed .py files: auto (run when mypy is installed), "
+            "mypy (required) or off."
+        ),
+    )
 
     @field_validator("gemma_base_url")
     @classmethod
@@ -402,11 +414,13 @@ class FoundryConfig(BaseModel):
             "AUTO_PR": "auto_pr",
             "PR_BASE": "pr_base",
             "PR_DRAFT": "pr_draft",
+            "TYPECHECK": "typecheck",
         }
         for var, field in simple.items():
             value = get(var)
             if value is not None:
-                data[field] = value.lower() if field in ("board_bridge_mode", "pre_review") else value
+                lowered = field in ("board_bridge_mode", "pre_review", "typecheck")
+                data[field] = value.lower() if lowered else value
 
         if "gemma_model" not in data:
             foreman_model = env.get("FOREMAN_MODEL", "").strip()

@@ -96,7 +96,7 @@ MAX_DIAGNOSIS_SENTENCES: int = 2
 ALERT_ID_PATTERN: str = r"^ALT-\d{8}-\d{3}$"
 """Format of ``ForemanEscalation.alert_id``: ``ALT-YYYYMMDD-NNN``."""
 
-GateCheck = Literal["syntax", "linter", "tests", "schema"]
+GateCheck = Literal["syntax", "linter", "typecheck", "tests", "schema"]
 """Kinds of deterministic gate checks run before any reviewer."""
 
 SubmissionStatus = Literal["ready_for_review", "blocked"]

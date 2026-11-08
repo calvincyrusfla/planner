@@ -190,6 +190,19 @@ def _kill(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
+_REF_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+
+def valid_ref(name: Any) -> bool:
+    """A branch name safe to hand to git/gh (the board's rule for a batch ``base``).
+
+    Only ``[A-Za-z0-9_./-]``, at most 200 characters, no ``..``, and no leading
+    ``-`` or ``/`` or trailing ``/`` (so it can never be read as an option).
+    """
+    return (isinstance(name, str) and 0 < len(name) <= 200 and bool(_REF_RE.match(name)) and ".." not in name
+            and not name.startswith(("-", "/")) and not name.endswith("/"))
+
+
 def github_repo(url: str) -> str | None:
     """``owner/name`` (``host/owner/name`` off github.com) from a remote URL; None if unparsable.
 
@@ -213,6 +226,13 @@ class _Fail(Exception):
         super().__init__(error)
         self.stage = stage
         self.error = error
+
+
+def _check_ref(name: Any, what: str) -> str:
+    """``name`` when it is a :func:`valid_ref`; else stops the publish before any git/gh call."""
+    if not valid_ref(name):
+        raise _Fail("bad_ref", f"refusing the {what} {str(name)[:80]!r}: not a plain branch name")
+    return str(name)
 
 
 class GitPublisher:
@@ -335,8 +355,11 @@ class GitPublisher:
         *,
         draft: bool | None = None,
         on_pushed: OnPushed | None = None,
+        base: str | None = None,
     ) -> PublishResult:
         """Branch, commit, push and open the PR for one task. Never raises.
+
+        ``base`` (e.g. a board batch's branch) overrides the publisher's base for this task.
 
         Idempotent per task: when a branch ``foundry/<task-id>-*`` from an earlier
         call already exists on the remote, no new branch is pushed; its existing
@@ -346,8 +369,11 @@ class GitPublisher:
         """
         async with self._lock:
             try:
+                for ref, what in ((base, "base branch"), (self.base, "base branch (FOUNDRY_PR_BASE)")):
+                    if ref:
+                        _check_ref(ref, what)
                 return await self._publish(task_id, title, Path(patch_path), dict(pr or {}),
-                                           self.draft if draft is None else bool(draft), on_pushed)
+                                           self.draft if draft is None else bool(draft), on_pushed, base=base)
             except _Fail as f:
                 return PublishResult(ok=False, error=f.error, stage=f.stage)
             except Exception as exc:  # noqa: BLE001 - publish must never break the caller
@@ -402,7 +428,7 @@ class GitPublisher:
     async def _branch_taken(self, git: str, name: str) -> bool:
         if (await self._git(git, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"))[0] == 0:
             return True
-        rc, out, _ = await self._git(git, "ls-remote", "--heads", self.remote, f"refs/heads/{name}",
+        rc, out, _ = await self._git(git, "ls-remote", "--heads", "--", self.remote, f"refs/heads/{name}",
                                      timeout=self.net_timeout)
         return rc == 0 and bool(out.strip())
 
@@ -486,14 +512,14 @@ class GitPublisher:
             log.warning("git publisher: on_pushed callback failed: %s", exc)
 
     async def _publish(self, task_id: str, title: str, patch: Path, pr: dict[str, Any], draft: bool,
-                       on_pushed: OnPushed | None) -> PublishResult:
+                       on_pushed: OnPushed | None, *, base: str | None = None) -> PublishResult:
         git = await self._require_repo()
         await self._clean_stale(git)
         if not patch.is_file() or patch.stat().st_size == 0:
             raise _Fail("no_patch", f"patch file missing or empty: {patch}")
         # check gh before pushing anything, so a missing CLI leaves no orphan branch
         gh = await self._require_gh()
-        base = await self._resolve_base(git)
+        base = _check_ref(base or await self._resolve_base(git), "base branch")
         pr_title = str(pr.get("title") or title or task_id).strip()
         pr_body = str(pr.get("body") or "")
 
@@ -520,13 +546,13 @@ class GitPublisher:
             result.commit = remote[name]
             return result
 
-        res = await self._git(git, "fetch", "--quiet", self.remote, base, timeout=self.net_timeout)
+        res = await self._git(git, "fetch", "--quiet", "--", self.remote, base, timeout=self.net_timeout)
         if res[0] != 0:
             raise _Fail("fetch_failed", f"git fetch {self.remote} {base} failed: " + self._msg(res, "fetch failed"))
         start = f"refs/remotes/{self.remote}/{base}"
         if (await self._git(git, "rev-parse", "--verify", "--quiet", start))[0] != 0:
             start = "FETCH_HEAD"
-        branch = await self._free_branch(git, task_id, title)
+        branch = _check_ref(await self._free_branch(git, task_id, title), "branch")
 
         wt_dir = self._wt_dir
         wt_dir.mkdir(parents=True, exist_ok=True)
@@ -535,7 +561,7 @@ class GitPublisher:
         commit: str | None = None
         added = False
         try:
-            res = await self._git(git, "worktree", "add", "--quiet", "--no-track", "-b", branch, str(wt), start)
+            res = await self._git(git, "worktree", "add", "--quiet", "--no-track", "-b", branch, "--", str(wt), start)
             if res[0] != 0:
                 raise _Fail("worktree_failed", self._msg(res, "git worktree add failed"))
             added = True
@@ -552,7 +578,7 @@ class GitPublisher:
             if res[0] != 0:
                 raise _Fail("commit_failed", self._msg(res, "git commit failed"))
             commit = (await self._git(git, "rev-parse", "HEAD", cwd=wt))[1].strip() or None
-            res = await self._git(git, "push", "--quiet", "-u", self.remote, f"refs/heads/{branch}:refs/heads/{branch}",
+            res = await self._git(git, "push", "--quiet", "-u", "--", self.remote, f"refs/heads/{branch}:refs/heads/{branch}",
                                   cwd=wt, timeout=self.net_timeout)
             if res[0] != 0:
                 raise _Fail("push_failed", self._msg(res, "git push failed"))
@@ -617,9 +643,13 @@ class GitPublisher:
         """
         async with self._lock:
             try:
+                _check_ref(branch, "branch")
+                for ref, what in ((base, "base branch"), (self.base, "base branch (FOUNDRY_PR_BASE)")):
+                    if ref:
+                        _check_ref(ref, what)
                 git = await self._require_repo()
                 gh = await self._require_gh()
-                base = base or await self._resolve_base(git)
+                base = _check_ref(base or await self._resolve_base(git), "base branch")
                 url = await self._existing_pr(gh, branch)
                 if url:
                     return PublishResult(ok=True, branch=branch, base=base, pr_url=url)
@@ -633,6 +663,8 @@ class GitPublisher:
 
     async def _create_pr(self, gh: str, branch: str, base: str, title: str, body: str,
                          draft: bool = False) -> PublishResult:
+        _check_ref(branch, "branch")
+        _check_ref(base, "base branch")
         fd, body_path = tempfile.mkstemp(prefix="foundry-pr-", suffix=".md")
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:

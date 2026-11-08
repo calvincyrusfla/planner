@@ -9,6 +9,13 @@ Every builder submission passes through these gates *before* any reviewer
 * ``linter`` - ``ruff`` when it is on ``PATH``, otherwise a small built-in AST
   checker (syntax-level errors via ``compile``, unused imports, bare
   ``except:``).
+* ``typecheck`` - ``mypy`` on the changed ``.py`` files (``--ignore-missing-imports
+  --follow-imports=silent``, the repository's own mypy config is ignored), so
+  only type errors in the files the builder touched fail the gate. Mode
+  ``auto`` (default, ``FOUNDRY_TYPECHECK``) runs it when mypy is installed and
+  skips it with a note otherwise; ``mypy`` requires it; ``off`` skips it. A
+  mypy that crashes or times out is skipped with a note (not the builder's
+  fault).
 * ``tests`` - runs a given test command (e.g. ``python -m pytest tests -q``)
   in the workspace with a timeout. Skipped when no command is given.
 * ``schema`` - checks that expected classes / functions / methods exist with
@@ -31,6 +38,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import fnmatch
+import importlib.util
 import json
 import os
 import posixpath
@@ -55,6 +63,7 @@ __all__ = [
     "GateOutcome",
     "RetryPolicy",
     "SolutionCache",
+    "TypecheckMode",
     "ValidationGates",
     "apply_diff",
     "builtin_lint",
@@ -62,10 +71,11 @@ __all__ = [
     "run_gates_outcome",
 ]
 
-ALL_CHECKS: tuple[GateCheck, ...] = ("syntax", "linter", "tests", "schema")
+ALL_CHECKS: tuple[GateCheck, ...] = ("syntax", "linter", "typecheck", "tests", "schema")
 """Default gate order. Cheapest first so failures short-circuit early."""
 
 LinterMode = Literal["auto", "ruff", "builtin"]
+TypecheckMode = Literal["auto", "mypy", "off"]
 
 _MAX_OUTPUT_CHARS = 20_000
 _RUFF_RULES = "E4,E7,E9,F"
@@ -641,6 +651,95 @@ def _gate_linter(
     return True, "builtin linter: clean", ""
 
 
+def _mypy_command() -> list[str] | None:
+    """argv prefix that runs mypy, or None when it is not installed.
+
+    Prefers mypy importable by this interpreter (the Foundry venv), run with
+    ``-I`` (isolated mode) so a ``mypy.py`` or ``mypy/`` package in the
+    workspace (the cwd of the run) is never imported instead; then a ``mypy``
+    executable on ``PATH``, as an absolute path.
+    """
+    try:
+        if importlib.util.find_spec("mypy") is not None:
+            return [sys.executable, "-I", "-m", "mypy"]
+    except (ImportError, ValueError):
+        pass
+    exe = shutil.which("mypy")
+    return [str(Path(exe).resolve())] if exe else None
+
+
+def _inside(path: str, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+_MYPY_LINE = re.compile(r"^(?P<path>[^:\n]+?):(?P<line>\d+)(?::\d+)?: (?P<kind>error|note|warning): ")
+
+
+def _gate_typecheck(
+    files: list[tuple[str, Path]], workspace: Path, mode: TypecheckMode, timeout: float
+) -> tuple[bool, str, str]:
+    if mode == "off":
+        return True, "typecheck skipped (FOUNDRY_TYPECHECK=off)", ""
+    py_files = [rel for rel, path in files if path.suffix.lower() in (".py", ".pyi")]
+    if not py_files:
+        return True, "no Python files to typecheck", ""
+    base = _mypy_command()
+    if base is not None and (not Path(base[0]).is_absolute() or _inside(base[0], workspace)):
+        # never run a mypy that lives in (or resolves into) the workspace
+        base = None
+    if base is None:
+        if mode == "mypy":
+            return False, "", "mypy requested but not installed (pip install mypy)"
+        return True, "typecheck skipped (mypy not installed)", ""
+    cmd = [
+        *base,
+        "--config-file=",
+        "--ignore-missing-imports",
+        "--follow-imports=silent",
+        "--explicit-package-bases",
+        "--no-error-summary",
+        "--no-color-output",
+        "--no-pretty",
+        "--show-column-numbers",
+        f"--cache-dir={os.devnull}",
+        "--",
+        *py_files,
+    ]
+    env = {k: v for k, v in os.environ.items() if k not in ("MYPYPATH", "MYPY_CACHE_DIR")}
+    try:
+        proc = subprocess.run(
+            cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout, env=env
+        )
+    except subprocess.TimeoutExpired:
+        return True, f"typecheck skipped (mypy timed out after {timeout:g}s)", ""
+    except OSError as exc:
+        return True, f"typecheck skipped (mypy could not start: {exc})", ""
+    output = proc.stdout.strip()
+    if proc.returncode not in (0, 1):
+        reason = (proc.stderr.strip() or output).splitlines()
+        first = reason[0] if reason else f"exit code {proc.returncode}"
+        return True, f"typecheck skipped (mypy could not run: {first})\n{output}".rstrip(), proc.stderr
+    changed = {_normalise_rel(rel) for rel in py_files}
+    errors: list[str] = []
+    for line in output.splitlines():
+        match = _MYPY_LINE.match(line)
+        if not match or match.group("kind") != "error":
+            continue
+        try:
+            rel = _normalise_rel(match.group("path"))
+        except DiffApplyError:
+            continue
+        if rel in changed:
+            errors.append(line)
+    if errors:
+        return False, "\n".join(errors), f"mypy: {len(errors)} type error(s) in changed files"
+    return True, "mypy: clean" + (f"\n{output}" if output else ""), ""
+
+
 def _split_cmd(test_cmd: str | Sequence[str]) -> list[str]:
     if isinstance(test_cmd, str):
         parts = shlex.split(test_cmd, posix=os.name != "nt")
@@ -797,6 +896,8 @@ def run_gates(
     schema_targets: Mapping[str, Sequence[str]] | None = None,
     test_timeout: float = 300.0,
     linter: LinterMode = "auto",
+    typecheck: TypecheckMode = "auto",
+    typecheck_timeout: float = 180.0,
     short_circuit: bool = True,
 ) -> list[DeterministicGateResult]:
     """Run the deterministic gates on a submission already applied to ``workspace``.
@@ -813,6 +914,10 @@ def run_gates(
         test_timeout: Seconds before the test command is killed (gate fails).
         linter: ``"auto"`` (ruff if installed, else built-in), ``"ruff"`` or
             ``"builtin"``.
+        typecheck: ``"auto"`` (mypy if installed, else skipped), ``"mypy"``
+            (fail when mypy is missing) or ``"off"``.
+        typecheck_timeout: Seconds before mypy is killed (the gate is then
+            skipped with a note).
         short_circuit: Stop after the first failing gate (default).
 
     Returns:
@@ -829,12 +934,14 @@ def run_gates(
 
     for check in checks:
         started = time.monotonic()
-        if check in ("syntax", "linter") and files is None:
+        if check in ("syntax", "linter", "typecheck") and files is None:
             passed, out, err = False, "", files_error
         elif check == "syntax":
             passed, out, err = _gate_syntax(files or [])
         elif check == "linter":
             passed, out, err = _gate_linter(files or [], root, linter)
+        elif check == "typecheck":
+            passed, out, err = _gate_typecheck(files or [], root, typecheck, typecheck_timeout)
         elif check == "tests":
             passed, out, err = _gate_tests(test_cmd, root, test_timeout)
         elif check == "schema":
@@ -875,8 +982,12 @@ class ValidationGates:
         schema_targets: Mapping[str, Sequence[str]] | None = None,
         test_timeout: float = 300.0,
         linter: LinterMode = "auto",
+        typecheck: TypecheckMode = "auto",
+        typecheck_timeout: float = 180.0,
     ) -> None:
         self.checks = tuple(checks)
+        self.typecheck: TypecheckMode = typecheck
+        self.typecheck_timeout = typecheck_timeout
         self.test_cmd = test_cmd
         self.schema_targets = dict(schema_targets) if schema_targets else None
         self.test_timeout = test_timeout
@@ -893,6 +1004,8 @@ class ValidationGates:
                 schema_targets=self.schema_targets,
                 test_timeout=self.test_timeout,
                 linter=self.linter,
+                typecheck=self.typecheck,
+                typecheck_timeout=self.typecheck_timeout,
             )
         )
 

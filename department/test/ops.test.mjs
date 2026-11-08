@@ -70,8 +70,8 @@ test('dispatch and updateSettings', () => {
 
 test('every op type is covered and missing args are tolerated', () => {
   assert.deepEqual(OP_TYPES.sort(), [
-    'addTask', 'assignTeam', 'deleteTask', 'dispatch', 'importState', 'reportProgress',
-    'reportUsage', 'reset', 'reviewTask', 'unassignTeam', 'updateSettings', 'updateTask',
+    'addTask', 'assignTeam', 'cancelBatch', 'claimBatch', 'deleteTask', 'dispatch', 'dispatchBatch', 'importState',
+    'reportProgress', 'reportUsage', 'reset', 'reviewTask', 'unassignTeam', 'updateBatch', 'updateSettings', 'updateTask',
   ]);
   const s = fresh();
   assert.deepEqual(applyOp(s, { type: 'dispatch' }), []);
@@ -114,7 +114,7 @@ test('importing a board into itself adds nothing', () => {
   const s = boardWith(['A', 'B', 'C', 'D']);
   const before = json(s);
   const r = op(s, 'importState', { state: json(s) });
-  assert.deepEqual(r, { added: 0, skipped: 4, idMap: {} });
+  assert.deepEqual(r, { added: 0, skipped: 4, idMap: {}, batches: { added: 0, updated: 0, idMap: {}, rejected: [] } });
   assert.deepEqual(s, before);
 });
 
