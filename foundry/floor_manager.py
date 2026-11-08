@@ -82,6 +82,9 @@ class WorkOrder(BaseModel):
     repo_root: str | None = Field(
         default=None, description="Repository the task belongs to (resolved); the manager's repo when absent."
     )
+    pr_base: str | None = Field(
+        default=None, description="Branch the task's pull request targets (a board batch's base); the publisher's when absent."
+    )
 
 
 @dataclass
@@ -1455,9 +1458,13 @@ class FloorManager:
                 kwargs["draft"] = self.pr_draft
             if "on_pushed" in params:
                 kwargs["on_pushed"] = lambda branch, commit=None: self._pushed(task_id, branch, commit)
+            order_base = getattr(order, "pr_base", None) if order else None
+            if order_base and "base" in params:
+                kwargs["base"] = order_base
             if pushed:
                 # only the PR step failed last time: open it for the branch already pushed
-                result = await _maybe_await(self.publisher.open_pr(st["branch"], req, base=st.get("base")))
+                result = await _maybe_await(
+                    self.publisher.open_pr(st["branch"], req, base=st.get("base") or order_base))
             else:
                 result = await _maybe_await(
                     publish(task_id, order.title if order else req["title"], patch, req, **kwargs)

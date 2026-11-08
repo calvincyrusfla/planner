@@ -335,8 +335,11 @@ class GitPublisher:
         *,
         draft: bool | None = None,
         on_pushed: OnPushed | None = None,
+        base: str | None = None,
     ) -> PublishResult:
         """Branch, commit, push and open the PR for one task. Never raises.
+
+        ``base`` (e.g. a board batch's branch) overrides the publisher's base for this task.
 
         Idempotent per task: when a branch ``foundry/<task-id>-*`` from an earlier
         call already exists on the remote, no new branch is pushed; its existing
@@ -347,7 +350,7 @@ class GitPublisher:
         async with self._lock:
             try:
                 return await self._publish(task_id, title, Path(patch_path), dict(pr or {}),
-                                           self.draft if draft is None else bool(draft), on_pushed)
+                                           self.draft if draft is None else bool(draft), on_pushed, base=base)
             except _Fail as f:
                 return PublishResult(ok=False, error=f.error, stage=f.stage)
             except Exception as exc:  # noqa: BLE001 - publish must never break the caller
@@ -486,14 +489,14 @@ class GitPublisher:
             log.warning("git publisher: on_pushed callback failed: %s", exc)
 
     async def _publish(self, task_id: str, title: str, patch: Path, pr: dict[str, Any], draft: bool,
-                       on_pushed: OnPushed | None) -> PublishResult:
+                       on_pushed: OnPushed | None, *, base: str | None = None) -> PublishResult:
         git = await self._require_repo()
         await self._clean_stale(git)
         if not patch.is_file() or patch.stat().st_size == 0:
             raise _Fail("no_patch", f"patch file missing or empty: {patch}")
         # check gh before pushing anything, so a missing CLI leaves no orphan branch
         gh = await self._require_gh()
-        base = await self._resolve_base(git)
+        base = base or await self._resolve_base(git)
         pr_title = str(pr.get("title") or title or task_id).strip()
         pr_body = str(pr.get("body") or "")
 

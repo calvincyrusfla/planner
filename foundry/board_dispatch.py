@@ -12,7 +12,8 @@ Foundry service on the user's PC runs one :class:`BatchWatcher`, which every
    case-insensitively; ``FOUNDRY_BATCH_REPO`` overrides). A batch claimed by a
    Foundry whose heartbeat is older than 10 minutes is taken over;
 3. submits each subtask, in order, as a normal Foundry work order
-   (``manager.accept``). A subtask with ``dependsOn`` is submitted only once
+   (``manager.accept``); its pull request targets the batch's ``base`` when
+   given, else the configured base (``FOUNDRY_PR_BASE`` / the repo default). A subtask with ``dependsOn`` is submitted only once
    all its dependencies are ``complete``; when a dependency ends any other way
    the subtask fails without being submitted;
 4. pushes each subtask's Foundry task id, state, PR record and error back with
@@ -439,7 +440,6 @@ class BatchWatcher:
         cancelled = batch.get("status") == "cancelled"
         first = not rec["tasks"] and not rec["failed"]
         results: dict[str, dict[str, Any]] = {}
-        note: str | None = None
 
         for key, sub in zip(keys, subtasks):
             if key in rec["failed"]:
@@ -476,12 +476,6 @@ class BatchWatcher:
             log.info("board dispatch: %s subtask %s -> %s", bid, key, tid)
             results[key] = subtask_state(manager, queue, tid)
 
-        if first and batch.get("base"):
-            base = getattr(self.service.config, "pr_base", None)
-            if base != batch.get("base"):
-                note = (f"requested base {batch.get('base')}; this Foundry opens PRs against "
-                        f"{base or 'the repo default branch'}")
-
         # The board closes a batch (and refuses further updates) once every subtask is
         # terminal, so "complete" is only reported once the subtask's PR is settled.
         auto_pr = self._auto_pr()
@@ -490,8 +484,6 @@ class BatchWatcher:
         args: dict[str, Any] = {"id": bid, "service": self.service_id, "heartbeat": True}
         if changed:
             args["results"] = changed
-        if note:
-            args["note"] = note
         if first and rec["tasks"] and batch.get("status") == "claimed":
             args["status"] = "running"
         self._save(bid, rec)
@@ -559,8 +551,9 @@ class BatchWatcher:
         context = f"Part of \"{batch.get('title')}\"" + (f": {goal}" if goal else "")
         desc = (desc + "\n\n" if desc else "") + f"{context}\n{marker(str(batch['id']), key)}"
         acceptance = [str(a) for a in (sub.get("acceptance") or sub.get("acceptance_criteria") or []) if str(a).strip()]
+        base = str(batch.get("base") or "").strip() or None  # else the publisher's (FOUNDRY_PR_BASE / repo default)
         order = WorkOrder(title=fields["title"], description=desc, files=fields["files"],
-                          acceptance_criteria=acceptance, repo_root=str(self.service.repo))
+                          acceptance_criteria=acceptance, repo_root=str(self.service.repo), pr_base=base)
         manager = self.service.factory.manager
         accept = getattr(manager, "accept", None)
         if not callable(accept):
