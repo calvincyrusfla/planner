@@ -194,7 +194,7 @@ def test_dispatch_and_poll_via_dashboard(fake: FakeBoardState, dashboard: str) -
     fake.state["foundryBatches"][0]["results"] = {"1": {"foundryTask": "F-001", "state": "building"}}
     st = d.poll_foundry_sprint("S-001", board=board)
     assert st.subtasks[0].foundry_task == "F-001" and st.subtasks[0].state == "building"
-    assert st.subtasks[1].state == "pending"
+    assert st.subtasks[1].state == "queued"
 
 
 def test_hub_sends_key_and_proxy_placeholder(fake: FakeBoardState, hub: str) -> None:

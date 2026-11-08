@@ -82,7 +82,7 @@ DEPT_CLI = REPO_ROOT / "department" / "dept.mjs"
 HUB_FILE = REPO_ROOT / "department" / "data" / "hub.json"
 
 BatchStatus = Literal["queued", "claimed", "running", "done", "failed", "cancelled"]
-SubtaskState = Literal["pending", "queued", "sizing", "building", "reviewing", "complete", "quarantined", "failed"]
+SubtaskState = Literal["queued", "sizing", "building", "reviewing", "complete", "quarantined", "failed"]
 TERMINAL_BATCH = frozenset({"done", "failed", "cancelled"})
 TERMINAL_SUBTASK = frozenset({"complete", "quarantined", "failed"})
 
@@ -250,7 +250,7 @@ class SubtaskStatus(_Model):
     key: str
     title: str = ""
     foundry_task: str | None = None
-    state: str = "pending"
+    state: str = "queued"
     pr_url: str | None = None
     pr_state: str | None = None
     pr_branch: str | None = None
@@ -307,7 +307,7 @@ class SprintStatus(_Model):
             pr: dict[str, Any] = raw_pr if isinstance(raw_pr, dict) else {}
             subs.append(SubtaskStatus(
                 key=key, title=str(st.get("title") or ""),
-                foundry_task=r.get("foundryTask") or None, state=str(r.get("state") or "pending"),
+                foundry_task=r.get("foundryTask") or None, state=str(r.get("state") or "queued"),
                 pr_url=pr.get("url") or None, pr_state=pr.get("state") or None,
                 pr_branch=pr.get("branch") or None, pr_error=pr.get("error") or None,
                 error=r.get("error") or None, updated_at=r.get("updatedAt") or None,
