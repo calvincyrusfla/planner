@@ -7,6 +7,8 @@
 // the default browser), then exits. Safe to run any number of times:
 // a running dashboard is reused, never duplicated. Works from any cwd and without
 // a shell PATH (GUI launchers), since it only relies on process.execPath.
+// It also starts Foundry (foundry/start_foundry.*) if its venv exists and nothing answers
+// on its port; on Windows in a minimised "Foundry" window. DEPT_FOUNDRY=off disables that.
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -155,7 +157,105 @@ async function main() {
 
   console.log(`Agent Department dashboard: ${URL_BASE}`);
   openAppWindow(URL_BASE);
+  // After the window is on its way: a refused probe is instant, a hang is capped at 1 s.
+  await maybeStartFoundry();
   process.exit(0);
+}
+
+// ---- Foundry: start it alongside the dashboard (DEPT_FOUNDRY=off disables) ----
+
+export const foundryPort = (env) => Number(env.FOUNDRY_SERVE_PORT) || 4310;
+
+// 'foundry' if the health route answers JSON with an ok field, 'free' only for a refused
+// connection (nothing listening), 'other' for anything else (timeout, non-JSON, HTTP error).
+export async function probeFoundry(port, timeoutMs = 1000) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const body = await res.json().catch(() => null);
+    return body && typeof body === 'object' && 'ok' in body ? 'foundry' : 'other';
+  } catch (err) {
+    const code = err && err.cause && err.cause.code;
+    return code === 'ECONNREFUSED' ? 'free' : 'other';
+  }
+}
+
+// cmd.exe would expand %VAR% or end the quoted path early at a ", so such paths are refused.
+const unsafeForCmd = (p) => /["%\r\n]/.test(p);
+
+// Pure: how to start Foundry on this platform, or {spec: null, reason}. `exists` is injected for tests.
+export function foundryLaunchSpec({ platform, repoRoot, env = {}, exists = fs.existsSync }) {
+  if (String(env.DEPT_FOUNDRY || '').toLowerCase() === 'off') return { spec: null, reason: 'disabled (DEPT_FOUNDRY=off)' };
+  if (platform === 'win32') {
+    const w = path.win32;
+    const bat = w.join(repoRoot, 'foundry', 'start_foundry.bat');
+    const py = w.join(repoRoot, '.venv', 'Scripts', 'python.exe');
+    if (!exists(bat)) return { spec: null, reason: `no ${bat}` };
+    if (!exists(py)) return { spec: null, reason: `no Python virtual environment at ${py}` };
+    if (unsafeForCmd(bat)) return { spec: null, reason: `path not safe to quote for cmd.exe: ${bat}` };
+    const cmd = w.join(env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
+    return {
+      spec: {
+        cmd,
+        // Verbatim, so the quotes reach cmd as written: start "<title>" /min "<bat>".
+        args: ['/d', '/s', '/c', 'start', '"Foundry"', '/min', `"${bat}"`],
+        opts: { cwd: repoRoot, detached: true, windowsHide: true, windowsVerbatimArguments: true, stdio: 'ignore' },
+      },
+      reason: 'starting',
+    };
+  }
+  const sh = path.posix.join(repoRoot, 'foundry', 'start_foundry.sh');
+  const py = path.posix.join(repoRoot, '.venv', 'bin', 'python');
+  if (!exists(sh)) return { spec: null, reason: `no ${sh}` };
+  if (!exists(py)) return { spec: null, reason: `no Python virtual environment at ${py}` };
+  const logDir = env.DEPT_DATA ? path.dirname(path.resolve(env.DEPT_DATA)) : path.join(repoRoot, 'department', 'data');
+  return {
+    spec: {
+      cmd: exists('/bin/bash') ? '/bin/bash' : 'bash',
+      args: [sh],
+      opts: { cwd: repoRoot, detached: true, windowsHide: true },
+      logFile: path.join(logDir, 'foundry.log'),
+    },
+    reason: 'starting',
+  };
+}
+
+// Never throws and never waits for Foundry; the dashboard chip notices it once it is up.
+export async function maybeStartFoundry({ env = process.env, platform = process.platform, repoRoot = path.dirname(here), log = console.log, probe = probeFoundry, run = spawn } = {}) {
+  try {
+    if (String(env.DEPT_FOUNDRY || '').toLowerCase() === 'off') return 'disabled';
+    const port = foundryPort(env);
+    const state = await probe(port);
+    if (state === 'foundry') return 'running';
+    if (state !== 'free') {
+      log(`Foundry: port ${port} answers but not as Foundry; not starting it.`);
+      return 'other';
+    }
+    const { spec, reason } = foundryLaunchSpec({ platform, repoRoot, env });
+    if (!spec) {
+      log(`Foundry: not started (${reason}).`);
+      return 'skipped';
+    }
+    let fd = null;
+    const opts = { ...spec.opts, env };
+    if (spec.logFile) {
+      fs.mkdirSync(path.dirname(spec.logFile), { recursive: true });
+      fd = fs.openSync(spec.logFile, 'a');
+      fs.writeSync(fd, `\n--- ${new Date().toISOString()} launch.mjs starting Foundry on port ${port}\n`);
+      opts.stdio = ['ignore', fd, fd];
+    }
+    try {
+      const child = run(spec.cmd, spec.args, opts);
+      child.on('error', () => {});
+      child.unref();
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+    }
+    log(`Foundry: starting on http://127.0.0.1:${port}${spec.logFile ? ` (log: ${spec.logFile})` : ' (minimised "Foundry" window)'}`);
+    return 'started';
+  } catch (err) {
+    log(`Foundry: could not start (${err && err.message}).`);
+    return 'error';
+  }
 }
 
 // Run only when executed directly, so tests can import windowsBrowserCandidates.

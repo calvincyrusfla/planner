@@ -26,6 +26,8 @@ npm run shortcut
 
 A shortcut named **Agent Department** with the network icon appears on your Desktop (also when your Desktop is in OneDrive). Double-click it. If the server isn't running yet, it starts in the background (its log goes to `department/data/server.log`). Then the dashboard opens in its own window, with no tabs or address bar and its own taskbar button. This uses Microsoft Edge's app mode, which every Windows 10 and 11 PC has. If Edge is missing, Chrome is used the same way. If neither is found, the dashboard opens in a normal tab of your default browser.
 
+The shortcut also starts Foundry if it isn't running yet and its `.venv` is set up: it opens minimised as a **Foundry** window on the taskbar (close that window or press Ctrl+C in it to stop Foundry). Set `DEPT_FOUNDRY=off` to turn this off.
+
 To pin it to the taskbar, right-click the shortcut and choose **Pin to taskbar** (on Windows 11, **Show more options** first).
 
 Closing the window doesn't stop the server; it keeps running in the background. There is no stop button. To stop it without touching other Node programs, run this in PowerShell:
