@@ -91,7 +91,7 @@ In the Claude artifact, data lives in the artifact's shared database and syncs a
 | `created` | number | Timestamp (ms) |
 | `doneAt` | number | Timestamp (ms) when completed |
 
-Small per-device preferences (last open tab, hidden calendar filters) are kept in the browser's local storage.
+Small per-device preferences (last open tab, hidden calendar filters) are kept in the browser's `localStorage`.
 
 ---
 
