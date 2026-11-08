@@ -1285,7 +1285,7 @@ _SECRET_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
 _MAX_SECRET_FINDINGS = 20
 
 
-def _added_lines(diff: str) -> Iterable[tuple[str, int, str]]:
+def _added_diff_lines(diff: str) -> Iterable[tuple[str, int, str]]:
     """Yield ``(path, new-file line, text)`` for every added line of a unified diff.
 
     Hunk line counts are deliberately not used, so a miscounted hunk cannot hide
@@ -1326,7 +1326,7 @@ def _gate_secrets(diff: str) -> tuple[bool, str, str]:
     if os.environ.get("FOUNDRY_SECRET_SCAN", "").strip().lower() in _SECRET_SCAN_OFF:
         return True, "secret scan skipped (FOUNDRY_SECRET_SCAN is off)", ""
     findings: list[str] = []
-    for path, line_no, text in _added_lines(diff):
+    for path, line_no, text in _added_diff_lines(diff):
         for kind, pattern in _SECRET_PATTERNS:
             for match in pattern.finditer(text):
                 excerpt = _mask_secret(match.group(match.lastgroup or 0))
