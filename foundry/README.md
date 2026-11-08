@@ -468,7 +468,7 @@ The dashboard uses these endpoints; you don't need them yourself. They answer on
 
 | Endpoint | What it does |
 |---|---|
-| `GET /api/health` | `{ok, repo, model, gemma_ok, claude_ok, version, pr_ready}` (plus the reason when `pr_ready` is false) |
+| `GET /api/health` | `{ok, repo, model, gemma_ok, claude_ok, version, gemma_speed, pr_ready, pr_reason}` (`pr_reason` says why PRs can't be opened) |
 | `GET /api/status` | the tasks (`id, title, state, team, builders, patch, md, rejected, reason, pr`), a Foreman telemetry summary, `paused_until` and `last_account_error` |
 | `POST /api/orders` | `{title, description?, files?, size?}` submits a work order for the service's repository and returns `{ok, task_id}` at once; the Shop Foreman then sizes it in the background (on a CPU this can take a minute), and `/api/status` shows the task as `sizing` until then. An order whose sizing was interrupted is sized again on the next start. A bad order gets HTTP 400 |
 | `POST /api/ask` | `{question}`: the Foreman's answer, streamed as `text/event-stream` (`data: {"text": "..."}` chunks, then `event: done`) |
@@ -500,7 +500,7 @@ When the service runs for a repository, **every approved task gets its own branc
 
 The repository you start Foundry with (`--repo`) must be a git repository with an `origin` remote on GitHub that you can push to.
 
-When the service starts it checks git, the `origin` remote and `gh` once. If something is missing it logs a clear warning, and `/api/health` reports `pr_ready: false` with the reason. Tasks still run; only the PR step is skipped or fails.
+When the service starts it checks git, the `origin` remote and `gh` once. If something is missing it logs a clear warning, and `/api/health` reports `pr_ready: false` with the reason in `pr_reason`. Tasks still run; only the PR step is skipped or fails.
 
 ### What Foundry does for each approved task
 
@@ -527,7 +527,7 @@ A restart never opens a second PR for the same task: an opened PR is remembered,
 
 ### When a PR fails
 
-The Foundry tasks list then shows **PR failed — Retry**; hover over it for the reason. Fix the cause and click **Retry** (or `POST /api/tasks/<id>/pr/retry`). The patch and `.md` files are always in the patches folder, so you can also [apply the change by hand](#real-mode-phase-2-untested-against-live-services).
+The Foundry tasks list then shows **PR failed** with a **Retry** button; hover over **PR failed** for the reason and the step that failed. Fix the cause and click **Retry** (or `POST /api/tasks/<id>/pr/retry`). When the branch was already pushed and only the PR step failed, Retry opens the PR for that same branch; it doesn't push a second one. The patch and `.md` files are always in the patches folder, so you can also [apply the change by hand](#real-mode-phase-2-untested-against-live-services).
 
 | Stage | What it means and what to do |
 |---|---|
@@ -538,6 +538,10 @@ The Foundry tasks list then shows **PR failed — Retry**; hover over it for the
 | `push_failed` | git couldn't push, usually because it isn't logged in or you can't write to the repository. Run `gh auth login` (answer Yes to git credentials), or `gh auth setup-git` |
 | `gh_missing` | the GitHub CLI is not installed: `winget install --id GitHub.cli`, open a new window, `gh auth login`, then restart Foundry |
 | `gh_not_logged_in` | run `gh auth login` |
+| `no_base` | Foundry couldn't tell which branch to open the PR against. Set `FOUNDRY_PR_BASE`, for example `main` |
+| `fetch_failed` | `git fetch` of the base branch failed: check your network and that the branch exists on `origin` |
+| `worktree_failed`, `commit_failed` | git couldn't create the temporary worktree or the commit (for example a commit hook refused it). Read the error, fix it, then Retry |
+| `no_patch` | the task has no patch to publish (an empty change, or the combined patch doesn't apply); the PR is `skipped` |
 | `pr_failed` | the branch was pushed but `gh pr create` failed (for example a PR for that branch already exists, or the base branch name is wrong). Read the error, fix it, then Retry, or open the PR from the pushed branch on GitHub |
 
 ## Dashboard integration

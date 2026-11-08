@@ -323,3 +323,42 @@ def test_http_pr_retry_route(tmp_path: Path) -> None:
             await svc.stop()
 
     asyncio.run(go())
+
+
+class OpenPrPublisher(FakePublisher):
+    """Fails at the PR step (branch pushed), then opens the PR via ``open_pr``."""
+
+    def __init__(self) -> None:
+        super().__init__({"ok": False, "branch": "foundry/f-001-add-clamp", "commit": "c0ffee", "base": "main",
+                          "error": "gh pr create failed", "stage": "pr_failed"})
+        self.open_calls: list[tuple[str, dict[str, Any], Any]] = []
+
+    async def open_pr(self, branch: str, pr: dict[str, Any], *, base: str | None = None) -> dict[str, Any]:
+        self.open_calls.append((branch, dict(pr), base))
+        if len(self.open_calls) == 1:
+            return {"ok": False, "branch": branch, "error": "not logged in", "stage": "gh_not_logged_in", "base": base}
+        return {"ok": True, "branch": branch, "pr_url": "https://github.com/me/repo/pull/7", "base": base}
+
+
+def test_retry_after_pr_failed_reuses_the_pushed_branch(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    pub = OpenPrPublisher()
+    f = _factory(tmp_path, repo, pub)
+
+    async def go() -> str:
+        tid = await _complete(f, repo)
+        st = f.manager.pr_state(tid)
+        assert st["state"] == "failed" and st["branch"] == "foundry/f-001-add-clamp" and st["commit"] == "c0ffee"
+        for _ in range(2):  # second failure (gh login) must still keep the pushed branch
+            assert (await f.manager.retry_pr(tid))["ok"] is True
+            await f.manager.drain()
+        return tid
+
+    tid = asyncio.run(go())
+    assert len(pub.calls) == 1  # publish (push) ran once; the retries only opened the PR
+    assert [c[0] for c in pub.open_calls] == ["foundry/f-001-add-clamp"] * 2
+    assert all(c[2] == "main" for c in pub.open_calls)
+    assert pub.open_calls[0][1]["body"].rstrip().endswith(f"Opened by Foundry (task {tid})")
+    st = f.manager.pr_state(tid)
+    assert st["state"] == "opened" and st["url"].endswith("/pull/7") and st["commit"] == "c0ffee"
+    f.close()

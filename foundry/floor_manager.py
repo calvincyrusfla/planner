@@ -1374,6 +1374,8 @@ class FloorManager:
             "branch": fields.get("branch"),
             "error": fields.get("error"),
             "stage": fields.get("stage"),
+            "commit": fields.get("commit"),
+            "base": fields.get("base"),
             "attempts": int(fields.get("attempts", old.get("attempts", 0)) or 0),
         }
         self.pr_states[task_id] = rec
@@ -1420,12 +1422,16 @@ class FloorManager:
         return {"title": title, "body": body, "draft": self.pr_draft}
 
     async def _publish(self, task_id: str) -> dict[str, Any]:
-        st = self.pr_states.get(task_id) or {}
+        st = dict(self.pr_states.get(task_id) or {})
         attempts = int(st.get("attempts") or 0) + 1
-        self._set_pr(task_id, "pending", attempts=attempts)
+        # branch + commit known: it was pushed and only the PR step failed (stage pr_failed)
+        pushed = bool(st.get("branch") and st.get("commit")) and callable(
+            getattr(self.publisher, "open_pr", None))
+        keep = {k: st.get(k) for k in ("branch", "commit", "base", "stage")} if pushed else {}
+        self._set_pr(task_id, "pending", attempts=attempts, **keep)
         self.save()  # a crash from here on leaves it pending: retried once on the next start
         patch = self._pr_patch(task_id)
-        if patch is None:
+        if patch is None and not pushed:
             rec = self._set_pr(task_id, "skipped", error="no patch to publish", stage="no_patch", attempts=attempts)
             self.save()
             return rec
@@ -1436,9 +1442,13 @@ class FloorManager:
             kwargs: dict[str, Any] = {}
             if "draft" in _params(publish):
                 kwargs["draft"] = self.pr_draft
-            result = await _maybe_await(
-                publish(task_id, order.title if order else req["title"], patch, req, **kwargs)
-            )
+            if pushed:
+                # only the PR step failed last time: open it for the branch already pushed
+                result = await _maybe_await(self.publisher.open_pr(st["branch"], req, base=st.get("base")))
+            else:
+                result = await _maybe_await(
+                    publish(task_id, order.title if order else req["title"], patch, req, **kwargs)
+                )
         except asyncio.CancelledError:
             log.info("floor manager: publishing %s interrupted; it is retried once on the next start", task_id)
             raise
@@ -1446,9 +1456,11 @@ class FloorManager:
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500], "stage": "error"}
         ok = bool(_get(result, "ok"))
         url = _get(result, "pr_url")
-        branch = _get(result, "branch")
+        branch = _get(result, "branch") or keep.get("branch")
+        extra = {"commit": _get(result, "commit") or keep.get("commit"),
+                 "base": _get(result, "base") or keep.get("base")}
         if ok:
-            rec = self._set_pr(task_id, "opened", url=url, branch=branch, attempts=attempts)
+            rec = self._set_pr(task_id, "opened", url=url, branch=branch, attempts=attempts, **extra)
             d = self.directives.get(task_id)
             try:
                 self.bridge.progress(
@@ -1461,7 +1473,7 @@ class FloorManager:
         else:
             err = str(_get(result, "error") or "publishing failed")[:500]
             rec = self._set_pr(task_id, "failed", url=url, branch=branch, error=err,
-                               stage=_get(result, "stage"), attempts=attempts)
+                               stage=_get(result, "stage"), attempts=attempts, **extra)
             log.warning("floor manager: %s PR not opened (%s): %s", task_id, rec["stage"], err)
         try:
             self.queue.record_event("pr_" + rec["state"], task_id, {k: v for k, v in rec.items() if v is not None})
@@ -1507,9 +1519,13 @@ class FloorManager:
             return {"ok": False, "reason": "the PR is already open", "pr": dict(st)}
         if self.is_publishing(task_id) or (st is not None and st.get("state") == "pending"):
             return {"ok": False, "reason": "already publishing", "pr": dict(st or {})}
-        if self._pr_patch(task_id) is None:
+        reuse = st is not None and bool(st.get("branch") and st.get("commit"))
+        if not reuse and self._pr_patch(task_id) is None:
             return {"ok": False, "reason": "no applicable patch to publish"}
-        self._set_pr(task_id, "pending", attempts=0)
+        # the branch is already pushed when only the PR step failed: keep it so the
+        # retry opens the PR for that branch instead of pushing a second "-2" branch
+        keep = {k: st.get(k) for k in ("branch", "commit", "base", "stage")} if reuse else {}
+        self._set_pr(task_id, "pending", attempts=0, **keep)
         self.save()
         self._start_publish(task_id)
         return {"ok": True, "pr": dict(self.pr_states[task_id])}
