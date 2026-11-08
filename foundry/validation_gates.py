@@ -78,7 +78,7 @@ __all__ = [
     "run_gates_outcome",
 ]
 
-ALL_CHECKS: tuple[GateCheck, ...] = ("syntax", "linter", "typecheck", "tests", "schema")
+ALL_CHECKS: tuple[GateCheck, ...] = ("syntax", "secrets", "linter", "typecheck", "tests", "schema")
 """Default gate order. Cheapest first so failures short-circuit early."""
 
 LinterMode = Literal["auto", "ruff", "builtin"]
@@ -1051,6 +1051,91 @@ def _gate_schema(
     return not errors, "\n".join(notes), "\n".join(errors)
 
 
+# Credential shapes the secrets gate looks for. When a pattern has a named group,
+# only that group is masked and reported (the rest is the name of the key).
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("private key", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")),
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    (
+        "AWS secret key",
+        re.compile(
+            r"""aws[_-]?secret[_-]?(?:access[_-]?)?key\\?["']?\]?\s*(?::=|=>|:|=)\s*\\?["']?"""
+            r"""(?P<value>[A-Za-z0-9/+]{40})(?![A-Za-z0-9/+])""",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "GitHub token",
+        re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})"),
+    ),
+    ("Slack token", re.compile(r"\b(?:xox[abeoprs]|xapp)-[A-Za-z0-9-]{10,}")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])")),
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    (
+        "OpenAI API key",
+        re.compile(r"\bsk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})"),
+    ),
+)
+_SECRET_SCAN_OFF = ("0", "false", "no", "off")
+_SECRET_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
+_MAX_SECRET_FINDINGS = 20
+
+
+def _added_lines(diff: str) -> Iterable[tuple[str, int, str]]:
+    """Yield ``(path, new-file line, text)`` for every added line of a unified diff.
+
+    Hunk line counts are deliberately not used, so a miscounted hunk cannot hide
+    a line. ``+++`` headers are yielded too: inside a hunk one can't be told
+    apart for certain from an added line.
+    """
+    path = "<diff>"
+    line_no = 0
+    previous = ""
+    for raw in diff.split("\n"):
+        line = raw.rstrip("\r")
+        hunk = _SECRET_HUNK_RE.match(line)
+        if hunk:
+            line_no = int(hunk.group(1))
+        elif line.startswith("+"):
+            is_header = line.startswith("+++ ") and previous.startswith("--- ")
+            if is_header:
+                path = line[4:].split("\t", 1)[0].strip().strip('"').removeprefix("b/")
+            yield path, line_no, line[1:]
+            line_no += 0 if is_header else 1
+        elif not line.startswith(("-", "\\")):
+            line_no += 1
+        previous = line
+
+
+def _mask_secret(value: str) -> str:
+    """Keep just enough of ``value`` to recognise it in the report."""
+    return f"{value[:4]}****"
+
+
+def _gate_secrets(diff: str) -> tuple[bool, str, str]:
+    """Fail when a line added by ``diff`` looks like a credential.
+
+    The report names the file, line and kind of secret with a masked excerpt, so
+    the secret itself never reaches gate output. ``FOUNDRY_SECRET_SCAN`` set to
+    ``0``, ``false``, ``no`` or ``off`` skips the scan; any other value scans.
+    """
+    if os.environ.get("FOUNDRY_SECRET_SCAN", "").strip().lower() in _SECRET_SCAN_OFF:
+        return True, "secret scan skipped (FOUNDRY_SECRET_SCAN is off)", ""
+    findings: list[str] = []
+    for path, line_no, text in _added_lines(diff):
+        for kind, pattern in _SECRET_PATTERNS:
+            for match in pattern.finditer(text):
+                excerpt = _mask_secret(match.group(match.lastgroup or 0))
+                findings.append(f"{path}:{line_no}: {kind}: {excerpt}")
+    if not findings:
+        return True, "secret scan: no secrets in the added lines", ""
+    report = findings[:_MAX_SECRET_FINDINGS]
+    if len(findings) > len(report):
+        report.append(f"... and {len(findings) - len(report)} more")
+    header = "possible secret in the diff; remove it and read it from the environment instead:"
+    return False, "", "\n".join([header, *report])
+
+
 # --------------------------------------------------------------------------
 # Public runner
 # --------------------------------------------------------------------------
@@ -1107,6 +1192,8 @@ def run_gates(
             passed, out, err = False, "", files_error
         elif check == "syntax":
             passed, out, err = _gate_syntax(files or [])
+        elif check == "secrets":
+            passed, out, err = _gate_secrets(submission.diff)
         elif check == "linter":
             passed, out, err = _gate_linter(files or [], root, linter)
         elif check == "typecheck":

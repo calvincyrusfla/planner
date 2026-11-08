@@ -170,6 +170,10 @@ def split_claude_args(text: str) -> list[str]:
     return list(lexer)
 
 
+_SECRET_SCAN_OFF = ("0", "false", "no", "off")
+"""``FOUNDRY_SECRET_SCAN`` values that turn the scan off (same list as the secrets gate)."""
+
+
 class AnomalyThresholds(BaseModel):
     """Limits the Shop Foreman uses to detect line anomalies.
 
@@ -302,6 +306,13 @@ class FoundryConfig(BaseModel):
         description="Base branch for Foundry PRs (None: the repo's default branch).",
     )
     pr_draft: bool = Field(default=False, description="Open Foundry PRs as drafts.")
+    secret_scan: bool = Field(
+        default=True,
+        description=(
+            "Whether the secrets gate scans added lines. Mirrors FOUNDRY_SECRET_SCAN, which "
+            "the gate reads itself: 0, false, no or off disable it, any other value scans."
+        ),
+    )
     typecheck: TypecheckMode = Field(
         default="auto",
         description=(
@@ -494,6 +505,10 @@ class FoundryConfig(BaseModel):
             data["claude_append_prompt"] = (
                 None if append_prompt.lower() == _NONE_WORD else append_prompt
             )
+
+        secret_scan = get("SECRET_SCAN")
+        if secret_scan is not None:
+            data["secret_scan"] = secret_scan.strip().lower() not in _SECRET_SCAN_OFF
 
         thresholds: dict[str, Any] = {}
         for var, field in {
