@@ -177,3 +177,20 @@ def test_health_without_factory_has_empty_gemma_speed(tmp_path: Path) -> None:
     svc = _service(tmp_path, demo_gemma())
     h = svc.health()
     assert h["gemma_speed"] == {"avg_ms": None, "last_ms": None, "fallbacks": 0, "calls": 0}
+
+
+def test_real_foreman_stats_flow_into_health(tmp_path: Path) -> None:
+    async def go() -> None:
+        svc = _service(tmp_path, _sizing_gemma())
+        await svc.start()
+        try:
+            tid = await svc.submit(**ORDER)
+            await _until(lambda: _sized(svc, tid))
+            speed = svc.health()["gemma_speed"]
+            assert speed["calls"] >= 1 and speed["last_ms"] is not None and speed["avg_ms"] is not None
+            assert svc.status()["foreman"]["gemma"]["calls"] == speed["calls"]
+            await svc.factory.manager.drain()
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())

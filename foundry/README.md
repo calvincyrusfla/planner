@@ -177,7 +177,7 @@ Gemma sizes every Foundry task and answers Ask the Foreman. If it runs on the CP
 
 7. **Tune the time limits if Gemma is still slow.** These are a safety net, not a speed-up:
    - `FOUNDRY_GEMMA_TIMEOUT_S` (default `180`): how long one sizing or review call may take before Foundry uses its heuristic.
-   - `FOUNDRY_ASK_TIMEOUT_S` (default `90`): how long Ask the Foreman waits for Gemma. When the time runs out you get the built-in status answer instead of an error. Keep it below 110 seconds, the dashboard's own limit for one answer.
+   - `FOUNDRY_ASK_TIMEOUT_S` (default `90`): how long Ask the Foreman waits for Gemma. When the time runs out you get the built-in status answer instead of an error. Keep it below 110 seconds, the service's own limit for one answer (`ASK_CHUNK_TIMEOUT_S` in `serve_api.py`).
 
    For example `setx FOUNDRY_GEMMA_TIMEOUT_S 300`, then restart Foundry.
 
@@ -434,12 +434,13 @@ When Foundry isn't running, the box and the button are disabled and the panel sa
 
 The dashboard shows which tasks Gemma really sized:
 
-- The **Foundry** list near Ask the Foreman shows each Foundry task with its id, title, state and team, and a badge:
+- While Foundry is running, the Ask the Foreman card has a **Foundry tasks** list (click it to open it; the summary line counts how many were sized by Gemma and how many by the fallback). Each row shows the task's id, title, state and team, and a badge:
   - **Gemma · 41 s**: Gemma sized the task, and it took 41 seconds.
-  - **Fallback**: Gemma was too slow or didn't answer, so the built-in heuristic sized it. The task still runs normally; the heuristic is just less precise about team size.
-- Hover over the **Foundry** chip to see Gemma's recent speed, for example `Gemma: avg 38 s per call, 2 fallbacks`.
+  - **Fallback**: Gemma was too slow or didn't answer, so the built-in rules sized it (with the time sizing took, when known). The task still runs normally; the rules are just less precise about the crew size.
+  - **Sizing…**: the task is still being sized.
+- Hover over the **Foundry** chip to see Gemma's recent speed, for example `Gemma: avg 38 s per call, 2 fallbacks (last 41 s, 12 calls)`.
 
-Many Fallback badges or a high average mean Gemma is too slow on this PC; see [Make Gemma fast](#make-gemma-fast). The same figures are in the service's API: each task row in `/api/status` has `sizing_source` (`gemma` or `heuristic`) and `sizing_ms`, `/api/status` has `foreman.gemma` with the call stats, and `/api/health` has `gemma_speed`.
+Many Fallback badges or a high average mean Gemma is too slow on this PC; see [Make Gemma fast](#make-gemma-fast). The same figures are in the service's API: each task row in `/api/status` has `sizing_source` (`gemma` or `heuristic`) and `sizing_ms`, `/api/status` has `foreman.gemma` (call counts, fallbacks, timeouts, average and last time, per hook), and `/api/health` has `gemma_speed` (`avg_ms`, `last_ms`, `fallbacks`, `calls`).
 
 ### When something doesn't work
 
