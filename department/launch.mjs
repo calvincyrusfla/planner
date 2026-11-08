@@ -237,6 +237,7 @@ export async function maybeStartFoundry({
   probe = probeFoundry,
   run = spawn,
   now = Date.now,
+  exists = fs.existsSync,
 } = {}) {
   const dataDir = foundryDataDir(env, repoRoot);
   const note = (line) => {
@@ -255,7 +256,7 @@ export async function maybeStartFoundry({
       note(`Foundry: port ${port} answers but not as Foundry; not starting it.`);
       return 'other';
     }
-    const { spec, reason } = foundryLaunchSpec({ platform, repoRoot, env });
+    const { spec, reason } = foundryLaunchSpec({ platform, repoRoot, env, exists });
     if (!spec) {
       note(`Foundry: not started (${reason}).`);
       return 'skipped';
