@@ -321,7 +321,9 @@ class FoundryConfig(BaseModel):
         default_factory=list,
         description=(
             "owner/name repos whose board batches may be claimed (case-insensitive). "
-            "Empty: no allowlist, every batch for this Foundry's repo is claimable."
+            "Empty: no allowlist, every batch for this Foundry's repo is claimable."       
+        ),
+    )
     secret_scan: bool = Field(
         default=True,
         description=(
