@@ -1739,10 +1739,11 @@ class BuilderWorker(_WorkerBase):
         # always shown in full.
         attempt = max(0, int(_get(ticket, "attempt", 0) or 0))
         widen: dict[str, Any] = {"level": self._context_level(ticket, attempt)}
-        # Names in the subtask's description pick edit targets too (the ticket's own
-        # description when it has one, else the task's work-order description).
-        description = str(_get(ticket, "description", "") or "") or self._work_order(
-            str(_get(ticket, "task_id")))["description"]
+        # Names in the ticket's description and in the task's work-order description both
+        # pick edit targets: either may be the only place a symbol is named.
+        texts = [str(_get(ticket, "description", "") or ""),
+                 self._work_order(str(_get(ticket, "task_id")))["description"]]
+        description = "\n".join(dict.fromkeys(t for t in texts if t))
         if description:
             widen["description"] = description
         extra = self._requested_symbols(ticket)
