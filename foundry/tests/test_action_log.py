@@ -319,13 +319,6 @@ def test_foreman_reads_the_action_log(tmp_path: Path) -> None:
     f.close()
 
 
-def _board_statuses(bridge: Any, task_id: str) -> list[str]:
-    return [
-        op["args"]["patch"]["status"] for op in bridge.ops
-        if op["type"] == "updateTask" and op.get("foundry_task", task_id) == task_id
-    ]
-
-
 def test_retry_and_undo_quarantine_set_the_board_task_active(tmp_path: Path) -> None:
     f = _factory(tmp_path)
     m, q = f.manager, f.queue
@@ -345,8 +338,8 @@ def test_retry_and_undo_quarantine_set_the_board_task_active(tmp_path: Path) -> 
     notes = [op["args"]["message"] for op in f.bridge.ops if op["type"] == "reportProgress"]
     assert any("retried with fresh attempts" in n for n in notes)
     assert any("quarantine undone" in n for n in notes)
-    kinds = [e["kind"] for e in q.events(task_id=t2)] if "task_id" in q.events.__code__.co_varnames else []
-    assert not kinds or "unquarantined" in kinds
+    [ev] = q.events(task_id=t2, kind="unquarantined")
+    assert ev["payload"]["note"] == "retry (Foreman)" and ev["payload"]["tickets"]
     f.close()
 
 
@@ -376,8 +369,6 @@ def test_reassign_uses_named_ticket_ids_and_partial_undo_says_so(tmp_path: Path)
 
 
 def test_still_owned_rejects_a_later_claim_with_the_same_attempt(tmp_path: Path) -> None:
-    from foundry.builder_worker import BuilderWorker  # noqa: F401  (the check lives on the worker base)
-
     f = _factory(tmp_path, teams=["alpha"])
     m, q = f.manager, f.queue
 
