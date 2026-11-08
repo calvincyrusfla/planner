@@ -177,7 +177,7 @@ def test_sprint_status_from_board() -> None:
         "unknownField": True,
     })
     assert st.sprint_id == "S-004" and st.completed == 1 and not st.terminal
-    assert st.subtasks[0].foundry_task == "F-012" and st.subtasks[0].pr_url.endswith("/pull/3")
+    assert st.subtasks[0].foundry_task == "F-012" and (st.subtasks[0].pr_url or "").endswith("/pull/3")
     assert st.subtasks[1].error == "boom" and st.subtasks[1].terminal
     text = st.summary()
     assert "F-012" in text and "pull/3" in text and "boom" in text and "PC" in text
@@ -374,7 +374,7 @@ def test_real_dashboard_board(tmp_path: Path) -> None:
             "2": {"foundryTask": "F-002", "state": "complete"}}})
         done = d.wait_for_sprint(st.sprint_id, board=board, timeout=5, interval=0.1)
         assert done.status == "done" and done.succeeded
-        assert done.subtasks[0].foundry_task == "F-001" and done.subtasks[0].pr_url.endswith("/pull/1")
+        assert done.subtasks[0].foundry_task == "F-001" and (done.subtasks[0].pr_url or "").endswith("/pull/1")
         assert done.claimed_by and done.claimed_by["host"] == "PC"
         with pytest.raises(d.BoardError):
             board.op("updateBatch", {"id": "S-999", "service": "svc"})
