@@ -68,6 +68,9 @@ Environment variable               Field (default)
 ``FOUNDRY_PR_BASE``                ``pr_base`` (unset: the repo's default
                                    branch, else the current branch)
 ``FOUNDRY_PR_DRAFT``               ``pr_draft`` (``false``): open PRs as drafts
+``FOUNDRY_MIN_SUBTASK_LINES``      ``min_subtask_lines`` (``30``): a one-file
+                                   subtask estimated below this many lines is
+                                   merged into a neighbour; ``0`` disables it
 ``FOUNDRY_TYPECHECK``              ``typecheck`` (``auto``; ``auto|mypy|off``):
                                    the mypy gate after the linter; ``auto``
                                    runs it when mypy is installed
@@ -276,6 +279,14 @@ class FoundryConfig(BaseModel):
         ),
     )
 
+    min_subtask_lines: int = Field(
+        default=30,
+        ge=0,
+        description=(
+            "A one-file subtask estimated below this many changed lines is merged into a "
+            "neighbour so it doesn't cost a whole builder; 0 disables merging."
+        ),
+    )
     pre_review: PreReviewMode = Field(
         default="gate",
         description=(
@@ -452,6 +463,7 @@ class FoundryConfig(BaseModel):
             "PR_BASE": "pr_base",
             "PR_DRAFT": "pr_draft",
             "TYPECHECK": "typecheck",
+            "MIN_SUBTASK_LINES": "min_subtask_lines",
         }
         for var, field in simple.items():
             value = get(var)

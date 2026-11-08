@@ -130,6 +130,7 @@ __all__ = [
     "calibration_shifts",
     "classify_quarantine",
     "heuristic_complexity",
+    "merge_tiny_subtasks",
     "similar_outcomes",
 ]
 
@@ -293,8 +294,9 @@ _SIZING_SCHEMA: dict[str, Any] = {
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                     "allowed_files": {"type": "array", "items": {"type": "string"}},
                     "independent": {"type": "boolean"},
+                    "estimated_lines": {"type": "integer", "minimum": 1},
                 },
-                "required": ["title", "acceptance_criteria", "allowed_files"],
+                "required": ["title", "acceptance_criteria", "allowed_files", "estimated_lines"],
             },
         },
     },
@@ -869,6 +871,70 @@ def _parse_pre_review(data: Any) -> PreReview | None:
         if len(issues) >= _PRE_REVIEW_MAX_ISSUES:
             break
     return PreReview(verdict=verdict, issues=tuple(issues), confidence=confidence, source="gemma")
+
+
+#: A subtask estimated below this many changed lines can be tiny.
+TINY_SUBTASK_MAX_LINES: int = 30
+
+#: A tiny subtask touches at most this many files.
+TINY_SUBTASK_MAX_FILES: int = 1
+
+
+def _line_estimate(value: Any) -> int | None:
+    """A usable per-subtask line estimate: a positive JSON integer, else ``None`` (unknown)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _add_estimates(first: Any, second: Any) -> int | None:
+    """Sum of two line estimates; ``None`` when either is unknown."""
+    if isinstance(first, int) and isinstance(second, int):
+        return first + second
+    return None
+
+
+def merge_tiny_subtasks(
+    subtasks: Sequence[Mapping[str, Any]],
+    *,
+    max_lines: int = TINY_SUBTASK_MAX_LINES,
+    max_files: int = TINY_SUBTASK_MAX_FILES,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fold tiny subtasks into a neighbour so each one doesn't cost a whole builder.
+
+    A subtask is tiny when its ``estimated_lines`` is known and below
+    ``max_lines`` and it touches at most ``max_files`` files; a subtask with
+    no estimate is never tiny. A tiny subtask joins the previous subtask (build
+    order is kept); a tiny first subtask absorbs the one after it.
+
+    Returns the new subtasks (the input is not changed) and one
+    ``"<title> into <title>"`` entry per merge.
+    """
+
+    def is_tiny(sub: Mapping[str, Any]) -> bool:
+        lines = sub.get("estimated_lines")
+        return isinstance(lines, int) and lines < max_lines and len(sub.get("allowed_files") or []) <= max_files
+
+    kept: list[dict[str, Any]] = []
+    merges: list[str] = []
+    for sub in subtasks:
+        if not kept or not (is_tiny(sub) or is_tiny(kept[-1])):
+            kept.append(
+                dict(
+                    sub,
+                    allowed_files=list(sub.get("allowed_files") or []),
+                    acceptance_criteria=list(sub.get("acceptance_criteria") or []),
+                )
+            )
+            continue
+        target = kept[-1]
+        merges.append(f"{_clip(str(sub.get('title')), 40)} into {_clip(str(target.get('title')), 40)}")
+        target["title"] = _clip(f"{target.get('title')} + {sub.get('title')}", 200)
+        target["acceptance_criteria"] += list(sub.get("acceptance_criteria") or [])
+        target["allowed_files"] = list(dict.fromkeys([*target["allowed_files"], *(sub.get("allowed_files") or [])]))
+        target["independent"] = bool(target.get("independent")) and bool(sub.get("independent"))
+        target["estimated_lines"] = _add_estimates(target.get("estimated_lines"), sub.get("estimated_lines"))
+    return kept, merges
 
 
 class ShopForeman:
@@ -1477,6 +1543,7 @@ class ShopForeman:
                     "earlier subtasks' finished work. Set \"independent\": true on a subtask only "
                     "when it needs nothing (no function, file or setting) from any other subtask; "
                     "otherwise false. "
+                    "Set \"estimated_lines\" on every subtask to the lines of code it will add or change. "
                     "Reply with JSON only."
                 ),
             },
@@ -1517,6 +1584,7 @@ class ShopForeman:
                         "allowed_files": _str_list(item.get("allowed_files")),
                         # only a literal JSON true counts: anything else keeps the subtask sequential
                         "independent": item.get("independent") is True,
+                        "estimated_lines": _line_estimate(item.get("estimated_lines")),
                     }
                 )
             directive = self._build_directive(
@@ -1540,7 +1608,7 @@ class ShopForeman:
         criteria: list[str],
         proposals: list[dict[str, Any]] | None,
     ) -> TaskSizingDirective:
-        """Normalise subtasks to one per builder and validate the directive."""
+        """Normalise subtasks to one per builder, merge tiny ones and validate the directive."""
         n = BUILDERS_FOR[complexity]
         override: str | None = None
         if files and len(files) < n:
@@ -1559,6 +1627,7 @@ class ShopForeman:
                 target["acceptance_criteria"] += extra["acceptance_criteria"]
                 target["allowed_files"] += extra["allowed_files"]
                 target["independent"] = bool(target.get("independent")) and bool(extra.get("independent"))
+                target["estimated_lines"] = _add_estimates(target.get("estimated_lines"), extra.get("estimated_lines"))
             if files:
                 allowed, seen = set(files), set()
                 for sub in subtasks:
@@ -1591,6 +1660,16 @@ class ShopForeman:
                         "allowed_files": part_files,
                     }
                 )
+        min_lines = self.config.min_subtask_lines
+        subtasks, merges = merge_tiny_subtasks(subtasks, max_lines=min_lines)
+        if merges:
+            note = _clip(
+                f"merged {len(merges)} tiny subtask(s) under {min_lines} lines: " + "; ".join(merges), 300
+            )
+            rationale = f"{rationale} ({note})"
+            summary = f"merged tiny subtasks; {n} to {len(subtasks)} builder(s)"
+            override = f"{override}; {summary}" if override else summary
+            n = len(subtasks)
         for sub in subtasks:
             if not sub["acceptance_criteria"]:
                 sub["acceptance_criteria"] = list(criteria) if criteria else [f"{sub['title']} is implemented and tested"]
