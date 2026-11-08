@@ -392,7 +392,8 @@ class BatchWatcher:
         if status == "queued":
             return True
         if status in _OPEN_BATCH:
-            by = batch.get("claimedBy") if isinstance(batch.get("claimedBy"), dict) else {}
+            claim = batch.get("claimedBy")
+            by: Mapping[str, Any] = claim if isinstance(claim, dict) else {}
             beat = _parse_time(batch.get("heartbeatAt") or by.get("at"))
             return beat is not None and self._now() - beat > STALE_HEARTBEAT_S
         return False
