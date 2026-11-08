@@ -559,8 +559,29 @@ async def run_service(service: Service, *, host: str = DEFAULT_HOST, port: int |
     return 0
 
 
+def enable_ctrl_c(platform: str | None = None, kernel32: Any = None) -> bool:
+    """Re-enable Ctrl+C on Windows; returns True if the call was made.
+
+    A process started in a new process group (as Node's ``detached`` spawn does)
+    inherits "ignore Ctrl+C"; ``SetConsoleCtrlHandler(NULL, FALSE)`` turns it back
+    on for this process. No-op on other platforms; never raises.
+    """
+    if (platform or sys.platform) != "win32":
+        return False
+    try:
+        if kernel32 is None:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.SetConsoleCtrlHandler(None, False)
+        return True
+    except Exception:  # noqa: BLE001 - best effort, the service runs anyway
+        return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point; returns the process exit code."""
+    enable_ctrl_c()
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     from foundry.config import FoundryConfig

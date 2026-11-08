@@ -298,6 +298,8 @@ Foundry is restart-safe on the same database:
 
 4. Leave the window open. You can minimise it.
 
+The dashboard's desktop shortcut (`node department/launch.mjs`) also starts Foundry this way when it isn't running yet, minimised as a **Foundry** window on the taskbar; close that window or press Ctrl+C in it to stop it. Set `DEPT_FOUNDRY=off` to turn this off. On macOS and Linux it runs `foundry/start_foundry.sh` in the background with its output in `department/data/foundry.log`. If Foundry wasn't started (for example, no `.venv` yet), `department/data/launch.log` says why.
+
 If something is missing, the window says so and waits for a key instead of closing:
 
 - `No Python virtual environment found`: do the [Install](#install) steps;
