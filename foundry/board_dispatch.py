@@ -46,12 +46,14 @@ from typing import Any, Callable, Mapping
 log = logging.getLogger("foundry.board_dispatch")
 
 __all__ = [
-    "BatchWatcher", "BoardRefused", "BoardUnavailable", "DashboardBoard",
+    "HEARTBEAT_S", "BatchWatcher", "BoardRefused", "BoardUnavailable", "DashboardBoard",
     "DEFAULT_BATCH_POLL_S", "STALE_HEARTBEAT_S", "batch_poll_interval", "batches_enabled",
     "repo_slug_for", "subtask_state",
 ]
 
 DEFAULT_BATCH_POLL_S = 15.0
+#: Without result changes, updateBatch (a hub write) is sent at most this often as a heartbeat.
+HEARTBEAT_S = 120.0
 #: A claim whose heartbeat is older than this may be taken over (the board enforces it too).
 STALE_HEARTBEAT_S = 600.0
 KV_PREFIX = "foundry_batch:"
@@ -286,6 +288,9 @@ class BatchWatcher:
         self._task: asyncio.Task[Any] | None = None
         self._warned_down = False
         self._lock = asyncio.Lock()
+        self.heartbeat_s = HEARTBEAT_S
+        #: batch id -> when the last updateBatch was accepted (this run).
+        self._last_sent: dict[str, float] = {}
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -521,6 +526,13 @@ class BatchWatcher:
         if first and rec["tasks"] and batch.get("status") == "claimed":
             args["status"] = "running"
         self._save(bid, rec)
+        last = self._last_sent.get(bid)
+        if not changed and "status" not in args and last is not None and self._now() - last < self.heartbeat_s:
+            # nothing new and the claim is fresh: no write to the (shared) board this round
+            if self._settled(keys, results, cancelled):
+                rec["closed"] = True
+                self._save(bid, rec)
+            return
         try:
             await asyncio.to_thread(self.board.op, "updateBatch", args)
         except BoardRefused as exc:
@@ -535,6 +547,7 @@ class BatchWatcher:
                 except BoardRefused as again:
                     exc = again
                 else:
+                    self._last_sent[bid] = self._now()
                     return
             if exc.code not in (404, 409) or not await self._gone(bid):
                 # e.g. 409 {"error": "busy"} from the hub: transient, tried again next round
@@ -545,6 +558,7 @@ class BatchWatcher:
             rec["closed"] = True
             self._save(bid, rec)
             return
+        self._last_sent[bid] = self._now()
         rec["pushed"].update(changed)
         if self._settled(keys, results, cancelled):
             rec["closed"] = True

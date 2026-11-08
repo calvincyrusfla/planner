@@ -381,3 +381,122 @@ def test_real_dashboard_board(tmp_path: Path) -> None:
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+class RecordingBoard:
+    def __init__(self, name: str, exc: BaseException | None = None) -> None:
+        self.name = name
+        self.exc = exc
+        self.ops: list[str] = []
+        self.reads = 0
+
+    def state(self) -> dict[str, Any]:
+        self.reads += 1
+        if self.exc:
+            raise self.exc
+        return {"foundryBatches": []}
+
+    def op(self, type: str, args: dict[str, Any]) -> Any:
+        self.ops.append(type)
+        if self.exc:
+            raise self.exc
+        return {"id": "S-001", "title": args.get("title"), "subtasks": [], "status": "queued"}
+
+
+def test_auto_does_not_replay_a_write_that_may_have_been_sent() -> None:
+    first = RecordingBoard("hub", d.BoardUnavailable("timed out", sent=True))
+    second = RecordingBoard("cli")
+    with pytest.raises(d.BoardOutcomeUnknown) as ei:
+        d.AutoBoard([first, second]).op("dispatchBatch", {"title": "x"})
+    assert second.ops == [] and "poll" in str(ei.value) and "foundry list" in str(ei.value)
+
+
+def test_auto_falls_through_when_not_sent_and_for_reads() -> None:
+    second = RecordingBoard("cli")
+    auto = d.AutoBoard([RecordingBoard("dash", d.BoardUnavailable("refused", sent=False)), second])
+    assert auto.op("dispatchBatch", {"title": "x"})["id"] == "S-001" and second.ops == ["dispatchBatch"]
+    reader = RecordingBoard("cli")
+    auto = d.AutoBoard([RecordingBoard("hub", d.BoardUnavailable("timed out", sent=True)), reader])
+    assert auto.state() == {"foundryBatches": []} and reader.reads == 1
+
+
+def test_refused_connection_is_not_sent() -> None:
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()  # nothing listens there now
+    with pytest.raises(d.BoardUnavailable) as ei:
+        d.DashboardBoard(f"http://127.0.0.1:{port}", timeout=2).op("dispatchBatch", {})
+    assert ei.value.sent is False
+
+
+def test_hub_timeout_after_send_is_not_replayed_through_cli(fake: FakeBoardState) -> None:
+    import time as _time
+
+    class Slow(BaseHTTPRequestHandler):
+        def log_message(self, *a: Any) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)))
+            fake.apply(body["type"], body["args"])  # the hub applies it ...
+            _time.sleep(1.5)  # ... but answers too late
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cli = RecordingBoard("cli")
+        auto = d.AutoBoard([d.HubBoard(f"http://127.0.0.1:{srv.server_address[1]}", timeout=0.5), cli])
+        with pytest.raises(d.BoardOutcomeUnknown):
+            d.dispatch_to_foundry(_batch(), board=auto)
+        assert cli.ops == [] and len(fake.state["foundryBatches"]) == 1
+    finally:
+        srv.shutdown()
+
+
+class ErroringBoard(ScriptedBoard):
+    def __init__(self, statuses: list[str | None], errors: list[BaseException]) -> None:
+        super().__init__(statuses)
+        self.errors = errors
+
+    def state(self) -> dict[str, Any]:
+        if self.errors:
+            raise self.errors.pop(0)
+        return super().state()
+
+
+def test_wait_retries_board_errors() -> None:
+    board = ErroringBoard(["running", "done"], [d.BoardError("busy (409)"), d.BoardError("upstream 502")])
+    st = d.wait_for_sprint("S-001", board=board, interval=1, sleep=lambda s: None, monotonic=lambda: 0.0)
+    assert st.status == "done"
+
+
+def test_wait_not_found_raises_at_once() -> None:
+    class Empty:
+        def state(self) -> dict[str, Any]:
+            return {"foundryBatches": []}
+
+        def op(self, type: str, args: dict[str, Any]) -> Any:
+            raise AssertionError
+
+    sleeps: list[float] = []
+    with pytest.raises(d.SprintNotFound):
+        d.wait_for_sprint("S-001", board=Empty(), sleep=sleeps.append, monotonic=lambda: 0.0)
+    assert sleeps == []
+
+
+def test_wait_gives_up_with_last_error() -> None:
+    t = [0.0]
+
+    def sleep(s: float) -> None:
+        t[0] += s
+
+    board = ErroringBoard(["running"], [d.BoardError("busy")] * 10)
+    with pytest.raises(d.BoardUnavailable) as ei:
+        d.wait_for_sprint("S-001", board=board, timeout=3, interval=1, sleep=sleep, monotonic=lambda: t[0])
+    assert "busy" in str(ei.value)
