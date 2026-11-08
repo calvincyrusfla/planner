@@ -514,10 +514,23 @@ Forks work too: Foundry reads `owner/name` from the `origin` URL and passes it t
 
 When the service starts it checks git, the `origin` remote and `gh` once. If something is missing it logs a clear warning, and `/api/health` reports `pr_ready: false` with the reason in `pr_reason`. Tasks still run; only the PR step is skipped or fails.
 
+### Where Foundry builds from
+
+Foundry does **not** build from your working folder. When a task is accepted (automatic PRs on and git available), Foundry fetches the branch it will open the PR against (`FOUNDRY_PR_BASE` or the batch's base, else the repository's default branch), pins that exact commit for the task, and checks it out as a clean snapshot under `foundry\data\base\` (a detached git worktree, git-ignored). The context Claude sees, the gates, the stacked workspace and the `git apply --check` of the combined patch all use that snapshot, and the PR branch is created from the same pinned commit, so what was built is exactly what gets published. The pin is saved with the task, so a restart keeps building from the same commit. Snapshots are removed once no unfinished task needs them.
+
+What this means for you:
+
+- **Your folder's branch doesn't matter.** You can sit on a feature branch, be behind `origin`, or have uncommitted changes: batches are built against the publish branch as it is on `origin`. Work you haven't pushed is not part of the base, so push it first if a task depends on it.
+- **Line endings don't matter.** With `core.autocrlf=true` (the Git for Windows default) your working files have CRLF while git stores LF. The snapshot is checked out with `core.autocrlf=false` and `core.eol=lf`, byte-identical to what is stored, so patches no longer fail with `apply_failed` because of CRLF context.
+- **Your working folder is never written.** Foundry never changes your files, index or current branch; it only adds the snapshot worktrees (and their entries under `.git\worktrees`) and updates the `origin/<base>` remote-tracking ref when it fetches.
+- **Fallback.** Without git, without an `origin` remote or when the fetch fails, Foundry builds from your folder as before and logs one warning per task that the patch may not apply on Windows with `autocrlf` (a task whose pin failed is pinned again on its next ticket, as long as none of its work is approved yet). With `FOUNDRY_AUTO_PR=false` there is no publish branch to pin, so Foundry builds from your folder without a warning: the patches are meant for you to apply by hand there.
+
+**Patch files have LF line endings.** Because they are built from the snapshot, the files in `foundry\data\patches\` match what git stores, not your CRLF working copy. On Windows with `autocrlf=true`, apply one by hand with `git apply --cached <task>.patch` (it patches the index, which holds LF), then `git checkout -- <the changed files>` to write them to your folder with your line endings; or simply let the PR carry the change. A plain `git apply` against CRLF working files may report `patch does not apply`.
+
 ### What Foundry does for each approved task
 
 1. Gemma drafts the PR title and description (the same draft that goes into `<task>.md`). The description ends with `Opened by Foundry (task F-012)`.
-2. Foundry makes a **temporary git worktree** under `foundry\data\worktrees\`, starting from the base branch (`FOUNDRY_PR_BASE`, else the repository's default branch, else the branch you are on).
+2. Foundry makes a **temporary git worktree** under `foundry\data\worktrees\`, starting from the commit the task was built from (see [Where Foundry builds from](#where-foundry-builds-from)); without a pinned commit, from the base branch (`FOUNDRY_PR_BASE`, else the repository's default branch, else the branch you are on).
 3. It creates the branch `foundry/<task id>-<short title>`, in lower case, for example `foundry/f-012-add-clamp-helper`. If that branch already exists it uses `-2`, `-3` and so on.
 4. It applies the patch, commits it (as you: the name and e-mail from your git config; your git hooks run as usual), and pushes the branch to `origin`.
 5. It opens the pull request with `gh pr create` and records the link.
@@ -546,7 +559,7 @@ The Foundry tasks list then shows **PR failed** with a **Retry** button; hover o
 | `no_git` | git is not installed or not on the PATH. Install Git for Windows (`winget install --id Git.Git`), then restart Foundry |
 | `not_a_repo` | `--repo` is not a git repository. Start Foundry with the repository's folder |
 | `no_remote` | the repository has no `origin` remote. Add it: `git remote add origin https://github.com/<you>/<repo>.git` |
-| `apply_failed` | the patch doesn't apply to the base branch: either the base changed since the task ran, or your task depended on changes you haven't pushed (Foundry applies the patch to `origin/<base>`, not to your local checkout). Push those changes first and Retry, merge `<task>.patch` by hand, or resubmit the task |
+| `apply_failed` | the patch doesn't apply to the base commit. With a snapshot this should not happen (build and publish use the same commit); without one (the fallback above) the base changed since the task ran, your task depended on changes you haven't pushed, or your working files have CRLF line endings (`core.autocrlf=true`) while git stores LF. Push those changes first and Retry, merge `<task>.patch` by hand, or resubmit the task |
 | `push_failed` | git couldn't push, usually because it isn't logged in or you can't write to the repository. Run `gh auth login` (answer Yes to git credentials), or `gh auth setup-git` |
 | `gh_missing` | the GitHub CLI is not installed: `winget install --id GitHub.cli`, open a new window, `gh auth login`, then restart Foundry |
 | `gh_not_logged_in` | run `gh auth login` |
@@ -726,7 +739,7 @@ Foundry only claims batches while the service is running. If the batch stays on 
 | `FOUNDRY_RPM` / `FOUNDRY_TPM` / `FOUNDRY_MAX_CONCURRENT` | `20` / `100000` / `3` |
 | `FOUNDRY_REVIEW_DWELL_S` | `600` (REVIEW_BOTTLENECK → PROMOTE_PEER_REVIEWER) |
 | `FOUNDRY_STALL_S` | `900` (AGENT_STALLED → RESET_BUILDER_CONTEXT) |
-| `FOUNDRY_GATE_FAIL_QUARANTINE` | `2` (LINE_JAM → QUARANTINE_TASK) |
+| `FOUNDRY_GATE_FAIL_QUARANTINE` | unset = `FOUNDRY_MAX_RETRIES` + 1 (`4` by default): gate failures on one ticket before LINE_JAM → QUARANTINE_TASK. With the default the Foreman never quarantines a ticket that still has attempts left; the retry cap quarantines it after its last attempt. A value you set still wins, and the alert's "(limit N)" shows the value in force |
 | `FOUNDRY_TPM_SPIKE_RATIO` | `0.9` (TOKEN_VELOCITY_SPIKE → THROTTLE_DISPATCH) |
 | `FOUNDRY_TEAMS` | `alpha,bravo,charlie` |
 | `FOUNDRY_BUILDERS_PER_TEAM` | `5` |

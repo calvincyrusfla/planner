@@ -1001,6 +1001,7 @@ class _WorkerBase:
         limit_cooldown_s: float = 1200.0,
         infra_backoff_s: float = 5.0,
         infra_failure_cap: int = 3,
+        base_for: Callable[[str], Any] | None = None,
     ) -> None:
         self.team_id = team_id
         self.queue = queue
@@ -1010,6 +1011,12 @@ class _WorkerBase:
         self.foreman = foreman
         self.claude_timeout = claude_timeout
         self.cwd = cwd
+        #: ``base_for(task_id) -> Path | None`` (sync or async): the clean snapshot of the
+        #: publish branch a task is built from (``FloorManager.task_base``); None (or a None
+        #: result) = the user's folder (``cwd`` / the gates' base / the engine's repo).
+        self.base_for = base_for
+        #: task id -> its snapshot directory, as last resolved by this worker.
+        self._bases: dict[str, Path] = {}
         self.backoff_attempts = backoff_attempts
         self.limit_cooldown_s = float(limit_cooldown_s)
         self.infra_backoff_s = float(infra_backoff_s)
@@ -1178,6 +1185,34 @@ class _WorkerBase:
                 out.append(str(_get(t, "ticket_id")))
         return out
 
+    # -- base snapshot ----------------------------------------------------------
+    async def _resolve_base(self, task_id: Any) -> Path | None:
+        """Ask ``base_for`` for the task's snapshot (None: build from the user's folder)."""
+        if self.base_for is None or not task_id:
+            return None
+        try:
+            got = await _maybe_await(self.base_for(str(task_id)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never stop the line over a snapshot: fall back to the user's folder
+            log.exception("%s: could not get the base snapshot of %s", self.agent_id, task_id)
+            got = None
+        if not got:
+            self._bases.pop(str(task_id), None)
+            return None
+        path = Path(got)
+        self._bases[str(task_id)] = path
+        return path
+
+    async def _claude_cwd(self, task_id: Any) -> str | None:
+        """Claude reads the task's snapshot when it has one, else ``cwd`` (it never writes)."""
+        if self.base_for is None:
+            return self.cwd
+        path = self._bases.get(str(task_id))
+        if path is None or not path.is_dir():
+            path = await self._resolve_base(task_id)
+        return str(path) if path is not None else self.cwd
+
     # -- Claude ---------------------------------------------------------------
     async def _call_claude(self, prompt: str, *, task_id: str) -> ClaudeResult:
         """One Claude call inside ``limiter.slot`` wrapped by ``call_with_backoff``.
@@ -1186,17 +1221,18 @@ class _WorkerBase:
         gives up.
         """
         estimate = _estimate_tokens(prompt)
+        cwd = await self._claude_cwd(task_id)
 
         async def once() -> ClaudeResult:
             if self.limiter is None:
                 self.claude_calls += 1
                 return await self.client.run(
-                    prompt, agent_id=self.agent_id, role=self.role, cwd=self.cwd, timeout=self.claude_timeout
+                    prompt, agent_id=self.agent_id, role=self.role, cwd=cwd, timeout=self.claude_timeout
                 )
             async with self.limiter.slot(estimate) as handle:
                 self.claude_calls += 1
                 result = await self.client.run(
-                    prompt, agent_id=self.agent_id, role=self.role, cwd=self.cwd, timeout=self.claude_timeout
+                    prompt, agent_id=self.agent_id, role=self.role, cwd=cwd, timeout=self.claude_timeout
                 )
                 # D11: charge uncached input + output only; cache reads are free for TPM.
                 actual = result.input_tokens + result.output_tokens
@@ -1445,6 +1481,8 @@ class BuilderWorker(_WorkerBase):
         pre_review_min_confidence: float = 0.7,
         pre_review_breaker: PreReviewBreaker | None = None,
         approved_diffs_before: Callable[[str], Any] | None = None,
+        base_for: Callable[[str], Any] | None = None,
+        base_lease: Callable[[str], Any] | None = None,
     ) -> None:
         super().__init__(
             team_id,
@@ -1459,6 +1497,7 @@ class BuilderWorker(_WorkerBase):
             limit_cooldown_s=limit_cooldown_s,
             infra_backoff_s=infra_backoff_s,
             infra_failure_cap=infra_failure_cap,
+            base_for=base_for,
         )
         mode = str(pre_review or "off").strip().lower()
         if mode not in PRE_REVIEW_MODES:
@@ -1498,6 +1537,11 @@ class BuilderWorker(_WorkerBase):
         self.approved_diffs_before = approved_diffs_before
         #: The stacked workspace of the ticket being processed (see :meth:`_prepare_stack`).
         self._stack: _Stack | None = None
+        #: The base snapshot of the ticket being processed (None: the user's folder).
+        self._base: Path | None = None
+        #: ``base_lease(task_id)`` -> async context manager yielding the task's snapshot and keeping
+        #: it from being pruned while the ticket runs (``FloorManager.base_lease``); else ``base_for``.
+        self.base_lease = base_lease
         #: Outcomes of processed tickets, in order ("review", "retry", "quarantined", "cached", ...).
         self.outcomes: list[str] = []
         self._backoff_s = 0.0
@@ -1722,6 +1766,12 @@ class BuilderWorker(_WorkerBase):
                 # gate the diff on top of the earlier approved diffs, in the stacked copy
                 # itself (WorkspaceGates(workspace=)): one repo copy per attempt
                 extra = _supported_kwargs(fn, {"workspace": stack.root})
+            elif self._base is not None:
+                # the gates copy the task's snapshot, not the user's folder (WorkspaceGates(base=))
+                based = _supported_kwargs(fn, {"base": self._base})
+                if based:
+                    outcome = await _maybe_await(fn(submission, assignment, **based))
+                    return self._gate_summary(outcome)
             if extra:
                 assert stack is not None and stack.root is not None
                 before = _snapshot_files(stack.root, extract_diff_paths(submission.diff))
@@ -1735,6 +1785,11 @@ class BuilderWorker(_WorkerBase):
                     _restore_files(stack.root, before)
             else:
                 outcome = await _maybe_await(fn(submission, assignment))
+        return self._gate_summary(outcome)
+
+    @staticmethod
+    def _gate_summary(outcome: Any) -> GateSummary:
+        """Normalize a gate runner's result to a :class:`GateSummary`."""
         if isinstance(outcome, GateSummary):
             return outcome
         if hasattr(outcome, "passed") and hasattr(outcome, "results"):
@@ -1779,18 +1834,39 @@ class BuilderWorker(_WorkerBase):
         """
         if self._task_state(_get(ticket, "task_id")) in _TERMINAL_STATES:
             return "skipped"
+        # everything for this ticket reads the task's snapshot of the publish branch
+        # (context, gates' base, stacked copy, normalisation), never the user's folder
+        task_id = _get(ticket, "task_id")
+        if self.base_lease is not None and task_id:
+            # held for the whole ticket: the snapshot is never pruned under this worker
+            async with self.base_lease(str(task_id)) as base:
+                if base:
+                    self._bases[str(task_id)] = Path(base)
+                else:
+                    self._bases.pop(str(task_id), None)
+                return await self._process_on_base(ticket, Path(base) if base else None)
+        return await self._process_on_base(ticket, await self._resolve_base(task_id))
+
+    async def _process_on_base(self, ticket: Any, base: Path | None) -> str:
+        """:meth:`process_ticket` with the task's base snapshot (None: the user's folder) resolved."""
+        self._base = base
         try:
             self._stack = await self._prepare_stack(ticket)
         except asyncio.CancelledError:
             raise
         except (DiffApplyError, OSError, shutil.Error) as exc:
             # not this builder's fault: no attempt spent, counted toward the infra cap
+            self._base = None
             self._event("stack_failed", _get(ticket, "task_id"),
                         {"ticket_id": _get(ticket, "ticket_id"), "error": _one_line(str(exc), 300)})
             return await self._infra_release(ticket, _StackError(str(exc)))
+        except BaseException:
+            self._base = None
+            raise
         try:
             return await self._process_ticket(ticket)
         finally:
+            self._base = None
             stack, self._stack = self._stack, None
             if stack is not None and stack.tmp is not None:
                 await asyncio.to_thread(shutil.rmtree, stack.tmp, True)
@@ -1822,7 +1898,10 @@ class BuilderWorker(_WorkerBase):
             return {}
 
     def _stack_base(self) -> Path | None:
-        """The directory a stacked workspace copies: the gates' base workspace, else the engine's repo."""
+        """The directory a stacked workspace copies: the task's snapshot, else the gates' base
+        workspace, else the engine's repo."""
+        if self._base is not None:
+            return self._base
         base = getattr(self.gates, "base_workspace", None) or getattr(self.context_engine, "repo_root", None)
         return Path(base) if base is not None else None
 
@@ -1855,16 +1934,17 @@ class BuilderWorker(_WorkerBase):
         return _Stack(root, tmp, work)
 
     def _stack_engine(self) -> Any:
-        """The context engine, re-rooted at the stacked workspace when there is one."""
+        """The context engine, re-rooted at the stacked workspace (else the task's snapshot) when there is one."""
         engine = self.context_engine
         stack = self._stack
-        if engine is None or stack is None or stack.root is None or not hasattr(engine, "repo_root"):
+        target = stack.root if stack is not None and stack.root is not None else self._base
+        if engine is None or target is None or not hasattr(engine, "repo_root"):
             return engine
         try:
-            if Path(engine.repo_root).resolve() == stack.root.resolve():
+            if Path(engine.repo_root).resolve() == target.resolve():
                 return engine
             clone = copy.copy(engine)
-            clone.repo_root = stack.root.resolve()
+            clone.repo_root = target.resolve()
             if hasattr(clone, "last_stats"):
                 clone.last_stats = None
             return clone
@@ -2003,6 +2083,8 @@ class BuilderWorker(_WorkerBase):
             return self._stack.root
         if self.workspace is not None:
             return self.workspace
+        if self._base is not None:
+            return self._base
         root = getattr(self.context_engine, "repo_root", None)
         return Path(root) if root is not None else None
 
@@ -2433,6 +2515,7 @@ class ReviewerWorker(_WorkerBase):
         limit_cooldown_s: float = 1200.0,
         infra_backoff_s: float = 5.0,
         infra_failure_cap: int = 3,
+        base_for: Callable[[str], Any] | None = None,
     ) -> None:
         super().__init__(
             team_id,
@@ -2447,6 +2530,7 @@ class ReviewerWorker(_WorkerBase):
             limit_cooldown_s=limit_cooldown_s,
             infra_backoff_s=infra_backoff_s,
             infra_failure_cap=infra_failure_cap,
+            base_for=base_for,
         )
         self.agent_id = reviewer_id or f"{team_id}-6"
         #: Builder id whose work this reviewer must not review (a promoted peer's own slot, D13).
@@ -2639,6 +2723,8 @@ class TeamPool:
         pre_review_min_confidence: float | None = None,
         pre_review_breaker: PreReviewBreaker | None = None,
         approved_diffs_before: Callable[[str], Any] | None = None,
+        base_for: Callable[[str], Any] | None = None,
+        base_lease: Callable[[str], Any] | None = None,
     ) -> None:
         if not 1 <= builders <= 5:
             raise ValueError("a team has 1..5 builder slots")
@@ -2674,6 +2760,8 @@ class TeamPool:
         self.on_approved = on_approved
         #: Earlier approved work per ticket (stacked tickets); None -> queue.approved_diffs_before.
         self.approved_diffs_before = approved_diffs_before
+        #: ``base_for(task_id)``: the task's base snapshot (``FloorManager.task_base``); None = user's folder.
+        self.base_for = base_for
         self.builders: list[BuilderWorker] = [
             BuilderWorker(
                 team_id,
@@ -2702,6 +2790,8 @@ class TeamPool:
                 pre_review_min_confidence=pre_review_min_confidence,
                 pre_review_breaker=self.pre_review_breaker,
                 approved_diffs_before=approved_diffs_before,
+                base_for=base_for,
+                base_lease=base_lease,
             )
             for slot in range(1, builders + 1)
         ]
@@ -2733,6 +2823,7 @@ class TeamPool:
             limit_cooldown_s=self._limit_cooldown_s,
             infra_backoff_s=self._infra_backoff_s,
             infra_failure_cap=self._infra_failure_cap,
+            base_for=self.base_for,
         )
 
     # -- callbacks --------------------------------------------------------------

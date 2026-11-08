@@ -251,6 +251,18 @@ class Service:
                 self.repo, base=getattr(self.config, "pr_base", None),
                 draft=bool(getattr(self.config, "pr_draft", False)),
             )
+        if "snapshots" not in kwargs and getattr(self.config, "auto_pr", False):
+            from foundry.git_publisher import GitPublisher
+
+            pub = kwargs.get("publisher")
+            if isinstance(pub, GitPublisher):
+                # build every task from a clean snapshot of the branch it is published to
+                # (your folder's branch and line endings no longer matter)
+                from foundry.base_snapshot import BaseSnapshots
+
+                # next to the publisher's worktrees (foundry/data/base by default; git-ignored)
+                kwargs["snapshots"] = BaseSnapshots(self.repo, remote=pub.remote,
+                                                    root=Path(pub.worktree_root).parent / "base")
         return build_factory(self.config, claude=self.claude, gemma=self.gemma, **kwargs)
 
     async def start(self) -> Service:
@@ -308,6 +320,12 @@ class Service:
             # a PR publish cut off by a stop/crash is retried once; opened/failed ones are left alone
             for tid in republish(self._mine):
                 log.info("foundry serve: publishing the PR for %s again", tid)
+        prune = getattr(m, "prune_snapshots", None)
+        if callable(prune) and getattr(m, "snapshots", None) is not None:
+            # snapshots of tasks that finished while stopped, or of commits nobody knows
+            t = asyncio.get_running_loop().create_task(prune())
+            self._resume_tasks.add(t)
+            t.add_done_callback(self._resume_tasks.discard)
         missing = getattr(m, "_patch_missing", None)
         for task in f.queue.all_tasks():
             tid = task["task_id"]

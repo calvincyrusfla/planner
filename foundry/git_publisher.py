@@ -42,6 +42,9 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+#: A full or abbreviated commit id (``publish(base_sha=)``); never an option or a ref expression.
+_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+
 #: Where temporary worktrees live by default (inside foundry/data, git-ignored).
 DEFAULT_WORKTREE_ROOT = Path(__file__).resolve().parent / "data" / "worktrees"
 
@@ -356,10 +359,14 @@ class GitPublisher:
         draft: bool | None = None,
         on_pushed: OnPushed | None = None,
         base: str | None = None,
+        base_sha: str | None = None,
     ) -> PublishResult:
         """Branch, commit, push and open the PR for one task. Never raises.
 
         ``base`` (e.g. a board batch's branch) overrides the publisher's base for this task.
+        ``base_sha`` (the commit the task was built on, see :mod:`foundry.base_snapshot`):
+        the branch starts from exactly that commit instead of the base's current tip, so
+        what was built and checked is what is published (the PR still targets ``base``).
 
         Idempotent per task: when a branch ``foundry/<task-id>-*`` from an earlier
         call already exists on the remote, no new branch is pushed; its existing
@@ -372,8 +379,11 @@ class GitPublisher:
                 for ref, what in ((base, "base branch"), (self.base, "base branch (FOUNDRY_PR_BASE)")):
                     if ref:
                         _check_ref(ref, what)
+                if base_sha is not None and not _SHA_RE.fullmatch(str(base_sha)):
+                    raise _Fail("bad_ref", f"invalid base commit: {str(base_sha)[:80]!r}")
                 return await self._publish(task_id, title, Path(patch_path), dict(pr or {}),
-                                           self.draft if draft is None else bool(draft), on_pushed, base=base)
+                                           self.draft if draft is None else bool(draft), on_pushed, base=base,
+                                           base_sha=base_sha)
             except _Fail as f:
                 return PublishResult(ok=False, error=f.error, stage=f.stage)
             except Exception as exc:  # noqa: BLE001 - publish must never break the caller
@@ -512,7 +522,8 @@ class GitPublisher:
             log.warning("git publisher: on_pushed callback failed: %s", exc)
 
     async def _publish(self, task_id: str, title: str, patch: Path, pr: dict[str, Any], draft: bool,
-                       on_pushed: OnPushed | None, *, base: str | None = None) -> PublishResult:
+                       on_pushed: OnPushed | None, *, base: str | None = None,
+                       base_sha: str | None = None) -> PublishResult:
         git = await self._require_repo()
         await self._clean_stale(git)
         if not patch.is_file() or patch.stat().st_size == 0:
@@ -552,6 +563,12 @@ class GitPublisher:
         start = f"refs/remotes/{self.remote}/{base}"
         if (await self._git(git, "rev-parse", "--verify", "--quiet", start))[0] != 0:
             start = "FETCH_HEAD"
+        if base_sha:
+            # build == publish: branch from the exact commit the task was built and checked on
+            if (await self._git(git, "rev-parse", "--verify", "--quiet", f"{base_sha}^{{commit}}"))[0] != 0:
+                raise _Fail("fetch_failed", f"the commit the task was built on ({base_sha[:12]}) is not in "
+                            f"the repository; fetch {self.remote} {base} and retry")
+            start = base_sha
         branch = _check_ref(await self._free_branch(git, task_id, title), "branch")
 
         wt_dir = self._wt_dir

@@ -28,7 +28,10 @@ Environment variable               Field (default)
 ``FOUNDRY_MAX_CONCURRENT``         ``max_concurrent`` (``3``)
 ``FOUNDRY_REVIEW_DWELL_S``         ``thresholds.review_dwell_s`` (``600``)
 ``FOUNDRY_STALL_S``                ``thresholds.stall_s`` (``900``)
-``FOUNDRY_GATE_FAIL_QUARANTINE``   ``thresholds.gate_fail_quarantine`` (``2``)
+``FOUNDRY_GATE_FAIL_QUARANTINE``   ``thresholds.gate_fail_quarantine`` (unset:
+                                   ``max_retries + 1``, so the Foreman never
+                                   quarantines a ticket with attempts left;
+                                   see ``effective_gate_fail_quarantine()``)
 ``FOUNDRY_TPM_SPIKE_RATIO``        ``thresholds.tpm_spike_ratio`` (``0.9``)
 ``FOUNDRY_TEAMS``                  ``teams`` (``alpha,bravo,charlie``; comma separated)
 ``FOUNDRY_BUILDERS_PER_TEAM``      ``builders_per_team`` (``5``)
@@ -175,8 +178,11 @@ class AnomalyThresholds(BaseModel):
             REVIEW_BOTTLENECK escalation (PROMOTE_PEER_REVIEWER).
         stall_s: Seconds a ticket may stay claimed with no new event before
             an AGENT_STALLED escalation (RESET_BUILDER_CONTEXT).
-        gate_fail_quarantine: Deterministic gate failures on one task that
-            trigger a LINE_JAM escalation (QUARANTINE_TASK).
+        gate_fail_quarantine: Deterministic gate failures on one ticket that
+            trigger a LINE_JAM escalation (QUARANTINE_TASK). ``None`` (the
+            default) means ``max_retries + 1``: every attempt failed its gates,
+            so the Foreman never quarantines a ticket that still has attempts
+            left (see :meth:`FoundryConfig.effective_gate_fail_quarantine`).
         tpm_spike_ratio: Fraction of the configured TPM cap above which a
             TOKEN_VELOCITY_SPIKE escalation (THROTTLE_DISPATCH) fires.
     """
@@ -185,7 +191,7 @@ class AnomalyThresholds(BaseModel):
 
     review_dwell_s: float = Field(default=600.0, gt=0)
     stall_s: float = Field(default=900.0, gt=0)
-    gate_fail_quarantine: int = Field(default=2, ge=1)
+    gate_fail_quarantine: int | None = Field(default=None, ge=1)
     tpm_spike_ratio: float = Field(default=0.9, gt=0, le=1)
 
 
@@ -363,6 +369,20 @@ class FoundryConfig(BaseModel):
         if self.patches_dir is not None:
             return self.patches_dir
         return self.db_path.parent / "patches"
+
+    def effective_gate_fail_quarantine(self) -> int:
+        """Return the LINE_JAM gate-failure limit the Shop Foreman applies.
+
+        An explicit ``thresholds.gate_fail_quarantine`` (or
+        ``FOUNDRY_GATE_FAIL_QUARANTINE``) wins; unset means
+        ``max_retries + 1``, i.e. every attempt the retry policy allows failed
+        its gates, so the Foreman never quarantines a ticket that still has
+        attempts left (the retry cap quarantines it at the end anyway).
+        """
+        explicit = self.thresholds.gate_fail_quarantine
+        if explicit is not None:
+            return int(explicit)
+        return int(self.max_retries) + 1
 
     def ensure_patches_dir(self) -> Path:
         """Create the resolved patches folder if needed and return it."""

@@ -33,7 +33,8 @@ def test_defaults() -> None:
     assert cfg.builders_per_team == 5
     assert cfg.board_bridge_mode == "auto"
     assert cfg.thresholds == AnomalyThresholds()
-    assert cfg.thresholds.gate_fail_quarantine == 2
+    assert cfg.thresholds.gate_fail_quarantine is None
+    assert cfg.effective_gate_fail_quarantine() == cfg.max_retries + 1 == 4
     assert cfg.thresholds.tpm_spike_ratio == 0.9
 
 

@@ -95,7 +95,8 @@ def line(tmp_path: Path, fake_clock: Any) -> dict[str, Any]:
     )
     (repo / "config_loader.py").write_text(big + "\n", encoding="utf-8")
     engine = ContextEngine(repo)
-    config = FoundryConfig(db_path=tmp_path / "foundry.db")
+    # The LINE_JAM mechanics tests pin an explicit limit of 2 (the default is max_retries + 1).
+    config = FoundryConfig(db_path=tmp_path / "foundry.db", thresholds=AnomalyThresholds(gate_fail_quarantine=2))
     yield {"queue": queue, "telemetry": telemetry, "engine": engine, "config": config, "clock": fake_clock}
     queue.close()
 
