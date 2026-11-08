@@ -68,6 +68,9 @@ Environment variable               Field (default)
 ``FOUNDRY_PR_BASE``                ``pr_base`` (unset: the repo's default
                                    branch, else the current branch)
 ``FOUNDRY_PR_DRAFT``               ``pr_draft`` (``false``): open PRs as drafts
+``FOUNDRY_MIN_SUBTASK_LINES``      ``min_subtask_lines`` (``30``): a one-file
+                                   subtask estimated below this many lines is
+                                   merged into a neighbour; ``0`` disables it
 ``FOUNDRY_TYPECHECK``              ``typecheck`` (``auto``; ``auto|mypy|off``):
                                    the mypy gate after the linter; ``auto``
                                    runs it when mypy is installed
@@ -168,6 +171,10 @@ def split_claude_args(text: str) -> list[str]:
     lexer.escape = ""
     lexer.commenters = ""
     return list(lexer)
+
+
+_SECRET_SCAN_OFF = ("0", "false", "no", "off")
+"""``FOUNDRY_SECRET_SCAN`` values that turn the scan off (same list as the secrets gate)."""
 
 
 class AnomalyThresholds(BaseModel):
@@ -276,6 +283,14 @@ class FoundryConfig(BaseModel):
         ),
     )
 
+    min_subtask_lines: int = Field(
+        default=30,
+        ge=0,
+        description=(
+            "A one-file subtask estimated below this many changed lines is merged into a "
+            "neighbour so it doesn't cost a whole builder; 0 disables merging."
+        ),
+    )
     pre_review: PreReviewMode = Field(
         default="gate",
         description=(
@@ -307,6 +322,11 @@ class FoundryConfig(BaseModel):
         description=(
             "owner/name repos whose board batches may be claimed (case-insensitive). "
             "Empty: no allowlist, every batch for this Foundry's repo is claimable."
+    secret_scan: bool = Field(
+        default=True,
+        description=(
+            "Whether the secrets gate scans added lines. Mirrors FOUNDRY_SECRET_SCAN, which "
+            "the gate reads itself: 0, false, no or off disable it, any other value scans."
         ),
     )
     typecheck: TypecheckMode = Field(
@@ -465,6 +485,7 @@ class FoundryConfig(BaseModel):
             "PR_BASE": "pr_base",
             "PR_DRAFT": "pr_draft",
             "TYPECHECK": "typecheck",
+            "MIN_SUBTASK_LINES": "min_subtask_lines",
         }
         for var, field in simple.items():
             value = get(var)
@@ -511,6 +532,10 @@ class FoundryConfig(BaseModel):
             data["claude_append_prompt"] = (
                 None if append_prompt.lower() == _NONE_WORD else append_prompt
             )
+
+        secret_scan = get("SECRET_SCAN")
+        if secret_scan is not None:
+            data["secret_scan"] = secret_scan.strip().lower() not in _SECRET_SCAN_OFF
 
         thresholds: dict[str, Any] = {}
         for var, field in {

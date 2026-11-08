@@ -97,6 +97,10 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
+#: ``hook(task_id, agent_id, work, status=..., team_id=...)``: what one agent is doing now
+#: (``BoardBridge.agent_status`` fits; workers never import the bridge).
+ActivityHook = Callable[..., Any]
+
 #: Longest fix hint stored on a reopened ticket (REVISE directives can be long).
 MAX_FIX_HINT_CHARS = 1200
 
@@ -1028,6 +1032,10 @@ class _WorkerBase:
         #: Consecutive counted failures before a ticket's task is quarantined (E1).
         self.infra_failure_cap = int(infra_failure_cap)
         self._local_infra: dict[str, int] = {}
+        #: Told what this agent is doing (optional, see :data:`ActivityHook`).
+        self.on_activity: ActivityHook | None = None
+        #: ``on_ticket_change(task_id, team_id=...)``: a ticket of the task changed state.
+        self.on_ticket_change: Callable[..., Any] | None = None
 
     @property
     def max_retries(self) -> int:
@@ -1056,6 +1064,26 @@ class _WorkerBase:
             fn(kind, task_id, payload)
         except Exception:  # pragma: no cover - defensive
             log.exception("record_event(%s) failed", kind)
+
+    def _activity(self, task_id: Any, work: str, *, status: str = "working") -> None:
+        """Tell ``on_activity`` what this agent is doing; reporting must never break the work."""
+        hook = self.on_activity
+        if hook is None or not task_id:
+            return
+        try:
+            hook(str(task_id), self.agent_id, work, status=status, team_id=self.team_id)
+        except Exception:  # pragma: no cover - defensive
+            log.exception("on_activity hook failed")
+
+    def _ticket_changed(self, task_id: Any) -> None:
+        """Tell ``on_ticket_change`` a ticket changed state; reporting must never break the work."""
+        hook = self.on_ticket_change
+        if hook is None or not task_id:
+            return
+        try:
+            hook(str(task_id), team_id=self.team_id)
+        except Exception:
+            log.exception("on_ticket_change hook failed")
 
     def _task_state(self, task_id: str) -> str:
         getter = getattr(self.queue, "get_task", None)
@@ -1134,9 +1162,11 @@ class _WorkerBase:
             self._tm("record_retry", task_id)
             self._event("retry", task_id, {"ticket_id": ticket_id, "attempt": attempt + 1, "reason": reason, "fix_hint": hint})
             self._release_later(ticket)
+            self._ticket_changed(task_id)
             return "retry"
         self._quarantine(task_id, f"retry limit reached ({reason}): {_one_line(hint)}")
         self._event("quarantined", task_id, {"ticket_id": ticket_id, "attempt": attempt, "reason": reason})
+        self._ticket_changed(task_id)
         return "quarantined"
 
     def _release_later(self, ticket: Any) -> list[str]:
@@ -1468,6 +1498,7 @@ class BuilderWorker(_WorkerBase):
         poll: float = 0.05,
         trust_cache: bool = False,
         on_state: Callable[[BuilderWorker], None] | None = None,
+        on_activity: ActivityHook | None = None,
         on_task_complete: Callable[[str], Any] | None = None,
         workspace: str | Path | None = None,
         repo_root: str | Path | None = None,
@@ -1527,6 +1558,7 @@ class BuilderWorker(_WorkerBase):
         self.poll = poll
         self.trust_cache = trust_cache
         self.on_state = on_state
+        self.on_activity = on_activity
         self.on_task_complete = on_task_complete
         self.busy = False
         self.current_ticket: Any = None
@@ -1970,6 +2002,15 @@ class BuilderWorker(_WorkerBase):
         return list(self._stack.work) if self._stack is not None else []
 
     async def _process_ticket(self, ticket: Any) -> str:
+        """Report this slot's activity around :meth:`_build_ticket`; the last report is always idle."""
+        task_id = _get(ticket, "task_id")
+        self._activity(task_id, f"Building {_get(ticket, 'ticket_id') or task_id}")
+        try:
+            return await self._build_ticket(ticket)
+        finally:
+            self._activity(task_id, "", status="idle")
+
+    async def _build_ticket(self, ticket: Any) -> str:
         """Process one claimed ticket end to end; returns the outcome label.
 
         Labels: ``"review"`` (sent to the reviewer), ``"cached"`` (cache hit
@@ -1981,6 +2022,8 @@ class BuilderWorker(_WorkerBase):
             return "skipped"
         assignment = await self.build_assignment(ticket)
         started = time.monotonic()
+
+        self._ticket_changed(task_id)  # the ticket was just claimed
 
         # 1. exact-match solution cache: a hit never calls Claude.
         meta = self._work_order(task_id)
@@ -2032,6 +2075,7 @@ class BuilderWorker(_WorkerBase):
             return self._send_back(ticket, _one_line(f"Fix the reply: {note}. {_SHORT_CONTRACT}", 700), reason="blocked")
 
         # 4. deterministic gates, short-circuit before any reviewer
+        self._activity(task_id, "Running gates")
         self._set_state(task_id, TaskState.VALIDATING)
         snapshot = self._snapshot(submission.diff)
         before = self._before_change(submission.diff)
@@ -2058,6 +2102,7 @@ class BuilderWorker(_WorkerBase):
         submission = self._normalized(ticket, submission, before)
 
         # 5. Gemma pre-review: may send obvious problems back once per ticket (gate mode).
+        self._activity(task_id, "Pre-review")
         send_back, notes, review = await self._pre_review(ticket, assignment, submission, gates.results)
         if send_back is not None:
             _restore_files(self.workspace, snapshot)
@@ -2430,6 +2475,7 @@ async def _complete_ticket(
     The queue itself moves the task to ``complete`` when every ticket is done.
     """
     all_done = worker.queue.complete_ticket(ticket_id)
+    worker._ticket_changed(task_id)
     if not all_done:
         return False
     worker._event("task_complete", task_id, {"by": worker.agent_id})
@@ -2479,6 +2525,17 @@ def _restore_files(workspace: Path | None, snapshot: dict[str, str | None] | Non
             log.exception("could not restore %s", rel)
 
 
+def _review_task_id(item: Any) -> str | None:
+    """The task a review item belongs to (None when it names none)."""
+    for holder in (item, getattr(item, "ticket", None), getattr(item, "assignment", None), getattr(item, "submission", None)):
+        if holder is None:
+            continue
+        value = _get(holder, "task_id")
+        if value:
+            return str(value)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Reviewer
 # ---------------------------------------------------------------------------
@@ -2508,6 +2565,8 @@ class ReviewerWorker(_WorkerBase):
         on_task_complete: Callable[[str], Any] | None = None,
         on_approved: Callable[[ReviewItem, ReviewerVerdict], Any] | None = None,
         exclude_builder: str | None = None,
+        on_ticket_change: Callable[..., Any] | None = None,
+        on_activity: ActivityHook | None = None,
         poll: float = 0.05,
         claude_timeout: float = 600,
         cwd: str | None = None,
@@ -2535,6 +2594,8 @@ class ReviewerWorker(_WorkerBase):
         self.agent_id = reviewer_id or f"{team_id}-6"
         #: Builder id whose work this reviewer must not review (a promoted peer's own slot, D13).
         self.exclude_builder: str | None = exclude_builder
+        self.on_ticket_change = on_ticket_change
+        self.on_activity = on_activity
         self.poll = poll
         self._backoff_s = 0.0
         self.cache = cache
@@ -2584,6 +2645,15 @@ class ReviewerWorker(_WorkerBase):
                 await self._wait(wait, stop)
 
     async def review(self, item: ReviewItem) -> ReviewerVerdict | None:
+        """Report this reviewer's activity around :meth:`_review_item`; the last report is always idle."""
+        task_id = _review_task_id(item)
+        self._activity(task_id, f"Reviewing {getattr(item, 'ticket_id', None) or task_id}")
+        try:
+            return await self._review_item(item)
+        finally:
+            self._activity(task_id, "", status="idle")
+
+    async def _review_item(self, item: ReviewItem) -> ReviewerVerdict | None:
         """Review one submission and act on the verdict; ``None`` if the task is already terminal."""
         task_id = item.assignment.task_id
         if self._task_state(task_id) in _TERMINAL_STATES or not self._still_owned(item.ticket):
@@ -2592,6 +2662,7 @@ class ReviewerWorker(_WorkerBase):
             return None
         item_key = str(item.ticket_id)
         self._tm("mark_review_start", task_id, item=item_key)
+        self._ticket_changed(task_id)
         retry = item.assignment.attempt
         prompt = build_reviewer_prompt(
             item.submission,
@@ -2715,6 +2786,7 @@ class TeamPool:
         claude_timeout: float = 600,
         cwd: str | None = None,
         config: Any = None,
+        on_activity: ActivityHook | None = None,
         repo_root: str | Path | None = None,
         limit_cooldown_s: float | None = None,
         infra_backoff_s: float = 5.0,
@@ -2756,6 +2828,8 @@ class TeamPool:
         self.on_task_complete = on_task_complete
         self.review_inbox: asyncio.Queue[ReviewItem] = asyncio.Queue()
         self._claude_timeout = claude_timeout
+        self.on_activity: ActivityHook | None = on_activity
+        self.on_ticket_change: Callable[..., Any] | None = None
         self._cwd = cwd
         self.on_approved = on_approved
         #: Earlier approved work per ticket (stacked tickets); None -> queue.approved_diffs_before.
@@ -2778,6 +2852,7 @@ class TeamPool:
                 poll=poll,
                 trust_cache=trust_cache,
                 on_state=self._on_builder_state,
+                on_activity=on_activity,
                 on_task_complete=self._task_completed,
                 workspace=workspace,
                 repo_root=repo_root,
@@ -2817,6 +2892,7 @@ class TeamPool:
             on_task_complete=self._task_completed,
             on_approved=self.on_approved,
             exclude_builder=exclude_builder,
+            on_activity=self.on_activity,
             poll=self._poll,
             claude_timeout=self._claude_timeout,
             cwd=self._cwd,
@@ -2824,7 +2900,20 @@ class TeamPool:
             infra_backoff_s=self._infra_backoff_s,
             infra_failure_cap=self._infra_failure_cap,
             base_for=self.base_for,
+            on_ticket_change=self.on_ticket_change,
         )
+
+    def set_on_ticket_change(self, on_ticket_change: Callable[..., Any] | None) -> None:
+        """Point every worker of this pool (peer reviewers too) at the ``on_ticket_change`` hook."""
+        self.on_ticket_change = on_ticket_change
+        for worker in [*self.builders, self.reviewer, *self.peer_reviewers.values()]:
+            worker.on_ticket_change = on_ticket_change
+
+    def set_on_activity(self, on_activity: ActivityHook | None) -> None:
+        """Point every worker of this pool (peer reviewers too) at the ``on_activity`` hook."""
+        self.on_activity = on_activity
+        for worker in [*self.builders, self.reviewer, *self.peer_reviewers.values()]:
+            worker.on_activity = on_activity
 
     # -- callbacks --------------------------------------------------------------
     async def _task_completed(self, task_id: str) -> None:
