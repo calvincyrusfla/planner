@@ -5,6 +5,7 @@
 
 import * as core from './core.mjs';
 import * as batches from './foundry-batches.mjs';
+import * as foundryMetrics from './foundry-metrics.mjs';
 
 const LOG_LIMIT = 500;
 const OPEN = new Set(['queued', 'active', 'review', 'paused']);
@@ -47,6 +48,9 @@ const OPS = {
   updateBatch: (state, { id, service, host, status, results, heartbeat, note } = {}) =>
     batches.updateBatch(state, { id, service, host, status, results, heartbeat, note }),
   cancelBatch: (state, { id, by } = {}) => batches.cancelBatch(state, { id, by }),
+  // Foundry metrics: latest report per service (see lib/foundry-metrics.mjs).
+  reportFoundryMetrics: (state, { service, host, reportedAt, metrics } = {}) =>
+    foundryMetrics.reportFoundryMetrics(state, { service, host, reportedAt, metrics }),
 };
 
 export const OP_TYPES = Object.keys(OPS);
@@ -74,6 +78,7 @@ export function applyOp(state, op) {
 // - Usage: the newer report (by reportedAt) wins; an older or invalid one is ignored.
 // - Foundry batches merge by id (lib/foundry-batches.mjs importBatches): same
 //   id + createdAt keeps the newer copy, a clashing id gets a fresh S-###.
+// - Foundry metrics: the newer report of each service wins; invalid ones are dropped.
 // - Finally dispatch runs so queued work picks up free teams.
 
 const TEAM_IDENTITY = new Set(['id', 'name', 'color', 'taskId', 'totalMs', 'issuesFound', 'agents']);
@@ -175,6 +180,7 @@ export function importState(state, other) {
   } else state.usage = ourUsage;
 
   const batchResult = batches.importBatches(state, incoming.foundryBatches);
+  foundryMetrics.importMetrics(state, incoming.foundryMetrics);
 
   core.dispatch(state);
   return { added: addedTasks.length, skipped: skippedIds.size, idMap, batches: batchResult };

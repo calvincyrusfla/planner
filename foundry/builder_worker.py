@@ -430,12 +430,45 @@ def _read_only_touched(files: Iterable[str], assignment: TaskAssignment) -> list
     return [f for f in files if _read_only_path(f) in protected]
 
 
+MAX_ORDER_DETAILS_CHARS = 6000  # cap on the work-order text quoted in builder and reviewer prompts
+
+
+def _capped_order_text(text: str, label: str) -> str:
+    """``text`` cut to the order-details cap, saying how much of the ``label`` was left out."""
+    if len(text) <= MAX_ORDER_DETAILS_CHARS:
+        return text
+    more = len(text) - MAX_ORDER_DETAILS_CHARS
+    return f"{text[:MAX_ORDER_DETAILS_CHARS].rstrip()}\n[... {label} truncated: {more} more characters]"
+
+
+def _order_details_section(description: str | None, part_description: str | None = None) -> list[str]:
+    """Prompt lines quoting the original work order and the ticket's own part; empty when there is neither.
+
+    The part is left out when it only repeats the order (a single-ticket task).
+    """
+    text = (description or "").strip()
+    part = (part_description or "").strip()
+    if part == text:
+        part = ""
+    lines: list[str] = []
+    if text:
+        lines += [
+            "The original work order this subtask is part of, for background; the acceptance criteria above set what "
+            "this subtask must do.",
+            _capped_order_text(text, "order description"),
+        ]
+    if part:
+        lines += ["", "### This part", _capped_order_text(part, "ticket description")]
+    return ["", "## Order details", *lines] if lines else []
+
+
 def build_builder_prompt(
     assignment: TaskAssignment,
     *,
     max_retries: int = MAX_RETRIES,
     already_done: Sequence[StackedWork] | None = None,
     focus_files: Sequence[str] | None = None,
+    order_description: str | None = None,
 ) -> str:
     """Return the exact prompt a builder sends to Claude for ``assignment``.
 
@@ -444,9 +477,11 @@ def build_builder_prompt(
     ``focus_files``: this subtask's own files; when they are a strict subset
     of the allowed files the prompt lists "## Your files" and, separately,
     "## You may also touch" (the rest of the task's files).
+    ``order_description``: the original work-order text, quoted (capped) under "## Order details".
+    ``assignment.ticket_description``: the ticket's own description, quoted (capped) under "### This part".
 
     Contains only: who/what (ids, attempt), the objective, acceptance criteria,
-    allowed files, the pruned ``ContextSlice`` snippets (edit targets in full,
+    the order details, allowed files, the pruned ``ContextSlice`` snippets (edit targets in full,
     the rest as outlines, plus a symbol inventory), the fix hint from the
     previous attempt (if any) and the ```edits / ```diff output contract.  Never
     whole files beyond the context engine's line budget.
@@ -464,6 +499,7 @@ def build_builder_prompt(
         "## Acceptance criteria",
     ]
     parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
+    parts += _order_details_section(order_description, assignment.ticket_description)
     allowed = list(assignment.allowed_files)
     read_files = list(getattr(assignment, "read_files", ()))
     protected = set(read_files)
@@ -542,6 +578,8 @@ def build_reviewer_prompt(
     retry_count: int = 0,
     pre_review_notes: str | None = None,
     max_retries: int = MAX_RETRIES,
+    order_description: str | None = None,
+    part_description: str | None = None,
 ) -> str:
     """Return the exact, diff-only prompt a reviewer sends to Claude.
 
@@ -550,6 +588,8 @@ def build_reviewer_prompt(
     gate stdout are deliberately left out.  ``pre_review_notes`` (Gemma's
     pre-review findings, if any) are added as advisory text the reviewer
     is told may be wrong.
+    ``order_description`` (the original work order, capped) is quoted under "## Order details".
+    ``part_description`` (the ticket's own description, capped) is quoted under "### This part".
     """
     who = f"You are reviewer {reviewer_id}. " if reviewer_id else "You are the reviewer. "
     parts: list[str] = [
@@ -560,6 +600,7 @@ def build_reviewer_prompt(
         "## Acceptance criteria",
     ]
     parts += [f"- {c.strip()}" for c in acceptance_criteria] or ["- (none given)"]
+    parts += _order_details_section(order_description, part_description)
     parts += ["", "## Deterministic gates (already run)"]
     if gate_results:
         for g in gate_results:
@@ -1715,19 +1756,7 @@ class BuilderWorker(_WorkerBase):
             "allowed_files": _get(ticket, "allowed_files"),
         }
         if info["acceptance_criteria"] is None or info["allowed_files"] is None:
-            sub = None
-            for name in ("get_subtask", "subtask_for"):
-                fn = getattr(self.queue, name, None)
-                if fn is not None:
-                    try:
-                        sub = fn(_get(ticket, "task_id"), _get(ticket, "subtask_id"))
-                    except (KeyError, ValueError):
-                        sub = None
-                    break
-            if sub is None:
-                task = getattr(self.queue, "get_task", lambda _t: None)(_get(ticket, "task_id"))
-                subs = _get(task, "subtasks") or _get(_get(task, "allocation"), "subtasks") or []
-                sub = next((s for s in subs if _get(s, "subtask_id") == _get(ticket, "subtask_id")), None)
+            sub = self._find_subtask(ticket)
             for key in info:
                 if info[key] is None:
                     info[key] = _get(sub, key)
@@ -1739,6 +1768,32 @@ class BuilderWorker(_WorkerBase):
         info["focus_files"] = focus or list(allowed)
         info["read_files"] = self._read_files(ticket, allowed)
         return info
+
+    def _find_subtask(self, ticket: Any) -> Any:
+        """The ticket's subtask from the queue or its task's allocation; None if not found."""
+        for name in ("get_subtask", "subtask_for"):
+            fn = getattr(self.queue, name, None)
+            if fn is not None:
+                try:
+                    sub = fn(_get(ticket, "task_id"), _get(ticket, "subtask_id"))
+                except (KeyError, ValueError):
+                    sub = None
+                if sub is not None:
+                    return sub
+                break
+        task = getattr(self.queue, "get_task", lambda _t: None)(_get(ticket, "task_id"))
+        subs = _get(task, "subtasks") or _get(_get(task, "allocation"), "subtasks") or []
+        return next((s for s in subs if _get(s, "subtask_id") == _get(ticket, "subtask_id")), None)
+
+    def _ticket_description(self, ticket: Any) -> str | None:
+        """The ticket's own description, from the ticket or else its subtask; None when there is none."""
+        text = _get(ticket, "description")
+        if not (isinstance(text, str) and text.strip()):
+            try:
+                text = _get(self._find_subtask(ticket), "description")
+            except Exception:  # best effort, like _work_order: the prompt just goes without it
+                return None
+        return text.strip() if isinstance(text, str) and text.strip() else None
 
     def _read_files(self, ticket: Any, allowed: Sequence[str]) -> list[str]:
         """Files this ticket may read but not change.
@@ -1890,6 +1945,7 @@ class BuilderWorker(_WorkerBase):
             "context": context,
             "attempt": attempt,
             "fix_hint": _get(ticket, "fix_hint"),
+            "ticket_description": self._ticket_description(ticket),
         }
         if not info["read_files"]:
             return TaskAssignment(**fields)
@@ -2167,7 +2223,8 @@ class BuilderWorker(_WorkerBase):
 
         # 2. Claude (inside limiter.slot + call_with_backoff)
         prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
-                                      focus_files=self._focus_files(ticket, assignment))
+                                      focus_files=self._focus_files(ticket, assignment),
+                                      order_description=meta.get("description"))
         self.scratch["last_prompt"] = prompt
         try:
             result = await self._call_claude(prompt, task_id=task_id)
@@ -2803,6 +2860,8 @@ class ReviewerWorker(_WorkerBase):
             retry_count=retry,
             pre_review_notes=item.pre_review_notes,
             max_retries=self.max_retries,
+            order_description=(item.cache_meta or {}).get("description"),
+            part_description=item.assignment.ticket_description,
         )
         started = time.monotonic()
         error: BaseException | None = None
