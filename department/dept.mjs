@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
+import { metricLines } from './lib/foundry-metrics.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
 
 // Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY is set
@@ -73,6 +74,8 @@ const HELP = `Agent Department CLI
   node department/dept.mjs foundry poll <S-id> [--json] Batch status: each subtask's F-id, state, PR
   node department/dept.mjs foundry list [--open]       Foundry batches, newest first
   node department/dept.mjs foundry cancel <S-id>       Cancel a batch that hasn't finished
+  node department/dept.mjs foundry metrics [--json]    Latest metrics report of each Foundry service:
+                                                       totals and per-task rows
   node department/dept.mjs json                        Dump the full state
   node department/dept.mjs reset                       Wipe all tasks and reset the teams
 
@@ -562,7 +565,7 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id>';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json]';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
 // "Title::description::file1,file2::S::read1,read2" → subtask. Empty parts are skipped.
@@ -621,7 +624,20 @@ function printBatch(b) {
   }
 }
 
+// `foundry metrics [--json]`: the latest metrics report of each Foundry service.
+async function foundryMetricsCommand(opt) {
+  const s = await currentState();
+  const reports = Array.isArray(s.foundryMetrics) ? s.foundryMetrics : [];
+  if (opt.json) return console.log(JSON.stringify(reports, null, 2));
+  if (!reports.length) return console.log('No Foundry metrics reported yet');
+  for (const r of reports) {
+    console.log(`${r.service}${r.host ? ` on ${r.host}` : ''} · reported ${r.reportedAt}`);
+    for (const line of metricLines(r.metrics)) console.log(line);
+  }
+}
+
 async function foundryCommand(sub, args, opt) {
+  if (sub === 'metrics') return foundryMetricsCommand(opt);
   switch (sub) {
     case 'dispatch': {
       let batch;
