@@ -309,6 +309,7 @@ def test_gemma_with_too_few_subtasks_is_split_deterministically(line: dict[str, 
 
 
 def test_prune_context_slice_delegates_and_records_savings(line: dict[str, Any]) -> None:
+    line["engine"].full_lines = 0  # outline-only slices (full edit targets: test_context_targets.py)
     foreman = make_foreman(line)
     subtask = SubtaskAllocation(subtask_id="F-007.1", title="Update parse_config",
                                 acceptance_criteria=["parse_config reads V1"], allowed_files=["config_loader.py"])

@@ -254,7 +254,7 @@ def test_parse_builder_reply_single_block_is_ready() -> None:
 @pytest.mark.parametrize(
     "reply, fragment",
     [
-        ("I changed it, trust me.", "no ```diff block"),
+        ("I changed it, trust me.", "no ```edits or ```diff block"),
         ("BLOCKED: the file does not exist", "BLOCKED: the file does not exist"),
         (fenced(GOOD_DIFF) + fenced(GOOD_DIFF), "2 ```diff blocks"),
         ("```diff\n" + GOOD_DIFF, "not closed"),
@@ -369,8 +369,11 @@ def test_builder_prompt_received_by_claude_is_pruned(tmp_path: Path) -> None:
     asyncio.run(run_pool(rig, ["T-P"]))
     prompt = rig.client.prompts_for(f"{TEAM}-1")[0]
     assert "def add(a, b)" in prompt
-    assert "return a + b" not in prompt  # body elided by the context engine
-    assert "## Context (pruned excerpts" in prompt
+    # T-026: a file within the full-body budget is shown whole, with line numbers,
+    # next to an inventory of its existing symbols (so nothing gets re-defined).
+    assert "  3|     return a + b" in prompt
+    assert "inventory of pkg/mathx.py" in prompt
+    assert "## Context\n" in prompt and "outline only" in prompt
 
 
 def test_medium_task_uses_two_slots_and_completes_once(tmp_path: Path) -> None:
@@ -427,7 +430,7 @@ def test_bad_reply_format_is_sent_back_without_review(tmp_path: Path) -> None:
     rig.submit("T-R", "S")
     asyncio.run(run_pool(rig, ["T-R"]))
     second = rig.client.prompts_for(f"{TEAM}-1")[1]
-    assert "no ```diff block" in second
+    assert "no ```edits or ```diff block" in second
     assert rig.client.calls[REVIEWER] == 1
 
 
