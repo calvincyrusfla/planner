@@ -33,7 +33,7 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -550,6 +550,84 @@ class FoundryQueue:
                 " WHERE task_id=? AND status IN ('open','claimed')",
                 (now, task_id),
             )
+
+    def reopen_quarantined(
+        self, task_id: str, tickets: Mapping[str, Mapping[str, Any]], note: str = ""
+    ) -> list[str]:
+        """Put a quarantined task back on the line (the Foreman's undo / RETRY_TASK).
+
+        The task returns to ``building`` (its quarantine reason cleared) and
+        every ticket named in ``tickets`` that is still ``blocked`` is open
+        again, claim and review flag cleared, slot kept within the
+        allocation. A ticket's mapping may carry ``attempt`` and
+        ``infra_failures`` to restore (missing keys keep the current values).
+        Returns the reopened ticket ids. ValueError when the task is not
+        quarantined; KeyError for an unknown task.
+        """
+        now = self.now()
+        with self.transaction() as conn:
+            row = self._require_task(conn, task_id)
+            cur = TaskState(row["state"])
+            if cur != TaskState.QUARANTINED:
+                raise ValueError(f"task {task_id!r} is {cur.value}, not quarantined")
+            alloc = int(row["allocated_builders"]) or 1
+            reopened: list[str] = []
+            for ticket_id, spec in tickets.items():
+                t = conn.execute("SELECT * FROM tickets WHERE ticket_id=? AND task_id=?",
+                                 (ticket_id, task_id)).fetchone()
+                if t is None or t["status"] != "blocked":
+                    continue
+                attempt = int(spec.get("attempt", t["attempt"]))
+                infra = int(spec.get("infra_failures", t["infra_failures"] or 0))
+                slot = int(t["slot"])
+                if slot > alloc:
+                    slot = self._least_loaded_slot(conn, task_id, alloc)
+                conn.execute(
+                    "UPDATE tickets SET status='open', attempt=?, infra_failures=?, slot=?,"
+                    " claimed_by=NULL, claimed_at=NULL, in_review=0, updated_at=? WHERE ticket_id=?",
+                    (attempt, infra, slot, now, ticket_id),
+                )
+                reopened.append(ticket_id)
+            conn.execute("UPDATE tasks SET quarantine_reason=NULL, updated_at=? WHERE task_id=?",
+                         (now, task_id))
+            self._set_state_row(conn, task_id, cur, TaskState.BUILDING, note or "unquarantined")
+            self._event(conn, "unquarantined", task_id, {"tickets": reopened, "note": note})
+            return reopened
+
+    def move_tickets(
+        self, task_id: str, team_id: str, ticket_ids: Iterable[str] | None = None
+    ) -> list[str]:
+        """Move a task's ``open`` tickets (all, or only ``ticket_ids``) to ``team_id``'s pool.
+
+        Claimed, done and blocked tickets stay where they are. The task's
+        ``team_id`` follows. Returns the moved ticket ids. KeyError for an
+        unknown task.
+        """
+        now = self.now()
+        with self.transaction() as conn:
+            row = self._require_task(conn, task_id)
+            wanted = None if ticket_ids is None else set(ticket_ids)
+            moved: list[str] = []
+            for t in conn.execute("SELECT ticket_id, team_id, status FROM tickets WHERE task_id=?"
+                                  " ORDER BY rowid", (task_id,)).fetchall():
+                if t["status"] != "open" or t["team_id"] == team_id:
+                    continue
+                if wanted is not None and t["ticket_id"] not in wanted:
+                    continue
+                conn.execute("UPDATE tickets SET team_id=?, updated_at=? WHERE ticket_id=?",
+                             (team_id, now, t["ticket_id"]))
+                moved.append(t["ticket_id"])
+            conn.execute("UPDATE tasks SET team_id=?, updated_at=? WHERE task_id=?",
+                         (team_id, now, task_id))
+            self._event(conn, "reassigned", task_id,
+                        {"from": row["team_id"], "to": team_id, "tickets": moved})
+            return moved
+
+    def delete_sizing_outcome(self, task_id: str) -> bool:
+        """Forget a task's recorded sizing outcome (an undone quarantine); True if one existed."""
+        with self.transaction() as conn:
+            return conn.execute("DELETE FROM sizing_outcomes WHERE task_id=?",
+                                (task_id,)).rowcount == 1
 
     def store_pr_summary(self, task_id: str, summary: dict[str, Any]) -> None:
         """Persist the Foreman's commit/PR draft for a finished task."""

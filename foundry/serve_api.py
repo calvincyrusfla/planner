@@ -14,6 +14,14 @@ Routes
 ``POST /api/ask``     ``{question}`` -> ``text/event-stream`` of
 ``data: {"text": "..."}`` chunks, then ``event: done`` (``event: error`` first
 if the answer fails mid-stream).
+``GET  /api/actions`` -> ``{ok, actions: [...]}`` the Foreman's applied actions,
+newest first (``?limit=N``, 1-200, default 50).
+``POST /api/tasks/<id>/pr/retry`` -> ``{ok: true, task_id, pr}`` (publishing again
+in the background); 409 ``{ok: false, reason, code: "refused"}`` when the PR is
+open, already publishing or has no patch; 404 for an unknown task.
+``POST /api/actions/<id>/undo`` -> ``{ok, action_id, ...}``; 409 ``{ok: false,
+reason, error, code: "refused"}`` when it cannot be undone (state moved on,
+not undoable, unknown id).
 
 Errors are JSON ``{ok: false, error, code}``: 400 ``invalid``, 403 ``not_local``,
 404, 405 ``method``, 413 ``too_large``, 503 ``not_running`` (orders/ask while
@@ -26,7 +34,9 @@ duck-typed methods, so tests can pass a simulated one:
 * ``status()`` -> dict,
 * ``submit(title=, description=, files=, size=)`` -> task id (str, or a dict
   with ``task_id``); raises ``ValueError`` for an invalid order,
-* ``ask(question)`` -> (async) iterator of text chunks.
+* ``ask(question)`` -> (async) iterator of text chunks,
+* ``actions(limit=)`` -> list of action dicts (optional; ``[]`` without it),
+* ``undo_action(action_id, by=)`` -> ``{ok, ...}`` / ``{ok: False, reason}``.
 
 Any of them may be a coroutine / async generator.  When the service exposes a
 running asyncio loop as ``service.loop`` the coroutine runs on that loop
@@ -45,8 +55,9 @@ import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from foundry import __version__
 
@@ -79,6 +90,16 @@ MAX_DESCRIPTION = 20_000
 MAX_FILES = 200
 MAX_QUESTION = 4_000
 SIZES = {"S": "S", "M": "M", "L": "L", "XL": "XL", "SMALL": "S", "MEDIUM": "M", "LARGE": "L"}
+
+
+ACTION_LIMIT_MAX = 200
+#: Ids in a route path (action ids, task ids): short plain tokens only.
+ROUTE_ID = r"([A-Za-z0-9][A-Za-z0-9_.:-]{0,79})"
+#: Routes with an id segment: (pattern, method, handler name).  The handler gets the id.
+PATTERN_ROUTES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (re.compile(rf"^/api/actions/{ROUTE_ID}/undo$"), "POST", "_undo"),
+    (re.compile(rf"^/api/tasks/{ROUTE_ID}/pr/retry$"), "POST", "_pr_retry"),  # handler: alpha-2
+)
 
 
 class OrderError(ValueError):
@@ -357,8 +378,18 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/status": ("GET", self._status),
             "/api/orders": ("POST", self._orders),
             "/api/ask": ("POST", self._ask),
+            "/api/actions": ("GET", self._actions),
         }
-        return routes.get(path)
+        hit = routes.get(path)
+        if hit is not None:
+            return hit
+        for pattern, method, name in PATTERN_ROUTES:
+            m = pattern.match(path)
+            handler = getattr(self, name, None) if m else None
+            if callable(handler):
+                ident = m.group(1)
+                return method, (lambda h=handler, i=ident: h(i))
+        return None
 
     def _dispatch(self) -> None:
         if not self._local():
@@ -456,6 +487,26 @@ class _Handler(BaseHTTPRequestHandler):
             raise RuntimeError("service.submit returned no task id")
         self._send_json(200, {"ok": True, "task_id": str(task_id)})
 
+    def _pr_retry(self, task_id: str) -> None:
+        """``POST /api/tasks/<id>/pr/retry``: publish a failed PR again (alpha-2)."""
+        self._read_json()  # body optional, ignored
+        svc = self.service
+        if _not_running(svc):
+            return self._error(503, "Foundry is not running.", "not_running")
+        fn = getattr(svc, "retry_pr", None)
+        if not callable(fn):
+            return self._error(404, "This Foundry cannot publish pull requests.", "not_found")
+        result = _call(svc, fn, task_id)
+        out = dict(result) if isinstance(result, dict) else {"ok": bool(result)}
+        out.setdefault("task_id", task_id)
+        if out.get("ok"):
+            out["ok"] = True
+            return self._send_json(200, out)
+        reason = str(out.get("reason") or out.get("error") or "The PR could not be retried.")
+        code = str(out.get("code") or "refused")
+        out.update({"ok": False, "reason": reason, "error": reason, "code": code})
+        self._send_json(404 if code == "not_found" else 409, out)
+
     def _ask(self) -> None:
         question = _validate_question(self._read_json())
         svc = self.service
@@ -489,6 +540,35 @@ class _Handler(BaseHTTPRequestHandler):
             self._event("done", {})
         finally:
             pump.close()
+
+    def _actions(self) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        raw = (query.get("limit") or ["50"])[0]
+        try:
+            limit = max(1, min(ACTION_LIMIT_MAX, int(raw)))
+        except ValueError:
+            raise OrderError("limit must be a number.") from None
+        svc = self.service
+        fn = getattr(svc, "actions", None)
+        rows = list(_call(svc, fn, limit=limit) or []) if callable(fn) else []
+        self._send_json(200, {"ok": True, "actions": rows[:limit]})
+
+    def _undo(self, action_id: str) -> None:
+        self._read_json()  # body is optional and ignored, but must be valid JSON when present
+        svc = self.service
+        fn = getattr(svc, "undo_action", None)
+        if not callable(fn):
+            return self._error(404, "This Foundry cannot undo actions.", "not_found")
+        result = _call(svc, fn, action_id, by="user")
+        out = dict(result) if isinstance(result, dict) else {"ok": bool(result)}
+        out.setdefault("action_id", action_id)
+        if out.get("ok"):
+            out["ok"] = True
+            return self._send_json(200, out)
+        reason = str(out.get("reason") or out.get("error") or "This action cannot be undone.")
+        out.update({"ok": False, "reason": reason, "error": reason})
+        out.setdefault("code", "refused")
+        self._send_json(409, out)
 
     def _event(self, name: str | None, payload: dict[str, Any]) -> None:
         text = ""

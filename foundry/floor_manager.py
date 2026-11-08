@@ -11,7 +11,7 @@ Flow::
                --> queue.apply_sizing (one ticket per builder slot)
                --> bridge.register_task (the Agent Department board)
 
-    ForemanEscalation --apply_escalation()--> one of six actions
+    ForemanEscalation --apply_escalation()--> one of eight actions (logged, most undoable)
     task complete --on_task_complete()--> foreman.draft_pr_summary --> bridge.done
 
 The ``claude`` client is accepted so a phase-2 manager can plan large work
@@ -32,6 +32,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -137,6 +138,10 @@ def _val(x: Any) -> Any:
 
 
 _KV_KEY = "floor_manager.state"
+#: kv key of the persisted Foreman action log (``{"seq": n, "actions": [...]}``).
+_ACTIONS_KEY = "floor_manager.actions"
+#: How many action log entries are kept (oldest dropped first).
+ACTION_LOG_MAX = 500
 #: How long :meth:`FloorManager.drain` waits by default for in-flight completion
 #: work (the Shop Foreman's PR draft, the patch file, the board's review/done).
 #: A real Gemma draft can take a minute; the Foreman falls back to a heuristic
@@ -185,8 +190,21 @@ class FloorManager:
         patches_dir: str | Path | None = None,
         repo_root: str | Path | None = None,
         finish_timeout: float = DEFAULT_FINISH_TIMEOUT_S,
+        publisher: Any = None,
+        auto_pr: bool | None = None,
+        pr_draft: bool = False,
     ) -> None:
         self.queue = queue
+        #: :class:`~foundry.git_publisher.GitPublisher` (or a fake): pushes an
+        #: approved task's patch to its own branch and opens the PR.
+        self.publisher = publisher
+        #: publish every approved task automatically (default: on when a publisher is given)
+        self.auto_pr = (publisher is not None) if auto_pr is None else bool(auto_pr)
+        self.pr_draft = bool(pr_draft)
+        #: task id -> ``{state: pending|opened|failed|skipped, url, branch, error, stage, attempts}``
+        self.pr_states: dict[str, dict[str, Any]] = {}
+        #: task id -> its background publish task
+        self._pr_tasks: dict[str, asyncio.Task[Any]] = {}
         self.finish_timeout = float(finish_timeout)
         self.foreman = foreman
         self.teams = dict(teams)
@@ -199,7 +217,11 @@ class FloorManager:
         self.orders: dict[str, WorkOrder] = {}
         self.pr_summaries: dict[str, dict[str, str]] = {}
         self.peer_reviewers: dict[str, PeerReviewerGrant] = {}
-        self.actions: list[ActionOutcome] = []
+        #: Every escalation outcome of this run, in order (see :meth:`actions` for the log).
+        self.outcomes: list[ActionOutcome] = []
+        #: The persisted action log, oldest first (dicts; see :meth:`_log_action`).
+        self.action_log: list[dict[str, Any]] = []
+        self._action_seq = 0
         #: Approved diffs per task and subtask (collected through :meth:`on_approved`).
         self.diffs: dict[str, dict[str, str]] = {}
         #: Combined patches that failed ``git apply --check`` (task -> .patch.rejected path).
@@ -270,6 +292,7 @@ class FloorManager:
             "diffs": {t: v for t, v in self.diffs.items() if t not in self._completed},
             "patch_names": dict(self.patch_names),
             "sizing_meta": {t: dict(m) for t, m in self.sizing_meta.items()},
+            "pr_states": {t: dict(v) for t, v in self.pr_states.items()},
         }
         try:
             fn(_KV_KEY, state)
@@ -292,6 +315,9 @@ class FloorManager:
             self.sizing_meta = {
                 str(t): _clean_meta(m) for t, m in (state.get("sizing_meta") or {}).items() if isinstance(m, dict)
             }
+            self.pr_states = {
+                str(t): dict(v) for t, v in (state.get("pr_states") or {}).items() if isinstance(v, dict)
+            }
             self.diffs = {}
             for t, v in (state.get("diffs") or {}).items():
                 # older saves stored a list; key it by position so nothing is lost
@@ -313,6 +339,7 @@ class FloorManager:
             if m:
                 highest = max(highest, int(m.group(1)))
         self._seq = highest
+        self._load_actions()
 
     # ------------------------------------------------------------- work orders
 
@@ -605,15 +632,25 @@ class FloorManager:
             PrescribedAction.RESIZE_ALLOCATION: self._resize_allocation,
             PrescribedAction.THROTTLE_DISPATCH: self._throttle_dispatch,
             PrescribedAction.NONE: self._no_action,
-        }[action]
+        }
+        for name, fn in (("REASSIGN_TEAM", self._reassign_team), ("RETRY_TASK", self._retry_task)):
+            member = getattr(PrescribedAction, name, None)
+            if member is not None:
+                handler[member] = fn
+        before: dict[str, Any] = {}
         try:
-            applied, detail, params = await handler(alert)
+            result = await handler[action](alert)
+            applied, detail, params = result[:3]
+            if len(result) > 3:
+                before = dict(result[3] or {})
         except Exception as exc:  # an action must never take the line down
             log.warning("floor manager: %s failed: %s", action.value, exc)
             applied, detail, params = False, f"failed: {exc}", {}
         outcome = ActionOutcome(alert.alert_id, action.value, applied, detail, params)
-        self.actions.append(outcome)
+        self.outcomes.append(outcome)
         self.applied_alerts[alert.alert_id] = outcome
+        if action != PrescribedAction.NONE:
+            self._log_action(alert, outcome, before)
         try:
             self.queue.record_escalation(alert, applied=True, result=outcome.__dict__)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
@@ -697,7 +734,10 @@ class FloorManager:
             return False, f"{team_id}-{slot} was not promoted (pool not running or slot busy)", {"slot": slot}
         grant = PeerReviewerGrant(team_id, slot, str(started), time.monotonic() + minutes * 60)
         self.peer_reviewers[team_id] = grant
-        return True, f"{grant.agent_id} reviews for {team_id} for {minutes:g} min", {"slot": slot, "minutes": minutes}
+        return (
+            True, f"{grant.agent_id} reviews for {team_id} for {minutes:g} min", {"slot": slot, "minutes": minutes},
+            {"team_id": team_id, "agent_id": grant.agent_id},
+        )
 
     async def _quarantine_task(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         task_id = alert.target_entity.task_id
@@ -709,9 +749,15 @@ class FloorManager:
             return False, f"unknown task {task_id}", {}
         if _val(task.get("state")) in _TERMINAL:
             return False, f"{task_id} is already {_val(task.get('state'))}", {}
+        # the tickets the quarantine blocks (and their attempts), so undo can reopen exactly those
+        tickets = {
+            t.ticket_id: {"status": t.status, "attempt": t.attempt}
+            for t in self.queue.tickets_for_task(task_id) if t.status in ("open", "claimed")
+        }
+        before = {"task_id": task_id, "state": _val(task.get("state")), "tickets": tickets}
         self.queue.quarantine(task_id, reason)
         self._report_quarantine(task_id, reason)
-        return True, f"{task_id} quarantined", {"reason": reason}
+        return True, f"{task_id} quarantined", {"reason": reason}, before
 
     def _report_quarantine(self, task_id: str, reason: str) -> None:
         """Post a quarantine to the board once per task (and record its sizing outcome)."""
@@ -798,12 +844,14 @@ class FloorManager:
         if not task_id or n is None:
             return False, "resize needs a task and a builder count", {}
         n = max(1, min(self.builders_per_team, int(n)))
+        task = self.queue.get_task(task_id)
+        previous = self.allocations.get(task_id) or int((task or {}).get("allocated_builders") or 0)
         self.queue.resize(task_id, n)
         self.allocations[task_id] = n
         if task_id in self.directives:
             d = self.directives[task_id]
             self.bridge.progress(task_id, f"[Foundry] resized to {n} builder(s)", team_id=d.team_id)
-        return True, f"{task_id} resized to {n} builder(s)", {"builders": n}
+        return True, f"{task_id} resized to {n} builder(s)", {"builders": n}, {"task_id": task_id, "builders": previous}
 
     async def _throttle_dispatch(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         factor = float(alert.action_parameters.get("factor", 0.5))
@@ -811,7 +859,322 @@ class FloorManager:
         if self.limiter is None:
             return False, "no rate limiter to throttle", {}
         self.limiter.throttle(factor, seconds)
-        return True, f"dispatch throttled to {factor:g}x for {seconds:g}s", {"factor": factor, "seconds": seconds}
+        return (
+            True, f"dispatch throttled to {factor:g}x for {seconds:g}s", {"factor": factor, "seconds": seconds},
+            {"factor": 1.0},
+        )
+
+    # ---------------------------------------------- REASSIGN_TEAM / RETRY_TASK
+
+    def _team_idle(self, team_id: str) -> bool:
+        """A team is idle when none of its tickets is open or claimed on a live task."""
+        for status in ("open", "claimed"):
+            for t in self.queue.tickets(team_id=team_id, status=status):
+                task = self.queue.get_task(t.task_id)
+                if task and _val(task.get("state")) not in _TERMINAL:
+                    return False
+        return True
+
+    async def _reassign_team(self, alert: ForemanEscalation) -> tuple[Any, ...]:
+        """Move a stuck task's open tickets to another (idle) team's pool."""
+        task_id = alert.target_entity.task_id
+        if not task_id:
+            return False, "no task to reassign", {}
+        task = self.queue.get_task(task_id)
+        if task is None:
+            return False, f"unknown task {task_id}", {}
+        if _val(task.get("state")) in _TERMINAL:
+            return False, f"{task_id} is already {_val(task.get('state'))}", {}
+        current = str(task.get("team_id") or self._team_for(alert) or "")
+        p = alert.action_parameters
+        wanted = p.get("to_team") or p.get("target_team") or p.get("team")
+        if not wanted and p.get("team_id") and p.get("team_id") != current:
+            wanted = p.get("team_id")
+        if wanted:
+            wanted = str(wanted)
+            if wanted == current:
+                return False, f"{task_id} is already on {current}", {}
+            if wanted not in self.teams:
+                return False, f"unknown team {wanted}", {}
+            target = wanted
+        else:
+            idle = [t for t in self.teams if t != current and self._team_idle(t)]
+            if not idle:
+                return False, f"no idle team to take {task_id} from {current}", {}
+            target = idle[0]
+        open_ids = [t.ticket_id for t in self.queue.tickets(task_id=task_id, status="open") if t.team_id == current]
+        if not open_ids:
+            return False, f"{task_id} has no open tickets to move", {}
+        moved = self.queue.move_tickets(task_id, target, open_ids)
+        self._set_directive_team(task_id, target)
+        why = str(p.get("reason") or "").strip()
+        self.bridge.progress(
+            task_id, f"[Foundry] moved {len(moved)} ticket(s) from {current} to {target}" + (f" ({why})" if why else ""),
+            team_id=target,
+        )
+        return (
+            True, f"{task_id} moved from {current} to {target} ({len(moved)} ticket(s))",
+            {"from_team": current, "to_team": target, "tickets": moved},
+            {"task_id": task_id, "from_team": current, "to_team": target, "tickets": moved},
+        )
+
+    def _set_directive_team(self, task_id: str, team_id: str) -> None:
+        d = self.directives.get(task_id)
+        if d is not None and d.team_id != team_id:
+            self.directives[task_id] = d.model_copy(update={"team_id": team_id})
+
+    def _retried(self, task_id: str) -> bool:
+        return any(
+            e.get("action") == "RETRY_TASK" and e.get("applied") and e.get("task_id") == task_id
+            for e in self.action_log
+        )
+
+    async def _retry_task(self, alert: ForemanEscalation) -> tuple[Any, ...]:
+        """Re-open a quarantined task with fresh attempts (at most once per task)."""
+        task_id = alert.target_entity.task_id
+        if not task_id:
+            return False, "no task to retry", {}
+        task = self.queue.get_task(task_id)
+        if task is None:
+            return False, f"unknown task {task_id}", {}
+        state = _val(task.get("state"))
+        if state != "quarantined":
+            return False, f"{task_id} is {state}, not quarantined", {}
+        if self._retried(task_id):
+            return False, f"{task_id} was already retried once", {}
+        blocked = [t for t in self.queue.tickets_for_task(task_id) if t.status == "blocked"]
+        if not blocked:
+            return False, f"{task_id} has no blocked tickets to retry", {}
+        reason = str(task.get("quarantine_reason") or "")
+        before = {
+            "task_id": task_id,
+            "reason": reason,
+            "tickets": {t.ticket_id: {"attempt": t.attempt, "infra_failures": t.infra_failures} for t in blocked},
+        }
+        reopened = self.queue.reopen_quarantined(
+            task_id, {t.ticket_id: {"attempt": 0, "infra_failures": 0} for t in blocked}, "retry (Foreman)"
+        )
+        self._back_on_line(task_id)
+        self.bridge.progress(task_id, f"[Foundry] {task_id} retried with fresh attempts", team_id=task.get("team_id"))
+        return True, f"{task_id} retried ({len(reopened)} ticket(s) reopened)", {"tickets": reopened}, before
+
+    def _back_on_line(self, task_id: str) -> None:
+        """A quarantine was lifted: report the next one again and forget the recorded outcome."""
+        self._reported_quarantine.discard(task_id)
+        fn = getattr(self.queue, "delete_sizing_outcome", None)
+        if callable(fn):
+            try:
+                fn(task_id)
+            except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+                log.debug("delete_sizing_outcome failed: %s", exc)
+
+    # -------------------------------------------------------------- action log
+
+    def _load_actions(self) -> None:
+        fn = getattr(self.queue, "kv_get", None)
+        if not callable(fn):
+            return
+        try:
+            raw = fn(_ACTIONS_KEY)
+            if isinstance(raw, (str, bytes)):
+                raw = json.loads(raw)
+            if isinstance(raw, dict):
+                self.action_log = [dict(e) for e in raw.get("actions") or [] if isinstance(e, dict)]
+                self._action_seq = int(raw.get("seq") or 0)
+        except Exception as exc:  # a corrupt log must not stop a restart
+            log.warning("floor manager: ignoring unreadable action log: %s", exc)
+            self.action_log, self._action_seq = [], 0
+
+    def _save_actions(self) -> None:
+        fn = getattr(self.queue, "kv_set", None)
+        if not callable(fn):
+            return
+        del self.action_log[:-ACTION_LOG_MAX]
+        try:
+            fn(_ACTIONS_KEY, {"seq": self._action_seq, "actions": self.action_log})
+        except Exception as exc:  # pragma: no cover - persistence must not stop the line
+            log.warning("floor manager: could not save the action log: %s", exc)
+
+    def _log_action(self, alert: ForemanEscalation, outcome: ActionOutcome, before: Mapping[str, Any]) -> dict[str, Any]:
+        """Append one applied escalation to the persisted action log."""
+        self._action_seq += 1
+        undoable, why = True, ""
+        if not outcome.applied:
+            undoable, why = False, "Nothing was changed."
+        elif outcome.action == "RESET_BUILDER_CONTEXT":
+            undoable, why = False, "A cleared builder context cannot be restored."
+        elif not before:
+            undoable, why = False, "Nothing recorded to undo."
+        t = alert.target_entity
+        entry: dict[str, Any] = {
+            "action_id": f"A-{self._action_seq:04d}",
+            "alert_id": alert.alert_id,
+            "at": _utc_now(),
+            "action": outcome.action,
+            "task_id": t.task_id,
+            "team": (before.get("from_team") if before else None) or self._team_for(alert),
+            "agent_id": t.agent_id,
+            "category": _val(alert.category),
+            "reason": alert.diagnosis,
+            "detail": outcome.detail,
+            "applied": outcome.applied,
+            "params": json.loads(json.dumps(outcome.parameters, default=str)),
+            "before": json.loads(json.dumps(dict(before), default=str)),
+            "undoable": undoable,
+            "undo_reason": why or None,
+            "undone_at": None,
+            "undone_by": None,
+        }
+        self.action_log.append(entry)
+        self._save_actions()
+        return entry
+
+    def actions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """The action log, newest first (copies; at most ``limit`` entries)."""
+        n = max(0, int(limit))
+        return [dict(e) for e in reversed(self.action_log)][:n]
+
+    def undo_action(self, action_id: str, by: str = "user") -> dict[str, Any]:
+        """Undo one logged action. ``{ok: True, ...}`` or ``{ok: False, reason}``.
+
+        Idempotent: undoing an action twice returns ``ok`` with
+        ``already_undone``. Refuses when the action is not undoable or the
+        state has moved on since (the task finished, the tickets were picked
+        up, a newer throttle replaced it ...).
+        """
+        entry = next((e for e in self.action_log if e.get("action_id") == action_id), None)
+        if entry is None:
+            return {"ok": False, "action_id": action_id, "reason": f"Unknown action {action_id}."}
+        base = {"action_id": action_id, "action": entry.get("action")}
+        if entry.get("undone_at"):
+            return {**base, "ok": True, "already_undone": True, "undone_at": entry["undone_at"],
+                    "detail": "Already undone."}
+        if not entry.get("undoable"):
+            return {**base, "ok": False, "reason": entry.get("undo_reason") or "This action cannot be undone."}
+        undo = {
+            "RESIZE_ALLOCATION": self._undo_resize,
+            "THROTTLE_DISPATCH": self._undo_throttle,
+            "PROMOTE_PEER_REVIEWER": self._undo_promote,
+            "QUARANTINE_TASK": self._undo_quarantine,
+            "REASSIGN_TEAM": self._undo_reassign,
+            "RETRY_TASK": self._undo_retry,
+        }.get(str(entry.get("action")))
+        if undo is None:
+            return {**base, "ok": False, "reason": "This action cannot be undone."}
+        try:
+            ok, detail = undo(entry)
+        except Exception as exc:  # undo must never take the line down
+            log.warning("floor manager: undo of %s failed: %s", action_id, exc)
+            ok, detail = False, f"Undo failed: {exc}"
+        if not ok:
+            return {**base, "ok": False, "reason": detail}
+        entry["undone_at"] = _utc_now()
+        entry["undone_by"] = str(by or "user")
+        entry["undo_detail"] = detail
+        self._save_actions()
+        self.save()
+        return {**base, "ok": True, "detail": detail, "undone_at": entry["undone_at"], "undone_by": entry["undone_by"]}
+
+    def _live_task(self, task_id: str | None) -> tuple[dict[str, Any] | None, str]:
+        task = self.queue.get_task(task_id) if task_id else None
+        if task is None:
+            return None, f"Task {task_id} no longer exists."
+        state = _val(task.get("state"))
+        if state in _TERMINAL:
+            return None, f"{task_id} is already {state}."
+        return task, ""
+
+    def _undo_resize(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
+        before = entry["before"]
+        task_id, previous = before.get("task_id"), int(before.get("builders") or 0)
+        task, why = self._live_task(task_id)
+        if task is None:
+            return False, why
+        now = self.allocations.get(task_id) or int(task.get("allocated_builders") or 0)
+        if now != int(entry["params"].get("builders") or 0):
+            return False, f"{task_id} was resized again since (now {now} builder(s))."
+        if previous < 1:
+            return False, "The earlier allocation is unknown."
+        self.queue.resize(task_id, previous)
+        self.allocations[task_id] = previous
+        return True, f"{task_id} back to {previous} builder(s)"
+
+    def _undo_throttle(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
+        if self.limiter is None:
+            return False, "No rate limiter."
+        if not getattr(self.limiter, "is_throttled", False):
+            return False, "The throttle already ended."
+        factor = float(entry["params"].get("factor") or 0)
+        current = float(getattr(self.limiter, "throttle_factor", factor))
+        if abs(current - factor) > 1e-9:
+            return False, "A newer throttle replaced this one."
+        self.limiter.throttle(1.0, 0)
+        return True, "dispatch back to full speed"
+
+    def _undo_promote(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
+        before = entry["before"]
+        team_id, agent_id = before.get("team_id"), before.get("agent_id")
+        grant = self.peer_reviewers.get(str(team_id))
+        if grant is None or grant.agent_id != agent_id or not grant.active():
+            return False, f"{agent_id} is no longer a temporary reviewer."
+        hook = getattr(self.teams.get(str(team_id)), "demote_peer_reviewer", None)
+        if not callable(hook):
+            return False, f"Team {team_id} cannot end a temporary reviewer early."
+        if not hook(agent_id):
+            return False, f"{agent_id} is no longer a temporary reviewer."
+        del self.peer_reviewers[str(team_id)]
+        return True, f"{agent_id} builds again"
+
+    def _undo_quarantine(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
+        before = entry["before"]
+        task_id = before.get("task_id")
+        task = self.queue.get_task(task_id) if task_id else None
+        if task is None:
+            return False, f"Task {task_id} no longer exists."
+        if _val(task.get("state")) != "quarantined":
+            return False, f"{task_id} is {_val(task.get('state'))}, not quarantined."
+        tickets = dict(before.get("tickets") or {})
+        current = {t.ticket_id: t for t in self.queue.tickets_for_task(task_id)}
+        if any(tid not in current or current[tid].status != "blocked" for tid in tickets):
+            return False, f"{task_id}'s tickets changed since the quarantine."
+        specs = {tid: {"attempt": spec.get("attempt", current[tid].attempt)} for tid, spec in tickets.items()}
+        reopened = self.queue.reopen_quarantined(task_id, specs, "quarantine undone")
+        self._back_on_line(task_id)
+        self.bridge.progress(task_id, f"[Foundry] {task_id} back on the line (quarantine undone)",
+                             team_id=task.get("team_id"))
+        return True, f"{task_id} back on the line ({len(reopened)} ticket(s) open)"
+
+    def _undo_reassign(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
+        before = entry["before"]
+        task_id, back, there = before.get("task_id"), before.get("from_team"), before.get("to_team")
+        task, why = self._live_task(task_id)
+        if task is None:
+            return False, why
+        if task.get("team_id") != there:
+            return False, f"{task_id} is on {task.get('team_id')} now, not {there}."
+        moved = set(before.get("tickets") or [])
+        still = [t.ticket_id for t in self.queue.tickets(task_id=task_id, status="open")
+                 if t.ticket_id in moved and t.team_id == there]
+        if not still:
+            return False, f"Team {there} already picked up {task_id}'s tickets."
+        self.queue.move_tickets(task_id, str(back), still)
+        self._set_directive_team(task_id, str(back))
+        self.bridge.progress(task_id, f"[Foundry] {task_id} moved back to {back} (undo)", team_id=back)
+        return True, f"{task_id} moved back to {back} ({len(still)} ticket(s))"
+
+    def _undo_retry(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
+        before = entry["before"]
+        task_id = before.get("task_id")
+        task, why = self._live_task(task_id)
+        if task is None:
+            return False, why
+        tickets = {t.ticket_id: t for t in self.queue.tickets_for_task(task_id)}
+        if any(tickets.get(tid) is not None and tickets[tid].status == "done" for tid in before.get("tickets") or {}):
+            return False, f"{task_id} already finished work after the retry."
+        reason = str(before.get("reason") or "retry undone")
+        self.queue.quarantine(task_id, reason)
+        self._report_quarantine(task_id, reason)
+        return True, f"{task_id} quarantined again"
 
     async def _no_action(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         return True, "no action", {}
@@ -942,7 +1305,9 @@ class FloorManager:
         if known is not None:
             # repair: the summary (and the board's review/done) are already recorded
             await self._write_patch(task_id, diff, known)
+            self._queue_publish(task_id)
             self.save()
+            self._start_publish(task_id)
             return known
         summary = self._drafts.get(task_id)
         if summary is None:
@@ -972,8 +1337,182 @@ class FloorManager:
         if d is not None:
             self.bridge.review(task_id, d.team_id, "APPROVED", note="Foundry reviewer approved")
         self.bridge.done(task_id, summary.get("commit_message", ""))
+        self._queue_publish(task_id)
         self.save()
+        self._start_publish(task_id)
         return summary
+
+    # ------------------------------------------------------- pull requests
+
+    def pr_state(self, task_id: str) -> dict[str, Any] | None:
+        """The task's PR record (a copy), or None when no PR was tried."""
+        st = self.pr_states.get(task_id)
+        return dict(st) if st is not None else None
+
+    def is_publishing(self, task_id: str) -> bool:
+        """True while the task's background publish is running."""
+        t = self._pr_tasks.get(task_id)
+        return t is not None and not t.done()
+
+    def _pr_patch(self, task_id: str) -> Path | None:
+        """The task's applicable ``.patch`` (None when it was rejected, missing or empty)."""
+        path = self.patch_paths.get(task_id)
+        if path is None and self.patches_dir is not None and task_id in self.patch_names:
+            path = self.patches_dir / f"{self.patch_names[task_id]}.patch"
+        try:
+            if path is not None and path.is_file() and path.read_text(encoding="utf-8").strip():
+                return path
+        except OSError:
+            return None
+        return None
+
+    def _set_pr(self, task_id: str, state: str, **fields: Any) -> dict[str, Any]:
+        old = self.pr_states.get(task_id) or {}
+        rec = {
+            "state": state,
+            "url": fields.get("url"),
+            "branch": fields.get("branch"),
+            "error": fields.get("error"),
+            "stage": fields.get("stage"),
+            "attempts": int(fields.get("attempts", old.get("attempts", 0)) or 0),
+        }
+        self.pr_states[task_id] = rec
+        return rec
+
+    def _queue_publish(self, task_id: str) -> bool:
+        """Record the task's PR as ``pending`` (or ``skipped``); True when a publish should start.
+
+        Never queues a task whose PR was already opened, failed, skipped or is in flight.
+        """
+        if not self.auto_pr or self.publisher is None or task_id in self.pr_states:
+            return False
+        if self._pr_patch(task_id) is None:
+            why = "the combined patch does not apply" if task_id in self.rejected_patches else "no patch to publish"
+            self._set_pr(task_id, "skipped", error=why, stage="no_patch")
+            return False
+        self._set_pr(task_id, "pending", attempts=0)
+        return True
+
+    def _start_publish(self, task_id: str) -> asyncio.Task[Any] | None:
+        st = self.pr_states.get(task_id)
+        if st is None or st.get("state") != "pending" or self.publisher is None:
+            return None
+        running = self._pr_tasks.get(task_id)
+        if running is not None and not running.done():
+            return running
+        t = asyncio.get_running_loop().create_task(self._publish(task_id))
+        self._pr_tasks[task_id] = t
+        self._pending.add(t)  # drain() (shutdown) waits for it
+        t.add_done_callback(self._pending.discard)
+        return t
+
+    def pr_request(self, task_id: str) -> dict[str, Any]:
+        """``{title, body, draft}`` for the task's PR, from the Foreman's draft."""
+        summary = self.pr_summaries.get(task_id) or {}
+        order = self.orders.get(task_id)
+        lines = [ln.strip() for ln in str(summary.get("commit_message") or "").splitlines() if ln.strip()]
+        title = (lines[0] if lines else (order.title if order else task_id))[:200]
+        body = str(summary.get("pr_body") or "").strip()
+        if not body and len(lines) > 1:
+            body = "\n".join(lines[1:])
+        footer = f"Opened by Foundry (task {task_id})"
+        body = f"{body}\n\n---\n{footer}\n" if body else f"{footer}\n"
+        return {"title": title, "body": body, "draft": self.pr_draft}
+
+    async def _publish(self, task_id: str) -> dict[str, Any]:
+        st = self.pr_states.get(task_id) or {}
+        attempts = int(st.get("attempts") or 0) + 1
+        self._set_pr(task_id, "pending", attempts=attempts)
+        self.save()  # a crash from here on leaves it pending: retried once on the next start
+        patch = self._pr_patch(task_id)
+        if patch is None:
+            rec = self._set_pr(task_id, "skipped", error="no patch to publish", stage="no_patch", attempts=attempts)
+            self.save()
+            return rec
+        order = self.orders.get(task_id)
+        req = self.pr_request(task_id)
+        try:
+            publish = self.publisher.publish
+            kwargs: dict[str, Any] = {}
+            if "draft" in _params(publish):
+                kwargs["draft"] = self.pr_draft
+            result = await _maybe_await(
+                publish(task_id, order.title if order else req["title"], patch, req, **kwargs)
+            )
+        except asyncio.CancelledError:
+            log.info("floor manager: publishing %s interrupted; it is retried once on the next start", task_id)
+            raise
+        except Exception as exc:  # publishing must never take the line down
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500], "stage": "error"}
+        ok = bool(_get(result, "ok"))
+        url = _get(result, "pr_url")
+        branch = _get(result, "branch")
+        if ok:
+            rec = self._set_pr(task_id, "opened", url=url, branch=branch, attempts=attempts)
+            d = self.directives.get(task_id)
+            try:
+                self.bridge.progress(
+                    task_id, f"[Foundry] PR opened: {url}" if url else f"[Foundry] pushed {branch}",
+                    team_id=d.team_id if d else None,
+                )
+            except Exception as exc:  # pragma: no cover - the board is best effort
+                log.debug("floor manager: PR note failed: %s", exc)
+            log.info("floor manager: %s PR opened: %s", task_id, url or branch)
+        else:
+            err = str(_get(result, "error") or "publishing failed")[:500]
+            rec = self._set_pr(task_id, "failed", url=url, branch=branch, error=err,
+                               stage=_get(result, "stage"), attempts=attempts)
+            log.warning("floor manager: %s PR not opened (%s): %s", task_id, rec["stage"], err)
+        try:
+            self.queue.record_event("pr_" + rec["state"], task_id, {k: v for k, v in rec.items() if v is not None})
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.debug("floor manager: could not record the PR event: %s", exc)
+        self.save()
+        return rec
+
+    def resume_publishing(self, only: Any = None) -> list[str]:
+        """After a restart: retry, once, a publish that was cut off (``pending`` without a result).
+
+        Opened PRs are never opened again; failed ones are only retried by
+        :meth:`retry_pr`. A publish interrupted twice is marked failed.
+        """
+        started = []
+        for tid, st in sorted(self.pr_states.items(), key=lambda kv: _task_number(kv[0])):
+            if st.get("state") != "pending" or self.is_publishing(tid):
+                continue
+            if only is not None and not only(tid):
+                continue
+            if int(st.get("attempts") or 0) >= 2:
+                self._set_pr(tid, "failed", error="publishing was interrupted twice; use Retry",
+                             stage="interrupted", attempts=st.get("attempts"))
+                continue
+            if self._start_publish(tid) is not None:
+                started.append(tid)
+        self.save()
+        if started:
+            log.info("floor manager: publishing again %s", ", ".join(started))
+        return started
+
+    async def retry_pr(self, task_id: str) -> dict[str, Any]:
+        """Publish a task whose PR failed (or was skipped) again; ``{ok, pr}`` or ``{ok: False, reason}``.
+
+        Returns at once; the publish runs in the background.
+        """
+        if self.publisher is None:
+            return {"ok": False, "reason": "pull requests are not set up (no publisher)"}
+        st = self.pr_states.get(task_id)
+        if task_id not in self.pr_summaries:
+            return {"ok": False, "reason": f"{task_id} is not an approved task"}
+        if st is not None and st.get("state") == "opened":
+            return {"ok": False, "reason": "the PR is already open", "pr": dict(st)}
+        if self.is_publishing(task_id) or (st is not None and st.get("state") == "pending"):
+            return {"ok": False, "reason": "already publishing", "pr": dict(st or {})}
+        if self._pr_patch(task_id) is None:
+            return {"ok": False, "reason": "no applicable patch to publish"}
+        self._set_pr(task_id, "pending", attempts=0)
+        self.save()
+        self._start_publish(task_id)
+        return {"ok": True, "pr": dict(self.pr_states[task_id])}
 
     async def _write_patch(self, task_id: str, diff: str, summary: Mapping[str, str]) -> bool:
         """Write ``<name>.patch`` (apply with ``git apply``) and ``<name>.md`` into patches_dir.
@@ -1056,6 +1595,11 @@ class FloorManager:
             if isinstance(got, (list, tuple)):
                 return "\n".join(str(x) for x in got)
         return ""
+
+
+def _utc_now() -> str:
+    """Current UTC time as an ISO-8601 string (``...Z``)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _finish_timeout(config: Any, explicit: float | None) -> float:
@@ -1283,6 +1827,7 @@ def build_factory(
     patches_dir: str | Path | None = None,
     finish_timeout: float | None = None,
     dispatch_repo: str | Path | None = None,
+    publisher: Any = None,
 ) -> Factory:
     """Build queue, telemetry, limiter, context engine, Foreman, cache, gates, pools and manager.
 
@@ -1307,6 +1852,10 @@ def build_factory(
             :data:`DEFAULT_FINISH_TIMEOUT_S`).
         dispatch_repo: when given, the pools only claim tickets of tasks that
             belong to this repository (real mode); None dispatches everything.
+        publisher: a :class:`~foundry.git_publisher.GitPublisher` that pushes
+            each approved task to its own branch and opens a PR (only used
+            when ``config.auto_pr``). None (default) publishes nothing; the
+            service (``foundry.serve``) passes one.
 
     The target repository is never modified: gates patch scratch copies only,
     Claude runs with ``cwd=repo_root`` (it reads, it does not write: diff-only
@@ -1358,7 +1907,12 @@ def build_factory(
         patches_dir=patches_dir,
         repo_root=repo_root,
         finish_timeout=_finish_timeout(config, finish_timeout),
+        publisher=publisher,
+        auto_pr=bool(getattr(config, "auto_pr", True)) and publisher is not None,
+        pr_draft=bool(getattr(config, "pr_draft", False)),
     )
+    # the Foreman reads the action log so it never prescribes RETRY_TASK twice for one task
+    foreman.actions_provider = manager.actions
     pool_extra: dict[str, Any] = {}
     if dispatch_repo is not None:
         if "repo_root" not in _params(TeamPool):

@@ -16,7 +16,8 @@ Interface used by the HTTP layer (all ``async`` methods must run on the
 service's event loop; ``*_threadsafe`` wrappers are for handler threads):
 
 * ``await service.start()`` / ``await service.stop()``
-* ``service.health() -> dict``  - ``{ok, repo, model, gemma_ok, claude_ok, version, gemma_speed}``
+* ``service.health() -> dict``  - ``{ok, repo, model, gemma_ok, claude_ok, version, gemma_speed, pr_ready, pr_reason}``
+* ``await service.retry_pr(task_id) -> {ok, pr} | {ok: False, reason}`` - re-publish a failed PR
 * ``service.status() -> dict``  - ``{ok, tasks, foreman, paused_until, last_account_error}``
 * ``await service.submit(payload) -> task_id`` - raises :class:`OrderError` (HTTP 400)
 * ``service.ask(question)`` - async iterator of answer text chunks
@@ -142,6 +143,32 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _at_key(value: Any) -> float:
+    """Sort key for an action's ``at`` (epoch seconds or an ISO string); unknown -> 0."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _jsonable(value: Any) -> Any:
+    """Make an action row JSON-safe (enums -> value, paths/others -> str)."""
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    inner = getattr(value, "value", None)
+    if isinstance(inner, (str, int, float)):
+        return inner
+    return str(value)
+
+
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
@@ -199,14 +226,24 @@ class Service:
         self.closed_factory: Any = None
         self.api: Any = None
         self.sizing_stop_s = DEFAULT_SIZING_STOP_S
+        #: ``GitPublisher.preflight()`` result from the last start (None before it ran).
+        self.pr_preflight: dict[str, Any] | None = None
+        self._preflight_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
     def _build(self) -> Any:
         from foundry.floor_manager import build_factory
 
-        kwargs = {"repo_root": self.repo, "workspace": self.repo, "dispatch_repo": self.repo}
+        kwargs: dict[str, Any] = {"repo_root": self.repo, "workspace": self.repo, "dispatch_repo": self.repo}
         kwargs.update(self._factory_kwargs)
+        if "publisher" not in kwargs and getattr(self.config, "auto_pr", False):
+            from foundry.git_publisher import GitPublisher
+
+            kwargs["publisher"] = GitPublisher(
+                self.repo, base=getattr(self.config, "pr_base", None),
+                draft=bool(getattr(self.config, "pr_draft", False)),
+            )
         return build_factory(self.config, claude=self.claude, gemma=self.gemma, **kwargs)
 
     async def start(self) -> Service:
@@ -223,6 +260,8 @@ class Service:
             pool.start()
         self.running = True
         self._resume()
+        # gh auth status may take a moment: check in the background (health says "not checked yet")
+        self._preflight_task = self.loop.create_task(self.check_pr_ready())
         await self.refresh_gemma()
         self._monitor_task = self.loop.create_task(self._monitor_loop())
         log.info("foundry serve: running for %s (%d pool(s))", self.repo, len(self.factory.pools))
@@ -241,6 +280,11 @@ class Service:
             # orders recorded but never sized (e.g. cut off by an old API timeout)
             for tid in resize(self._mine):
                 self.resumed.append(tid)
+        republish = getattr(m, "resume_publishing", None)
+        if callable(republish):
+            # a PR publish cut off by a stop/crash is retried once; opened/failed ones are left alone
+            for tid in republish(self._mine):
+                log.info("foundry serve: publishing the PR for %s again", tid)
         missing = getattr(m, "_patch_missing", None)
         for task in f.queue.all_tasks():
             tid = task["task_id"]
@@ -276,6 +320,10 @@ class Service:
             except (asyncio.CancelledError, Exception):
                 pass
             self._monitor_task = None
+        if self._preflight_task is not None and not self._preflight_task.done():
+            self._preflight_task.cancel()
+            await asyncio.gather(self._preflight_task, return_exceptions=True)
+        self._preflight_task = None
         f = self.factory
         try:
             stop_sizing = getattr(f.manager, "stop_sizing", None)
@@ -356,6 +404,54 @@ class Service:
             self.gemma_ok = False
         return self.gemma_ok
 
+    # ------------------------------------------------------------------ pull requests
+
+    def _publisher(self) -> Any:
+        m = getattr(self.factory, "manager", None) if self.factory is not None else None
+        return getattr(m, "publisher", None)
+
+    async def check_pr_ready(self, timeout: float = 90.0) -> dict[str, Any]:
+        """Run the publisher's ``preflight()`` once and log a clear warning when PRs can't be opened."""
+        if not getattr(self.config, "auto_pr", False):
+            self.pr_preflight = {"ok": False, "reason": "automatic pull requests are off (FOUNDRY_AUTO_PR)"}
+            return self.pr_preflight
+        pub = self._publisher()
+        fn = getattr(pub, "preflight", None)
+        if not callable(fn):
+            self.pr_preflight = {"ok": False, "reason": "no git publisher is set up"}
+            return self.pr_preflight
+        try:
+            report = await asyncio.wait_for(_maybe_await(fn()), timeout)
+            report = dict(report) if isinstance(report, Mapping) else {"ok": bool(report)}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # a failed check must not stop the service
+            report = {"ok": False, "reason": f"the pull-request check failed: {type(exc).__name__}: {exc}"}
+        report["ok"] = bool(report.get("ok"))
+        if not report["ok"] and not report.get("reason"):
+            report["reason"] = "git or the GitHub CLI is not ready"
+        self.pr_preflight = report
+        if report["ok"]:
+            log.info("foundry serve: automatic pull requests are ready")
+        else:
+            log.warning(
+                "foundry serve: WARNING - automatic pull requests will fail: %s. Approved work is still "
+                "saved as a .patch; fix this, then use Retry on the task.", report["reason"],
+            )
+        return report
+
+    async def retry_pr(self, task_id: str) -> dict[str, Any]:
+        """``POST /api/tasks/<id>/pr/retry``: publish a failed PR again (in the background)."""
+        f = self.factory
+        if f is None:
+            return {"ok": False, "reason": "Foundry is not running"}
+        if not self._mine(task_id) or f.queue.get_task(task_id) is None:
+            return {"ok": False, "reason": f"unknown task {task_id}", "code": "not_found"}
+        fn = getattr(f.manager, "retry_pr", None)
+        if not callable(fn):
+            return {"ok": False, "reason": "this Foundry cannot publish pull requests"}
+        return dict(await _maybe_await(fn(task_id)))
+
     # ------------------------------------------------------------------ API surface
 
     def health(self) -> dict[str, Any]:
@@ -365,7 +461,10 @@ class Service:
         Foreman's call stats (all ``None``/0 before the first Gemma call).
         """
         stats = self._gemma_stats()
+        pre = self.pr_preflight or {}
         return {
+            "pr_ready": bool(pre.get("ok")),
+            "pr_reason": None if pre.get("ok") else (pre.get("reason") or "not checked yet"),
             "ok": bool(self.running),
             "repo": str(self.repo),
             "model": getattr(self.config, "gemma_model", None),
@@ -468,7 +567,21 @@ class Service:
             "reason": reason,
             "sizing_source": meta.get("source"),
             "sizing_ms": meta.get("ms"),
+            "pr": self._pr_row(tid),
         }
+
+    def _pr_row(self, tid: str) -> dict[str, Any] | None:
+        """``{state, url, branch, error, stage}`` of the task's PR (None: no PR tried)."""
+        m = self.factory.manager
+        fn = getattr(m, "pr_state", None)
+        st = fn(tid) if callable(fn) else None
+        if not st:
+            return None
+        out = {k: st.get(k) for k in ("state", "url", "branch", "error", "stage")}
+        is_pub = getattr(m, "is_publishing", None)
+        if callable(is_pub) and is_pub(tid):
+            out["state"] = "pending"
+        return out
 
     def status(self) -> dict[str, Any]:
         """``{ok, tasks, foreman, paused_until, last_account_error}`` (this repo's tasks only)."""
@@ -509,6 +622,45 @@ class Service:
             "paused_until": paused_until,
             "last_account_error": _account_error(f),
         }
+
+    # ------------------------------------------------------------------ Foreman actions (charlie-1)
+
+    def actions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """The Foreman's applied actions, newest first (``manager.actions(limit)``); ``[]`` without a log."""
+        f = self.factory
+        fn = getattr(getattr(f, "manager", None), "actions", None) if f is not None else None
+        if not callable(fn):
+            return []
+        try:
+            rows = fn(limit=limit)
+        except TypeError:
+            rows = fn()
+        out = [_jsonable(dict(r)) for r in (rows or []) if isinstance(r, Mapping)]
+        out = [r for r in out if not self._foreign(r.get("task_id"))]
+        out.sort(key=lambda r: _at_key(r.get("at")), reverse=True)
+        return out[: max(0, int(limit))]
+
+    def _foreign(self, tid: Any) -> bool:
+        """True only when the task is known to belong to another repository (its actions stay hidden)."""
+        if not tid:
+            return False
+        try:
+            repo = self.factory.manager.task_repo(str(tid))
+        except Exception:  # noqa: BLE001 - a fake/older manager: show the action
+            return False
+        return bool(repo) and not self._mine(str(tid))
+
+    async def undo_action(self, action_id: str, by: str = "user") -> dict[str, Any]:
+        """Undo one Foreman action (``manager.undo_action``); ``{ok, ...}`` or ``{ok: False, reason}``."""
+        f = self.factory
+        fn = getattr(getattr(f, "manager", None), "undo_action", None) if f is not None else None
+        if not callable(fn):
+            return {"ok": False, "reason": "This Foundry version cannot undo actions.", "code": "unsupported"}
+        result = await _maybe_await(fn(action_id, by=by))
+        out = _jsonable(dict(result)) if isinstance(result, Mapping) else {"ok": bool(result)}
+        out["ok"] = bool(out.get("ok"))
+        out.setdefault("action_id", action_id)
+        return out
 
     @staticmethod
     def validate_order(payload: Any) -> dict[str, Any]:

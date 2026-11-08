@@ -312,6 +312,19 @@
   .fo-badge.gemma { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
   .fo-badge.fallback { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
   .fo-empty { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+  /* PR link / retry on Foundry tasks and the Foreman actions log. Links are --accent on --surface (>= 7:1);
+     the failed badge is --bad on --surface-2 (>= 5:1). Small buttons keep a 28 px tap height. */
+  .fo-pr { font-size: 12px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+  .fo-pr:hover, .fo-pr:focus-visible { text-decoration: underline; }
+  .fo-badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, transparent); }
+  .fo-small { font-size: 12px; padding: 2px 9px; min-height: 28px; }
+  .fo-actions { margin-top: 12px; }
+  .fo-actions summary { cursor: pointer; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .fo-actions summary b { color: var(--text); font-weight: 600; }
+  .fa-list .fa-time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .fa-list .fa-text { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+  .fa-list li.undone .fa-text { color: var(--muted); }
+  .fa-list .fa-err { flex-basis: 100%; font-size: 12px; color: var(--bad); overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -369,6 +382,8 @@
     <div class="foreman-answer" id="foreman-answer" role="region" aria-label="Foreman's answer" aria-live="polite" hidden></div>
     <details class="fo-tasks" id="fo-tasks" hidden><summary id="fo-sum"><b>Foundry tasks</b></summary>
       <ul class="fo-list" id="fo-list" aria-label="Foundry tasks"></ul><p class="fo-empty" id="fo-empty" hidden>No Foundry tasks yet.</p></details>
+    <details class="fo-actions" id="fo-actions" open hidden><summary id="fa-sum"><b>Foreman actions</b></summary>
+      <ul class="fo-list fa-list" id="fa-list" aria-label="Foreman actions, newest first" aria-live="polite"></ul><p class="fo-empty" id="fa-empty" hidden>The Foreman hasn't had to step in yet.</p></details>
   </section>
 
   <h2>Teams</h2>
@@ -981,7 +996,7 @@ async function pollFoundry() {
   chip.querySelector('.fc-text').innerHTML = text;
   syncFoundryRow();
   foremanSetUp(foundryUp, health); // the Ask the Foreman panel shares this poll
-  await foundryTasks(foundryUp);
+  await Promise.all([foundryTasks(foundryUp), foundryActions(foundryUp)]);
 }
 // "41 s", "2.5 s", "850 ms", "3 min 5 s"; '' for missing values.
 function fmtMs(ms) {
@@ -1032,6 +1047,8 @@ async function foundryTasks(up) {
     }
     const meta = [String(t.state || ''), t.team ? teamName(t.team) : ''].filter(Boolean).join(' · ');
     if (meta) li.append(el('span', 'fo-meta', meta));
+    const pr = foundryPr(t);
+    if (pr) li.append(pr);
     return li;
   });
   $('#fo-list').replaceChildren(...rows);
@@ -1040,6 +1057,143 @@ async function foundryTasks(up) {
   const fb = tasks.filter((t) => ['heuristic', 'fallback'].includes(String(t.sizing_source || '').toLowerCase())).length;
   $('#fo-sum').replaceChildren(el('b', '', 'Foundry tasks'),
     ` · ${tasks.length}` + (gem || fb ? ` (${gem} by Gemma, ${fb} fallback)` : '') + foremanLearning(r.json.foreman));
+}
+// PR cell of a Foundry task row (t.pr = {state, url, branch, error, stage}): "PR #12" link, "PR failed" + Retry, or "PR…".
+const prRetrying = new Set();
+function foundryPr(t) {
+  const pr = t && t.pr && typeof t.pr === 'object' ? t.pr : null;
+  if (!pr) return null;
+  const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
+  const url = String(pr.url || '');
+  if (pr.state === 'opened' && /^https?:\/\//i.test(url)) {
+    const num = url.match(/\/pull\/(\d+)/);
+    const a = el('a', 'fo-pr', num ? `PR #${num[1]}` : 'Pull request');
+    a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    a.title = `Open the pull request${pr.branch ? ` (branch ${pr.branch})` : ''} in your browser`;
+    return a;
+  }
+  if (pr.state === 'pending' || prRetrying.has(t.id)) {
+    const b = el('span', 'fo-badge', 'Opening PR…');
+    b.title = 'Foundry is pushing the branch and opening the pull request';
+    return b;
+  }
+  if (pr.state !== 'failed') return null;
+  const wrap = el('span', 'fo-pr-failed', '');
+  const b = el('span', 'fo-badge bad', 'PR failed');
+  b.title = [pr.error, pr.stage ? `(step: ${pr.stage})` : ''].filter(Boolean).join(' ') || 'The pull request could not be opened';
+  const btn = el('button', 'fo-small', 'Retry');
+  btn.type = 'button';
+  btn.setAttribute('aria-label', `Retry the pull request for ${t.id}`);
+  btn.addEventListener('click', async () => {
+    btn.disabled = true; prRetrying.add(t.id);
+    let r = null;
+    try { r = await foundryJson(`/tasks/${encodeURIComponent(t.id)}/pr/retry`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }); } catch {}
+    prRetrying.delete(t.id);
+    if (r && r.json && r.json.ok) toast(`Retrying the pull request for ${t.id}`);
+    else toast(`Couldn't retry the PR for ${t.id}: ${(r && r.json && (r.json.error || r.json.reason)) || (r ? `HTTP ${r.status}` : "the dashboard server didn't answer")}`);
+    foundryTasks(foundryUp);
+  });
+  wrap.append(b, ' ', btn);
+  return wrap;
+}
+
+// ---- Foreman actions log (GET /api/foundry/actions, newest first; Undo -> POST /api/foundry/actions/<id>/undo) ----
+const actionErrors = new Map(); // action_id -> last undo failure, shown under the row until the next success
+const actionBusy = new Set();
+function actionTime(at) {
+  const d = typeof at === 'number' ? new Date(at * 1000) : at ? new Date(at) : null;
+  if (!d || isNaN(d)) return '';
+  const same = d.toDateString() === new Date().toDateString();
+  return same ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+// Plain words, e.g. "Moved F-012 to Team Bravo (stuck 14 min)". Text only.
+function actionWords(a) {
+  if (a.summary || a.text) return String(a.summary || a.text);
+  const p = a.params && typeof a.params === 'object' ? a.params : {};
+  const teamName = (id) => (id && state && state.teams && state.teams.find((t) => t.id === id)?.name) || (id ? `Team ${String(id).charAt(0).toUpperCase()}${String(id).slice(1)}` : '');
+  const task = a.task_id ? String(a.task_id) : 'a task';
+  const kind = String(a.action || '').toUpperCase();
+  const n = p.builders ?? p.to_builders ?? p.new_builders ?? p.allocated_builders;
+  let words;
+  switch (kind) {
+    case 'REASSIGN_TEAM': { const to = p.to_team || p.team || a.to_team; words = `Moved ${task}${to ? ` to ${teamName(to)}` : ' to another team'}`; break; }
+    case 'RETRY_TASK': words = `Gave ${task} a fresh try`; break;
+    case 'QUARANTINE_TASK': words = `Put ${task} aside (quarantined)`; break;
+    case 'RESIZE_ALLOCATION': words = `Changed ${task} to ${n != null ? `${n} builder${Number(n) === 1 ? '' : 's'}` : 'a new crew size'}`; break;
+    case 'THROTTLE_DISPATCH': words = 'Slowed down starting new work'; break;
+    case 'PROMOTE_PEER_REVIEWER': words = `Made a builder peer reviewer${a.team ? ` on ${teamName(a.team)}` : ''}`; break;
+    case 'RESET_BUILDER_CONTEXT': words = `Restarted a builder on ${task} with a clean slate`; break;
+    default: words = `${kind ? kind.toLowerCase().replace(/_/g, ' ') : 'Action'}${a.task_id ? ` on ${task}` : ''}`;
+  }
+  // "reason" is the Foreman's diagnosis (e.g. "stuck 14 min"); "detail" (what was changed) goes in the tooltip.
+  const why = String(a.reason || '').trim();
+  return why ? `${words} (${why.length > 120 ? why.slice(0, 119) + '…' : why})` : words;
+}
+async function foundryActions(up) {
+  const wrap = $('#fo-actions');
+  if (!up) { wrap.hidden = true; return; }
+  let r = null;
+  try { r = await foundryJson('/actions'); } catch {}
+  const list = r && r.json && r.json.ok && Array.isArray(r.json.actions) ? r.json.actions : null;
+  if (!list) { wrap.hidden = true; return; } // older Foundry without an action log
+  wrap.hidden = false;
+  const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
+  const rows = list.filter((a) => a && typeof a === 'object').map((a) => {
+    const id = String(a.action_id ?? '');
+    const li = document.createElement('li');
+    const undone = !!a.undone_at;
+    const failed = a.ok === false || !!a.error || a.applied === false;
+    if (undone) li.className = 'undone';
+    li.dataset.action = id;
+    const time = el('span', 'fa-time', actionTime(a.at));
+    if (a.at) time.title = String(typeof a.at === 'number' ? new Date(a.at * 1000).toLocaleString() : new Date(a.at).toLocaleString());
+    const words = el('span', 'fa-text', actionWords(a));
+    const tip = [a.detail, a.undo_detail ? `Undo: ${a.undo_detail}` : '', a.undoable === false && a.undo_reason && a.applied !== false ? `Can't be undone: ${a.undo_reason}` : '']
+      .filter(Boolean).map(String).join('\n');
+    if (tip) words.title = tip;
+    li.append(time, words);
+    if (undone) {
+      const tag = el('span', 'fo-badge', 'Undone');
+      tag.title = `Undone ${actionTime(a.undone_at)}${a.undone_by ? ` by ${a.undone_by}` : ''}`.trim();
+      li.append(tag);
+    } else if (failed) {
+      const tag = el('span', 'fo-badge bad', a.applied === false && !a.error ? "Didn't apply" : 'Failed');
+      tag.title = String(a.error || a.detail || "This action didn't work");
+      li.append(tag);
+    } else if (a.undoable && id) {
+      const btn = el('button', 'fo-small', actionBusy.has(id) ? 'Undoing…' : 'Undo');
+      btn.type = 'button'; btn.disabled = actionBusy.has(id);
+      btn.setAttribute('aria-label', `Undo: ${actionWords(a)}`);
+      btn.addEventListener('click', () => undoAction(id, btn));
+      li.append(btn);
+    }
+    if (failed && (a.error || a.detail)) li.append(el('span', 'fa-err', String(a.error || a.detail)));
+    const err = actionErrors.get(id);
+    if (err && !undone) li.append(el('span', 'fa-err', `Couldn't undo: ${err}`));
+    return li;
+  });
+  $('#fa-list').replaceChildren(...rows);
+  $('#fa-empty').hidden = rows.length > 0;
+  const open = list.filter((a) => a && a.undoable && !a.undone_at && a.ok !== false && a.applied !== false && !a.error).length;
+  $('#fa-sum').replaceChildren(el('b', '', 'Foreman actions'), ` · ${list.length}` + (open ? ` (${open} can be undone)` : ''));
+}
+async function undoAction(id, btn) {
+  if (actionBusy.has(id)) return;
+  actionBusy.add(id);
+  btn.disabled = true; btn.textContent = 'Undoing…';
+  let r = null;
+  try { r = await foundryJson(`/actions/${encodeURIComponent(id)}/undo`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }); } catch {}
+  actionBusy.delete(id);
+  if (r && r.json && r.json.ok) {
+    actionErrors.delete(id);
+    toast(r.json.message || r.json.detail ? `Undone: ${r.json.message || r.json.detail}` : 'Undone');
+  } else {
+    const why = (r && r.json && (r.json.reason || r.json.error)) || (r ? `HTTP ${r.status}` : "the dashboard server didn't answer");
+    actionErrors.set(id, String(why));
+    toast(`Couldn't undo: ${why}`);
+  }
+  await Promise.all([foundryActions(foundryUp), foundryTasks(foundryUp)]);
 }
 // " · Pre-review: N sent back (≈N Claude reviews saved) · Sizing accuracy: X % over N tasks"; parts with no data are left out.
 function foremanLearning(fm) {

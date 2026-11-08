@@ -468,10 +468,77 @@ The dashboard uses these endpoints; you don't need them yourself. They answer on
 
 | Endpoint | What it does |
 |---|---|
-| `GET /api/health` | `{ok, repo, model, gemma_ok, claude_ok, version}` |
-| `GET /api/status` | the tasks (`id, title, state, team, builders, patch, md, rejected, reason`), a Foreman telemetry summary, `paused_until` and `last_account_error` |
+| `GET /api/health` | `{ok, repo, model, gemma_ok, claude_ok, version, pr_ready}` (plus the reason when `pr_ready` is false) |
+| `GET /api/status` | the tasks (`id, title, state, team, builders, patch, md, rejected, reason, pr`), a Foreman telemetry summary, `paused_until` and `last_account_error` |
 | `POST /api/orders` | `{title, description?, files?, size?}` submits a work order for the service's repository and returns `{ok, task_id}` at once; the Shop Foreman then sizes it in the background (on a CPU this can take a minute), and `/api/status` shows the task as `sizing` until then. An order whose sizing was interrupted is sized again on the next start. A bad order gets HTTP 400 |
 | `POST /api/ask` | `{question}`: the Foreman's answer, streamed as `text/event-stream` (`data: {"text": "..."}` chunks, then `event: done`) |
+| `POST /api/tasks/<id>/pr/retry` | opens the pull request again for a task whose PR failed (see [Automatic pull requests](#automatic-pull-requests)) |
+| `GET /api/actions` | `{ok, actions}`: the Foreman's actions, newest first (see [The Foreman fixes things itself](#the-foreman-fixes-things-itself)) |
+| `POST /api/actions/<id>/undo` | undoes one action; `{ok: false, reason}` when it can't be undone |
+
+## Automatic pull requests
+
+When the service runs for a repository, **every approved task gets its own branch and pull request** on GitHub, with no clicks from you. The Shop Foreman (Gemma) writes the PR title and description. The `.patch` and `.md` files are still written to the patches folder as before, so nothing is lost if the PR can't be opened.
+
+### Set it up once (Windows)
+
+1. Install the GitHub CLI. In PowerShell or a Command Prompt:
+
+   ```powershell
+   winget install --id GitHub.cli
+   ```
+
+   Then **open a new window** so `gh` is on the PATH. (Without winget, download the installer from https://cli.github.com/.)
+2. Log in once:
+
+   ```powershell
+   gh auth login
+   ```
+
+   Pick **GitHub.com**, **HTTPS**, and **Login with a web browser**. Answer **Yes** when it asks to use your GitHub credentials for git, so Foundry's `git push` uses the same login.
+3. Check it: `foundry\setup_foreman.bat` now ends with a GitHub check that says whether `gh` is installed and logged in (`./foundry/setup_foreman.sh` on macOS/Linux). It only reports; it never fails the setup. You can also run `gh auth status` yourself.
+
+The repository you start Foundry with (`--repo`) must be a git repository with an `origin` remote on GitHub that you can push to.
+
+When the service starts it checks git, the `origin` remote and `gh` once. If something is missing it logs a clear warning, and `/api/health` reports `pr_ready: false` with the reason. Tasks still run; only the PR step is skipped or fails.
+
+### What Foundry does for each approved task
+
+1. Gemma drafts the PR title and description (the same draft that goes into `<task>.md`). The description ends with `Opened by Foundry (task F-012)`.
+2. Foundry makes a **temporary git worktree** under `foundry\data\worktrees\`, starting from the base branch (`FOUNDRY_PR_BASE`, else the repository's default branch, else the branch you are on).
+3. It creates the branch `foundry/<task id>-<short title>`, for example `foundry/F-012-add-clamp-helper`. If that branch already exists it uses `-2`, `-3` and so on.
+4. It applies the patch, commits it (as you: the name and e-mail from your git config; your git hooks run as usual), and pushes the branch to `origin`.
+5. It opens the pull request with `gh pr create` and records the link.
+6. It removes the temporary worktree.
+
+**Your working files and your current branch are never touched.** Everything happens in the separate worktree, which is deleted afterwards. Foundry never force-pushes, and never pushes to the base branch.
+
+You'll find the link in three places: the Foundry tasks list on the dashboard (**PR #12**, opens in your browser), a progress note on the board task, and the task's `pr` field in `/api/status` (`state` is `pending`, `opened`, `failed` or `skipped`, with `url`, `branch`, `error` and `stage`).
+
+A restart never opens a second PR for the same task: an opened PR is remembered, a failed one is not retried by itself, and one that was still pending when the service stopped is tried once more.
+
+### Settings
+
+| Variable | Default | What it does |
+|---|---|---|
+| `FOUNDRY_AUTO_PR` | `true` | `0` / `false` turns automatic PRs off; Foundry then only writes the patch files |
+| `FOUNDRY_PR_BASE` | unset | the branch PRs are opened against (unset: the repository's default branch, else your current branch) |
+| `FOUNDRY_PR_DRAFT` | `false` | `1` / `true` opens every PR as a draft |
+
+### When a PR fails
+
+The Foundry tasks list then shows **PR failed — Retry**; hover over it for the reason. Fix the cause and click **Retry** (or `POST /api/tasks/<id>/pr/retry`). The patch and `.md` files are always in the patches folder, so you can also [apply the change by hand](#real-mode-phase-2-untested-against-live-services).
+
+| Stage | What it means and what to do |
+|---|---|
+| `no_git` | git is not installed or not on the PATH. Install Git for Windows (`winget install --id Git.Git`), then restart Foundry |
+| `not_a_repo` | `--repo` is not a git repository. Start Foundry with the repository's folder |
+| `no_remote` | the repository has no `origin` remote. Add it: `git remote add origin https://github.com/<you>/<repo>.git` |
+| `apply_failed` | the patch doesn't apply to the base branch any more (it changed since the task ran). Merge `<task>.patch` by hand, or resubmit the task |
+| `push_failed` | git couldn't push, usually because it isn't logged in or you can't write to the repository. Run `gh auth login` (answer Yes to git credentials), or `gh auth setup-git` |
+| `gh_missing` | the GitHub CLI is not installed: `winget install --id GitHub.cli`, open a new window, `gh auth login`, then restart Foundry |
+| `gh_not_logged_in` | run `gh auth login` |
+| `pr_failed` | the branch was pushed but `gh pr create` failed (for example a PR for that branch already exists, or the base branch name is wrong). Read the error, fix it, then Retry, or open the PR from the pushed branch on GitHub |
 
 ## Dashboard integration
 
@@ -585,6 +652,9 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_INFRA_FAILURE_CAP` | `3` consecutive infrastructure failures on one ticket before it is quarantined |
 | `FOUNDRY_CLAUDE_APPEND_PROMPT` | the Foundry role prompt; `none` = no `--append-system-prompt` |
 | `FOUNDRY_PATCHES_DIR` | `patches/` next to the database (`foundry/data/patches` by default) |
+| `FOUNDRY_AUTO_PR` | `true`: every approved task gets its own branch and pull request (see [Automatic pull requests](#automatic-pull-requests)) |
+| `FOUNDRY_PR_BASE` | unset: PRs target the repository's default branch, else the current branch |
+| `FOUNDRY_PR_DRAFT` | `false`: `true` opens PRs as drafts |
 
 ## Escalation actions (Floor Manager)
 
@@ -595,9 +665,35 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `RESET_BUILDER_CONTEXT` | clears the builder's scratch and releases its claimed ticket (`queue.release_ticket`: attempt unchanged); the next claim starts with a fresh prompt. Every reset is logged as a `builder_reset` event |
 | `RESIZE_ALLOCATION` | `queue.resize(task, builders)`; the manager's allocation view is updated as well |
 | `THROTTLE_DISPATCH` | `limiter.throttle(factor, seconds)` |
+| `REASSIGN_TEAM` | moves a stuck task's open tickets to an idle team's pool |
+| `RETRY_TASK` | re-opens a task quarantined for infrastructure reasons with fresh attempts (once per task) |
 | `NONE` | nothing (still recorded and posted) |
 
-Every escalation is validated as a `ForemanEscalation`, stored in the queue and posted to the board. A failing action is logged and reported as `applied=False`; it never takes the line down.
+Every escalation is validated as a `ForemanEscalation`, stored in the queue and posted to the board. A failing action is logged and reported as `applied=False`; it never takes the line down. Every applied action is also written to the action log with what is needed to undo it (`manager.actions()`, `manager.undo_action(action_id)`); see [The Foreman fixes things itself](#the-foreman-fixes-things-itself).
+
+## The Foreman fixes things itself
+
+The Shop Foreman watches the line all the time. When it spots a problem (a stuck task, a review queue that isn't moving, a task that keeps failing, tokens running out too fast) it **acts on its own**, for every kind of action, including quarantine. You don't have to approve anything. Instead, every action is logged and almost every one can be undone with one click.
+
+### The Foreman actions log
+
+The Ask the Foreman card on the dashboard has a **Foreman actions** log, newest first. Each line says when it happened and what the Foreman did, in plain words, for example `Moved F-012 to Team Bravo (stuck 14 min)`. An action that failed is shown as failed. Actions that can be undone have an **Undo** button; once undone the line is tagged **Undone**. The same log is in the service's API: `GET /api/actions` and `POST /api/actions/<id>/undo`.
+
+### What each action does, and what Undo does
+
+| Action | What the Foreman did | What Undo does |
+|---|---|---|
+| Change the crew size (`RESIZE_ALLOCATION`) | gave a task more or fewer builders | puts back the previous number of builders |
+| Slow down dispatch (`THROTTLE_DISPATCH`) | slowed down how fast new Claude calls start, to stay under the usage limit | lifts the slow-down at once |
+| Extra reviewer (`PROMOTE_PEER_REVIEWER`) | ran an idle builder as an extra reviewer for a while | stops the extra reviewer |
+| Quarantine (`QUARANTINE_TASK`) | took a task that keeps failing off the line and paused it | puts the task back on the line with the attempts it had before |
+| Move to another team (`REASSIGN_TEAM`) | moved a stuck or slow task's open work from a busy team to an idle one | moves the work that is still open back to the first team |
+| Try again (`RETRY_TASK`) | put a task that was quarantined for a passing problem (a timeout, a crash, not a real build failure) back on the line with fresh attempts; at most once per task | quarantines it again |
+| Fresh start for a builder (`RESET_BUILDER_CONTEXT`) | cleared a stuck builder's scratch so its next try starts with a fresh prompt | **can't be undone**: the cleared scratch is gone. The log says so, and there is no Undo button |
+
+Undo is safe to click twice: the second click does nothing. If things have moved on since the action (for example the moved work is already finished, or the task was already quarantined again), Undo refuses and says why, and nothing changes.
+
+The Foreman never retries the same task twice. Every action (and every undo) is also posted to the board task as a progress note.
 
 ## Honest limits
 
@@ -605,7 +701,7 @@ Every escalation is validated as a `ForemanEscalation`, stored in the queue and 
 - **The solution cache matches exactly.** It hits only on identical criteria, files and context; fuzzy matching is phase 2.
 - **The context engine uses AST and regex, not semantics.** Python is pruned with `ast` (signatures, fields, docstring first lines) and TS/JS with signature regexes. Snippet relevance comes from keyword overlap, which Gemma can re-rank.
 - **The default lint is light.** Without `ruff` installed, the linter gate is a small AST check (unused imports, bare `except`, and so on).
-- **Patches are not applied for you.** Foundry writes `.patch` files; you apply them with `git apply`. A patch can conflict if the repo changed since the run. Without git installed, the `--check` step is skipped.
+- **Patches are not applied to your working tree.** The service pushes each approved task to its own branch and opens a PR ([Automatic pull requests](#automatic-pull-requests)); `--real` and the patch files leave applying to you, with `git apply`. A patch can conflict if the repo changed since the run. Without git installed, the `--check` step is skipped.
 - **Everything runs in one process.** The queue is safe across processes (WAL, `BEGIN IMMEDIATE`), but teams run as asyncio tasks in one process. A crash is recovered with `queue.resume()`.
 - **The bridge is fire-and-forget.** If the board refuses an op (for example the team is busy on another task), the bridge only logs it; Foundry state stays authoritative in SQLite. Through the CLI fallback, the ops go wherever `dept.mjs` is configured to send them, which may be the shared hub.
 - **Demo timing is simulated.** The demo's TPM spike comes from realistic per-call session overhead on the simulated client, and its waits use virtual time.

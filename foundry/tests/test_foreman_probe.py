@@ -385,7 +385,7 @@ def test_setup_sh_without_gh_still_succeeds(tmp_path: Path) -> None:
 
 def test_setup_bat_gh_check() -> None:
     text = BAT_SCRIPT.read_bytes().decode("ascii")
-    gh = text[text.index("\r\n:gh_check\r\n") : text.index("\r\n:finish\r\n")]
+    gh = text[text.index("\r\n:gh_check\r\n") : text.index("\r\n:gpu_line\r\n")]
     for needle in (
         "where gh",
         "gh auth status >nul 2>&1",
