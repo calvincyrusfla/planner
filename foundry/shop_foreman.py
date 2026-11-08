@@ -305,8 +305,9 @@ _SIZING_SCHEMA: dict[str, Any] = {
                     "allowed_files": {"type": "array", "items": {"type": "string"}},
                     "independent": {"type": "boolean"},
                     "estimated_lines": {"type": "integer", "minimum": 1},
+                    "part_note": {"type": "string"},
                 },
-                "required": ["title", "acceptance_criteria", "allowed_files", "estimated_lines"],
+                "required": ["title", "part_note", "acceptance_criteria", "allowed_files", "estimated_lines"],
             },
         },
     },
@@ -931,6 +932,12 @@ def _add_estimates(first: Any, second: Any) -> int | None:
     return None
 
 
+def _join_part_notes(first: Any, second: Any) -> str:
+    """One part note for two merged subtasks (blanks and repeats dropped)."""
+    notes = [str(n).strip() for n in (first, second) if n and str(n).strip()]
+    return "; ".join(dict.fromkeys(notes))
+
+
 def merge_tiny_subtasks(
     subtasks: Sequence[Mapping[str, Any]],
     *,
@@ -967,6 +974,8 @@ def merge_tiny_subtasks(
         target = kept[-1]
         merges.append(f"{_clip(str(sub.get('title')), 40)} into {_clip(str(target.get('title')), 40)}")
         target["title"] = _clip(f"{target.get('title')} + {sub.get('title')}", 200)
+        if note := _join_part_notes(target.get("part_note"), sub.get("part_note")):
+            target["part_note"] = note
         target["acceptance_criteria"] += list(sub.get("acceptance_criteria") or [])
         target["allowed_files"] = list(dict.fromkeys([*target["allowed_files"], *(sub.get("allowed_files") or [])]))
         target["independent"] = bool(target.get("independent")) and bool(sub.get("independent"))
@@ -1602,6 +1611,9 @@ class ShopForeman:
                     "when it needs nothing (no function, file or setting) from any other subtask; "
                     "otherwise false. "
                     "Set \"estimated_lines\" on every subtask to the lines of code it will add or change. "
+                    "Never reword, summarise or shorten the order: every builder gets its full text word for word. "
+                    "Set \"part_note\" on every subtask to one short line saying which part of the order it covers, "
+                    "and do not restate the order there. "
                     "Reply with JSON only."
                 ),
             },
@@ -1638,6 +1650,7 @@ class ShopForeman:
                 proposals.append(
                     {
                         "title": str(item.get("title") or "").strip(),
+                        "part_note": str(item.get("part_note") or "").strip(),
                         "acceptance_criteria": _str_list(item.get("acceptance_criteria")),
                         "allowed_files": _str_list(item.get("allowed_files")),
                         # only a literal JSON true counts: anything else keeps the subtask sequential
@@ -1683,6 +1696,7 @@ class ShopForeman:
             for k, extra in enumerate(proposals[n:]):  # merge surplus proposals round-robin
                 target = subtasks[k % n]
                 target["acceptance_criteria"] += extra["acceptance_criteria"]
+                target["part_note"] = _join_part_notes(target.get("part_note"), extra.get("part_note"))
                 target["allowed_files"] += extra["allowed_files"]
                 target["independent"] = bool(target.get("independent")) and bool(extra.get("independent"))
                 target["estimated_lines"] = _add_estimates(target.get("estimated_lines"), extra.get("estimated_lines"))
@@ -1714,6 +1728,7 @@ class ShopForeman:
                 subtasks.append(
                     {
                         "title": title if n == 1 else _clip(f"{title} ({label})", 200),
+                        "part_note": "Covers the whole order" if n == 1 else f"Covers {label}",
                         "acceptance_criteria": criteria[k::n] if criteria else [],
                         "allowed_files": part_files,
                     }
@@ -1741,6 +1756,7 @@ class ShopForeman:
                 SubtaskAllocation(
                     subtask_id=f"{task_id}.{k + 1}",
                     title=sub["title"],
+                    part_note=sub.get("part_note") or sub["title"],
                     acceptance_criteria=sub["acceptance_criteria"],
                     allowed_files=sub["allowed_files"],
                     independent=bool(sub.get("independent", False)),  # heuristic split: never
@@ -1771,7 +1787,7 @@ class ShopForeman:
             criteria = subtask.acceptance_criteria
         if self.context_engine is None:
             text = objective or (subtask.title if subtask is not None else "Complete the subtask.")
-            return ContextSlice(objective=_first_sentences(text), acceptance_criteria=list(criteria or []))
+            return ContextSlice(objective=text, acceptance_criteria=list(criteria or []))
         builder = getattr(self.context_engine, "abuild_slice", None)
         if callable(builder):
             sliced = await builder(subtask, objective, **kwargs)

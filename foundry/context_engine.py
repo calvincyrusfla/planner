@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 from foundry.context_text import request_terms, spread_hits
 from foundry.schemas import (
-    MAX_OBJECTIVE_SENTENCES,
+    MAX_OBJECTIVE_CHARS,
     MAX_SNIPPET_LINES,
     CodeSnippet,
     ContextSlice,
@@ -113,20 +113,21 @@ def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / 4)
 
 
-def trim_objective(text: str, max_sentences: int = MAX_OBJECTIVE_SENTENCES) -> str:
-    """Collapse whitespace and keep at most ``max_sentences`` sentences.
+def trim_objective(text: str, max_sentences: int | None = None) -> str:
+    """Collapse whitespace and cap the objective at ``MAX_OBJECTIVE_CHARS``.
 
+    The order is kept in full unless ``max_sentences`` asks for a shorter one.
     Sentence boundaries follow :func:`foundry.schemas.count_sentences` (``.``,
-    ``!`` or ``?`` followed by whitespace or the end), so the result always
-    passes the ``ContextSlice.objective`` validator.
+    ``!`` or ``?`` followed by whitespace or the end).
     """
     flat = " ".join(text.split())
     if not flat:
         return ""
-    ends = list(_SENTENCE_END.finditer(flat))
-    if len(ends) >= max_sentences and ends[max_sentences - 1].end() < len(flat):
-        return flat[: ends[max_sentences - 1].end()].strip()
-    return flat
+    if max_sentences is not None:
+        ends = list(_SENTENCE_END.finditer(flat))
+        if len(ends) >= max_sentences and ends[max_sentences - 1].end() < len(flat):
+            flat = flat[: ends[max_sentences - 1].end()]
+    return flat[:MAX_OBJECTIVE_CHARS].strip()
 
 
 def _clip(line: str, width: int = _MAX_LINE_CHARS) -> str:
@@ -1363,6 +1364,11 @@ class ContextEngine:
             subtask, objective, acceptance_criteria, allowed_files, extra_files
         )
         ranked, imports = self._prepare(title, objective, criteria, sources)
+        note = getattr(subtask, "part_note", "")
+        if isinstance(note, str) and note.strip() and note.strip() != objective:
+            # the note follows the order's full text; room is reserved so the cap can't cut it off
+            suffix = f"\n\nThis subtask's part of the order: {note.strip()}"
+            objective = objective[: MAX_OBJECTIVE_CHARS - len(suffix)].rstrip() + suffix
         files = list(allowed_files if allowed_files is not None else (subtask.allowed_files if subtask else []))
         allowed = [p for p in self.expand_files(files) if p in sources]
         description = description or str(getattr(subtask, "description", "") or "")
@@ -1390,7 +1396,7 @@ class ContextEngine:
         Args:
             subtask: the allocation; its title/criteria/allowed_files are used
                 unless overridden by the keyword arguments.
-            objective: task objective; trimmed to two sentences (defaults to
+            objective: task objective, kept in full up to the cap (defaults to
                 the subtask title).
             acceptance_criteria: overrides ``subtask.acceptance_criteria``.
             allowed_files: overrides ``subtask.allowed_files`` (globs allowed;
