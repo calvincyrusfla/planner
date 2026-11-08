@@ -195,6 +195,10 @@ class FloorManager:
         self._drafts: dict[str, dict[str, str]] = {}
         self._reported_quarantine: set[str] = set()
         self._pending: set[asyncio.Task[Any]] = set()
+        #: task id -> its background sizing task (see :meth:`accept`).
+        self._sizing_tasks: dict[str, asyncio.Task[Any]] = {}
+        #: task id -> why its background sizing failed.
+        self.sizing_errors: dict[str, str] = {}
         #: Current builder allocation per task (updated on RESIZE_ALLOCATION).
         self.allocations: dict[str, int] = {}
         #: alert_id -> outcome of every escalation already applied (idempotency).
@@ -302,10 +306,12 @@ class FloorManager:
                 load[d.team_id] += 1
         return min(names, key=lambda t: (load[t], names.index(t)))
 
-    async def submit(self, work_order: WorkOrder | Mapping[str, Any]) -> str:
-        """Size a work order with the Foreman, queue its tickets and put it on the board.
+    def _prepare(self, work_order: WorkOrder | Mapping[str, Any]) -> str:
+        """Assign the task id, team and repo, record the order and add the task (backlog).
 
-        Returns the Foundry task id.
+        The order is saved right away, so an order whose sizing never finishes
+        (cancelled, crashed, service stopped) is found and sized again by
+        :meth:`resume_sizing` on the next start.
         """
         order = work_order if isinstance(work_order, WorkOrder) else WorkOrder.model_validate(dict(work_order))
         task_id = order.task_id or self._next_task_id()
@@ -315,10 +321,85 @@ class FloorManager:
         order = order.model_copy(update={"task_id": task_id, "team_id": self._pick_team(order), "repo_root": repo})
         self.orders[task_id] = order
         self._add_task(order)
+        self.save()
+        return task_id
+
+    async def submit(self, work_order: WorkOrder | Mapping[str, Any], *, background: bool = False) -> str:
+        """Size a work order with the Foreman, queue its tickets and put it on the board.
+
+        Returns the Foundry task id. With ``background=True`` this is
+        :meth:`accept`: it returns at once and the sizing runs on its own.
+        """
+        if background:
+            return self.accept(work_order)
+        task_id = self._prepare(work_order)
+        await self._size_and_register(task_id)
+        return task_id
+
+    def accept(self, work_order: WorkOrder | Mapping[str, Any]) -> str:
+        """Record a work order and return its task id at once; size it in the background.
+
+        Must be called on the event loop that should run the sizing. The
+        sizing task belongs to the manager, so cancelling the caller (an HTTP
+        timeout) never cancels it. A Foreman on CPU can take a minute or more.
+        """
+        task_id = self._prepare(work_order)
+        self._start_sizing(task_id)
+        return task_id
+
+    def is_sizing(self, task_id: str) -> bool:
+        """True while the task's background sizing is running."""
+        t = self._sizing_tasks.get(task_id)
+        return t is not None and not t.done()
+
+    def _start_sizing(self, task_id: str) -> asyncio.Task[Any]:
+        running = self._sizing_tasks.get(task_id)
+        if running is not None and not running.done():
+            return running
+        self.sizing_errors.pop(task_id, None)
+        t = asyncio.get_running_loop().create_task(self._background_size(task_id))
+        self._sizing_tasks[task_id] = t
+        self._pending.add(t)
+        t.add_done_callback(self._pending.discard)
+        return t
+
+    async def _background_size(self, task_id: str) -> None:
+        try:
+            await self._size_and_register(task_id)
+        except asyncio.CancelledError:
+            # stopped mid-sizing: nothing was applied; the next start sizes it again
+            log.info("floor manager: sizing of %s interrupted; it is sized again on the next start", task_id)
+            raise
+        except Exception as exc:  # a sizing failure must never take the service down
+            reason = f"sizing failed: {type(exc).__name__}: {exc}"[:500]
+            log.warning("floor manager: %s %s", task_id, reason)
+            self.sizing_errors[task_id] = reason
+            try:
+                self.queue.record_event("sizing_failed", task_id, {"error": reason})
+                task = self.queue.get_task(task_id)
+                if task and _val(task.get("state")) not in _TERMINAL and not self.queue.tickets_for_task(task_id):
+                    self.queue.quarantine(task_id, reason)
+            except Exception as inner:  # pragma: no cover - bookkeeping is best effort
+                log.debug("floor manager: could not record the sizing failure: %s", inner)
+        finally:
+            if self._sizing_tasks.get(task_id) is asyncio.current_task():
+                self._sizing_tasks.pop(task_id, None)
+
+    async def _size_and_register(self, task_id: str) -> None:
+        """Size a recorded order and apply it (tickets, board, saved state).
+
+        Everything after the Foreman's answer runs without awaiting, so a
+        cancellation either leaves the task unsized (backlog, no tickets) or
+        fully sized and registered.
+        """
+        order = self.orders[task_id]
         directive = await self._size(order)
+        if self.queue.tickets_for_task(task_id):
+            return  # sized meanwhile by someone else (a second resume)
+        self.queue.apply_sizing(directive)
+        # recorded only once the tickets exist: a directive without tickets would look applied
         self.directives[task_id] = directive
         self.allocations[task_id] = directive.allocated_builders
-        self.queue.apply_sizing(directive)
         self.queue.record_event(
             "sized",
             task_id,
@@ -338,7 +419,96 @@ class FloorManager:
             team_id=directive.team_id,
         )
         self.save()
-        return task_id
+
+    def unsized_tasks(self, only: Any = None) -> list[str]:
+        """Open tasks that have no tickets yet (orders whose sizing never finished)."""
+        out = []
+        for task in self.queue.all_tasks():
+            tid = str(task.get("task_id"))
+            if _val(task.get("state")) not in ("backlog", "sizing"):
+                continue
+            if only is not None and not only(tid):
+                continue
+            if self.queue.tickets_for_task(tid):
+                continue
+            out.append(tid)
+        return out
+
+    def _rebuild_order(self, tid: str) -> WorkOrder:
+        """A work order for a queue task whose saved order is missing (title/description/team/repo only)."""
+        task = self.queue.get_task(tid) or {}
+        order = WorkOrder(
+            title=str(task.get("title") or tid),
+            description=str(task.get("description") or ""),
+            task_id=tid,
+            team_id=task.get("team_id") or self._pick_team(WorkOrder(title=tid)),
+            repo_root=task.get("repo_root") or (str(self.repo_root.resolve()) if self.repo_root else None),
+        )
+        log.warning(
+            "floor manager: %s has no saved order; rebuilt it from the queue row without its files "
+            "(the Foreman sizes it from the title and description only)", tid,
+        )
+        return order
+
+    def resume_sizing(self, only: Any = None) -> list[str]:
+        """Size again, in the background, every open task left without tickets.
+
+        This repairs orders whose sizing was cancelled half-way (before the
+        fix, an HTTP timeout did that). A task with no saved order is rebuilt
+        from its queue row. Identical unsized orders (same repo, title,
+        description and files: the user resent the order after a timeout) are
+        sized once, as the newest of them; the others are quarantined as
+        duplicates. ``only(task_id) -> bool`` limits it (e.g. to one repo).
+        Returns the task ids being sized; call on the event loop.
+        """
+        groups: dict[tuple[Any, ...], list[str]] = {}
+        for tid in self.unsized_tasks(only):
+            if self.is_sizing(tid):
+                continue
+            if tid not in self.orders:
+                try:
+                    self.orders[tid] = self._rebuild_order(tid)
+                except Exception as exc:  # cannot be rebuilt: say so instead of leaving it stuck
+                    reason = f"order could not be recovered for sizing: {exc}"[:500]
+                    log.warning("floor manager: %s %s", tid, reason)
+                    self.queue.quarantine(tid, reason)
+                    continue
+            groups.setdefault(_order_key(self.orders[tid]), []).append(tid)
+        started = []
+        for ids in groups.values():
+            ids.sort(key=_task_number)
+            keep, dupes = ids[-1], ids[:-1]
+            for tid in dupes:
+                reason = f"duplicate of {keep} (resent after the old 30 s timeout)"
+                log.warning("floor manager: %s is a %s; quarantined, %s is sized instead", tid, reason, keep)
+                self.queue.quarantine(tid, reason)
+                self._reported_quarantine.add(tid)  # never on the board: nothing to report
+            self.directives.pop(keep, None)  # a directive without tickets was never applied
+            self._start_sizing(keep)
+            started.append(keep)
+        started.sort(key=_task_number)
+        if groups:
+            self.save()
+        if started:
+            log.info("floor manager: sizing again %s", ", ".join(started))
+        return started
+
+    async def stop_sizing(self, timeout: float) -> list[str]:
+        """Wait up to ``timeout`` s for background sizing, then cancel what is left.
+
+        Returns the ids whose sizing was cancelled (they stay unsized and are
+        sized again by :meth:`resume_sizing` on the next start).
+        """
+        tasks = {t for t in self._sizing_tasks.values() if not t.done()}
+        if tasks:
+            await asyncio.wait(tasks, timeout=max(0.0, float(timeout)))
+        left = {tid: t for tid, t in self._sizing_tasks.items() if not t.done()}
+        for t in left.values():
+            t.cancel()
+        if left:
+            await asyncio.gather(*left.values(), return_exceptions=True)
+            log.warning("floor manager: stopped while sizing %s", ", ".join(sorted(left)))
+        return sorted(left)
 
     def _add_task(self, order: WorkOrder) -> None:
         """``queue.add_task`` with the task's repo (G1), on queues that store it."""
@@ -833,6 +1003,20 @@ def _params(fn: Any) -> set[str]:
         return set(inspect.signature(fn).parameters)
     except (TypeError, ValueError):
         return set()
+
+
+def _order_key(order: WorkOrder) -> tuple[Any, ...]:
+    """What makes two orders the same request (repo, title, description, files; whitespace/case folded)."""
+    def norm(text: str) -> str:
+        return " ".join(str(text or "").split()).casefold()
+
+    repo = str(Path(order.repo_root).resolve()).casefold() if order.repo_root else None
+    return (repo, norm(order.title), norm(order.description), tuple(sorted(f.strip() for f in order.files)))
+
+
+def _task_number(task_id: str) -> tuple[int, str]:
+    m = _TASK_ID_RE.match(task_id)
+    return (int(m.group(1)) if m else -1, task_id)
 
 
 def _with_newline(text: str) -> str:

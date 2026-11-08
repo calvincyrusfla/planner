@@ -354,7 +354,7 @@ The dashboard uses these endpoints; you don't need them yourself. They answer on
 |---|---|
 | `GET /api/health` | `{ok, repo, model, gemma_ok, claude_ok, version}` |
 | `GET /api/status` | the tasks (`id, title, state, team, builders, patch, md, rejected, reason`), a Foreman telemetry summary, `paused_until` and `last_account_error` |
-| `POST /api/orders` | `{title, description?, files?, size?}` submits a work order for the service's repository and returns `{ok, task_id}`. A bad order gets HTTP 400 |
+| `POST /api/orders` | `{title, description?, files?, size?}` submits a work order for the service's repository and returns `{ok, task_id}` at once; the Shop Foreman then sizes it in the background (on a CPU this can take a minute), and `/api/status` shows the task as `sizing` until then. An order whose sizing was interrupted is sized again on the next start. A bad order gets HTTP 400 |
 | `POST /api/ask` | `{question}`: the Foreman's answer, streamed as `text/event-stream` (`data: {"text": "..."}` chunks, then `event: done`) |
 
 ## Dashboard integration
@@ -437,6 +437,7 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_DB_PATH` | `foundry/data/foundry.db` |
 | `FOUNDRY_GEMMA_BASE_URL` | `http://localhost:11434/v1` |
 | `FOUNDRY_GEMMA_MODEL` | `gemma4:e4b` (falls back to `FOREMAN_MODEL`) |
+| `FOUNDRY_GEMMA_TIMEOUT_S` | `180` seconds one Gemma request may take before the Foreman falls back to its heuristic (sizing runs in the background, so a slow CPU Gemma is fine) |
 | `FOUNDRY_CLAUDE_BIN` | `claude` |
 | `FOUNDRY_RPM` / `FOUNDRY_TPM` / `FOUNDRY_MAX_CONCURRENT` | `20` / `100000` / `3` |
 | `FOUNDRY_REVIEW_DWELL_S` | `600` (REVIEW_BOTTLENECK → PROMOTE_PEER_REVIEWER) |
