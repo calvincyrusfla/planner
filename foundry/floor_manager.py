@@ -869,6 +869,7 @@ class FloorManager:
             PrescribedAction.RESET_BUILDER_CONTEXT: self._reset_builder_context,
             PrescribedAction.RESIZE_ALLOCATION: self._resize_allocation,
             PrescribedAction.THROTTLE_DISPATCH: self._throttle_dispatch,
+            PrescribedAction.WIDEN_CONTEXT: self._widen_context,
             PrescribedAction.NONE: self._no_action,
         }
         for name, fn in (("REASSIGN_TEAM", self._reassign_team), ("RETRY_TASK", self._retry_task)):
@@ -1214,6 +1215,23 @@ class FloorManager:
             except Exception as exc:  # pragma: no cover - bookkeeping is best effort
                 log.debug("delete_sizing_outcome failed: %s", exc)
 
+    async def _widen_context(self, alert: ForemanEscalation) -> tuple[Any, ...]:
+        """Raise the task's context level by one, so its next attempts see more of the code."""
+        task_id = alert.target_entity.task_id
+        if not task_id:
+            return False, "no task to widen context for", {}
+        task, why = self._live_task(task_id)
+        if task is None:
+            return False, why, {}
+        level = self.queue.task_context_level(task_id)
+        if level >= self.queue.MAX_CONTEXT_LEVEL:
+            return False, f"{task_id} is already at the widest context (level {level})", {}
+        widened = level + 1
+        self.queue.set_task_context_level(task_id, widened)
+        self.bridge.progress(task_id, f"[Foundry] {task_id} context widened from level {level} to {widened}")
+        before = {"task_id": task_id, "level": level, "widened_to": widened}
+        return True, f"{task_id} context widened to level {widened}", {"level": widened}, before
+
     # -------------------------------------------------------------- action log
 
     def _load_actions(self) -> None:
@@ -1304,6 +1322,7 @@ class FloorManager:
             "QUARANTINE_TASK": self._undo_quarantine,
             "REASSIGN_TEAM": self._undo_reassign,
             "RETRY_TASK": self._undo_retry,
+            "WIDEN_CONTEXT": self._undo_widen,
         }.get(str(entry.get("action")))
         if undo is None:
             return {**base, "ok": False, "reason": "This action cannot be undone."}
@@ -1422,6 +1441,16 @@ class FloorManager:
         self.queue.quarantine(task_id, reason)
         self._report_quarantine(task_id, reason)
         return True, f"{task_id} quarantined again"
+
+    def _undo_widen(self, entry: Mapping[str, Any]) -> tuple[bool, str]:
+        before = entry["before"]
+        task_id = before.get("task_id")
+        level = int(before["level"])
+        refusal = self.queue.restore_task_context_level(task_id, int(before["widened_to"]), level)
+        if refusal is not None:
+            return False, refusal
+        self.bridge.progress(task_id, f"[Foundry] {task_id} context back to level {level} (undone)")
+        return True, f"{task_id} context back to level {level}"
 
     async def _no_action(self, alert: ForemanEscalation) -> tuple[bool, str, dict[str, Any]]:
         return True, "no action", {}

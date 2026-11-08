@@ -186,6 +186,7 @@ class PrescribedAction(str, Enum):
     RESIZE_ALLOCATION = "RESIZE_ALLOCATION"
     REASSIGN_TEAM = "REASSIGN_TEAM"
     RETRY_TASK = "RETRY_TASK"
+    WIDEN_CONTEXT = "WIDEN_CONTEXT"
     NONE = "NONE"
 
     def __str__(self) -> str:  # pragma: no cover - trivial
