@@ -111,13 +111,39 @@ def branch_name(task_id: str, title: str) -> str:
     return f"{task_prefix(task_id)}{slugify(title)}"
 
 
-def commit_message(title: str, body: str, limit: int = 2000) -> str:
-    """PR title as the subject line, then a summary of the body."""
+def commit_message(title: str, body: str, limit: int = 2000,
+                   trailers: Mapping[str, str] | None = None) -> str:
+    """PR title as the subject line, then a summary of the body, then git trailers."""
     subject = " ".join((title or "Foundry change").split())[:200]
     text = (body or "").strip()
     if len(text) > limit:
         text = text[:limit].rstrip() + "\n..."
-    return f"{subject}\n\n{text}\n" if text else f"{subject}\n"
+    msg = f"{subject}\n\n{text}\n" if text else f"{subject}\n"
+    if trailers:
+        msg += "\n" + "".join(f"{k}: {' '.join(str(v).split())}\n" for k, v in trailers.items())
+    return msg
+
+
+def patch_digest(text: str) -> str:
+    """sha256 of the patch with line endings normalised (CRLF/CR -> LF, one final newline)."""
+    norm = text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def parse_trailers(message: str) -> dict[str, str]:
+    """``Key: value`` lines of a commit message's last paragraph."""
+    paras = [p for p in (message or "").strip().split("\n\n") if p.strip()]
+    out: dict[str, str] = {}
+    if paras:
+        for line in paras[-1].splitlines():
+            m = re.match(r"^([A-Za-z0-9-]+):\s*(.*?)\s*$", line)
+            if m:
+                out[m.group(1)] = m.group(2)
+    return out
+
+
+TASK_TRAILER = "Foundry-Task"
+PATCH_TRAILER = "Foundry-Patch"
 
 
 async def default_runner(
@@ -416,6 +442,24 @@ class GitPublisher:
                     local.append(name)
         return remote, local
 
+    async def _matching_branches(self, git: str, remote: Mapping[str, str],
+                                 trailers: Mapping[str, str]) -> list[str]:
+        """Remote branches whose tip commit message has every one of ``trailers``."""
+        if not remote:
+            return []
+        names = sorted(remote)
+        await self._git(git, "fetch", "--quiet", "--no-tags", self.remote,
+                        *[f"refs/heads/{n}" for n in names], timeout=self.net_timeout)
+        out: list[str] = []
+        for name in names:
+            rc, msg, _ = await self._git(git, "log", "-1", "--format=%B", remote[name])
+            if rc != 0:
+                continue
+            found = parse_trailers(msg)
+            if all(found.get(k) == v for k, v in trailers.items()):
+                out.append(name)
+        return out
+
     async def _existing_pr(self, gh: str, branch: str) -> str | None:
         """URL of a PR (any state) whose head is ``branch``; None when there is none or gh fails."""
         res = await self._run([gh, "pr", "list", *self._repo_args(), "--head", branch, "--state", "all",
@@ -457,8 +501,13 @@ class GitPublisher:
         # local-only branches of this task are left alone (the user may have committed there by
         # hand): _free_branch skips their names and picks the next free -2, -3 ...
         remote, _local_only = await self._task_branches(git, task_id)
-        if remote:
-            ordered = sorted(remote, key=_suffix_order)
+        # only a branch whose tip carries this task's id AND this exact patch is "ours" (a reset
+        # or second database can reuse task ids for different work)
+        trailers = {TASK_TRAILER: task_id, PATCH_TRAILER: patch_digest(patch.read_text(encoding="utf-8",
+                                                                                     errors="replace"))}
+        mine = await self._matching_branches(git, remote, trailers)
+        if mine:
+            ordered = sorted(mine, key=_suffix_order)
             for name in ordered:
                 url = await self._existing_pr(gh, name)
                 if url:
@@ -494,7 +543,7 @@ class GitPublisher:
             if res[0] != 0:
                 raise _Fail("apply_failed", self._msg(res, "git apply failed"))
             msg_file = wt_dir / f"{wt.name}.msg"
-            msg_file.write_text(commit_message(pr_title, pr_body), encoding="utf-8", newline="\n")
+            msg_file.write_text(commit_message(pr_title, pr_body, trailers=trailers), encoding="utf-8", newline="\n")
             try:
                 ident = await self._identity_args(git)
                 res = await self._git(git, *ident, "commit", "--quiet", "-F", str(msg_file), cwd=wt)
@@ -637,5 +686,5 @@ def _rmdir_quiet(path: Path) -> None:
 
 __all__ = [
     "BRANCH_PREFIX", "DEFAULT_WORKTREE_ROOT", "GitPublisher", "PublishResult", "STAGES",
-    "branch_name", "commit_message", "default_runner", "github_repo", "slugify", "task_prefix",
+    "PATCH_TRAILER", "TASK_TRAILER", "branch_name", "commit_message", "parse_trailers", "patch_digest", "default_runner", "github_repo", "slugify", "task_prefix",
 ]

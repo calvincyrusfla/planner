@@ -20,6 +20,8 @@ import pytest
 from foundry.git_publisher import (
     default_runner,
     github_repo,
+    parse_trailers,
+    patch_digest,
     STAGES,
     GitPublisher,
     PublishResult,
@@ -513,3 +515,37 @@ def test_default_runner_kills_child_on_cancel(monkeypatch) -> None:
 def test_default_runner_timeout() -> None:
     rc, _, err = asyncio.run(default_runner([sys.executable, "-c", "import time; time.sleep(60)"], timeout=0.5))
     assert rc is None and "timed out" in err
+
+
+def test_patch_digest_and_trailers() -> None:
+    assert patch_digest("a\r\nb\r\n") == patch_digest("a\nb\n") == patch_digest("a\nb")
+    assert patch_digest("a\n") != patch_digest("b\n")
+    msg = commit_message("T", "Body", trailers={"Foundry-Task": "F-1", "Foundry-Patch": "abc"})
+    assert msg.endswith("\n\nFoundry-Task: F-1\nFoundry-Patch: abc\n")
+    assert parse_trailers(msg) == {"Foundry-Task": "F-1", "Foundry-Patch": "abc"}
+    assert parse_trailers("subject only") == {}
+
+
+@needs_sh
+def test_same_task_id_different_patch_gets_new_branch_and_pr(world) -> None:
+    pub = world["pub"]
+    first = asyncio.run(pub.publish("F-012", "Add world", world["patch"], PR))
+    msg = _git(world["origin"], "log", "-1", "--format=%B", first.branch)
+    assert "Foundry-Task: F-012" in msg and "Foundry-Patch: " in msg
+    # a reset / second database: same task id, different work
+    p2 = world["tmp"] / "p2.patch"
+    p2.write_text("diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n"
+                  "@@ -0,0 +1 @@\n+brand new\n", encoding="utf-8", newline="\n")
+    second = asyncio.run(pub.publish("F-012", "Add world", p2, {"title": "Different", "body": "c"}))
+    assert second.ok and second.branch == first.branch + "-2" and second.commit != first.commit
+    assert _git(world["origin"], "show", f"{second.branch}:new.txt") == "brand new"
+    assert _creates(world) == 2
+    # the original work republished (CRLF copy of the same patch) still finds its own branch + PR
+    crlf = world["tmp"] / "crlf.patch"
+    crlf.write_bytes(world["patch"].read_bytes().replace(b"\n", b"\r\n"))
+    third = asyncio.run(pub.publish("F-012", "Add world", crlf, PR))
+    assert third.branch == first.branch and _creates(world) == 2
+    # a branch without trailers (pushed by hand) is never adopted
+    _git(world["repo"], "push", "-q", "origin", "main:refs/heads/foundry/f-099-add-world")
+    fresh = asyncio.run(pub.publish("F-099", "Add world", world["patch"], PR))
+    assert fresh.ok and fresh.branch == "foundry/f-099-add-world-2"
