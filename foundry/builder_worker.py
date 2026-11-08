@@ -51,6 +51,7 @@ import time
 from pathlib import Path
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -406,6 +407,29 @@ def _already_done_section(done: Sequence[StackedWork]) -> list[str]:
     return parts
 
 
+class _ReadOnlyAssignment(TaskAssignment):
+    """An assignment with files the builder may read but never change."""
+
+    read_files: list[str] = []
+    read_only_excerpts: list[dict[str, Any]] = []
+
+
+def _read_only_path(path: Any) -> str:
+    """A repo-relative path in the form diffs use (forward slashes), so paths compare reliably."""
+    return _normalize_path(str(path).strip().replace("\\", "/"))
+
+
+def _path_covered(path: str, patterns: Iterable[str]) -> bool:
+    """True when ``path`` is one of ``patterns``, exactly or through a glob."""
+    return any(path == p or fnmatchcase(path, p) for p in map(_read_only_path, patterns))
+
+
+def _read_only_touched(files: Iterable[str], assignment: TaskAssignment) -> list[str]:
+    """The ``files`` the assignment marks read-only, whatever ``allowed_files`` says."""
+    protected = {_read_only_path(f) for f in getattr(assignment, "read_files", ())}
+    return [f for f in files if _read_only_path(f) in protected]
+
+
 def build_builder_prompt(
     assignment: TaskAssignment,
     *,
@@ -441,6 +465,9 @@ def build_builder_prompt(
     ]
     parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
     allowed = list(assignment.allowed_files)
+    read_files = list(getattr(assignment, "read_files", ()))
+    protected = set(read_files)
+    allowed = [f for f in allowed if _read_only_path(f) not in protected]
     focus = [f for f in (focus_files or ()) if f in allowed]
     also = [f for f in allowed if f not in focus]
     if focus and also:
@@ -455,7 +482,9 @@ def build_builder_prompt(
         parts += [f"- {f}" for f in also]
     else:
         parts += ["", "## Files you may modify"]
-        parts += [f"- {f}" for f in allowed] or ["- (no restriction given)"]
+        parts += [f"- {f}" for f in allowed] or [
+            "- (no restriction given)" if not assignment.allowed_files else "- (none: every listed file is read-only)"
+        ]
     if already_done:
         parts += _already_done_section(already_done)
     if ctx.snippets:
@@ -483,6 +512,23 @@ def build_builder_prompt(
             "## Fix required (your previous attempt was sent back)",
             assignment.fix_hint.strip(),
         ]
+    if read_files:
+        parts += [
+            "",
+            "## Read-only files",
+            "For reference only. Do not change these files: a reply that edits any of them is refused. "
+            "To see more of one, reply `BLOCKED:` naming the symbol in backticks.",
+        ]
+        parts += [f"- {f}" for f in read_files]
+        for excerpt in getattr(assignment, "read_only_excerpts", ()):
+            text = str(excerpt["text"])
+            fence = _fence_for(text)
+            parts += [
+                f"### {excerpt['path']} (lines {excerpt['start_line']}-{excerpt['end_line']})",
+                f"{fence}text",
+                text.rstrip("\n"),
+                fence,
+            ]
     parts += ["", "## Output contract", BUILDER_CONTRACT]
     return "\n".join(parts) + "\n"
 
@@ -649,6 +695,14 @@ def parse_builder_reply(
             checks={**checks, "unified_diff": False},
         )
     allowed = {_normalize_path(f) for f in assignment.allowed_files}
+    touched = _read_only_touched(files, assignment)
+    if touched:
+        return blocked(
+            "diff touches read-only files: " + ", ".join(touched),
+            diff=diff,
+            files=files,
+            checks={**checks, "read_only_untouched": False},
+        )
     outside = [f for f in files if allowed and f not in allowed]
     checks["files_allowed"] = not outside
     if outside:
@@ -725,6 +779,10 @@ def _parse_edits_reply(
         diff += "\n"
     files = extract_diff_paths(diff)
     allowed_set = set(allowed)
+    touched = _read_only_touched(files, assignment)
+    if touched:
+        return blocked("edits touch read-only files: " + ", ".join(touched), diff=diff, files=files,
+                       checks={**checks, "edits_applied": True, "read_only_untouched": False})
     outside = [f for f in files if allowed_set and f not in allowed_set]
     checks["edits_applied"] = True
     checks["files_allowed"] = not outside
@@ -1542,6 +1600,8 @@ class BuilderWorker(_WorkerBase):
         self._local_pre_review: dict[str, int] = {}
         #: Stand-in for queues without kv: per-ticket symbols requested in BLOCKED notes.
         self._local_symbols: dict[str, list[str]] = {}
+        #: ``read_files_for(task_id) -> [path, ...]``: the task's read-only files (set by ``build_factory``).
+        self.read_files_for: Callable[[str], Sequence[str]] | None = None
         #: Skips the pre-review for a while after repeated Gemma errors (TeamPool shares one).
         self.pre_review_breaker = pre_review_breaker if pre_review_breaker is not None else PreReviewBreaker()
         self.workspace: Path | None = Path(workspace) if workspace is not None else None
@@ -1677,7 +1737,33 @@ class BuilderWorker(_WorkerBase):
         allowed = info["allowed_files"]
         focus = [f for f in (_get(ticket, "focus_files") or []) if f in allowed]
         info["focus_files"] = focus or list(allowed)
+        info["read_files"] = self._read_files(ticket, allowed)
         return info
+
+    def _read_files(self, ticket: Any, allowed: Sequence[str]) -> list[str]:
+        """Files this ticket may read but not change.
+
+        The ticket's own ``read_files`` always count. The task's list is general, so
+        a file this ticket is allowed to edit (exactly or through a glob) is left out of it.
+        """
+        own = [_read_only_path(f) for f in (_get(ticket, "read_files") or [])]
+        task_files = self.read_files_for(str(_get(ticket, "task_id"))) if self.read_files_for is not None else ()
+        general = [p for p in map(_read_only_path, task_files) if not _path_covered(p, allowed)]
+        return [f for f in dict.fromkeys(own + general) if f]
+
+    def _read_only_excerpts(self, ticket: Any, info: dict[str, Any]) -> list[dict[str, Any]]:
+        """The lines of the ticket's read-only files that its text names (see the context engine)."""
+        build = getattr(self._stack_engine(), "read_only_excerpts", None)
+        if build is None:
+            return []
+        texts = [
+            str(info["title"]),
+            *map(str, info["acceptance_criteria"]),
+            str(_get(ticket, "description", "") or ""),
+            self._work_order(str(_get(ticket, "task_id")))["description"],
+            *(str(name) for name in self._requested_symbols(ticket)),
+        ]
+        return list(build(info["read_files"], "\n".join(t for t in texts if t)))
 
     def _context_level(self, ticket: Any, attempt: int) -> int:
         """The level for this attempt: the task's level from the queue, widened by retries.
@@ -1784,22 +1870,33 @@ class BuilderWorker(_WorkerBase):
         """Build the :class:`TaskAssignment` for ``ticket`` (context from the context engine).
 
         Records the pruning savings in telemetry (``tokens_saved`` source ``pruning``).
+        Read-only files are kept out of the edit targets and shown in their own excerpts.
         """
         info = self._subtask_info(ticket)
-        context, saved = await self._context_for(ticket, info)
+        protected = set(info["read_files"])
+        editable = [f for f in info["allowed_files"] if _read_only_path(f) not in protected]
+        focus = [f for f in info["focus_files"] if f in editable]
+        context, saved = await self._context_for(ticket, {**info, "allowed_files": editable, "focus_files": focus})
         if saved > 0:
             self._tm("record_tokens_saved", _get(ticket, "task_id"), "pruning", saved)
         attempt = max(0, min(int(_get(ticket, "attempt", 0) or 0), self.max_retries))
-        return TaskAssignment(
-            task_id=_get(ticket, "task_id"),
-            team_id=self.team_id,
-            builder_id=self.agent_id,
-            subtask_id=_get(ticket, "subtask_id"),
-            acceptance_criteria=info["acceptance_criteria"],
-            allowed_files=info["allowed_files"],
-            context=context,
-            attempt=attempt,
-            fix_hint=_get(ticket, "fix_hint"),
+        fields: dict[str, Any] = {
+            "task_id": _get(ticket, "task_id"),
+            "team_id": self.team_id,
+            "builder_id": self.agent_id,
+            "subtask_id": _get(ticket, "subtask_id"),
+            "acceptance_criteria": info["acceptance_criteria"],
+            "allowed_files": info["allowed_files"],
+            "context": context,
+            "attempt": attempt,
+            "fix_hint": _get(ticket, "fix_hint"),
+        }
+        if not info["read_files"]:
+            return TaskAssignment(**fields)
+        return _ReadOnlyAssignment(
+            **fields,
+            read_files=info["read_files"],
+            read_only_excerpts=self._read_only_excerpts(ticket, info),
         )
 
     # -- gates ------------------------------------------------------------------

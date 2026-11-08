@@ -80,6 +80,8 @@
   .crew-pick { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
   .crew-pick select { padding: 5px 8px; }
   .crew-pick small { color: var(--muted); font-size: 12px; }
+  /* Foundry batches: read-only files listed under a subtask */
+  .sub-read { flex-basis: 100%; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
   /* Foundry: header status chip + "Send to Foundry" row on the new-task form */
   .foundry-chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border: 1px solid var(--border); border-radius: 99px;
     background: var(--surface); color: var(--muted); font-size: 12px; max-width: 100%; min-width: 0; }
@@ -1013,6 +1015,7 @@ function subtaskRow(b, st) {
     ${href ? `<a class="fo-pr" href="${esc(href)}" target="_blank" rel="noopener noreferrer">PR${pr.state ? ` (${esc(pr.state)})` : ''}</a>`
       : pr && pr.state ? `<span class="none">PR ${esc(pr.state)}</span>` : ''}
     ${err ? `<span class="sub-err">${esc(err)}</span>` : ''}
+    ${Array.isArray(st.readFiles) && st.readFiles.length ? `<span class="sub-read">${st.readFiles.map((f) => `<code>${esc(f)}</code> (read-only)`).join(', ')}</span>` : ''}
   </li>`;
 }
 function batchCard(b) {
@@ -1248,6 +1251,7 @@ function actionWords(a) {
     case 'THROTTLE_DISPATCH': words = 'Slowed down starting new work'; break;
     case 'PROMOTE_PEER_REVIEWER': words = `Made a builder peer reviewer${a.team ? ` on ${teamName(a.team)}` : ''}`; break;
     case 'RESET_BUILDER_CONTEXT': words = `Restarted a builder on ${task} with a clean slate`; break;
+    case 'WIDEN_CONTEXT': words = `Showed more of the code to the builders on ${task}`; break;
     default: words = `${kind ? kind.toLowerCase().replace(/_/g, ' ') : 'Action'}${a.task_id ? ` on ${task}` : ''}`;
   }
   // "reason" is the Foreman's diagnosis (e.g. "stuck 14 min"); "detail" (what was changed) goes in the tooltip.

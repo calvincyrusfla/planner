@@ -10,7 +10,7 @@
 //   status: "queued"|"claimed"|"running"|"done"|"failed"|"cancelled",
 //   claimedBy: {host, service, at} | null, heartbeatAt: iso|null, note: string,
 //   subtasks: [{key, title, description, files: [], size: "S"|"M"|"L"|"XL"|null,
-//               acceptance: [], dependsOn: [keys]}],
+//               acceptance: [], dependsOn: [keys], readFiles: []}],
 //   results: {[key]: {foundryTask: "F-012"|null, state, pr: {state,url,branch,error}|null,
 //                     error: string|null, updatedAt}},
 // }
@@ -119,11 +119,13 @@ function cleanSubtasks(raw) {
       text(a, `${n} acceptance ${j + 1}`, LIMITS.acceptanceItem, { required: true }),
     );
     const files = list(st.files, `${n} files`, LIMITS.files).map((f) => relPath(f, `${n} file`));
+    const readFiles = list(st.readFiles ?? st.read_files, `${n} readFiles`, LIMITS.files).map((f) => relPath(f, `${n} read file`));
     return {
       key,
       title: text(st.title, `${n} title`, LIMITS.title, { required: true }),
       description: text(st.description, `${n} description`, LIMITS.description),
       files: [...new Set(files)],
+      readFiles: [...new Set(readFiles)],
       size,
       acceptance,
       dependsOn: list(st.dependsOn ?? st.depends_on, `${n} dependsOn`, LIMITS.subtasks).map((d) => String(d).trim()),

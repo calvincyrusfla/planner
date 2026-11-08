@@ -225,3 +225,14 @@ def test_undo_action_reports_refusal(tmp_path: Path) -> None:
         assert "changed" in undone["reason"]
         assert "undone_at" not in manager.action_log[0]
         assert queue.task_context_level("F-001") == 1
+
+
+def test_widen_refusal_without_action_log() -> None:
+    manager: Any = FloorManager.__new__(FloorManager)
+    assert manager._widen_refusal("F-001") is None
+
+
+def test_widen_refusal_with_empty_action_log() -> None:
+    manager: Any = FloorManager.__new__(FloorManager)
+    manager.action_log = None
+    assert manager._widen_refusal("F-001") is None

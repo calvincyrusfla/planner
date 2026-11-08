@@ -790,6 +790,7 @@ The Ask the Foreman card on the dashboard has a **Foreman actions** log, newest 
 | Quarantine (`QUARANTINE_TASK`) | took a task that keeps failing off the line and paused it | puts the task back on the line with the attempts it had before |
 | Move to another team (`REASSIGN_TEAM`) | moved a stuck or slow task's open work from a busy team to an idle one | moves the work that is still open back to the first team |
 | Try again (`RETRY_TASK`) | put a task that was quarantined for a passing problem (a timeout, a crash, not a real build failure) back on the line with fresh attempts; at most once per task | quarantines it again |
+| Show more code (`WIDEN_CONTEXT`) | raised how much of the code a task's builders and reviewers are shown, after the task failed because they couldn't see enough of it | puts back the previous context level |
 | Fresh start for a builder (`RESET_BUILDER_CONTEXT`) | cleared a stuck builder's scratch so its next try starts with a fresh prompt | **can't be undone**: the cleared scratch is gone. The log says so, and there is no Undo button |
 
 Undo is safe to click twice: the second click does nothing. If things have moved on since the action (for example the moved work is already finished, or the task was already quarantined again), Undo refuses and says why, and nothing changes.

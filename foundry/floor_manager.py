@@ -32,6 +32,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,9 @@ class WorkOrder(BaseModel):
     task_id: str | None = Field(default=None, description="Optional id; generated as F-### when absent.")
     team_id: str | None = Field(default=None, description="Optional team; least-loaded team when absent.")
     files: list[str] = Field(default_factory=list, description="Repo-relative files the work may touch.")
+    read_files: list[str] = Field(
+        default_factory=list, description="Repo-relative files builders are shown but may not change."
+    )
     acceptance_criteria: list[str] = Field(default_factory=list)
     repo_root: str | None = Field(
         default=None, description="Repository the task belongs to (resolved); the manager's repo when absent."
@@ -397,14 +401,22 @@ class FloorManager:
 
         The order is saved right away, so an order whose sizing never finishes
         (cancelled, crashed, service stopped) is found and sized again by
-        :meth:`resume_sizing` on the next start.
+        :meth:`resume_sizing` on the next start. Existing tests of the order's
+        files are added to its read-only files.
         """
         order = work_order if isinstance(work_order, WorkOrder) else WorkOrder.model_validate(dict(work_order))
         task_id = order.task_id or self._next_task_id()
         repo = order.repo_root or (str(self.repo_root.resolve()) if self.repo_root else None)
         if repo:
             repo = str(Path(repo).resolve())
-        order = order.model_copy(update={"task_id": task_id, "team_id": self._pick_team(order), "repo_root": repo})
+        order = order.model_copy(
+            update={
+                "task_id": task_id,
+                "team_id": self._pick_team(order),
+                "repo_root": repo,
+                "read_files": _read_only_files(order.files, order.read_files, repo),
+            }
+        )
         self.orders[task_id] = order
         self._add_task(order)
         self.save()
@@ -608,6 +620,11 @@ class FloorManager:
             self.queue.add_task(*args, repo_root=order.repo_root)
         else:
             self.queue.add_task(*args)
+
+    def read_files_for(self, task_id: str) -> list[str]:
+        """The files the task's builders may read but not change (empty for an unknown task)."""
+        order = self.orders.get(task_id)
+        return list(order.read_files) if order else []
 
     def task_repo(self, task_id: str) -> str | None:
         """The repository a task belongs to (queue column first, then the saved order)."""
@@ -1246,10 +1263,11 @@ class FloorManager:
         """Why the task's context may not be widened yet, from the action log; ``None`` when it may.
 
         A timestamp in the future (clock mismatch) counts as recent; an
-        unreadable one is ignored.
+        unreadable one is ignored. A manager without an action log has
+        nothing to refuse on.
         """
         now = _parse_utc(_utc_now()) or datetime.now(timezone.utc)
-        for row in reversed(self.action_log):
+        for row in reversed(getattr(self, "action_log", None) or []):
             if row.get("action") != "WIDEN_CONTEXT" or row.get("task_id") != task_id:
                 continue
             undone = _parse_utc(row.get("undone_at"))
@@ -2062,6 +2080,26 @@ def _task_number(task_id: str) -> tuple[int, str]:
     return (int(m.group(1)) if m else -1, task_id)
 
 
+def _posix_path(path: Any) -> str:
+    """A repo-relative path with forward slashes and no leading ``./``."""
+    text = str(path).strip().replace("\\", "/")
+    return text[2:] if text.startswith("./") else text
+
+
+def _read_only_files(files: list[str], read_files: list[str], root: str | None) -> list[str]:
+    """``read_files`` plus the existing tests of ``files``, minus whatever ``files`` lets the task edit."""
+    editable = [_posix_path(f) for f in files]
+    wanted = [_posix_path(f) for f in read_files]
+    if root is not None:
+        for path in editable:
+            folder, _, name = path.rpartition("/")
+            if not name.endswith(".py") or name.startswith("test_") or any(c in path for c in "*?["):
+                continue
+            nearby = f"{folder}/tests/test_{name}" if folder else f"tests/test_{name}"
+            wanted += [t for t in (nearby, f"tests/test_{name}") if (Path(root) / t).is_file()]
+    return [f for f in dict.fromkeys(wanted) if f and not any(f == e or fnmatchcase(f, e) for e in editable)]
+
+
 def _with_newline(text: str) -> str:
     return text if text.endswith("\n") else text + "\n"
 
@@ -2489,6 +2527,9 @@ def build_factory(
         for team in config.teams
     }
     manager.teams = dict(pools)
+    for pool in pools.values():
+        for builder in getattr(pool, "builders", ()):
+            builder.read_files_for = manager.read_files_for
     for pool in pools.values():
         attach = getattr(pool, "set_on_ticket_change", None)
         if callable(attach):
