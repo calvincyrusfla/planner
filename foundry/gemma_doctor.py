@@ -220,7 +220,9 @@ def assess(model: str, gpu_pct: int | None, tps: float | None) -> Assessment:
         advice.append("Gemma is slow even so: a GPU with more VRAM would help most.")
     advice.append(
         "Slow Gemma is safe: tasks are still sized by the built-in fallback. "
-        "You can raise FOUNDRY_GEMMA_TIMEOUT_S / FOUNDRY_ASK_TIMEOUT_S to wait longer."
+        "You can raise FOUNDRY_GEMMA_TIMEOUT_S to let sizing wait longer; "
+        "Ask the Foreman waits up to about 100 s (FOUNDRY_ASK_TIMEOUT_S, default 90) "
+        "and then answers with the built-in status."
     )
     return Assessment(False, EXIT_SLOW, verdict, advice)
 

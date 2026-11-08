@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import contextvars
 import inspect
 import math
 import re
@@ -94,6 +95,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "ASK_BUDGET_CAP_S",
     "CONVENTIONAL_TYPES",
     "FOREMAN_TOOLS",
     "MAX_HINT_CHARS",
@@ -107,6 +109,15 @@ __all__ = [
 
 #: Maximum tool-calling rounds in :meth:`ShopForeman.answer_question`.
 MAX_TOOL_ROUNDS: int = 4
+
+#: Upper bound (seconds) on the Ask the Foreman Gemma budget, whatever
+#: ``ask_timeout_s`` says: 10 s below ``serve_api.ASK_CHUNK_TIMEOUT_S`` (110)
+#: so the fallback answer always arrives before the API gives up on the chunk.
+ASK_BUDGET_CAP_S: float = 100.0
+
+#: Hooks that called Gemma in the current asyncio task since their last
+#: ``last_source`` write (immutable, so concurrent tasks never share it).
+_ASKED: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar("foreman_gemma_asked", default=frozenset())
 
 #: Maximum length of a condensed error hint.
 MAX_HINT_CHARS: int = 160
@@ -226,7 +237,10 @@ class GemmaStats:
     * ``calls`` -- Gemma requests attempted (successful or not).
     * ``errors`` / ``timeouts`` -- requests that failed (timeouts included in errors).
     * ``fallbacks`` -- hook results produced by the deterministic fallback
-      (Gemma absent, failed, timed out or gave an unusable reply).
+      after Gemma was asked (it failed, timed out or gave an unusable reply).
+      Hook runs that never asked Gemma (no client, or a hook such as
+      ``prune_context_slice`` whose Gemma use lives elsewhere) are not counted,
+      so ``fallbacks`` never exceeds ``calls``.
     * ``avg_ms`` / ``last_ms`` -- duration of the last :attr:`window` requests
       (failed ones included: a timeout is time the user waited).
     """
@@ -286,7 +300,11 @@ class GemmaStats:
 
 
 class _SourceLog(dict):
-    """``last_source`` mapping that also feeds :class:`GemmaStats` on every write."""
+    """``last_source`` mapping that also feeds :class:`GemmaStats`.
+
+    A write is counted only when the hook asked Gemma (via ``ShopForeman._chat``)
+    in the current asyncio task since its previous write.
+    """
 
     def __init__(self, stats: GemmaStats) -> None:
         super().__init__()
@@ -294,7 +312,10 @@ class _SourceLog(dict):
 
     def __setitem__(self, hook: str, source: str) -> None:
         super().__setitem__(hook, source)
-        self._stats.record_source(hook, source)
+        asked = _ASKED.get()
+        if hook in asked:
+            _ASKED.set(asked - {hook})
+            self._stats.record_source(hook, source)
 
 
 def _accepts_timeout(chat: Any) -> bool:
@@ -577,6 +598,7 @@ class ShopForeman:
         kwargs: dict[str, Any] = {"tools": tools, "json_schema": json_schema, "temperature": temperature}
         if timeout is not None and _accepts_timeout(self.gemma.chat):
             kwargs["timeout"] = timeout
+        _ASKED.set(_ASKED.get() | {hook})
         started = time.monotonic()
         error: str | None = None
         timed_out = False
@@ -1302,8 +1324,8 @@ class ShopForeman:
         without tools. Without Gemma (or if it fails) a deterministic status
         answer built from the tools is streamed.
 
-        All rounds together get ``config.ask_timeout_s`` seconds (kept below the
-        API's per-chunk timeout); when Gemma runs out of time the status answer
+        All rounds together get ``config.ask_timeout_s`` seconds, capped at
+        :data:`ASK_BUDGET_CAP_S` (below the API's per-chunk timeout); when Gemma runs out of time the status answer
         is streamed instead of an error.
         """
         if self.gemma is None:
@@ -1323,7 +1345,7 @@ class ShopForeman:
         ]
         tokens = 0
         answer: str | None = None
-        budget = float(getattr(self.config, "ask_timeout_s", 90.0))
+        budget = min(float(getattr(self.config, "ask_timeout_s", 90.0)), ASK_BUDGET_CAP_S)
         deadline = time.monotonic() + budget
         timed_out = False
         self._last_timed_out = False
