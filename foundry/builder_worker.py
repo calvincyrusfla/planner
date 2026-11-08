@@ -316,8 +316,13 @@ def build_builder_prompt(assignment: TaskAssignment) -> str:
     if ctx.snippets:
         parts += [
             "",
-            "## Context (pruned excerpts; symbols you must change are shown in full with line "
-            "numbers, others as outlines whose elided bodies are `...`)",
+            "## Context",
+            "Three kinds of excerpt: (1) a per-file **inventory** of the symbols that already "
+            "exist (name and line range): never define any of them again; (2) **full targets** "
+            "with numbered lines (`N| code`): these are the symbols to edit; (3) **outlines** "
+            "ending with `# outline only — body hidden; do not redefine, ask for it`: do not "
+            "rewrite them; if you need one, reply `BLOCKED:` naming it in backticks and it is "
+            "shown in full next attempt.",
         ]
         for snip in ctx.snippets:
             fence = _fence_for(snip.text)
@@ -1418,6 +1423,12 @@ class BuilderWorker(_WorkerBase):
         # symbols a builder asked for (BLOCKED note) are always shown in full.
         attempt = max(0, int(_get(ticket, "attempt", 0) or 0))
         widen: dict[str, Any] = {"level": min(attempt + 1, MAX_CONTEXT_LEVEL)}
+        # Names in the subtask's description pick edit targets too (the ticket's own
+        # description when it has one, else the task's work-order description).
+        description = str(_get(ticket, "description", "") or "") or self._work_order(
+            str(_get(ticket, "task_id")))["description"]
+        if description:
+            widen["description"] = description
         extra = self._requested_symbols(ticket)
         if extra:
             widen["extra_symbols"] = extra

@@ -373,7 +373,7 @@ def test_builder_prompt_received_by_claude_is_pruned(tmp_path: Path) -> None:
     # next to an inventory of its existing symbols (so nothing gets re-defined).
     assert "  3|     return a + b" in prompt
     assert "inventory of pkg/mathx.py" in prompt
-    assert "## Context (pruned excerpts" in prompt
+    assert "## Context\n" in prompt and "outline only" in prompt
 
 
 def test_medium_task_uses_two_slots_and_completes_once(tmp_path: Path) -> None:

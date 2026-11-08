@@ -273,6 +273,8 @@ def test_attempts_widen_the_context_level_and_pass_requested_symbols(tmp_path: P
     assert worker.queue.kv_get(f"{EXTRA_SYMBOLS_KV_PREFIX}7") == ["helper_7", "Shop.total"]
     asyncio.run(worker.build_assignment({**ticket, "attempt": 1}))
     assert engine.calls[-1]["extra_symbols"] == ["helper_7", "Shop.total"]
+    asyncio.run(worker.build_assignment({**ticket, "description": "Make helper_9 faster"}))
+    assert engine.calls[-1]["description"] == "Make helper_9 faster"
     # a fresh worker (restart) still sees them through the queue kv
     again = BuilderWorker(TEAM, 1, worker.queue, SimulatedClaudeClient(), None, None, engine, None, None, None)
     assert again._requested_symbols(ticket) == ["helper_7", "Shop.total"]
