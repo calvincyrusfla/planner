@@ -207,14 +207,24 @@ def test_pushed_branch_without_pr_gets_its_pr(world) -> None:
 
 
 @needs_sh
-def test_suffix_when_name_is_held_and_never_force(world) -> None:
+def test_local_only_branch_is_never_deleted(world) -> None:
     repo = world["repo"]
-    # a branch of that name exists locally and is checked out in another worktree: it can't be dropped
+    # a local-only branch of this task with a commit the user made by hand
+    _git(repo, "branch", "foundry/f-012-add-world", "main")
     other = world["tmp"] / "other-wt"
-    _git(repo, "worktree", "add", "-q", "-b", "foundry/f-012-add-world", str(other), "main")
+    _git(repo, "worktree", "add", "-q", str(other), "foundry/f-012-add-world")
+    (other / "mine.txt").write_text("by hand\n", encoding="utf-8")
+    _git(other, "add", "mine.txt")
+    _git(other, "commit", "-q", "-m", "user work")
+    _git(repo, "worktree", "remove", str(other))
+    user_sha = _git(repo, "rev-parse", "foundry/f-012-add-world")
     res = asyncio.run(world["pub"].publish("F-012", "Add world", world["patch"], PR))
     assert res.ok and res.branch == "foundry/f-012-add-world-2"
+    assert _git(repo, "rev-parse", "foundry/f-012-add-world") == user_sha  # untouched
     assert _git(world["origin"], "rev-parse", res.branch) == res.commit
+    again = asyncio.run(world["pub"].publish("F-012", "Add world", world["patch"], PR))
+    assert again.branch == res.branch and _creates(world) == 1
+    assert _git(repo, "rev-parse", "foundry/f-012-add-world") == user_sha
 
 
 @needs_sh

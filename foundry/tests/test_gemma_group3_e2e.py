@@ -127,6 +127,9 @@ with log.open("a", encoding="utf-8") as fh:
     fh.write(json.dumps(entry) + "\n")
 if args[:2] == ["auth", "status"]:
     sys.exit(0)
+if args[:2] == ["pr", "list"]:
+    print("[]")
+    sys.exit(0)
 if args[:2] == ["pr", "create"]:
     if fail.exists():
         fail.unlink()

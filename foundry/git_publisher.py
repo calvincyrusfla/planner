@@ -454,10 +454,9 @@ class GitPublisher:
         pr_body = str(pr.get("body") or "")
 
         # resume: an earlier call already pushed this task's branch (crash before the state was saved)
-        remote, local_only = await self._task_branches(git, task_id)
-        for name in local_only:
-            # never reached the remote: a leftover of an interrupted run (fails harmlessly if checked out)
-            await self._git(git, "branch", "-D", name)
+        # local-only branches of this task are left alone (the user may have committed there by
+        # hand): _free_branch skips their names and picks the next free -2, -3 ...
+        remote, _local_only = await self._task_branches(git, task_id)
         if remote:
             ordered = sorted(remote, key=_suffix_order)
             for name in ordered:
