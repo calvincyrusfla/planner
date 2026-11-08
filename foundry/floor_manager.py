@@ -558,6 +558,8 @@ class FloorManager:
             "description": order.description,
             "files": list(order.files),
             "acceptance_criteria": list(order.acceptance_criteria),
+            # calibration reads only this repository's past sizing outcomes
+            "repo_root": order.repo_root,
         }
         started = time.monotonic()
         result = await _maybe_await(self.foreman.size_task_scope(task))

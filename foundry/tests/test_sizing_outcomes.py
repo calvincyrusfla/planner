@@ -221,3 +221,37 @@ def test_record_outcome_is_best_effort_without_queue_support() -> None:
 
     m = FloorManager(Q(), object(), {}, None, Bridge())
     assert m.record_outcome("F-001") is None
+
+
+def test_sizing_passes_the_task_repo_to_the_outcomes_provider(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, demo_claude(repo, fail_first=None), repo=repo, teams=["alpha"])
+    q = f.queue
+    here = str(repo.resolve())
+    # history: 8 M-sized tasks of this repo that were actually L, 8 of another repo that were S
+    clock_rows = [("/elsewhere/repo", "S", 2), (here, "L", 9)]
+    n = 0
+    for root, _actual, calls in clock_rows:
+        for _ in range(8):
+            n += 1
+            tid = f"H-{n:03d}"
+            q.add_task(tid, f"history {n}", "", "alpha", repo_root=root)
+            q.record_sizing_outcome(tid, files=["shop/mathx.py"], predicted="M",
+                                    attempts=3, subtasks=2, claude_calls=calls, final_state="complete")
+    seen: list[Any] = []
+    real = q.sizing_outcomes
+
+    def provider(repo: Any = None, limit: int = 50) -> list[dict[str, Any]]:
+        seen.append(repo)
+        return real(repo=repo, limit=limit)
+
+    f.foreman.outcomes_provider = provider
+    tid = asyncio.run(f.manager.submit(WorkOrder(**S_ORDER)))
+    assert seen and all(r is not None for r in seen)
+    assert {normalize_repo_root(r) for r in seen} == {normalize_repo_root(here)}
+    rows = provider(repo=seen[0])
+    assert len(rows) == 8 and all(r["repo"] == normalize_repo_root(here) for r in rows)
+    # newest first
+    assert [r["task_id"] for r in rows] == [f"H-{i:03d}" for i in range(16, 8, -1)]
+    assert f.manager.directives[tid]
+    f.close()
