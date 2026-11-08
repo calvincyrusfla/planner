@@ -144,6 +144,9 @@ def _val(x: Any) -> Any:
 _KV_KEY = "floor_manager.state"
 #: kv key of the persisted Foreman action log (``{"seq": n, "actions": [...]}``).
 _ACTIONS_KEY = "floor_manager.actions"
+# Limits on WIDEN_CONTEXT per task: time since its last widen, and since a widen of it was undone.
+_WIDEN_COOLDOWN_S = 10 * 60.0
+_WIDEN_UNDO_SUPPRESS_S = 2 * 3600.0
 #: How many action log entries are kept (oldest dropped first).
 ACTION_LOG_MAX = 500
 #: How long :meth:`FloorManager.drain` waits by default for in-flight completion
@@ -1216,7 +1219,11 @@ class FloorManager:
                 log.debug("delete_sizing_outcome failed: %s", exc)
 
     async def _widen_context(self, alert: ForemanEscalation) -> tuple[Any, ...]:
-        """Raise the task's context level by one, so its next attempts see more of the code."""
+        """Raise the task's context level by one, so its next attempts see more of the code.
+
+        Refused at the widest level, within 10 minutes of the task's last widen
+        and within 2 hours of an undo of one.
+        """
         task_id = alert.target_entity.task_id
         if not task_id:
             return False, "no task to widen context for", {}
@@ -1226,11 +1233,32 @@ class FloorManager:
         level = self.queue.task_context_level(task_id)
         if level >= self.queue.MAX_CONTEXT_LEVEL:
             return False, f"{task_id} is already at the widest context (level {level})", {}
+        refusal = self._widen_refusal(task_id)
+        if refusal is not None:
+            return False, refusal, {}
         widened = level + 1
         self.queue.set_task_context_level(task_id, widened)
         self.bridge.progress(task_id, f"[Foundry] {task_id} context widened from level {level} to {widened}")
         before = {"task_id": task_id, "level": level, "widened_to": widened}
         return True, f"{task_id} context widened to level {widened}", {"level": widened}, before
+
+    def _widen_refusal(self, task_id: str) -> str | None:
+        """Why the task's context may not be widened yet, from the action log; ``None`` when it may.
+
+        A timestamp in the future (clock mismatch) counts as recent; an
+        unreadable one is ignored.
+        """
+        now = _parse_utc(_utc_now()) or datetime.now(timezone.utc)
+        for row in reversed(self.action_log):
+            if row.get("action") != "WIDEN_CONTEXT" or row.get("task_id") != task_id:
+                continue
+            undone = _parse_utc(row.get("undone_at"))
+            if undone is not None and (now - undone).total_seconds() < _WIDEN_UNDO_SUPPRESS_S:
+                return f"{task_id} had a context widen undone less than 2 hours ago"
+            widened = _parse_utc(row.get("at")) if row.get("applied") else None
+            if widened is not None and (now - widened).total_seconds() < _WIDEN_COOLDOWN_S:
+                return f"{task_id} had its context widened less than 10 minutes ago"
+        return None
 
     # -------------------------------------------------------------- action log
 
@@ -1989,6 +2017,17 @@ class FloorManager:
 def _utc_now() -> str:
     """Current UTC time as an ISO-8601 string (``...Z``)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_utc(stamp: Any) -> datetime | None:
+    """An ISO-8601 timestamp as an aware datetime (UTC assumed); ``None`` when absent or unreadable."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _finish_timeout(config: Any, explicit: float | None) -> float:
