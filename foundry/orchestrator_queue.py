@@ -276,7 +276,8 @@ CREATE TABLE IF NOT EXISTS sizing_outcomes (
     actual               TEXT,
     raw_predicted        TEXT,
     quarantine_kind      TEXT,
-    excluded_from_calibration INTEGER NOT NULL DEFAULT 0
+    excluded_from_calibration INTEGER NOT NULL DEFAULT 0,
+    context_level        INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_sizing_outcomes_repo ON sizing_outcomes(repo, recorded_at);
 """
@@ -300,6 +301,7 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "raw_predicted": "TEXT",
         "quarantine_kind": "TEXT",
         "excluded_from_calibration": "INTEGER NOT NULL DEFAULT 0",
+        "context_level": "INTEGER NOT NULL DEFAULT 1",
     },
 }
 
@@ -1547,10 +1549,32 @@ class FoundryQueue:
                 (len(prefix), prefix)).fetchall()
         return {r["key"]: json.loads(r["value"]) for r in rows}
 
+    #: Queue kv key prefix holding a task's context level.
+    CONTEXT_LEVEL_KV_PREFIX = "context_level:"
+    #: Narrowest and widest context level a task can be set to.
+    MIN_CONTEXT_LEVEL = 1
+    MAX_CONTEXT_LEVEL = 3
+
+    def task_context_level(self, task_id: str) -> int:
+        """The task's context level (1..3); 1 when none is stored or the value is unusable."""
+        stored = self.kv_get(f"{self.CONTEXT_LEVEL_KV_PREFIX}{task_id}", self.MIN_CONTEXT_LEVEL)
+        try:
+            level = int(stored)
+        except (TypeError, ValueError):
+            return self.MIN_CONTEXT_LEVEL
+        return max(self.MIN_CONTEXT_LEVEL, min(level, self.MAX_CONTEXT_LEVEL))
+
+    def set_task_context_level(self, task_id: str, level: int) -> None:
+        """Store the task's context level, clamped to 1..3."""
+        clamped = max(self.MIN_CONTEXT_LEVEL, min(int(level), self.MAX_CONTEXT_LEVEL))
+        self.kv_set(f"{self.CONTEXT_LEVEL_KV_PREFIX}{task_id}", clamped)
+
     # -------------------------------------------------------- sizing outcomes
 
     #: Fix-hint prefix of a Gemma pre-review send-back (counted per outcome).
     PRE_REVIEW_HINT_PREFIX = "[pre-review]"
+    #: Kv key prefix of the level a ticket was built at (``builder_worker`` writes it).
+    CONTEXT_LEVEL_USED_KV_PREFIX = "context_level_used:"
 
     def record_sizing_outcome(
         self,
@@ -1591,8 +1615,9 @@ class FoundryQueue:
             task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             if task is None:
                 return None
-            tickets = conn.execute("SELECT attempt, allowed_files FROM tickets WHERE task_id=?",
-                                   (task_id,)).fetchall()
+            tickets = conn.execute(
+                "SELECT ticket_id, attempt, allowed_files FROM tickets WHERE task_id=?",
+                (task_id,)).fetchall()
             if files is None:
                 seen: dict[str, None] = {}
                 for t in tickets:
@@ -1628,6 +1653,7 @@ class FoundryQueue:
                 "final_state": state,
                 "quarantine_kind": qkind,
                 "excluded_from_calibration": qkind == "other",
+                "context_level": self._highest_context_level(conn, tickets),
                 **self._claude_usage(conn, task_id),
             }
             for key, value in overrides.items():
@@ -1638,15 +1664,15 @@ class FoundryQueue:
                 "INSERT INTO sizing_outcomes (task_id, recorded_at, repo, title, files, predicted,"
                 " sizing_source, builders, subtasks, attempts, gate_failures, pre_review_sendbacks,"
                 " reviewer_rejections, claude_calls, tokens, wall_time_s, final_state, actual,"
-                " raw_predicted, quarantine_kind, excluded_from_calibration)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " raw_predicted, quarantine_kind, excluded_from_calibration, context_level)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, now, row["repo"], row["title"], _dump(row["files"]), row["predicted"],
                  row["sizing_source"], int(row["builders"]), int(row["subtasks"]),
                  int(row["attempts"]), int(row["gate_failures"]), int(row["pre_review_sendbacks"]),
                  int(row["reviewer_rejections"]), int(row["claude_calls"]), int(row["tokens"]),
                  float(row["wall_time_s"]), str(row["final_state"]), row["actual"],
                  row["raw_predicted"], row["quarantine_kind"],
-                 1 if row["excluded_from_calibration"] else 0),
+                 1 if row["excluded_from_calibration"] else 0, int(row["context_level"])),
             )
             self._event(conn, "sizing_outcome", task_id,
                         {"predicted": row["predicted"], "raw_predicted": row["raw_predicted"],
@@ -1655,6 +1681,22 @@ class FoundryQueue:
             stored = conn.execute("SELECT * FROM sizing_outcomes WHERE task_id=?",
                                   (task_id,)).fetchone()
         return self._outcome_dict(stored)
+
+    def _highest_context_level(self, conn: sqlite3.Connection, tickets: Iterable[sqlite3.Row]) -> int:
+        """Highest context level any of ``tickets`` was built at (1 when none was recorded)."""
+        highest = self.MIN_CONTEXT_LEVEL
+        for t in tickets:
+            row = conn.execute(
+                "SELECT value FROM kv WHERE key=?",
+                (f"{self.CONTEXT_LEVEL_USED_KV_PREFIX}{t['ticket_id']}",)).fetchone()
+            if row is None:
+                continue
+            try:
+                level = int(json.loads(row["value"]))
+            except (TypeError, ValueError):
+                continue
+            highest = max(highest, min(level, self.MAX_CONTEXT_LEVEL))
+        return highest
 
     def sizing_outcomes(
         self, repo: str | Path | None = None, limit: int = 50, *, include_excluded: bool = False
