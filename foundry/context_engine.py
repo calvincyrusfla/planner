@@ -1427,6 +1427,67 @@ class ContextEngine:
             self._import_outlines(plan, sources, caps_lines) if plan.level >= 2 else (),
         )
 
+    def read_only_excerpts(
+        self, paths: Iterable[str], query_text: str, *, max_lines: int = 400, whole_file: int = 150
+    ) -> list[dict[str, Any]]:
+        """Numbered excerpts of files a builder may read but not edit.
+
+        Small files are shown whole. In larger ones, the symbols and text that
+        ``query_text`` names are shown in full; when it names nothing, only each
+        symbol's first line. Files outside the repository or missing are skipped.
+
+        Files with named lines get the line budget first, and a whole file that
+        no longer fits shrinks to its named lines, so an unrelated file can't
+        crowd out what the ticket asked to see.
+        """
+        root = Path(self.repo_root).resolve()
+        dotted, code, plain = _query_names(query_text)
+        names = {*code, *plain}
+        qualified = {f"{a}.{b}" for a, b in dotted}
+        text_names = _text_names(query_text)
+        files: list[tuple[str, list[str], set[int], set[int]]] = []
+        for rel in dict.fromkeys(paths):
+            target = (root / rel).resolve()
+            if not target.is_relative_to(root) or not target.is_file():
+                continue
+            try:
+                source = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = source.splitlines()
+            n = len(lines)
+            if n == 0:
+                continue
+            units = _units_for(rel, source)
+            hits: set[int] = set()
+            for u in units:
+                if u.name in names or u.qualname in names or u.qualname in qualified:
+                    hits.update(range(u.start, u.end + 1))
+            for _name, k in _text_hits(text_names, lines)[:_MAX_TEXT_WINDOWS]:
+                hits.update(range(max(1, k - _TEXT_WINDOW), k + _TEXT_WINDOW + 1))
+            named = {k for k in hits if 1 <= k <= n}
+            if n <= whole_file:
+                wanted = set(range(1, n + 1))
+            else:
+                wanted = named or {u.start for u in units} or set(range(1, 41))
+            files.append((rel, lines, wanted, named))
+        excerpts: list[dict[str, Any]] = []
+        left = max_lines
+        for rel, lines, wanted, named in sorted(files, key=lambda f: not f[3]):
+            if left <= 0:
+                break
+            keep = sorted(named if named and len(wanted) > left else wanted)[:left]
+            left -= len(keep)
+            rows: list[tuple[int | None, str]] = []
+            previous: int | None = None
+            for k in keep:
+                if previous is not None and k != previous + 1:
+                    rows.append((None, "..."))
+                rows.append((k, _clip_full(lines[k - 1])))
+                previous = k
+            excerpts.append({"path": rel, "start_line": keep[0], "end_line": keep[-1], "text": _render(rows, True)})
+        return excerpts
+
     def build_slice_with_stats(self, *args: Any, **kwargs: Any) -> tuple[ContextSlice, SliceStats]:
         """:meth:`build_slice` returning ``(slice, stats)``."""
         sliced = self.build_slice(*args, **kwargs)
