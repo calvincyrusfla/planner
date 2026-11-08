@@ -174,7 +174,9 @@ def test_builder_prompt_contains_only_the_pruned_slice(tmp_path: Path) -> None:
     }
     ids, states = _run(_submit_and_run(f, order))
     prompt = claude.prompts_for("alpha-1")[0]
-    assert "SECRET_BODY_LINE" not in prompt  # no function bodies of the big file
+    # T-026: the named edit target is shown in full; every other body stays hidden.
+    assert "SECRET_BODY_LINE_3_0" in prompt
+    assert not re.search(r"SECRET_BODY_LINE_(?!3_)\d+_", prompt)
     assert "def compute_total_3(rows, rate):" in prompt  # the relevant signature is there
     assert len(prompt.splitlines()) < len(big.splitlines()) / 2
     # every snippet block is at most 50 lines

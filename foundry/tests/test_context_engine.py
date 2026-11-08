@@ -149,6 +149,14 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _outline_engine(root: Path, *args: object, **kwargs: object) -> ContextEngine:
+    """Outline-only engine (no full edit targets, no inventory): the pre-T-026 slices.
+
+    Full edit targets and the inventory are covered in ``test_context_targets.py``.
+    """
+    return ContextEngine(root, *args, full_lines=0, inventory=False, **kwargs)  # type: ignore[arg-type]
+
+
 def _all_text(sl: ContextSlice) -> str:
     return "\n".join(s.text for s in sl.snippets)
 
@@ -157,7 +165,7 @@ def _all_text(sl: ContextSlice) -> str:
 
 
 def test_big_fixture_bodies_never_appear(repo: Path) -> None:
-    engine = ContextEngine(repo)
+    engine = _outline_engine(repo)
     sub = SubtaskAllocation(
         subtask_id="T-1.1",
         title="Fix tax in compute_invoice_total",
@@ -185,7 +193,7 @@ def test_big_fixture_bodies_never_appear(repo: Path) -> None:
 
 def test_line_numbers_preserved(repo: Path) -> None:
     source = _big_module().splitlines()
-    engine = ContextEngine(repo)
+    engine = _outline_engine(repo)
     sl = engine.build_slice(allowed_files=["app/billing.py"], objective="Touch compute_invoice_total.")
     snippet = next(s for s in sl.snippets if "compute_invoice_total" in s.text)
     def_line = next(i for i, ln in enumerate(source, 1) if ln.startswith("def compute_invoice_total"))
@@ -227,7 +235,7 @@ def test_large_class_split_into_capped_snippets(tmp_path: Path) -> None:
 
 
 def test_syntax_error_falls_back_to_outline(repo: Path) -> None:
-    sl = ContextEngine(repo).build_slice(allowed_files=["app/broken.py"], objective="Fix bad.")
+    sl = _outline_engine(repo).build_slice(allowed_files=["app/broken.py"], objective="Fix bad.")
     text = _all_text(sl)
     assert "def ok(a):" in text and "def bad(:" in text
     assert "BROKEN_BODY" not in text
@@ -245,7 +253,7 @@ def test_typescript_signatures(repo: Path) -> None:
     assert names["formatTotal"].text == "export const formatTotal = (n: number): string => ..."
     assert "get(key: string): number | undefined { ... }" in names["RateCache"].text
     assert (names["loadRates"].start_line, names["loadRates"].end_line) == (7, 11)
-    sl = ContextEngine(repo).build_slice(allowed_files=["web/api.ts"], objective="Change loadRates and RateCache.")
+    sl = _outline_engine(repo).build_slice(allowed_files=["web/api.ts"], objective="Change loadRates and RateCache.")
     text = _all_text(sl)
     assert "TS_BODY_SECRET" not in text
     assert "import { Invoice } from './types';" in text
@@ -265,7 +273,7 @@ def test_js_department_core_is_sliced() -> None:
 
 
 def test_relevance_prefers_matching_symbols(repo: Path) -> None:
-    engine = ContextEngine(repo)
+    engine = _outline_engine(repo)
     sl = engine.build_slice(
         objective="Make parse_config read TOML.",
         acceptance_criteria=["parse_config returns a dict of settings"],
@@ -279,7 +287,7 @@ def test_relevance_prefers_matching_symbols(repo: Path) -> None:
 
 
 def test_no_match_gives_outline_within_budget(repo: Path) -> None:
-    engine = ContextEngine(repo)
+    engine = _outline_engine(repo)
     sl = engine.build_slice(objective="Do something vague.", allowed_files=["app/billing.py"], max_snippets=5, max_total_lines=60)
     assert 1 <= len([s for s in sl.snippets if "<imports>" not in s.text]) <= 6
     assert sl.snippet_line_count <= 60 + MAX_SNIPPET_LINES

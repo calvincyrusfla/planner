@@ -1417,7 +1417,7 @@ class BuilderWorker(_WorkerBase):
         # Retries widen the context: attempt 1 -> level 1, attempt 2 -> 2, attempt 3+ -> 3;
         # symbols a builder asked for (BLOCKED note) are always shown in full.
         attempt = max(0, int(_get(ticket, "attempt", 0) or 0))
-        widen = {"level": min(attempt + 1, MAX_CONTEXT_LEVEL)}
+        widen: dict[str, Any] = {"level": min(attempt + 1, MAX_CONTEXT_LEVEL)}
         extra = self._requested_symbols(ticket)
         if extra:
             widen["extra_symbols"] = extra

@@ -312,7 +312,7 @@ def test_s002_a_replace_symbol_inside_a_2000_line_module(tmp_path: Path) -> None
     # the function to change is shown in full, with its real line number
     assert TARGET_BODY_LINE.strip() in prompt
     assert "return abs(values[-1] - mean) > cutoff" in prompt
-    assert str(_target_line()) in prompt
+    assert f"{_target_line()}| {TARGET_BODY_LINE}" in prompt  # real line number in the gutter
     assert BUILDER_CONTRACT in prompt
     # one builder call, gates passed, reviewer saw a generated diff that git-applies on the original
     assert rig.client.calls[BUILDER] == 1 and rig.client.calls[REVIEWER] == 1

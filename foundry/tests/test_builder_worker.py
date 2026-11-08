@@ -369,7 +369,10 @@ def test_builder_prompt_received_by_claude_is_pruned(tmp_path: Path) -> None:
     asyncio.run(run_pool(rig, ["T-P"]))
     prompt = rig.client.prompts_for(f"{TEAM}-1")[0]
     assert "def add(a, b)" in prompt
-    assert "return a + b" not in prompt  # body elided by the context engine
+    # T-026: a file within the full-body budget is shown whole, with line numbers,
+    # next to an inventory of its existing symbols (so nothing gets re-defined).
+    assert "  3|     return a + b" in prompt
+    assert "inventory of pkg/mathx.py" in prompt
     assert "## Context (pruned excerpts" in prompt
 
 

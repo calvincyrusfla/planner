@@ -92,6 +92,7 @@ OUTLINE_MARKER: str = "outline only \u2014 body hidden; do not redefine, ask for
 _CONTEXT_PAD = 3  # lines of surrounding context shown before/after a full target
 _GAP_FILL = 2  # gaps this small between two full ranges are shown too (one snippet run)
 _MIN_TARGET_SCORE = 2.0  # top-ranked (not named) symbols need at least this relevance
+_RANKED_RELATIVE = 0.5  # ...and at least this share of the best candidate's score
 _MAX_RANKED_CLASS_LINES = 80  # larger classes are only shown in full when named
 _INVENTORY_WIDTH = 150
 _FULL_LINE_CHARS = 2000  # full views keep lines verbatim (diff/edit anchors) up to this width
@@ -384,7 +385,9 @@ _PY_DECL = re.compile(r"^(\s*)(@\w|async\s+def\s|def\s|class\s|import\s|from\s+\
 
 def _skeletonize_python_lines(path: str, source: str) -> list[SourceSymbol]:
     """Fallback for Python files that do not parse: keep declaration lines only."""
-    lines = [(n, _clip(t)) for n, t in enumerate(source.splitlines(), 1) if _PY_DECL.match(t)]
+    lines: list[tuple[int | None, str]] = [
+        (n, _clip(t)) for n, t in enumerate(source.splitlines(), 1) if _PY_DECL.match(t)
+    ]
     if not lines:
         return []
     return [SourceSymbol(path, "<outline>", "outline", lines[0][0] or 1, lines[-1][0] or 1, lines)]
@@ -523,7 +526,7 @@ def skeletonize_script(path: str, source: str) -> list[SourceSymbol]:
             kind in {"const", "let", "var"} and re.search(r"=\s*(?:async\s+)?(?:function\b|\(|[A-Za-z_$][\w$]*\s*=>)", text)
         ):
             sig_end = _signature_end(lines, i)
-            sig = [(n + 1, _clip(lines[n])) for n in range(i, sig_end + 1)]
+            sig: list[tuple[int | None, str]] = [(n + 1, _clip(lines[n])) for n in range(i, sig_end + 1)]
             last_no, last = sig[-1]
             sig[-1] = (last_no, _clip(_cut_body(last)))
             kept = sig
@@ -983,7 +986,9 @@ class ContextEngine:
                 return False
             lo, hi = max(1, start - _CONTEXT_PAD), min(n, end + _CONTEXT_PAD)
             new = set(range(lo, hi + 1)) - plan.covered[p]
-            if not new:
+            if not new:  # already visible (e.g. inside a whole class/file): record, no cost
+                if reason in {"extra", "named"} and all((t.path, t.symbol) != (p, symbol) for t in plan.targets):
+                    plan.targets.append(EditTarget(p, symbol, kind, start, min(end, n), reason))
                 return True
             if not force and plan.used + len(new) > budget:
                 return False
@@ -1049,8 +1054,10 @@ class ContextEngine:
                 if s >= _MIN_TARGET_SCORE:
                     scored.append((s, order, p, u))
         scored.sort(key=lambda item: (-item[0], item[1]))
-        for _, _, p, u in scored:
-            if plan.used >= budget:
+        # Only near-top symbols: siblings that merely share words with a named target stay outlines.
+        floor = max(_MIN_TARGET_SCORE, scored[0][0] * _RANKED_RELATIVE) if scored else 0.0
+        for s, _, p, u in scored:
+            if plan.used >= budget or s < floor:
                 break
             add(p, u.qualname, u.kind, u.start, u.end, "ranked")
 
@@ -1204,7 +1211,9 @@ class ContextEngine:
             for p, cov in plan.covered.items():
                 src = sources[p].splitlines()
                 for s, e in _runs(cov):
-                    run = [(n, _clip_full(src[n - 1])) for n in range(s, e + 1) if n <= len(src)]
+                    run: list[tuple[int | None, str]] = [
+                        (n, _clip_full(src[n - 1])) for n in range(s, e + 1) if n <= len(src)
+                    ]
                     full_shown += len(run)
                     for k in range(0, len(run), MAX_SNIPPET_LINES):
                         piece = run[k : k + MAX_SNIPPET_LINES]
@@ -1217,8 +1226,8 @@ class ContextEngine:
                     inventory_files.append(p)
                     last = max(1, plan.line_counts[p])
                     for k in range(0, len(rows), MAX_SNIPPET_LINES):
-                        piece = [(None, r) for r in rows[k : k + MAX_SNIPPET_LINES]]
-                        pieces_out.append((order.get(p, 0), 0, k, p, 1, last, piece, False))
+                        inv: list[tuple[int | None, str]] = [(None, r) for r in rows[k : k + MAX_SNIPPET_LINES]]
+                        pieces_out.append((order.get(p, 0), 0, k, p, 1, last, inv, False))
 
         pieces_out.sort(key=lambda item: (item[0], item[1], item[2]))
         snippets = [
