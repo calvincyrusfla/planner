@@ -642,3 +642,36 @@ def test_config_typecheck_mode_from_env() -> None:
     assert FoundryConfig.from_env({"FOUNDRY_TYPECHECK": "mypy"}).typecheck == "mypy"
     with pytest.raises(ValueError):
         FoundryConfig.from_env({"FOUNDRY_TYPECHECK": "pyright"})
+
+
+@needs_mypy
+def test_typecheck_never_runs_workspace_mypy(tmp_path: Path) -> None:
+    marker = tmp_path / "PWNED"
+    hijack = f"open({str(marker)!r}, 'w').write('x')\nraise SystemExit(0)\n"
+    write(tmp_path, "mypy.py", hijack)
+    write(tmp_path, "mypy/__init__.py", hijack)
+    write(tmp_path, "mypy/__main__.py", hijack)
+    write(tmp_path, "bad.py", TYPE_BAD)
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"])
+    assert not marker.exists()
+    assert not res.passed and "bad.py:2" in res.stdout
+
+
+def test_typecheck_ignores_mypy_executable_inside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = write(tmp_path, "bin/mypy", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(vg, "_mypy_command", lambda: [str(fake)])
+    write(tmp_path, "bad.py", TYPE_BAD)
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"])
+    assert res.passed and res.note and "mypy not installed" in res.note
+    monkeypatch.setattr(vg, "_mypy_command", lambda: ["mypy"])  # relative: refused too
+    [res] = run_gates(submission(["bad.py"]), tmp_path, checks=["typecheck"], typecheck="mypy")
+    assert not res.passed and "not installed" in res.stderr
+
+
+@needs_mypy
+def test_typecheck_dash_file_name_is_a_file(tmp_path: Path) -> None:
+    write(tmp_path, "-x.py", TYPE_BAD)
+    [res] = run_gates(submission(["-x.py"]), tmp_path, checks=["typecheck"])
+    assert not res.passed and "-x.py:2" in res.stdout, res.stdout + res.stderr

@@ -5,7 +5,7 @@ Foundry is a Python "factory" that runs coding work for the Agent Department.
 - The **Floor Manager** (`floor_manager.py`) is the planning tier. It takes work orders, has the Shop Foreman size them, queues one ticket per allocated builder, carries out escalations and drafts the PR text when a task is finished. It makes no polling Claude calls.
 - The **Shop Foreman** (`shop_foreman.py`) is a local **Gemma 4** model served by **Ollama** (OpenAI-compatible API at `http://localhost:11434/v1`). It sizes tasks (S = 1 builder, M = 2, L/XL = 5), prunes context, condenses tracebacks into one-line fix hints, drafts commit/PR text, answers questions through read-only tools and raises structured `ForemanEscalation`s. Every Foreman hook has a deterministic fallback, so the factory keeps working with Gemma offline.
 - **Builders** (up to 5 per team) and **reviewers** (1 per team, `<team>-6`) are **Claude**. They run as headless Claude Code (`claude -p --output-format json`) on your PC under your Claude subscription. Foundry uses no API keys anywhere.
-- **Deterministic gates** (`validation_gates.py`: syntax, lint, tests, schema) run before any reviewer. A failure skips the reviewer and sends the builder a one-line fix hint. A task gets at most 2 retries, then it is quarantined.
+- **Deterministic gates** (`validation_gates.py`, in this order: syntax → linter → typecheck → tests → schema) run before any reviewer. A failure skips the reviewer and sends the builder a one-line fix hint. A task gets at most 2 retries, then it is quarantined.
 - Underneath: a SQLite (WAL) queue with crash resume (`orchestrator_queue.py`), a token-bucket rate limiter with jittered backoff (`rate_limiter.py`), telemetry (`telemetry.py`) and an exact-match solution cache (`solution_cache.py`).
 
 Foundry **feeds the existing Agent Department dashboard**; it does not replace it (see [Board bridge](#how-it-feeds-the-agent-department-dashboard)).
@@ -41,7 +41,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r foundry/requirements-dev.txt
 ```
 
-You need Python 3.11+. The only runtime dependency is `pydantic>=2.7`; everything else uses the standard library.
+You need Python 3.11+. The runtime dependencies are `pydantic>=2.7` and `mypy>=1.10` (used by the typecheck gate; Foundry still runs without it, the gate is then skipped); everything else uses the standard library.
 
 ## Run the simulated demo
 
@@ -684,10 +684,12 @@ node department/dept.mjs foundry cancel S-001
 
 - **Which batches it claims.** Only queued batches whose `repo` matches the service's repository: the `owner/name` of its `origin` remote, compared without case. Set `FOUNDRY_BATCH_REPO=owner/name` when `origin` isn't a GitHub URL. A batch for another repository is left alone for the Foundry that owns it.
 - **Claiming.** The claim is atomic on the board, so two Foundry services never both take a batch. The batch shows `claimed`, then `running`, with the host name and a heartbeat that Foundry refreshes every poll. If a claimed batch gets no heartbeat for 10 minutes (the PC was switched off), another Foundry for that repository may take it over.
-- **Orders.** Each subtask becomes one order with its title, description, files, size hint and acceptance criteria. The description also names the batch and the subtask, for example `(Foundry batch S-001, subtask 2)`. A subtask with `depends_on` waits until those subtasks are complete.
+- **Orders.** Each subtask becomes one order with its title, description, files, size hint and acceptance criteria. The description also names the batch (with its creation time, so two batches with the same S-id never mix) and the subtask, for example `(Foundry batch S-001 of 2026-11-08T09:15:00.000Z, subtask 2)`. A subtask with `depends_on` waits until those subtasks are complete.
+- **`depends_on` only orders the work.** The dependent subtask is sent in after its dependencies are complete, but it is built from the base branch, not on top of the dependency's change: that change is still an unmerged PR. If subtask 2 needs subtask 1's code, merge subtask 1's PR first and send subtask 2 in a new batch.
 - **Base branch.** Each subtask's pull request targets the batch's `base` branch: Foundry fetches it, branches from it and opens the PR with `--base` set to it. A batch without `base` uses `FOUNDRY_PR_BASE`, else the repository's default branch.
 - **Restarts.** Foundry stores which F-id belongs to which batch subtask. After a restart it picks the batch up again and sends in only the subtasks that never got an order.
-- **The end.** The batch is `done` when every subtask is complete, and `failed` when every subtask has finished and one of them failed or was quarantined (or a subtask couldn't be sent in; the reason is on the batch). You can cancel a queued or claimed batch from the dashboard or with `foundry cancel`.
+- **The end.** The batch is `done` when every subtask is complete, and `failed` when every subtask has finished and one of them failed or was quarantined (or a subtask couldn't be sent in; the reason is on the batch). You can cancel a batch that hasn't finished from the dashboard or with `foundry cancel`. Cancelling a running batch stops Foundry from sending in more subtasks; subtasks it already sent in still finish (and get their PRs) as normal F-tasks.
+- **Validation.** The board checks every batch when it is dispatched (repo `owner/name`, `base` a branch name, relative file paths without `..`, the limits above), and Foundry checks the base and the files again before it sends a subtask in. A subtask that fails Foundry's check is marked failed with the reason.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -719,6 +721,7 @@ Foundry only claims batches while the service is running. If the batch stays on 
 | `FOUNDRY_TEAMS` | `alpha,bravo,charlie` |
 | `FOUNDRY_BUILDERS_PER_TEAM` | `5` |
 | `FOUNDRY_BOARD_BRIDGE_MODE` | `auto` (`auto`, `dry`, `off`) |
+| `FOUNDRY_TYPECHECK` | `auto`: the typecheck gate runs mypy (`--ignore-missing-imports --follow-imports=silent`) on the changed `.py` files when mypy is installed and is skipped otherwise. `mypy` requires it, `off` skips it. Gate order: syntax → linter → typecheck → tests → schema. Only errors in the changed files fail it, but that includes errors that were already in those files. A mypy crash or timeout skips the gate with a note |
 | `FOUNDRY_TRUST_CACHE` | `false`: a cache hit skips only the builder's Claude call; the gates and the reviewer still run. `true` also skips the reviewer |
 | `FOUNDRY_LIMIT_COOLDOWN_S` | `1200` (pause after a usage limit whose reset time can't be parsed) |
 | `FOUNDRY_CLAUDE_ARGS` | extra flags **appended** to the safe defaults above |
@@ -774,6 +777,7 @@ The Foreman never retries the same task twice. Every action is also posted to th
 - **Nothing has run against real Claude Code or a real Gemma yet.** The real clients are unit-tested only against fakes (a fake `claude` script and a local fake HTTP server).
 - **The solution cache matches exactly.** It hits only on identical criteria, files and context; fuzzy matching is phase 2.
 - **The context engine uses AST and regex, not semantics.** Python is pruned with `ast` (signatures, fields, docstring first lines) and TS/JS with signature regexes. Snippet relevance comes from keyword overlap, which Gemma can re-rank.
+- **The typecheck gate checks whole files.** mypy runs on every `.py` file the builder changed, so type errors that were already in such a file also fail the gate, even if the builder didn't write them. Set `FOUNDRY_TYPECHECK=off` for a repository with many existing type errors.
 - **The default lint is light.** Without `ruff` installed, the linter gate is a small AST check (unused imports, bare `except`, and so on).
 - **Patches are not applied to your working tree.** The service pushes each approved task to its own branch and opens a PR ([Automatic pull requests](#automatic-pull-requests)); `--real` and the patch files leave applying to you, with `git apply`. A patch can conflict if the repo changed since the run. Without git installed, the `--check` step is skipped.
 - **Everything runs in one process.** The queue is safe across processes (WAL, `BEGIN IMMEDIATE`), but teams run as asyncio tasks in one process. A crash is recovered with `queue.resume()`.

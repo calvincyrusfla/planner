@@ -821,3 +821,22 @@ async def _until_sized(svc: Service, timeout: float = 15.0) -> None:
     while not m.orders or any(m.is_sizing(t) for t in m.orders):
         assert loop.time() < end, "sizing did not finish"
         await asyncio.sleep(0.02)
+
+
+def test_option_like_batch_base_fails_the_subtask_without_submitting(tmp_path: Path) -> None:
+    board = FakeBoard()
+    b = board.add(base="--upload-pack=touch X;git-upload-pack")
+
+    async def go() -> None:
+        svc = _service(tmp_path, publisher=FakePublisher())
+        await svc.start()
+        try:
+            await _watcher(svc, board).poll_once()
+            assert not svc.factory.manager.orders
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+    got = board.get(b["id"])
+    assert got["status"] == "failed"
+    assert all("not a plain branch name" in got["results"][k]["error"] for k in ("1", "2"))

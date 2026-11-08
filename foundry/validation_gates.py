@@ -654,16 +654,26 @@ def _gate_linter(
 def _mypy_command() -> list[str] | None:
     """argv prefix that runs mypy, or None when it is not installed.
 
-    Prefers mypy importable by this interpreter (the Foundry venv), then a
-    ``mypy`` executable on ``PATH``.
+    Prefers mypy importable by this interpreter (the Foundry venv), run with
+    ``-I`` (isolated mode) so a ``mypy.py`` or ``mypy/`` package in the
+    workspace (the cwd of the run) is never imported instead; then a ``mypy``
+    executable on ``PATH``, as an absolute path.
     """
     try:
         if importlib.util.find_spec("mypy") is not None:
-            return [sys.executable, "-m", "mypy"]
+            return [sys.executable, "-I", "-m", "mypy"]
     except (ImportError, ValueError):
         pass
     exe = shutil.which("mypy")
-    return [exe] if exe else None
+    return [str(Path(exe).resolve())] if exe else None
+
+
+def _inside(path: str, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
 
 
 _MYPY_LINE = re.compile(r"^(?P<path>[^:\n]+?):(?P<line>\d+)(?::\d+)?: (?P<kind>error|note|warning): ")
@@ -678,6 +688,9 @@ def _gate_typecheck(
     if not py_files:
         return True, "no Python files to typecheck", ""
     base = _mypy_command()
+    if base is not None and (not Path(base[0]).is_absolute() or _inside(base[0], workspace)):
+        # never run a mypy that lives in (or resolves into) the workspace
+        base = None
     if base is None:
         if mode == "mypy":
             return False, "", "mypy requested but not installed (pip install mypy)"
@@ -693,6 +706,7 @@ def _gate_typecheck(
         "--no-pretty",
         "--show-column-numbers",
         f"--cache-dir={os.devnull}",
+        "--",
         *py_files,
     ]
     env = {k: v for k, v in os.environ.items() if k not in ("MYPYPATH", "MYPY_CACHE_DIR")}

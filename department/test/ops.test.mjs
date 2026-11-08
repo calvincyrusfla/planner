@@ -114,7 +114,7 @@ test('importing a board into itself adds nothing', () => {
   const s = boardWith(['A', 'B', 'C', 'D']);
   const before = json(s);
   const r = op(s, 'importState', { state: json(s) });
-  assert.deepEqual(r, { added: 0, skipped: 4, idMap: {}, batches: { added: 0, updated: 0, idMap: {} } });
+  assert.deepEqual(r, { added: 0, skipped: 4, idMap: {}, batches: { added: 0, updated: 0, idMap: {}, rejected: [] } });
   assert.deepEqual(s, before);
 });
 

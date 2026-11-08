@@ -253,6 +253,42 @@ test('result updates are not logged one by one; status changes and claims are', 
   assert.match(s.log.at(-1).message, /S-001 running/);
 });
 
+test('importState validates imported batches and drops bad ones (charlie-6 repro)', () => {
+  const src = fresh();
+  op(src, 'dispatchBatch', sample({ title: 'good' }));
+  op(src, 'dispatchBatch', sample({ title: 'evil base' }));
+  op(src, 'dispatchBatch', sample({ title: 'evil files' }));
+  op(src, 'dispatchBatch', sample({ title: 'evil url' }));
+  op(src, 'claimBatch', { id: 'S-004', host, service });
+  op(src, 'updateBatch', { id: 'S-004', service, results: { 1: { state: 'building', pr: { url: 'https://ok' } } } });
+  const raw = JSON.parse(JSON.stringify(src));
+  raw.foundryBatches[1].base = '--upload-pack=touch /tmp/pwned';
+  raw.foundryBatches[2].subtasks[0].files = ['../../etc/passwd'];
+  raw.foundryBatches[3].results['1'].pr.url = 'javascript:alert(1)';
+  raw.foundryBatches.push(
+    { id: 'S-005', title: 'x', repo: 'a/b', status: 'queued', subtasks: [{ key: '1', title: 'a', dependsOn: ['9'] }] },
+    { id: 'S-006', title: 'x', repo: 'evil', status: 'queued', subtasks: [{ title: 'a' }] },
+    { id: 'S-007', title: 'x', repo: 'a/b', status: 'hacked', subtasks: [{ title: 'a' }] },
+    { id: 'S-008', title: 'x', repo: 'a/b', status: 'queued', subtasks: Array.from({ length: 21 }, (_, i) => ({ title: `t${i}` })) },
+    'junk',
+  );
+  const s = fresh();
+  const r = op(s, 'importState', { state: raw });
+  assert.deepEqual(s.foundryBatches.map((b) => b.title), ['good', 'evil url']);
+  assert.deepEqual(r.batches.rejected.map((x) => x.id), ['S-002', 'S-003', 'S-005', 'S-006', 'S-007', 'S-008', '']);
+  assert.match(r.batches.rejected[0].reason, /branch/);
+  assert.match(r.batches.rejected[1].reason, /\.\./);
+  assert.equal(s.foundryBatches[1].results['1'].pr.url, null, 'unsafe PR url cleaned');
+  assert.equal(s.foundryBatches[1].claimedBy.service, service);
+  for (const base of ['-x', 'a..b', 'a b', 'a;b', 'feat/ok']) {
+    const ok = base === 'feat/ok';
+    const one = JSON.parse(JSON.stringify(src));
+    one.foundryBatches = [{ ...one.foundryBatches[0], base }];
+    const t = fresh();
+    assert.equal(op(t, 'importState', { state: one }).batches.added, ok ? 1 : 0, base);
+  }
+});
+
 // ---------- hub function ----------
 
 function fakeStore() {
@@ -361,9 +397,20 @@ test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
     let out = cli('foundry', 'dispatch', '--title', 'Two things', '--repo', 'me/planner', '--base', 'main',
       '--subtask', 'Add X::do x::a.py,b/c.py::M', '--subtask', 'Add Y');
     assert.match(out, /S-001 dispatched to Foundry \(me\/planner, 2 subtasks\)/);
+    assert.match(cli('foundry', 'dispatch', '--title=Eq form', '--repo=me/planner', '--base=dev', '--subtask=Only one'), /S-002 dispatched/);
+    const eq = JSON.parse(fs.readFileSync(env.DEPT_DATA, 'utf8')).foundryBatches[1];
+    assert.equal(eq.base, 'dev');
+    assert.equal(eq.title, 'Eq form');
+    assert.equal(eq.subtasks[0].title, 'Only one');
+    const badBase = spawnSync(process.execPath, [CLI, 'foundry', 'dispatch', '--title=x', '--repo=me/p', '--base=--upload-pack=x', '--subtask=a'], { env, encoding: 'utf8' });
+    assert.notEqual(badBase.status, 0);
+    assert.match(badBase.stderr, /branch/);
+    const flagValue = spawnSync(process.execPath, [CLI, 'foundry', 'list', '--open=yes'], { env, encoding: 'utf8' });
+    assert.match(flagValue.stderr, /--open takes no value/);
+    cli('foundry', 'cancel', 'S-002');
     const file = path.join(dir, 'batch.json');
     fs.writeFileSync(file, JSON.stringify(sample({ title: 'From JSON' })));
-    assert.match(cli('foundry', 'dispatch', '--json', file), /S-002 dispatched/);
+    assert.match(cli('foundry', 'dispatch', '--json', file), /S-003 dispatched/);
     const st = JSON.parse(fs.readFileSync(env.DEPT_DATA, 'utf8'));
     assert.deepEqual(st.foundryBatches[0].subtasks[0].files, ['a.py', 'b/c.py']);
     assert.equal(st.foundryBatches[0].subtasks[0].size, 'M');
@@ -381,9 +428,9 @@ test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
     assert.equal(JSON.parse(cli('foundry', 'poll', 'S-001', '--json')).results['1'].foundryTask, 'F-007');
     assert.equal(JSON.parse(cli('foundry', 'poll', '--json', 'S-001')).id, 'S-001');
     out = cli('foundry', 'list');
-    assert.ok(out.indexOf('S-002') < out.indexOf('S-001'), 'newest first');
-    assert.match(cli('foundry', 'cancel', 'S-002'), /S-002 cancelled/);
-    assert.doesNotMatch(cli('foundry', 'list', '--open'), /S-002/);
+    assert.ok(out.indexOf('S-003') < out.indexOf('S-001'), 'newest first');
+    assert.match(cli('foundry', 'cancel', 'S-003'), /S-003 cancelled/);
+    assert.doesNotMatch(cli('foundry', 'list', '--open'), /S-003/);
     const bad = spawnSync(process.execPath, [CLI, 'foundry', 'dispatch', '--title', 'x', '--repo', 'me/p', '--subtask', 'A::d::../up'], { env, encoding: 'utf8' });
     assert.notEqual(bad.status, 0);
     assert.match(bad.stderr, /must not contain/);

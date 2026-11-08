@@ -432,12 +432,42 @@ def test_injected_runner_flow(tmp_path: Path) -> None:
     assert res.ok and res.pr_url == "https://example.test/pull/7" and res.base == "trunk"
     assert res.commit == "deadbeef" and res.branch == "foundry/f-3-do-it"
     joined = [" ".join(c[1:]) for c in runner.calls]
-    assert any(j.startswith("push --quiet -u origin refs/heads/foundry/f-3-do-it:") for j in joined)
+    assert any(j.startswith("push --quiet -u -- origin refs/heads/foundry/f-3-do-it:") for j in joined)
+    assert any(j == "fetch --quiet -- origin trunk" for j in joined)
     assert not any("--force" in c or "-f" in c for c in runner.calls if c[1] == "push")
     assert not any("--no-verify" in c for c in runner.calls)
     pr = next(c for c in runner.calls if c[1:3] == ["pr", "create"])
     assert pr[pr.index("--base") + 1] == "trunk" and "B" not in pr
     assert any(c[1:3] == ["worktree", "remove"] for c in runner.calls)
+
+
+@pytest.mark.parametrize("bad", ["--upload-pack=touch X;git-upload-pack", "-x", "a..b", "/abs", "a b", "a;b", "x" * 201])
+def test_option_like_base_is_refused_before_any_git_call(tmp_path: Path, bad: str) -> None:
+    patch = tmp_path / "p.patch"
+    patch.write_text("diff\n", encoding="utf-8")
+    runner = FakeRunner()
+    pub = GitPublisher(tmp_path, runner=runner, gh="g", git="git-fake", worktree_root=tmp_path / "wt")
+    res = asyncio.run(pub.publish("F-3", "Do it", patch, {"title": "T"}, base=bad))
+    assert not res.ok and res.stage == "bad_ref" and "not a plain branch name" in res.error
+    res = asyncio.run(pub.open_pr("foundry/f-3-x", {"title": "T"}, base=bad))
+    assert not res.ok and res.stage == "bad_ref"
+    res = asyncio.run(pub.open_pr(bad, {"title": "T"}))
+    assert not res.ok and res.stage == "bad_ref"
+    configured = GitPublisher(tmp_path, runner=runner, gh="g", git="git-fake", base=bad,
+                              worktree_root=tmp_path / "wt")  # FOUNDRY_PR_BASE
+    res = asyncio.run(configured.publish("F-3", "Do it", patch, {"title": "T"}))
+    assert not res.ok and res.stage == "bad_ref"
+    assert runner.calls == []  # nothing was run
+    assert not (tmp_path / "X").exists()
+
+
+def test_valid_ref_accepts_plain_branches() -> None:
+    from foundry.git_publisher import valid_ref
+
+    for ok in ("main", "release/1.2", "feature_x-y", "foundry/f-012-add-clamp"):
+        assert valid_ref(ok)
+    for bad in ("", None, "-main", "main/", "a..b", "a:b", "a~1", "refs/heads/a^"):
+        assert not valid_ref(bad)
 
 
 def test_injected_runner_timeout_is_push_failed(tmp_path: Path) -> None:

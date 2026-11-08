@@ -91,9 +91,17 @@ function parse(argv) {
   const opt = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    const eq = a.startsWith('--') ? a.indexOf('=') : -1;
     if (a === '-m') opt.message = argv[++i];
     else if (a === '--subtask') (opt.subtask ||= []).push(argv[++i]); // repeatable
-    else if (a.startsWith('--')) {
+    else if (eq > 2) {
+      // --key=value
+      const key = a.slice(2, eq);
+      const value = a.slice(eq + 1);
+      if (FLAGS.has(key)) throw new core.DeptError(`--${key} takes no value`);
+      if (key === 'subtask') (opt.subtask ||= []).push(value);
+      else opt[key] = value;
+    } else if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];
       if (next === undefined || next.startsWith('--') || next === '-m' || FLAGS.has(key)) opt[key] = true;

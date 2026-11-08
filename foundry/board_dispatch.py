@@ -622,6 +622,7 @@ class BatchWatcher:
 
     def _submit(self, batch: Mapping[str, Any], key: str, sub: Mapping[str, Any]) -> str:
         from foundry.floor_manager import WorkOrder
+        from foundry.git_publisher import valid_ref
         from foundry.serve import Service
 
         fields = Service.validate_order({
@@ -636,6 +637,9 @@ class BatchWatcher:
         desc = (desc + "\n\n" if desc else "") + f"{context}\n{marker(str(batch['id']), key, batch.get('createdAt'))}"
         acceptance = [str(a) for a in (sub.get("acceptance") or sub.get("acceptance_criteria") or []) if str(a).strip()]
         base = str(batch.get("base") or "").strip() or None  # else the publisher's (FOUNDRY_PR_BASE / repo default)
+        if base is not None and not valid_ref(base):
+            # the board checks this too; never hand git anything that could read as an option
+            raise ValueError(f"the batch base {base[:80]!r} is not a plain branch name")
         order = WorkOrder(title=fields["title"], description=desc, files=fields["files"],
                           acceptance_criteria=acceptance, repo_root=str(self.service.repo), pr_base=base)
         manager = self.service.factory.manager

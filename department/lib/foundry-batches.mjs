@@ -352,13 +352,77 @@ export function cancelBatch(state, { id, by } = {}) {
   return { ok: true, batch: b };
 }
 
+// An imported batch gets the same checks as dispatchBatch (repo, base, title,
+// subtasks with files/limits/keys/deps) plus checks on status, claim and
+// results. Returns a clean copy or throws DeptError.
+function validateImported(raw) {
+  if (!isObj(raw)) throw bad('batch must be an object');
+  const id = String(raw.id || '');
+  if (!/^S-\d{1,9}$/.test(id)) throw bad('bad batch id');
+  if (!BATCH_STATUSES.includes(raw.status)) throw bad(`bad status ${raw.status}`);
+  const iso = (v, name) => {
+    if (v === undefined || v === null || v === '') return null;
+    if (typeof v !== 'string' || !Number.isFinite(Date.parse(v))) throw bad(`${name} must be a time`);
+    return v;
+  };
+  const b = {
+    id,
+    title: text(raw.title, 'title', LIMITS.title, { required: true }),
+    goal: text(raw.goal, 'goal', LIMITS.goal),
+    repo: repoSlug(raw.repo),
+    base: branch(raw.base),
+    createdAt: iso(raw.createdAt, 'createdAt'),
+    createdBy: text(raw.createdBy, 'createdBy', 100) || 'floor-manager',
+    updatedAt: iso(raw.updatedAt, 'updatedAt'),
+    finishedAt: iso(raw.finishedAt, 'finishedAt'),
+    status: raw.status,
+    claimedBy: null,
+    heartbeatAt: iso(raw.heartbeatAt, 'heartbeatAt'),
+    note: text(raw.note, 'note', LIMITS.note),
+    subtasks: cleanSubtasks(raw.subtasks),
+    results: {},
+  };
+  if (raw.claimedBy !== undefined && raw.claimedBy !== null) {
+    if (!isObj(raw.claimedBy)) throw bad('claimedBy must be an object');
+    b.claimedBy = {
+      host: text(raw.claimedBy.host, 'claimedBy host', 200, { required: true }),
+      service: text(raw.claimedBy.service, 'claimedBy service', 200, { required: true }),
+      at: iso(raw.claimedBy.at, 'claimedBy at'),
+    };
+  }
+  if (raw.results !== undefined && raw.results !== null) {
+    if (!isObj(raw.results)) throw bad('results must be an object');
+    for (const [key, r] of Object.entries(raw.results)) {
+      const clean = cleanResult(b, key, r);
+      b.results[key] = {
+        foundryTask: clean.foundryTask ?? null,
+        state: clean.state ?? 'queued',
+        pr: clean.pr ?? null,
+        error: clean.error ?? null,
+        updatedAt: iso(r.updatedAt, 'result updatedAt'),
+      };
+    }
+  }
+  return b;
+}
+
 // ---------- importState ----------
 // Same id + same createdAt = the same batch: the more recently updated copy
 // wins. Same id, different batch: appended under a fresh S-###. New ids are kept.
+// Every incoming batch is validated first; invalid ones are dropped and listed
+// in result.rejected as {id, reason}.
 export function importBatches(state, incoming) {
   normalizeBatches(state);
-  const theirs = Array.isArray(incoming) ? incoming.filter((b) => isObj(b) && typeof b.id === 'string') : [];
-  const result = { added: 0, updated: 0, idMap: {} };
+  const result = { added: 0, updated: 0, idMap: {}, rejected: [] };
+  const theirs = [];
+  for (const raw of Array.isArray(incoming) ? incoming : []) {
+    try {
+      theirs.push(validateImported(raw));
+    } catch (err) {
+      if (!(err instanceof DeptError)) throw err;
+      result.rejected.push({ id: isObj(raw) ? String(raw.id ?? '').slice(0, 40) : '', reason: err.message });
+    }
+  }
   const highest = theirs.reduce((m, b) => Math.max(m, Number(/^S-(\d+)$/.exec(b.id)?.[1]) || 0), 0);
   // Reserve numbers above both boards' batches so kept ids and fresh ids never collide.
   if (state.nextBatchNumber <= highest) state.nextBatchNumber = highest + 1;
