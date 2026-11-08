@@ -288,6 +288,11 @@ class BatchWatcher:
         self._task: asyncio.Task[Any] | None = None
         self._warned_down = False
         self._lock = asyncio.Lock()
+        configured = getattr(getattr(service, "config", None), "allowed_repos", None)
+        #: FOUNDRY_ALLOWED_REPOS as configured; empty means no allowlist.
+        self.allowed_repos: list[str] = [str(r) for r in configured] if isinstance(configured, (list, tuple)) else []
+        self._allowed_keys = frozenset(r.strip().lower() for r in self.allowed_repos)
+        self._warned_no_allowlist = False
         self.heartbeat_s = HEARTBEAT_S
         #: batch id -> when the last updateBatch was accepted (this run).
         self._last_sent: dict[str, float] = {}
@@ -325,7 +330,8 @@ class BatchWatcher:
 
     def summary(self) -> dict[str, Any]:
         return {"enabled": self.enabled and bool(self.repo_slug), "repo": self.repo_slug, "service": self.service_id,
-                "rounds": self.rounds, "claimed": list(self.claimed), "last_error": self.last_error}
+                "rounds": self.rounds, "claimed": list(self.claimed), "last_error": self.last_error,
+                "allowed_repos": list(self.allowed_repos)}
 
     # ------------------------------------------------------------------ one round
 
@@ -385,8 +391,19 @@ class BatchWatcher:
         repo = batch.get("repo")
         return isinstance(repo, str) and bool(self.repo_slug) and repo.strip().lower() == str(self.repo_slug).lower()
 
+    def _allowed(self, batch: Mapping[str, Any]) -> bool:
+        """True when ``FOUNDRY_ALLOWED_REPOS`` lets this batch be claimed; an empty list allows all (warned once)."""
+        if not self._allowed_keys:
+            if not self._warned_no_allowlist:
+                log.warning("board dispatch: FOUNDRY_ALLOWED_REPOS is empty; any batch queued for %s can be claimed",
+                            self.repo_slug)
+                self._warned_no_allowlist = True
+            return True
+        repo = batch.get("repo")
+        return isinstance(repo, str) and repo.strip().lower() in self._allowed_keys
+
     def _claimable(self, batch: Mapping[str, Any]) -> bool:
-        if not self._matches_repo(batch):
+        if not self._matches_repo(batch) or not self._allowed(batch):
             return False
         status = batch.get("status")
         if status == "queued":
