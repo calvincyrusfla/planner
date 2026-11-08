@@ -19,7 +19,7 @@ from foundry.board_bridge import BoardBridge
 from foundry.config import FoundryConfig
 from foundry.floor_manager import WorkOrder, build_factory
 from foundry.main import demo_claude, demo_gemma, write_demo_repo
-from foundry.serve import OrderError, Service, build_parser, monitor_interval, run_service, serve_port
+from foundry.serve import OrderError, Service, build_parser, enable_ctrl_c, monitor_interval, run_service, serve_port
 
 ORDER = {"title": "Add clamp helper", "description": "Add clamp(x, lo, hi).", "files": ["shop/mathx.py"]}
 
@@ -440,3 +440,27 @@ def test_other_oserrors_are_not_labelled_port_in_use(tmp_path: Path) -> None:
         assert not any(p.running for p in svc.closed_factory.pools.values())
 
     asyncio.run(go())
+
+
+def test_enable_ctrl_c_calls_kernel32_only_on_windows() -> None:
+    calls: list[tuple[Any, Any]] = []
+
+    class FakeKernel32:
+        def SetConsoleCtrlHandler(self, handler: Any, add: Any) -> int:  # noqa: N802
+            calls.append((handler, add))
+            return 1
+
+    assert enable_ctrl_c("linux", FakeKernel32()) is False
+    assert calls == []
+    assert enable_ctrl_c("win32", FakeKernel32()) is True
+    assert calls == [(None, False)]
+
+
+def test_enable_ctrl_c_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Broken:
+        def SetConsoleCtrlHandler(self, handler: Any, add: Any) -> int:  # noqa: N802
+            raise OSError("no console")
+
+    assert enable_ctrl_c("win32", Broken()) is False
+    monkeypatch.setattr("sys.platform", "win32")
+    assert enable_ctrl_c() is False  # no ctypes.windll off Windows: swallowed
