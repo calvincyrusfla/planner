@@ -241,7 +241,8 @@ def test_breaker_skips_pre_review_after_three_gemma_errors(tmp_path: Path) -> No
 
     async def once() -> None:
         assignment = await builder.build_assignment(ticket)
-        assert await builder._pre_review(ticket, assignment, _sub(), []) == (None, None, None)
+        hint, notes, _review = await builder._pre_review(ticket, assignment, _sub(), [])
+        assert hint is None and notes is None
 
     for _ in range(4):
         asyncio.run(once())

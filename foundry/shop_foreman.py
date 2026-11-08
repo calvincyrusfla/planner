@@ -516,6 +516,16 @@ def _outcome_predicted(outcome: Any) -> str | None:
     return value if value in SIZE_ORDER else None
 
 
+def _outcome_raw(outcome: Any) -> str | None:
+    """The size predicted before calibration (``raw_predicted``; ``predicted`` on old rows)."""
+    value = str(_outcome_get(outcome, "raw_predicted", default="")).upper()
+    return value if value in SIZE_ORDER else _outcome_predicted(outcome)
+
+
+def _excluded(outcome: Any) -> bool:
+    return bool(_field(outcome, "excluded_from_calibration"))
+
+
 def _outcome_actual(outcome: Any) -> str | None:
     """The outcome's actual size: its stored value, else the queue's ``actual_complexity``."""
     value = str(_outcome_get(outcome, "actual_complexity", "actual", default="")).upper()
@@ -550,7 +560,7 @@ def similar_outcomes(
     for k, outcome in enumerate(outcomes):
         if task_id and str(_field(outcome, "task_id") or "") == task_id:
             continue
-        if _outcome_predicted(outcome) is None or _outcome_actual(outcome) is None:
+        if _excluded(outcome) or _outcome_raw(outcome) is None or _outcome_actual(outcome) is None:
             continue
         f = len(want_files & set(_outcome_files(outcome)))
         w = len(want_words & _title_words(str(_field(outcome, "title") or "")))
@@ -567,7 +577,7 @@ def _example_line(outcome: Any) -> str:
     attempts = _outcome_get(outcome, "builder_attempts", "total_attempts", "attempts", default=0)
     calls = _outcome_get(outcome, "claude_calls", default=0)
     return (
-        f"Past task {title} (files {shown}): you predicted {_outcome_predicted(outcome)}, "
+        f"Past task {title} (files {shown}): you predicted {_outcome_raw(outcome)}, "
         f"it actually took {_outcome_actual(outcome)} ({attempts} attempts, {calls} Claude calls)"
     )
 
@@ -575,7 +585,10 @@ def _example_line(outcome: Any) -> str:
 def calibration_shifts(outcomes: Sequence[Any]) -> dict[str, dict[str, Any]]:
     """Bias rules: predicted size -> {to, n, bigger, smaller, pct, direction}.
 
-    For each predicted size, the most recent :data:`CALIBRATION_WINDOW`
+    Rows are bucketed by the *raw* prediction (``raw_predicted``, before any
+    shift; ``predicted`` on old rows), so applied shifts never feed back into
+    the rule; rows flagged ``excluded_from_calibration`` are ignored. For each
+    raw predicted size, the most recent :data:`CALIBRATION_WINDOW`
     outcomes are counted; with at least :data:`CALIBRATION_MIN_OUTCOMES` of
     them and :data:`CALIBRATION_SHIFT_SHARE` or more actually bigger (or
     smaller), sizes predicted that way move one step up (or down). Never more
@@ -583,7 +596,9 @@ def calibration_shifts(outcomes: Sequence[Any]) -> dict[str, dict[str, Any]]:
     """
     by_pred: dict[str, list[str]] = {}
     for outcome in outcomes:
-        pred, actual = _outcome_predicted(outcome), _outcome_actual(outcome)
+        if _excluded(outcome):
+            continue
+        pred, actual = _outcome_raw(outcome), _outcome_actual(outcome)
         if pred is None or actual is None:
             continue
         bucket = by_pred.setdefault(pred, [])
@@ -823,6 +838,10 @@ class ShopForeman:
         self.throttle_seconds = float(throttle_seconds)
         #: ``(repo=None, limit=50) -> list[outcome]`` (newest first); ``queue.sizing_outcomes`` when absent.
         self.outcomes_provider = outcomes_provider
+        #: Size Gemma / the heuristic chose for the latest sizing, before the calibration
+        #: shift (stored as the outcome's ``raw_predicted`` so calibration never learns from itself).
+        self.last_raw_complexity: str | None = None
+        self._gemma_raw: str | None = None
         self._raised: dict[str, datetime] = {}
         self._alert_day: str | None = None
         self._alert_seq = 0
@@ -1246,11 +1265,16 @@ class ShopForeman:
             )
             if directive is not None:
                 self.last_source["size_task_scope"] = "gemma"
+                # set with no await before the return, so the caller reads this task's value
+                self.last_raw_complexity = self._gemma_raw
                 return directive
         self.last_source["size_task_scope"] = "heuristic"
         complexity, rationale = heuristic_complexity(title, description, files, criteria)
+        raw = complexity
         complexity, rationale = self._calibrate(task_id, complexity, rationale, shifts)
-        return self._build_directive(task_id, team_id, title, complexity, rationale, files, criteria, None)
+        directive = self._build_directive(task_id, team_id, title, complexity, rationale, files, criteria, None)
+        self.last_raw_complexity = raw
+        return directive
 
     def _outcomes(self, repo: str | None = None, limit: int = 50) -> list[Any]:
         """Finished sizing outcomes (newest first) from the provider; ``[]`` on any problem."""
@@ -1284,15 +1308,17 @@ class ShopForeman:
         )
         return new, _clip(rationale, 500 - len(note)) + note
 
-    def calibration_summary(self) -> dict[str, Any]:
+    def calibration_summary(self, repo: str | None = None) -> dict[str, Any]:
         """How well past sizing matched reality, and the bias shifts in force.
 
         ``{n, accuracy_pct, under, over, shift_rules: [...]}``; ``under`` counts
         tasks that were actually bigger than predicted, ``over`` smaller.
-        ``accuracy_pct`` is ``None`` with no outcomes.
+        ``accuracy_pct`` is ``None`` with no outcomes. Accuracy compares the
+        applied (post-shift) prediction with the actual size; ``shift_rules``
+        use the same outcomes (``repo`` scope) as :meth:`size_task_scope`.
         """
         n = exact = under = over = 0
-        outcomes = self._outcomes()
+        outcomes = self._outcomes(repo)
         for outcome in outcomes:
             pred, actual = _outcome_predicted(outcome), _outcome_actual(outcome)
             if pred is None or actual is None:
@@ -1354,6 +1380,7 @@ class ShopForeman:
             if complexity not in BUILDERS_FOR:
                 raise ValueError(f"unknown complexity {complexity!r}")
             rationale = _clip(str(data.get("rationale") or "Sized by the Shop Foreman."), 500)
+            raw = complexity
             complexity, rationale = self._calibrate(task_id, complexity, rationale, shifts or {})
             raw_subtasks = data.get("subtasks")
             if not isinstance(raw_subtasks, list):
@@ -1376,6 +1403,7 @@ class ShopForeman:
             log.info("Shop Foreman: invalid Gemma sizing (%s); using heuristic", exc)
             return None
         self._save(task_id, "triage", _reply_tokens(reply, messages))
+        self._gemma_raw = raw
         return directive
 
     def _build_directive(

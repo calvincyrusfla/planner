@@ -153,3 +153,64 @@ def test_queue_sizing_outcomes_used_by_default(queue: FoundryQueue) -> None:
         pytest.skip("queue has no sizing_outcomes yet")
     f = ShopForeman(None, queue, None, None, FoundryConfig())
     assert f.calibration_summary()["n"] == 0
+
+
+# ---------------------------------------------------------------- feedback loop (review round 1)
+
+M_REPLY = {"complexity": "M", "rationale": "Two modules.", "subtasks": [
+    {"title": "A", "acceptance_criteria": ["a"], "allowed_files": ["a.py"]},
+    {"title": "B", "acceptance_criteria": ["b"], "allowed_files": ["b.py"]},
+]}
+
+
+def _size_and_record(f: ShopForeman, rows: list[dict[str, Any]], k: int, actual: str) -> str:
+    """Size one M-ish task, then record its outcome the way the floor manager does (newest first)."""
+    directive = run(f.size_task_scope(dict(M_TASK, task_id=f"R-{k}")))
+    row = outcome(f"R-{k}", directive.complexity, actual)
+    row["raw_predicted"] = f.last_raw_complexity
+    rows.insert(0, row)
+    return directive.complexity
+
+
+def test_calibration_does_not_learn_from_its_own_shift(queue: FoundryQueue) -> None:
+    rows = history_m_was_l()
+    f = foreman(queue, None, SimulatedGemmaClient(lambda req: M_REPLY))
+    f.outcomes_provider = Provider(rows)
+    applied = [_size_and_record(f, rows, k, "L") for k in range(60)]
+    assert applied == ["L"] * 60  # no oscillation: the rule holds while M tasks keep taking L
+    assert f.last_raw_complexity == "M"
+    assert calibration_shifts(rows)["M"]["to"] == "L"
+
+
+def test_calibration_unlearns_when_evidence_changes(queue: FoundryQueue) -> None:
+    rows = history_m_was_l(20)
+    f = foreman(queue, None, SimulatedGemmaClient(lambda req: M_REPLY))
+    f.outcomes_provider = Provider(rows)
+    applied = [_size_and_record(f, rows, k, "M") for k in range(20)]
+    assert applied[0] == "L" and applied[-1] == "M"
+    assert "M" not in calibration_shifts(rows)
+
+
+def test_heuristic_sets_raw_complexity(queue: FoundryQueue) -> None:
+    f = foreman(queue, history_m_was_l())
+    assert run(f.size_task_scope(M_TASK)).complexity == "L"
+    assert f.last_raw_complexity == "M"
+
+
+def test_old_rows_without_raw_and_excluded_rows() -> None:
+    rows = history_m_was_l()  # no raw_predicted: falls back to predicted
+    assert calibration_shifts(rows)["M"]["to"] == "L"
+    rows[0]["excluded_from_calibration"] = 1
+    assert calibration_shifts(rows) == {}  # only 7 usable rows left
+    rows[1]["raw_predicted"] = "S"  # bucketed by raw, not applied
+    assert "S" not in calibration_shifts(rows)
+
+
+def test_calibration_summary_takes_repo(queue: FoundryQueue) -> None:
+    rows = history_m_was_l() + [outcome("X-1", "S", "S", repo="/other")]
+    provider = Provider(rows)
+    f = ShopForeman(None, queue, None, None, FoundryConfig(), outcomes_provider=provider)
+    assert f.calibration_summary()["n"] == 9
+    scoped = f.calibration_summary("/other")
+    assert scoped["n"] == 1 and scoped["shift_rules"] == []
+    assert provider.calls[-1] == ("/other", 50)
