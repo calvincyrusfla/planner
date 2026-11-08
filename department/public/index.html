@@ -278,6 +278,15 @@
   .usage-update[aria-busy="true"] { cursor: progress; }
   .usage-update.waiting { cursor: default; }
   .usage-update[aria-disabled="true"]:hover { border-color: var(--border); background: var(--surface-2); }
+  /* Foundry metrics: one card per reporting service, above the batches. */
+  .fm-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+  .fm-card { padding: 10px 14px; min-width: 0; }
+  .fm-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 10px; margin-bottom: 6px; }
+  .fm-when, .fm-more { font-size: 12px; color: var(--muted); }
+  .fm-rows { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; margin: 0; font-size: 13px; }
+  .fm-rows dt { color: var(--muted); overflow-wrap: anywhere; }
+  .fm-rows dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .fm-more { margin-top: 6px; }
   .usage-update .spin { display: none; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--muted); border-top-color: transparent; animation: usage-spin .8s linear infinite; }
   .usage-update[aria-busy="true"] .spin { display: inline-block; }
   .usage-update .lbl { font-variant-numeric: tabular-nums; }
@@ -1046,6 +1055,45 @@ function batchCard(b) {
     ${['queued', 'claimed'].includes(b.status) ? `<div class="batch-actions"><button class="small danger" data-cancel-batch="${esc(b.id)}">Cancel</button></div>` : ''}
   </article>`;
 }
+// ---- Foundry metrics (state.foundryMetrics, latest report per service). Text only, never HTML. ----
+const METRIC_ROWS = 30;
+function metricEntries(value, prefix = '') {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return Object.entries(value).flatMap(([k, v]) => metricEntries(v, prefix ? `${prefix}.${k}` : k));
+  }
+  if (typeof value === 'number') return [[prefix, value.toLocaleString(undefined, { maximumFractionDigits: 2 })]];
+  return [[prefix, Array.isArray(value) ? JSON.stringify(value) : String(value)]];
+}
+function renderFoundryMetrics() {
+  const reports = (Array.isArray(state.foundryMetrics) ? state.foundryMetrics : [])
+    .filter((r) => r && r.metrics && typeof r.metrics === 'object')
+    .sort((a, b) => String(a.service).localeCompare(String(b.service)));
+  let wrap = document.getElementById('foundry-metrics-wrap');
+  if (!reports.length) { if (wrap) wrap.hidden = true; return; }
+  const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
+  if (!wrap) {
+    const before = document.getElementById('batches-wrap');
+    if (!before) return;
+    wrap = el('section', '', '');
+    wrap.id = 'foundry-metrics-wrap';
+    const list = el('div', 'fm-list', '');
+    list.id = 'foundry-metrics';
+    wrap.append(el('h2', '', 'Foundry metrics'), list);
+    before.before(wrap);
+  }
+  wrap.hidden = false;
+  document.getElementById('foundry-metrics').replaceChildren(...reports.map((r) => {
+    const card = el('div', 'card fm-card', '');
+    const head = el('div', 'fm-head', '');
+    head.append(el('b', '', String(r.service || '?')), el('span', 'fm-when', `${r.host ? `${r.host} · ` : ''}${actionTime(r.reportedAt) || 'unknown time'}`));
+    const rows = metricEntries(r.metrics);
+    const dl = el('dl', 'fm-rows', '');
+    for (const [name, value] of rows.slice(0, METRIC_ROWS)) dl.append(el('dt', '', name), el('dd', '', value));
+    card.append(head, dl);
+    if (rows.length > METRIC_ROWS) card.append(el('div', 'fm-more', `${rows.length - METRIC_ROWS} more, see dept.mjs foundry metrics`));
+    return card;
+  }));
+}
 function renderBatches() {
   const all = (Array.isArray(state.foundryBatches) ? state.foundryBatches : []).slice()
     .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')) || String(b.id).localeCompare(String(a.id)));
@@ -1070,7 +1118,7 @@ function render() {
     return;
   }
   pending = false;
-  renderStats(); renderTeams(); renderTime(); renderTasks(); renderBatches(); renderLog();
+  renderStats(); renderTeams(); renderTime(); renderTasks(); renderFoundryMetrics(); renderBatches(); renderLog();
 }
 document.addEventListener('focusout', () => setTimeout(() => pending && render(), 0));
 

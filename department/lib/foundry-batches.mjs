@@ -12,12 +12,13 @@
 //   subtasks: [{key, title, description, files: [], size: "S"|"M"|"L"|"XL"|null,
 //               acceptance: [], dependsOn: [keys], readFiles: []}],
 //   results: {[key]: {foundryTask: "F-012"|null, state, pr: {state,url,branch,error}|null,
-//                     error: string|null, updatedAt}},
+//                     error: string|null, updatedAt, usage?: {...}|null}},
 // }
 // Log entries go to state.log with kind "foundry" and batchId: dispatch, claims,
 // batch status changes and cancel only (not every result update).
 
 import { DeptError, clockNow } from './core.mjs';
+import { cleanUsage } from './foundry-metrics.mjs';
 
 export const BATCH_STATUSES = ['queued', 'claimed', 'running', 'done', 'failed', 'cancelled'];
 export const RESULT_STATES = ['queued', 'sizing', 'building', 'reviewing', 'complete', 'quarantined', 'failed'];
@@ -181,6 +182,7 @@ function cleanResult(batch, key, partial) {
   const pr = cleanPr(partial.pr);
   if (pr !== undefined) out.pr = pr;
   if (partial.error !== undefined) out.error = partial.error === null ? null : text(partial.error, 'error', LIMITS.error) || null;
+  if (partial.usage !== undefined) out.usage = cleanUsage(partial.usage, `result for ${key} usage`);
   return out;
 }
 
@@ -354,6 +356,17 @@ export function cancelBatch(state, { id, by } = {}) {
   return { ok: true, batch: b };
 }
 
+// Usage is optional reporting: an imported result with bad usage loses the
+// usage, not its whole batch. Returns undefined when there is none to keep.
+function importedUsage(usage, name) {
+  try {
+    return cleanUsage(usage, name);
+  } catch (err) {
+    if (!(err instanceof DeptError)) throw err;
+    return undefined;
+  }
+}
+
 // An imported batch gets the same checks as dispatchBatch (repo, base, title,
 // subtasks with files/limits/keys/deps) plus checks on status, claim and
 // results. Returns a clean copy or throws DeptError.
@@ -395,12 +408,14 @@ function validateImported(raw) {
   if (raw.results !== undefined && raw.results !== null) {
     if (!isObj(raw.results)) throw bad('results must be an object');
     for (const [key, r] of Object.entries(raw.results)) {
-      const clean = cleanResult(b, key, r);
+      const clean = cleanResult(b, key, isObj(r) ? { ...r, usage: undefined } : r);
+      const usage = importedUsage(r.usage, `result for ${key} usage`);
       b.results[key] = {
         foundryTask: clean.foundryTask ?? null,
         state: clean.state ?? 'queued',
         pr: clean.pr ?? null,
         error: clean.error ?? null,
+        ...(usage !== undefined ? { usage } : {}),
         updatedAt: iso(r.updatedAt, 'result updatedAt'),
       };
     }
