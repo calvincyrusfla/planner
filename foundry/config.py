@@ -317,6 +317,11 @@ class FoundryConfig(BaseModel):
         description="Base branch for Foundry PRs (None: the repo's default branch).",
     )
     pr_draft: bool = Field(default=False, description="Open Foundry PRs as drafts.")
+    allowed_repos: list[str] = Field(
+        default_factory=list,
+        description=(
+            "owner/name repos whose board batches may be claimed (case-insensitive). "
+            "Empty: no allowlist, every batch for this Foundry's repo is claimable."
     secret_scan: bool = Field(
         default=True,
         description=(
@@ -353,6 +358,12 @@ class FoundryConfig(BaseModel):
         if len(set(cleaned)) != len(cleaned):
             raise ValueError("team ids must be unique")
         return cleaned
+
+    @field_validator("allowed_repos")
+    @classmethod
+    def _clean_allowed_repos(cls, value: list[str]) -> list[str]:
+        """Strip entries and drop blanks and exact duplicates, keeping the order."""
+        return list(dict.fromkeys(r.strip() for r in value if r.strip()))
 
     @field_validator("pr_base")
     @classmethod
@@ -486,6 +497,10 @@ class FoundryConfig(BaseModel):
             foreman_model = env.get("FOREMAN_MODEL", "").strip()
             if foreman_model:
                 data["gemma_model"] = foreman_model
+
+        allowed_repos = get("ALLOWED_REPOS")
+        if allowed_repos is not None:
+            data["allowed_repos"] = allowed_repos.split(",")
 
         teams = get("TEAMS")
         if teams is not None:
