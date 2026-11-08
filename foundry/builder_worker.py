@@ -775,7 +775,15 @@ class _WorkerBase:
             return False
         if _get(current, "status") != "claimed":
             return False
-        return int(_get(current, "attempt", 0) or 0) == int(_get(ticket, "attempt", 0) or 0)
+        if int(_get(current, "attempt", 0) or 0) != int(_get(ticket, "attempt", 0) or 0):
+            return False
+        # the same claim, not a later one (an undo/retry/reset can reopen a ticket with the
+        # same attempt and another builder claim it): compare the claim's time and holder
+        for key in ("claimed_at", "claimed_by"):
+            mine = _get(ticket, key, None)
+            if mine is not None and _get(current, key, None) != mine:
+                return False
+        return True
 
     def _send_back(self, ticket: Any, hint: str, *, reason: str) -> str:
         """Reopen ``ticket`` with ``hint`` (attempt + 1) or quarantine at the cap.
@@ -1999,6 +2007,8 @@ class TeamPool:
         ]
         self.reviewer = self._make_reviewer(reviewer_id or f"{team_id}-6")
         self.peer_reviewers: dict[str, ReviewerWorker] = {}
+        #: agent id -> the stop event of its peer reviewer (see :meth:`demote_peer_reviewer`).
+        self._peer_stops: dict[str, asyncio.Event] = {}
         self.completed_tasks: list[str] = []
         self._stop: asyncio.Event | None = None
         self._tasks: list[asyncio.Task[None]] = []
@@ -2148,6 +2158,7 @@ class TeamPool:
         builder.promoted = True  # M1: no build tickets while reviewing
         peer_stop = asyncio.Event()
         pool_stop = self._stop
+        self._peer_stops[agent_id] = peer_stop
 
         async def run_peer() -> None:
             async def expire() -> None:
@@ -2164,6 +2175,19 @@ class TeamPool:
                 timer.cancel()
                 self.peer_reviewers.pop(agent_id, None)
                 builder.promoted = False
+                self._peer_stops.pop(agent_id, None)
 
         self._tasks.append(asyncio.create_task(run_peer(), name=f"{agent_id}-peer-reviewer"))
         return agent_id
+
+    def demote_peer_reviewer(self, agent_id: str) -> bool:
+        """Undo PROMOTE_PEER_REVIEWER: stop ``agent_id``'s peer reviewer early.
+
+        The peer finishes its current review (if any) and the slot builds
+        again. Returns False when ``agent_id`` is not a running peer.
+        """
+        stop = self._peer_stops.get(agent_id)
+        if stop is None or agent_id not in self.peer_reviewers:
+            return False
+        stop.set()
+        return True

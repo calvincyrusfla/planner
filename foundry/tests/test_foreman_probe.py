@@ -345,6 +345,64 @@ def test_setup_sh_without_ollama_prints_download_link(tmp_path: Path) -> None:
     assert "https://ollama.com/download" in proc.stdout
 
 
+def _fake_gh(bin_dir: Path, tmp_path: Path, *, logged_in: bool) -> Path:
+    """A fake ``gh`` that records its argv; ``gh auth status`` exits 0 when logged in."""
+    calls = tmp_path / "gh-calls"
+    gh = bin_dir / "gh"
+    gh.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\nexit {0 if logged_in else 1}\n')
+    gh.chmod(0o755)
+    return calls
+
+
+@needs_bash
+@pytest.mark.parametrize("logged_in", [True, False])
+def test_setup_sh_reports_gh_login(tmp_path: Path, logged_in: bool) -> None:
+    bin_dir, _ = _fake_bin(tmp_path)
+    calls = _fake_gh(bin_dir, tmp_path, logged_in=logged_in)
+    proc = _run_sh(tmp_path, bin_dir)
+    out = proc.stdout
+    assert proc.returncode == 0, out + proc.stderr  # never fails the setup
+    assert calls.read_text().split() == ["auth", "status"]  # read-only check only
+    assert f"gh found: {bin_dir / 'gh'}" in out
+    if logged_in:
+        assert "gh is logged in" in out and "gh auth login" not in out
+    else:
+        assert "gh is not logged in. Run: gh auth login" in out
+    # After the speed check, before the next-step line.
+    assert out.index("-m foundry.gemma_doctor") < out.index("GitHub check") < out.index("-m foundry.main")
+
+
+@needs_bash
+def test_setup_sh_without_gh_still_succeeds(tmp_path: Path) -> None:
+    bin_dir, _ = _fake_bin(tmp_path)
+    proc = _run_sh(tmp_path, bin_dir)
+    out = proc.stdout
+    assert proc.returncode == 0, out + proc.stderr
+    assert "gh is not installed" in out and "https://cli.github.com/" in out
+    assert "FOUNDRY_AUTO_PR=0" in out
+    assert out.strip().splitlines()[-1].endswith('-m foundry.main --real --repo <path> --title "..."')
+
+
+def test_setup_bat_gh_check() -> None:
+    text = BAT_SCRIPT.read_bytes().decode("ascii")
+    gh = text[text.index("\r\n:gh_check\r\n") : text.index("\r\n:gpu_line\r\n")]
+    for needle in (
+        "where gh",
+        "gh auth status >nul 2>&1",
+        "winget install --id GitHub.cli",
+        "gh auth login",
+        "%ProgramFiles%\\GitHub CLI\\gh.exe",
+        "FOUNDRY_AUTO_PR=0",
+    ):
+        assert needle in gh, needle
+    # Never changes the exit code, and every branch returns.
+    assert "RC=" not in gh
+    assert gh.count("exit /b 0") == 3
+    # Runs once, at the shared next-step point (after the doctor, both real and dry-run).
+    assert text.count("call :gh_check") == 1
+    assert text.index(":next_step\r\n") < text.index("call :gh_check") < text.index(":next_step_venv\r\n")
+
+
 # --------------------------------------------------------------------------- setup_foreman.bat (static)
 
 

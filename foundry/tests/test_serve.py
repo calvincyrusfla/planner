@@ -324,7 +324,7 @@ def test_health_reports_clients(tmp_path: Path) -> None:
         await svc.start()
         try:
             h = svc.health()
-            assert set(h) == {"ok", "repo", "model", "gemma_ok", "claude_ok", "version", "gemma_speed"}
+            assert set(h) == {"ok", "repo", "model", "gemma_ok", "claude_ok", "version", "gemma_speed", "pr_ready", "pr_reason"}
             assert h["gemma_ok"] is False and h["claude_ok"] is True
         finally:
             await svc.stop()

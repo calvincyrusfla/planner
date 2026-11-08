@@ -177,6 +177,8 @@ class PrescribedAction(str, Enum):
     PROMOTE_PEER_REVIEWER = "PROMOTE_PEER_REVIEWER"
     THROTTLE_DISPATCH = "THROTTLE_DISPATCH"
     RESIZE_ALLOCATION = "RESIZE_ALLOCATION"
+    REASSIGN_TEAM = "REASSIGN_TEAM"
+    RETRY_TASK = "RETRY_TASK"
     NONE = "NONE"
 
     def __str__(self) -> str:  # pragma: no cover - trivial

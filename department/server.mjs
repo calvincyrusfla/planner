@@ -258,7 +258,22 @@ async function refreshUsage(req, res) {
 // endpoints only, short timeouts, and the SSE answer of POST /ask is streamed through.
 const FOUNDRY_PORT = Number(process.env.FOUNDRY_SERVE_PORT) || 4310;
 const FOUNDRY_DOWN = 'Foundry is not running — start it with foundry\\start_foundry.bat (or: python -m foundry.serve --repo <path>)';
-const FOUNDRY_ROUTES = { 'GET health': 3000, 'GET status': 5000, 'POST orders': 10000, 'POST ask': 15000 }; // ms until headers
+const FOUNDRY_ROUTES = { 'GET health': 3000, 'GET status': 5000, 'POST orders': 10000, 'POST ask': 15000, 'GET actions': 5000 }; // ms until headers
+// Routes with an id segment: [method, pattern, timeout]. Ids are short plain tokens only.
+const FOUNDRY_ID = '[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}';
+const FOUNDRY_PATTERNS = [
+  ['POST', new RegExp(`^actions/${FOUNDRY_ID}/undo$`), 10000],
+  ['POST', new RegExp(`^tasks/${FOUNDRY_ID}/pr/retry$`), 10000],
+];
+
+function foundryRoute(method, rest) {
+  if (FOUNDRY_ROUTES[`${method} ${rest}`]) return { timeout: FOUNDRY_ROUTES[`${method} ${rest}`] };
+  const exact = Object.keys(FOUNDRY_ROUTES).some((k) => k.endsWith(` ${rest}`));
+  const hit = FOUNDRY_PATTERNS.filter(([, re]) => re.test(rest));
+  const same = hit.find(([m]) => m === method);
+  if (same) return { timeout: same[2] };
+  return { known: exact || hit.length > 0 };
+}
 const FOUNDRY_IDLE_MS = 120000; // a streamed answer may pause this long between chunks
 
 async function readRaw(req) {
@@ -272,9 +287,8 @@ async function readRaw(req) {
 
 async function foundryProxy(req, res, rest) {
   if (!refreshAllowed(req)) return send(res, 403, { ok: false, error: 'Foundry is only reachable from this computer', code: 'forbidden' });
-  const timeout = FOUNDRY_ROUTES[`${req.method} ${rest}`];
+  const { timeout, known } = foundryRoute(req.method, rest);
   if (!timeout) {
-    const known = Object.keys(FOUNDRY_ROUTES).some((k) => k.endsWith(` ${rest}`));
     return send(res, known ? 405 : 404, { ok: false, error: known ? 'Method not allowed' : 'Not found' });
   }
   const body = req.method === 'POST' ? await readRaw(req) : '';
@@ -399,7 +413,7 @@ const server = http.createServer(async (req, res) => {
       if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use POST', code: 'method' });
       return await refreshUsage(req, res);
     }
-    const fm = url.pathname.match(/^\/api\/foundry\/([a-z]+)$/);
+    const fm = url.pathname.match(/^\/api\/foundry\/([a-z]+|actions\/[^/]+\/undo|tasks\/[^/]+\/pr\/retry)$/);
     if (fm) return await foundryProxy(req, res, fm[1]);
     if (url.pathname.startsWith('/api/foundry')) return send(res, 404, { ok: false, error: 'Not found' });
     if (url.pathname.startsWith('/api/')) {

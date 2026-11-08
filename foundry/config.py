@@ -56,6 +56,11 @@ Environment variable               Field (default)
                                    infrastructure failures on one ticket
                                    (timeouts, crashes; not usage limits)
                                    before its task is quarantined
+``FOUNDRY_AUTO_PR``                ``auto_pr`` (``true``): push every approved
+                                   task to its own branch and open a PR
+``FOUNDRY_PR_BASE``                ``pr_base`` (unset: the repo's default
+                                   branch, else the current branch)
+``FOUNDRY_PR_DRAFT``               ``pr_draft`` (``false``): open PRs as drafts
 =================================  ==========================================
 
 Empty environment values are treated as unset.  The rate-limit defaults are
@@ -258,6 +263,18 @@ class FoundryConfig(BaseModel):
         le=1,
         description="Minimum Gemma confidence for a pre-review send-back in gate mode.",
     )
+    auto_pr: bool = Field(
+        default=True,
+        description=(
+            "Push every approved task to its own foundry/<task>-<slug> branch (in a "
+            "temporary worktree) and open a pull request with Gemma's description."
+        ),
+    )
+    pr_base: str | None = Field(
+        default=None,
+        description="Base branch for Foundry PRs (None: the repo's default branch).",
+    )
+    pr_draft: bool = Field(default=False, description="Open Foundry PRs as drafts.")
 
     @field_validator("gemma_base_url")
     @classmethod
@@ -280,6 +297,14 @@ class FoundryConfig(BaseModel):
         if len(set(cleaned)) != len(cleaned):
             raise ValueError("team ids must be unique")
         return cleaned
+
+    @field_validator("pr_base")
+    @classmethod
+    def _blank_base_is_none(cls, value: str | None) -> str | None:
+        """Treat a blank PR base as "use the repo default"."""
+        if value is None or not value.strip():
+            return None
+        return value.strip()
 
     @field_validator("claude_append_prompt")
     @classmethod
@@ -374,6 +399,9 @@ class FoundryConfig(BaseModel):
             "INFRA_FAILURE_CAP": "infra_failure_cap",
             "PRE_REVIEW": "pre_review",
             "PRE_REVIEW_MIN_CONFIDENCE": "pre_review_min_confidence",
+            "AUTO_PR": "auto_pr",
+            "PR_BASE": "pr_base",
+            "PR_DRAFT": "pr_draft",
         }
         for var, field in simple.items():
             value = get(var)

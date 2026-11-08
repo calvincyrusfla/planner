@@ -484,11 +484,11 @@ def test_floor_manager_executes_each_action(tmp_path: Path) -> None:
         assert out.applied and out.detail == "no action"
 
     _run(go())
-    assert [a.action for a in m.actions] == [
+    assert [a.action for a in m.outcomes] == [
         "QUARANTINE_TASK", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "RESET_BUILDER_CONTEXT",
         "PROMOTE_PEER_REVIEWER", "PROMOTE_PEER_REVIEWER", "NONE",
     ]
-    assert [a.applied for a in m.actions] == [True, True, True, True, False, True, True]
+    assert [a.applied for a in m.outcomes] == [True, True, True, True, False, True, True]
     # every escalation is stored and posted to the board in the agreed format
     assert len(f.queue.escalations()) == 7
     posted = [op["args"]["message"] for op in f.bridge.ops if op["type"] == "reportProgress" and op["args"]["message"].startswith("[Foreman]")]
