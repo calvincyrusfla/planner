@@ -362,3 +362,84 @@ def test_retry_after_pr_failed_reuses_the_pushed_branch(tmp_path: Path) -> None:
     st = f.manager.pr_state(tid)
     assert st["state"] == "opened" and st["url"].endswith("/pull/7") and st["commit"] == "c0ffee"
     f.close()
+
+
+class CrashAfterPushPublisher(FakePublisher):
+    """``publish`` pushes (on_pushed), opens the PR, then hangs (the service dies before saving)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.branches: list[str] = []
+        self.prs: dict[str, str] = {}  # branch -> url ("GitHub")
+        self.open_calls: list[str] = []
+
+    async def publish(self, task_id: str, title: str, patch_path: Any, pr: dict[str, Any], *,
+                      on_pushed: Any = None) -> dict[str, Any]:
+        self.calls.append({"task_id": task_id})
+        branch = f"foundry/{task_id.lower()}-add-clamp"
+        self.branches.append(branch)
+        if on_pushed is not None:
+            on_pushed(branch, "c0ffee")
+        self.prs[branch] = "https://github.com/me/repo/pull/3"
+        await asyncio.sleep(30)  # killed here: the PR exists, the state is still pending
+        return {"ok": True, "branch": branch, "commit": "c0ffee", "pr_url": self.prs[branch]}
+
+    async def open_pr(self, branch: str, pr: dict[str, Any], *, base: str | None = None) -> dict[str, Any]:
+        self.open_calls.append(branch)
+        url = self.prs.setdefault(branch, f"https://github.com/me/repo/pull/{len(self.prs) + 3}")
+        return {"ok": True, "branch": branch, "pr_url": url, "base": base}
+
+
+def test_publish_succeeded_state_pending_restart_gives_one_branch_one_pr(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    pub = CrashAfterPushPublisher()
+    f = _factory(tmp_path, repo, pub)
+
+    async def first() -> str:
+        tid = await f.manager.submit(WorkOrder(**ORDER))
+        _seed(f.manager, tid, repo)
+        await f.manager.on_task_complete(tid)
+        await _until(lambda: pub.branches)
+        f.manager._pr_tasks[tid].cancel()  # the service dies
+        await asyncio.gather(f.manager._pr_tasks[tid], return_exceptions=True)
+        return tid
+
+    tid = asyncio.run(first())
+    f.close()  # nothing after on_pushed's own save
+
+    g = _factory(tmp_path, repo, pub)  # same "GitHub"
+    st = g.manager.pr_state(tid)
+    assert st["state"] == "pending" and st["branch"] == pub.branches[0] and st["commit"] == "c0ffee"
+
+    async def second() -> None:
+        assert g.manager.resume_publishing() == [tid]
+        await g.manager.drain()
+
+    asyncio.run(second())
+    assert len(pub.calls) == 1 and len(pub.branches) == 1  # never pushed again
+    assert pub.open_calls == [pub.branches[0]] and len(pub.prs) == 1
+    st = g.manager.pr_state(tid)
+    assert st["state"] == "opened" and st["url"] == "https://github.com/me/repo/pull/3"
+    g.close()
+
+
+def test_task_finished_before_auto_prs_is_never_published(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, repo, None)  # an older Foundry: no PRs
+    tid = asyncio.run(_complete(f, repo))
+    f.close()
+    (tmp_path / "patches" / f"{tid}.patch").unlink()  # the repair path rewrites it on the next start
+
+    pub = FakePublisher()
+    g = _factory(tmp_path, repo, pub)
+
+    async def go() -> None:
+        await g.manager.on_task_complete(tid)
+        await g.manager.drain()
+
+    asyncio.run(go())
+    assert (tmp_path / "patches" / f"{tid}.patch").is_file()
+    assert pub.calls == []
+    st = g.manager.pr_state(tid)
+    assert st["state"] == "skipped" and st["error"] == "finished before automatic PRs"
+    g.close()

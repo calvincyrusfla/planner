@@ -71,6 +71,11 @@ Runner = Callable[..., Awaitable[RunResult]]
 _TIMEOUT = 120.0
 _NET_TIMEOUT = 300.0
 _URL_RE = re.compile(r"https?://\S+")
+#: Inherited git location variables would point every command at another repository.
+_GIT_LOCATION_VARS = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+})
 
 
 @dataclass
@@ -127,23 +132,50 @@ async def default_runner(
         stderr=asyncio.subprocess.PIPE,
         env=dict(env) if env is not None else None,
     )
+    done = False
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        done = True
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), 10)
-        except asyncio.TimeoutError:
-            pass
         return None, "", f"timed out after {timeout:.0f}s"
+    finally:
+        if not done:  # timeout or cancellation: never leave the child running
+            _kill(proc)
+            try:
+                await asyncio.shield(asyncio.wait_for(proc.wait(), 10))
+            except (asyncio.TimeoutError, asyncio.CancelledError, ProcessLookupError):
+                pass
     return (
         proc.returncode,
         out.decode("utf-8", errors="replace"),
         err.decode("utf-8", errors="replace"),
     )
+
+
+def _kill(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def github_repo(url: str) -> str | None:
+    """``owner/name`` (``host/owner/name`` off github.com) from a remote URL; None if unparsable.
+
+    Handles ``https://[user@]host/owner/name(.git)``, ``ssh://git@host[:port]/owner/name(.git)``
+    and scp-style ``git@host:owner/name(.git)``. Local paths give None.
+    """
+    url = (url or "").strip()
+    m = re.match(r"^(?:https?|ssh|git)://(?:[^@/]+@)?([^/:]+)(?::\d+)?/([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        m = re.match(r"^(?:[^@/\s]+@)?([A-Za-z0-9.-]+\.[A-Za-z]+):/?([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        return None
+    host, owner, name = m.group(1).lower(), m.group(2), m.group(3)
+    if not owner or not name:
+        return None
+    return f"{owner}/{name}" if host in ("github.com", "www.github.com") else f"{host}/{owner}/{name}"
 
 
 class _Fail(Exception):
@@ -194,7 +226,7 @@ class GitPublisher:
 
     @staticmethod
     def _env() -> dict[str, str]:
-        env = dict(os.environ)
+        env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
         env["GIT_TERMINAL_PROMPT"] = "0"   # never hang on a credentials prompt
         env["GH_PROMPT_DISABLED"] = "1"
         env["GH_NO_UPDATE_NOTIFIER"] = "1"

@@ -1305,9 +1305,10 @@ class FloorManager:
         if known is not None:
             # repair: the summary (and the board's review/done) are already recorded
             await self._write_patch(task_id, diff, known)
-            self._queue_publish(task_id)
+            if self.auto_pr and self.publisher is not None and task_id not in self.pr_states:
+                # its summary was recorded before automatic PRs existed (or were on): never open one now
+                self._set_pr(task_id, "skipped", error="finished before automatic PRs", stage="before_auto_pr")
             self.save()
-            self._start_publish(task_id)
             return known
         summary = self._drafts.get(task_id)
         if summary is None:
@@ -1424,8 +1425,9 @@ class FloorManager:
     async def _publish(self, task_id: str) -> dict[str, Any]:
         st = dict(self.pr_states.get(task_id) or {})
         attempts = int(st.get("attempts") or 0) + 1
-        # branch + commit known: it was pushed and only the PR step failed (stage pr_failed)
-        pushed = bool(st.get("branch") and st.get("commit")) and callable(
+        # branch + commit known (only the PR step failed), or a pending one whose
+        # on_pushed was saved before a restart: it is on the remote -> open_pr only
+        pushed = bool(st.get("branch") and (st.get("commit") or st.get("state") == "pending")) and callable(
             getattr(self.publisher, "open_pr", None))
         keep = {k: st.get(k) for k in ("branch", "commit", "base", "stage")} if pushed else {}
         self._set_pr(task_id, "pending", attempts=attempts, **keep)
@@ -1440,8 +1442,11 @@ class FloorManager:
         try:
             publish = self.publisher.publish
             kwargs: dict[str, Any] = {}
-            if "draft" in _params(publish):
+            params = _params(publish)
+            if "draft" in params:
                 kwargs["draft"] = self.pr_draft
+            if "on_pushed" in params:
+                kwargs["on_pushed"] = lambda branch, commit=None: self._pushed(task_id, branch, commit)
             if pushed:
                 # only the PR step failed last time: open it for the branch already pushed
                 result = await _maybe_await(self.publisher.open_pr(st["branch"], req, base=st.get("base")))
@@ -1456,9 +1461,10 @@ class FloorManager:
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500], "stage": "error"}
         ok = bool(_get(result, "ok"))
         url = _get(result, "pr_url")
-        branch = _get(result, "branch") or keep.get("branch")
-        extra = {"commit": _get(result, "commit") or keep.get("commit"),
-                 "base": _get(result, "base") or keep.get("base")}
+        cur = self.pr_states.get(task_id) or {}  # on_pushed may have recorded the branch meanwhile
+        branch = _get(result, "branch") or cur.get("branch") or keep.get("branch")
+        extra = {"commit": _get(result, "commit") or cur.get("commit") or keep.get("commit"),
+                 "base": _get(result, "base") or cur.get("base") or keep.get("base")}
         if ok:
             rec = self._set_pr(task_id, "opened", url=url, branch=branch, attempts=attempts, **extra)
             d = self.directives.get(task_id)
@@ -1482,6 +1488,21 @@ class FloorManager:
         self.save()
         return rec
 
+    def _pushed(self, task_id: str, branch: Any, commit: Any = None) -> None:
+        """``on_pushed`` callback: the branch is on the remote; save it at once.
+
+        A restart after this point (even after the PR was created but before
+        the result was saved) goes through ``open_pr`` for this branch, which
+        finds an existing PR instead of pushing a second branch.
+        """
+        st = self.pr_states.get(task_id)
+        if st is None or not branch:
+            return
+        st["branch"] = str(branch)
+        if commit:
+            st["commit"] = str(commit)
+        self.save()
+
     def resume_publishing(self, only: Any = None) -> list[str]:
         """After a restart: retry, once, a publish that was cut off (``pending`` without a result).
 
@@ -1496,7 +1517,8 @@ class FloorManager:
                 continue
             if int(st.get("attempts") or 0) >= 2:
                 self._set_pr(tid, "failed", error="publishing was interrupted twice; use Retry",
-                             stage="interrupted", attempts=st.get("attempts"))
+                             stage="interrupted", attempts=st.get("attempts"),
+                             **{k: st.get(k) for k in ("branch", "commit", "base")})
                 continue
             if self._start_publish(tid) is not None:
                 started.append(tid)
@@ -1519,7 +1541,7 @@ class FloorManager:
             return {"ok": False, "reason": "the PR is already open", "pr": dict(st)}
         if self.is_publishing(task_id) or (st is not None and st.get("state") == "pending"):
             return {"ok": False, "reason": "already publishing", "pr": dict(st or {})}
-        reuse = st is not None and bool(st.get("branch") and st.get("commit"))
+        reuse = st is not None and bool(st.get("branch"))
         if not reuse and self._pr_patch(task_id) is None:
             return {"ok": False, "reason": "no applicable patch to publish"}
         # the branch is already pushed when only the PR step failed: keep it so the

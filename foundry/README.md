@@ -506,12 +506,12 @@ When the service starts it checks git, the `origin` remote and `gh` once. If som
 
 1. Gemma drafts the PR title and description (the same draft that goes into `<task>.md`). The description ends with `Opened by Foundry (task F-012)`.
 2. Foundry makes a **temporary git worktree** under `foundry\data\worktrees\`, starting from the base branch (`FOUNDRY_PR_BASE`, else the repository's default branch, else the branch you are on).
-3. It creates the branch `foundry/<task id>-<short title>`, for example `foundry/F-012-add-clamp-helper`. If that branch already exists it uses `-2`, `-3` and so on.
+3. It creates the branch `foundry/<task id>-<short title>`, in lower case, for example `foundry/f-012-add-clamp-helper`. If that branch already exists it uses `-2`, `-3` and so on.
 4. It applies the patch, commits it (as you: the name and e-mail from your git config; your git hooks run as usual), and pushes the branch to `origin`.
 5. It opens the pull request with `gh pr create` and records the link.
 6. It removes the temporary worktree.
 
-**Your working files and your current branch are never touched.** Everything happens in the separate worktree, which is deleted afterwards. Foundry never force-pushes, and never pushes to the base branch.
+**Your working files and your current branch are never touched.** Everything happens in the separate worktree, which is deleted afterwards. Foundry never force-pushes, and never pushes to the base branch. After a successful publish the local `foundry/*` branch is kept in your repository (it isn't checked out); you can delete it safely, for example `git branch -D foundry/f-012-add-clamp-helper`.
 
 You'll find the link in three places: the Foundry tasks list on the dashboard (**PR #12**, opens in your browser), a progress note on the board task, and the task's `pr` field in `/api/status` (`state` is `pending`, `opened`, `failed` or `skipped`, with `url`, `branch`, `error` and `stage`).
 
@@ -534,7 +534,7 @@ The Foundry tasks list then shows **PR failed** with a **Retry** button; hover o
 | `no_git` | git is not installed or not on the PATH. Install Git for Windows (`winget install --id Git.Git`), then restart Foundry |
 | `not_a_repo` | `--repo` is not a git repository. Start Foundry with the repository's folder |
 | `no_remote` | the repository has no `origin` remote. Add it: `git remote add origin https://github.com/<you>/<repo>.git` |
-| `apply_failed` | the patch doesn't apply to the base branch any more (it changed since the task ran). Merge `<task>.patch` by hand, or resubmit the task |
+| `apply_failed` | the patch doesn't apply to the base branch: either the base changed since the task ran, or your task depended on changes you haven't pushed (Foundry applies the patch to `origin/<base>`, not to your local checkout). Push those changes first and Retry, merge `<task>.patch` by hand, or resubmit the task |
 | `push_failed` | git couldn't push, usually because it isn't logged in or you can't write to the repository. Run `gh auth login` (answer Yes to git credentials), or `gh auth setup-git` |
 | `gh_missing` | the GitHub CLI is not installed: `winget install --id GitHub.cli`, open a new window, `gh auth login`, then restart Foundry |
 | `gh_not_logged_in` | run `gh auth login` |
