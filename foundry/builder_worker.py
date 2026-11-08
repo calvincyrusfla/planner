@@ -2360,7 +2360,12 @@ async def _complete_ticket(
 
 
 def _snapshot_files(workspace: Path, paths: Iterable[str]) -> dict[str, str | None]:
-    """Read the current text of ``paths`` under ``workspace`` (None when absent)."""
+    """Read the current text of ``paths`` under ``workspace`` (None when absent).
+
+    Read as bytes and decoded without newline translation, so CRLF files keep
+    their ``\\r\\n`` (diff normalisation and restores must be byte-exact).
+    A file that cannot be read or decoded is left out (never treated as absent).
+    """
     snap: dict[str, str | None] = {}
     root = workspace.resolve()
     for rel in paths:
@@ -2368,9 +2373,9 @@ def _snapshot_files(workspace: Path, paths: Iterable[str]) -> dict[str, str | No
         if not target.is_relative_to(root):
             continue  # apply_diff refuses these anyway
         try:
-            snap[rel] = target.read_text(encoding="utf-8") if target.is_file() else None
+            snap[rel] = target.read_bytes().decode("utf-8") if target.is_file() else None
         except (OSError, UnicodeDecodeError):
-            snap[rel] = None
+            continue
     return snap
 
 
@@ -2387,7 +2392,7 @@ def _restore_files(workspace: Path | None, snapshot: dict[str, str | None] | Non
                     target.unlink()
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding="utf-8")
+                target.write_bytes(text.encode("utf-8"))  # no newline translation (CRLF stays CRLF)
         except OSError:
             log.exception("could not restore %s", rel)
 

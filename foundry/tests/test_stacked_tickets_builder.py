@@ -445,3 +445,61 @@ def test_loose_raw_diff_is_stored_normalised_and_the_next_ticket_stacks(tmp_path
     ticket = rig.claim_tests()
     assert asyncio.run(rig.worker.process_ticket(ticket)) == "review"  # stacked, no stack_failed
     assert "def mul(a: int, b: int) -> int:" in rig.client.prompts_for("alpha-2")[0]
+
+
+# ---------------------------------------------------------------------------
+# CRLF files (Windows): normalisation is byte-exact
+# ---------------------------------------------------------------------------
+
+CFG = "config.py"
+
+
+def _crlf_repo(root: Path, content: bytes) -> Path:
+    root.mkdir(parents=True)
+    (root / CFG).write_bytes(content)
+    return root
+
+
+@pytest.mark.parametrize("crlf_in_diff", [True, False])
+def test_crlf_file_normalised_diff_stacks_strictly(tmp_path: Path, crlf_in_diff: bool) -> None:
+    """alpha-6's repro: CRLF config.py, an offset hunk adding ``C = 3`` (CRLF or LF lines from Claude)."""
+    from foundry.builder_worker import _snapshot_files
+    from foundry.validation_gates import normalize_diff
+
+    eol = "\r\n" if crlf_in_diff else "\n"
+    base = _crlf_repo(tmp_path / "base", b"A = 1\r\nB = 2\r\n")
+    raw = f"--- a/{CFG}\n+++ b/{CFG}\n@@ -7,2 +7,3 @@\n A = 1{eol} B = 2{eol}+C = 3{eol}"
+    before = _snapshot_files(base, [CFG])
+    assert before == {CFG: "A = 1\r\nB = 2\r\n"}  # no newline translation
+    norm = normalize_diff(raw, before)
+    assert "+C = 3\r\n" in norm and " A = 1\r\n" in norm and "@@ -1,2 +1,3 @@" in norm
+    root = prepare_stacked_workspace(base, tmp_path / "stack", [("T-1.1", norm)])
+    assert (root / CFG).read_bytes() == b"A = 1\r\nB = 2\r\nC = 3\r\n"
+    if shutil.which("git"):
+        assert _git_apply_check(base, norm).returncode == 0
+
+
+def test_crlf_file_without_trailing_newline(tmp_path: Path) -> None:
+    from foundry.builder_worker import _snapshot_files
+    from foundry.validation_gates import normalize_diff
+
+    base = _crlf_repo(tmp_path / "base", b"A = 1\r\nB = 2")
+    raw = (f"--- a/{CFG}\n+++ b/{CFG}\n@@ -1,2 +1,3 @@\n A = 1\n-B = 2\n\\ No newline at end of file\n"
+           "+B = 2\n+C = 3\n\\ No newline at end of file\n")
+    norm = normalize_diff(raw, _snapshot_files(base, [CFG]))
+    assert "-B = 2\n\\ No newline at end of file\n" in norm and "+C = 3\n\\ No newline at end of file\n" in norm
+    root = prepare_stacked_workspace(base, tmp_path / "stack", [norm])
+    assert (root / CFG).read_bytes() == b"A = 1\r\nB = 2\r\nC = 3"
+    if shutil.which("git"):
+        assert _git_apply_check(base, norm).returncode == 0
+
+
+def test_restore_keeps_crlf(tmp_path: Path) -> None:
+    from foundry.builder_worker import _restore_files, _snapshot_files
+
+    base = _crlf_repo(tmp_path / "base", b"A = 1\r\nB = 2\r\n")
+    snap = _snapshot_files(base, [CFG, "new.py"])
+    (base / CFG).write_bytes(b"changed\n")
+    (base / "new.py").write_bytes(b"x\n")
+    _restore_files(base, snap)
+    assert (base / CFG).read_bytes() == b"A = 1\r\nB = 2\r\n" and not (base / "new.py").exists()
