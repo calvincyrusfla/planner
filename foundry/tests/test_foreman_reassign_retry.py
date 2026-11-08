@@ -11,13 +11,13 @@ from foundry.config import FoundryConfig
 from foundry.gemma_client import SimulatedGemmaClient
 from foundry.schemas import EscalationCategory, ForemanEscalation, PrescribedAction
 from foundry.shop_foreman import ShopForeman, classify_quarantine
-from foundry.tests.test_shop_foreman import line, run, sized_task  # noqa: F401 - `line` is a fixture
+from foundry.tests.test_shop_foreman import fail_gate, line, run, sized_task  # noqa: F401 - `line` is a fixture
 
 INFRA = "infrastructure: claude CLI timed out after 600 s"
 
 
-def foreman_for(line: dict[str, Any], gemma: Any = None, **kwargs: Any) -> ShopForeman:  # noqa: F811
-    config = FoundryConfig(db_path=line["config"].db_path, builders_per_team=1)
+def foreman_for(line: dict[str, Any], gemma: Any = None, builders: int = 1, **kwargs: Any) -> ShopForeman:  # noqa: F811
+    config = FoundryConfig(db_path=line["config"].db_path, builders_per_team=builders)
     return ShopForeman(gemma, line["queue"], line["telemetry"], line["engine"], config, **kwargs)
 
 
@@ -245,3 +245,85 @@ def test_gemma_plain_text_reply_keeps_the_retry_with_its_diagnosis(line: dict[st
     alert = run(foreman_for(line, gemma).evaluate_line_anomaly())
     assert alert.prescribed_action == PrescribedAction.RETRY_TASK
     assert alert.diagnosis == "The CLI timed out. Retry once."
+
+
+# --------------------------------------------------------------------------- respecting undo (review round 1)
+
+
+def _quarantine_and_undo(line: dict[str, Any], task_id: str, note: str = "quarantine undone") -> None:  # noqa: F811
+    queue = line["queue"]
+    blocked = {t.ticket_id: {} for t in queue.tickets_for_task(task_id)}
+    queue.quarantine(task_id, "failed its gates")
+    queue.reopen_quarantined(task_id, blocked, note)
+
+
+def test_undone_quarantine_is_not_represcribed_without_new_evidence(line: dict[str, Any]) -> None:  # noqa: F811
+    sized_task(line["queue"], "F-150", "alpha", 1)
+    fail_gate(line, "F-150")
+    fail_gate(line, "F-150")
+    foreman = foreman_for(line)
+    first = run(foreman.evaluate_line_anomaly())
+    assert first.prescribed_action == PrescribedAction.QUARANTINE_TASK
+    _quarantine_and_undo(line, "F-150")
+    line["clock"].advance(301)  # past the cooldown
+    assert run(foreman.evaluate_line_anomaly()) is None
+    assert run(foreman_for(line).evaluate_line_anomaly()) is None  # a fresh Foreman (restart) too
+    fail_gate(line, "F-150")  # new evidence: it fails again on its last attempt
+    alert = run(foreman_for(line).evaluate_line_anomaly())
+    assert alert is not None and alert.prescribed_action == PrescribedAction.QUARANTINE_TASK
+    assert alert.target_entity.task_id == "F-150"
+
+
+def test_after_a_retry_only_new_gate_failures_count(line: dict[str, Any]) -> None:  # noqa: F811
+    sized_task(line["queue"], "F-151", "alpha", 1)
+    fail_gate(line, "F-151")
+    fail_gate(line, "F-151")
+    _quarantine_and_undo(line, "F-151", note="retry (Foreman)")
+    line["clock"].advance(10)
+    fail_gate(line, "F-151")
+    assert run(foreman_for(line).evaluate_line_anomaly()) is None  # 1 fresh failure < limit 2
+    fail_gate(line, "F-151")
+    alert = run(foreman_for(line).evaluate_line_anomaly())
+    assert alert.prescribed_action == PrescribedAction.QUARANTINE_TASK
+
+
+def _undone_log(action: str, task_id: str | None, undone_at: str) -> list[dict[str, Any]]:
+    return [{"action": action, "task_id": task_id, "undone_at": undone_at, "applied": True}]
+
+
+def test_undone_reassign_is_not_represcribed_within_two_hours(line: dict[str, Any]) -> None:  # noqa: F811
+    stuck_line(line)  # fake clock is now 2026-01-15T12:15:01Z
+    log = _undone_log("REASSIGN_TEAM", "F-102", "2026-01-15T12:15:00Z")
+    foreman = foreman_for(line, actions_provider=lambda limit=50: log)
+    assert run(foreman.evaluate_line_anomaly()) is None
+    line["clock"].advance(2 * 3600 + 5)
+    line["queue"].record_event("build_progress", "F-101",
+                               {"ticket_id": line["queue"].tickets_for_task("F-101")[0].ticket_id})
+    alert = run(foreman.evaluate_line_anomaly())
+    assert alert is not None and alert.prescribed_action == PrescribedAction.REASSIGN_TEAM
+
+
+def test_undone_reassign_read_from_the_stored_action_log(line: dict[str, Any]) -> None:  # noqa: F811
+    stuck_line(line)
+    line["queue"].kv_set("floor_manager.actions",
+                         {"seq": 1, "actions": _undone_log("REASSIGN_TEAM", "F-102", "2026-01-15T12:15:00Z")})
+    assert run(foreman_for(line).evaluate_line_anomaly()) is None
+
+
+def test_undone_resize_is_suppressed(line: dict[str, Any]) -> None:  # noqa: F811
+    queue = line["queue"]
+    sized_task(queue, "F-152", "alpha", 2)
+    queue.resize("F-152", 1)
+    line["telemetry"].set_idle("alpha", 4)
+    log = _undone_log("RESIZE_ALLOCATION", "F-152", "2026-01-15T11:59:00Z")
+    assert run(foreman_for(line, builders=5, actions_provider=lambda limit=50: log).evaluate_line_anomaly()) is None
+    other = _undone_log("RESIZE_ALLOCATION", "F-999", "2026-01-15T11:59:00Z")  # another task's undo
+    alert = run(foreman_for(line, builders=5, actions_provider=lambda limit=50: other).evaluate_line_anomaly())
+    assert alert is not None and alert.prescribed_action == PrescribedAction.RESIZE_ALLOCATION
+
+
+def test_quarantine_without_blocked_tickets_is_not_retried(line: dict[str, Any]) -> None:  # noqa: F811
+    line["queue"].add_task("F-153", "Task", "desc", "bravo")  # never sized: no tickets
+    line["queue"].quarantine("F-153", "sizing failed: TimeoutError: timed out")
+    line["clock"].advance(120)
+    assert run(foreman_for(line).evaluate_line_anomaly()) is None

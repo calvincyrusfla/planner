@@ -179,6 +179,12 @@ _QA_TASK_ID = "foreman-qa"
 #: (give the infrastructure a moment) and only within ``_RETRY_MAX_AGE_S``.
 _RETRY_MIN_WAIT_S = 60.0
 _RETRY_MAX_AGE_S = 6 * 3600.0
+#: After the user undoes one of these actions, the Foreman does not prescribe it
+#: again for the same task for this long (seconds).
+_UNDO_SUPPRESS_S = 2 * 3600.0
+_UNDO_SUPPRESSED = frozenset({"REASSIGN_TEAM", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "PROMOTE_PEER_REVIEWER"})
+#: kv key the Floor Manager stores its action log under (read only here).
+_ACTIONS_KV_KEY = "floor_manager.actions"
 #: Gemma decisions (REASSIGN/RETRY choices) asked per ``evaluate_line_anomaly`` call.
 _MAX_DECISIONS_PER_EVAL = 3
 #: Quarantine reasons that are real build/review failures: never retried.
@@ -1189,13 +1195,44 @@ class ShopForeman:
 
         Gates short-circuit on the first failure, so one failed row is one
         failed submission: the same unit the retry policy counts (D8).
+
+        After the task was put back on the line (an ``unquarantined`` event):
+        a Foreman RETRY_TASK gave fresh attempts, so only failures since then
+        count; an undone quarantine kept the attempts, so the earlier failures
+        count again only once a new one arrived (no new evidence -> nothing).
         """
         rows = self._sql(
             "SELECT subtask_id, COUNT(*) FROM gate_results WHERE task_id=? AND passed=0 GROUP BY subtask_id",
             (task_id,),
         )
         done = {t.subtask_id for t in self.queue.tickets_for_task(task_id) if t.status == "done"}
-        return {str(sub): int(n) for sub, n in rows if sub not in done}
+        counts = {str(sub): int(n) for sub, n in rows if sub not in done}
+        reopened = self._last_reopen(task_id)
+        if counts and reopened is not None:
+            since, note = reopened
+            fresh = {str(sub): int(n) for sub, n in self._sql(
+                "SELECT subtask_id, COUNT(*) FROM gate_results WHERE task_id=? AND passed=0 AND ts>?"
+                " GROUP BY subtask_id", (task_id, since)) if sub not in done}
+            if note.startswith("retry"):
+                counts = fresh
+            else:
+                counts = {sub: n for sub, n in counts.items() if fresh.get(sub, 0) > 0}
+        return counts
+
+    def _last_reopen(self, task_id: str) -> tuple[str, str] | None:
+        """``(ts, note)`` of the task's latest ``unquarantined`` event, or ``None``."""
+        try:
+            events = self.queue.events(task_id=task_id, kind="unquarantined")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("reading unquarantined events failed: %s", exc)
+            return None
+        best = None
+        for ev in events or []:
+            ts = str(ev.get("ts") or "")
+            if ts and (best is None or ts >= best[0]):
+                note = str((ev.get("payload") or {}).get("note") or "").strip().lower()
+                best = (ts, note)
+        return best
 
     def _pending_review_items(self) -> list[dict[str, Any]]:
         """Submissions still waiting for a reviewer: ``{task_id, item, dwell_seconds}``, oldest first."""
@@ -2166,6 +2203,52 @@ class ShopForeman:
             )
         return found
 
+    def _action_log(self) -> list[Mapping[str, Any]]:
+        """The Floor Manager's action log: ``actions_provider``, ``queue.actions`` and the stored kv copy."""
+        rows: list[Mapping[str, Any]] = []
+        for source in (self.actions_provider, getattr(self.queue, "actions", None)):
+            if not callable(source):
+                continue
+            try:
+                try:
+                    got = source(limit=1000)
+                except TypeError:
+                    got = source()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("reading the action log failed: %s", exc)
+                continue
+            rows.extend(r for r in got or [] if isinstance(r, Mapping))
+        kv_get = getattr(self.queue, "kv_get", None)
+        if callable(kv_get):
+            try:
+                raw = kv_get(_ACTIONS_KV_KEY)
+                if isinstance(raw, (str, bytes)):
+                    raw = json.loads(raw)
+                if isinstance(raw, Mapping):
+                    rows.extend(r for r in raw.get("actions") or [] if isinstance(r, Mapping))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("reading the stored action log failed: %s", exc)
+        return rows
+
+    def _undone_recently(self, anomaly: Anomaly, now: datetime) -> bool:
+        """True when the user undid the same action for the same target within ``_UNDO_SUPPRESS_S``.
+
+        Applies to REASSIGN_TEAM, RESIZE_ALLOCATION, THROTTLE_DISPATCH and
+        PROMOTE_PEER_REVIEWER (a task-less THROTTLE matches any undone throttle).
+        QUARANTINE_TASK needs new gate evidence instead (see ``_ticket_gate_failures``).
+        """
+        if anomaly.action.value not in _UNDO_SUPPRESSED:
+            return False
+        for row in self._action_log():
+            if str(row.get("action")) != anomaly.action.value or not row.get("undone_at"):
+                continue
+            if anomaly.task_id and row.get("task_id") != anomaly.task_id:
+                continue
+            undone = _parse_ts(row.get("undone_at"))
+            if undone is None or (now - undone).total_seconds() < _UNDO_SUPPRESS_S:
+                return True  # a clock mismatch (undo "in the future") also counts as recent
+        return False
+
     def _retried_tasks(self) -> set[str]:
         """Tasks a RETRY_TASK was already prescribed or applied for (memory, escalations, action log)."""
         done = set(self._retry_prescribed)
@@ -2177,23 +2260,9 @@ class ShopForeman:
                         done.add(str(tid))
         except Exception as exc:  # noqa: BLE001
             log.debug("reading escalations failed: %s", exc)
-        for source in (self.actions_provider, getattr(self.queue, "actions", None)):
-            if not callable(source):
-                continue
-            try:
-                rows = source(limit=1000)
-            except TypeError:
-                try:
-                    rows = source()
-                except Exception:  # noqa: BLE001
-                    rows = []
-            except Exception as exc:  # noqa: BLE001
-                log.debug("reading the action log failed: %s", exc)
-                rows = []
-            for row in rows or []:
-                if isinstance(row, Mapping) and str(row.get("action")) == PrescribedAction.RETRY_TASK.value \
-                        and row.get("task_id"):
-                    done.add(str(row["task_id"]))
+        for row in self._action_log():
+            if str(row.get("action")) == PrescribedAction.RETRY_TASK.value and row.get("task_id"):
+                done.add(str(row["task_id"]))
         return done
 
     def _retry_anomalies(self, now: datetime) -> list[Anomaly]:
@@ -2217,6 +2286,8 @@ class ShopForeman:
             age = (now - since).total_seconds()
             if age < _RETRY_MIN_WAIT_S or age > _RETRY_MAX_AGE_S:
                 continue
+            if not any(t.status == "blocked" for t in self.queue.tickets_for_task(tid)):
+                continue  # nothing to re-open (e.g. sizing failed: sizing re-runs on restart)
             reason = str(task.get("quarantine_reason") or "")
             kind = classify_quarantine(reason)
             if kind == "real" or (kind == "unclear" and self.gemma is None):
@@ -2301,6 +2372,8 @@ class ShopForeman:
             last = self._raised.get(anomaly.key)
             if last is not None and (now - last).total_seconds() < self.cooldown_s:
                 continue
+            if self._undone_recently(anomaly, now):
+                continue  # the user undid this very action: respect that for a while
             if anomaly.choices and self.gemma is not None:
                 if decisions >= _MAX_DECISIONS_PER_EVAL:
                     if anomaly.action == PrescribedAction.NONE:
