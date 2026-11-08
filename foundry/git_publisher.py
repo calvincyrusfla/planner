@@ -26,6 +26,9 @@ and a ``stage`` naming what went wrong (see ``STAGES``).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
+import json
 import logging
 import os
 import re
@@ -67,6 +70,8 @@ STAGES: tuple[str, ...] = (
 RunResult = tuple["int | None", str, str]
 #: Injected subprocess runner: ``await runner(argv, cwd=..., timeout=..., env=...)``.
 Runner = Callable[..., Awaitable[RunResult]]
+#: ``on_pushed(branch, commit)``, sync or async.
+OnPushed = Callable[[str, "str | None"], Any]
 
 _TIMEOUT = 120.0
 _NET_TIMEOUT = 300.0
@@ -103,8 +108,7 @@ def slugify(text: str, limit: int = 40) -> str:
 
 def branch_name(task_id: str, title: str) -> str:
     """``foundry/<task-id>-<slug>``, lowercase and safe for git refs on every OS."""
-    tid = re.sub(r"[^a-z0-9]+", "-", (task_id or "task").lower()).strip("-") or "task"
-    return f"{BRANCH_PREFIX}{tid}-{slugify(title)}"
+    return f"{task_prefix(task_id)}{slugify(title)}"
 
 
 def commit_message(title: str, body: str, limit: int = 2000) -> str:
@@ -214,6 +218,10 @@ class GitPublisher:
         self.timeout = timeout
         self.net_timeout = net_timeout
         self._lock = asyncio.Lock()
+        self._gh_repo: str | None = None
+        # one folder per repository, so cleaning up stale worktrees never touches another repo's
+        key = hashlib.sha1(os.path.normcase(os.path.abspath(self.repo_root)).encode("utf-8")).hexdigest()[:8]
+        self._wt_dir = self.worktree_root / f"{slugify(self.repo_root.name, 20)}-{key}"
 
     # -- helpers ---------------------------------------------------------
 
@@ -298,11 +306,22 @@ class GitPublisher:
         title: str,
         patch_path: str | os.PathLike[str],
         pr: Mapping[str, Any] | None = None,
+        *,
+        draft: bool | None = None,
+        on_pushed: OnPushed | None = None,
     ) -> PublishResult:
-        """Branch, commit, push and open the PR for one task. Never raises."""
+        """Branch, commit, push and open the PR for one task. Never raises.
+
+        Idempotent per task: when a branch ``foundry/<task-id>-*`` from an earlier
+        call already exists on the remote, no new branch is pushed; its existing
+        PR is returned, or a PR is opened for it. ``on_pushed(branch, commit)``
+        (sync or async) is called right after a successful push, so the caller
+        can persist it before the PR step.
+        """
         async with self._lock:
             try:
-                return await self._publish(task_id, title, Path(patch_path), dict(pr or {}))
+                return await self._publish(task_id, title, Path(patch_path), dict(pr or {}),
+                                           self.draft if draft is None else bool(draft), on_pushed)
             except _Fail as f:
                 return PublishResult(ok=False, error=f.error, stage=f.stage)
             except Exception as exc:  # noqa: BLE001 - publish must never break the caller
@@ -315,8 +334,10 @@ class GitPublisher:
             raise _Fail("no_git", "git is not installed")
         if not self.repo_root.is_dir() or (await self._git(git, "rev-parse", "--git-dir"))[0] != 0:
             raise _Fail("not_a_repo", f"{self.repo_root} is not a git repository")
-        if (await self._git(git, "remote", "get-url", self.remote))[0] != 0:
+        rc, out, _ = await self._git(git, "remote", "get-url", self.remote)
+        if rc != 0:
             raise _Fail("no_remote", f"the repository has no '{self.remote}' remote")
+        self._gh_repo = github_repo(out.strip().splitlines()[0] if out.strip() else "")
         return git
 
     async def _require_gh(self) -> str:
@@ -328,6 +349,9 @@ class GitPublisher:
             raise _Fail("gh_not_logged_in", "the GitHub CLI is not logged in (run: gh auth login): "
                         + self._msg(res, "gh auth status failed"))
         return gh
+
+    def _repo_args(self) -> list[str]:
+        return ["--repo", self._gh_repo] if self._gh_repo else []
 
     async def _resolve_base(self, git: str) -> str:
         if self.base:
@@ -373,13 +397,81 @@ class GitPublisher:
             args += ["-c", "user.email=foundry@localhost"]
         return args
 
-    async def _publish(self, task_id: str, title: str, patch: Path, pr: dict[str, Any]) -> PublishResult:
+    async def _task_branches(self, git: str, task_id: str) -> tuple[dict[str, str], list[str]]:
+        """This task's earlier branches: ({remote branch: sha}, [local-only branches])."""
+        pattern = f"refs/heads/{task_prefix(task_id)}*"
+        remote: dict[str, str] = {}
+        rc, out, _ = await self._git(git, "ls-remote", "--heads", self.remote, pattern, timeout=self.net_timeout)
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].startswith("refs/heads/"):
+                    remote[parts[1][len("refs/heads/"):]] = parts[0]
+        local: list[str] = []
+        rc, out, _ = await self._git(git, "for-each-ref", "--format=%(refname)", pattern)
+        if rc == 0:
+            for line in out.splitlines():
+                name = line.strip()[len("refs/heads/"):]
+                if name and name not in remote:
+                    local.append(name)
+        return remote, local
+
+    async def _existing_pr(self, gh: str, branch: str) -> str | None:
+        """URL of a PR (any state) whose head is ``branch``; None when there is none or gh fails."""
+        res = await self._run([gh, "pr", "list", *self._repo_args(), "--head", branch, "--state", "all",
+                               "--json", "url,number", "--limit", "1"], timeout=self.net_timeout)
+        if res[0] != 0:
+            return None
+        try:
+            data = json.loads(res[1] or "[]")
+        except ValueError:
+            return None
+        if isinstance(data, list) and data and isinstance(data[0], Mapping):
+            url = data[0].get("url")
+            return str(url) if url else None
+        return None
+
+    async def _notify_pushed(self, on_pushed: OnPushed | None, branch: str, commit: str | None) -> None:
+        if on_pushed is None:
+            return
+        try:
+            out = on_pushed(branch, commit)
+            if inspect.isawaitable(out):
+                await out
+        except Exception as exc:  # noqa: BLE001 - the caller's bookkeeping never breaks publishing
+            log.warning("git publisher: on_pushed callback failed: %s", exc)
+
+    async def _publish(self, task_id: str, title: str, patch: Path, pr: dict[str, Any], draft: bool,
+                       on_pushed: OnPushed | None) -> PublishResult:
         git = await self._require_repo()
+        await self._clean_stale(git)
         if not patch.is_file() or patch.stat().st_size == 0:
             raise _Fail("no_patch", f"patch file missing or empty: {patch}")
         # check gh before pushing anything, so a missing CLI leaves no orphan branch
         gh = await self._require_gh()
         base = await self._resolve_base(git)
+        pr_title = str(pr.get("title") or title or task_id).strip()
+        pr_body = str(pr.get("body") or "")
+
+        # resume: an earlier call already pushed this task's branch (crash before the state was saved)
+        remote, local_only = await self._task_branches(git, task_id)
+        for name in local_only:
+            # never reached the remote: a leftover of an interrupted run (fails harmlessly if checked out)
+            await self._git(git, "branch", "-D", name)
+        if remote:
+            ordered = sorted(remote, key=_suffix_order)
+            for name in ordered:
+                url = await self._existing_pr(gh, name)
+                if url:
+                    log.info("git publisher: %s already has a PR for %s: %s", task_id, name, url)
+                    return PublishResult(ok=True, branch=name, commit=remote[name], pr_url=url, base=base)
+            name = ordered[-1]
+            log.info("git publisher: %s branch %s already pushed; opening its PR", task_id, name)
+            await self._notify_pushed(on_pushed, name, remote[name])
+            result = await self._create_pr(gh, name, base, pr_title, pr_body, draft)
+            result.commit = remote[name]
+            return result
+
         res = await self._git(git, "fetch", "--quiet", self.remote, base, timeout=self.net_timeout)
         if res[0] != 0:
             raise _Fail("fetch_failed", f"git fetch {self.remote} {base} failed: " + self._msg(res, "fetch failed"))
@@ -387,11 +479,10 @@ class GitPublisher:
         if (await self._git(git, "rev-parse", "--verify", "--quiet", start))[0] != 0:
             start = "FETCH_HEAD"
         branch = await self._free_branch(git, task_id, title)
-        pr_title = str(pr.get("title") or title or task_id).strip()
-        pr_body = str(pr.get("body") or "")
 
-        self.worktree_root.mkdir(parents=True, exist_ok=True)
-        wt = self.worktree_root / f"{slugify(task_id, 20)}-{uuid.uuid4().hex[:8]}"
+        wt_dir = self._wt_dir
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        wt = wt_dir / f"{slugify(task_id, 20)}-{uuid.uuid4().hex[:8]}"
         pushed = False
         commit: str | None = None
         added = False
@@ -403,7 +494,7 @@ class GitPublisher:
             res = await self._git(git, "apply", "--index", "--whitespace=nowarn", str(patch.resolve()), cwd=wt)
             if res[0] != 0:
                 raise _Fail("apply_failed", self._msg(res, "git apply failed"))
-            msg_file = wt.parent / f"{wt.name}.msg"
+            msg_file = wt_dir / f"{wt.name}.msg"
             msg_file.write_text(commit_message(pr_title, pr_body), encoding="utf-8", newline="\n")
             try:
                 ident = await self._identity_args(git)
@@ -425,47 +516,82 @@ class GitPublisher:
             if added:
                 await self._remove_worktree(git, wt)
             else:
-                shutil.rmtree(wt, ignore_errors=True)
+                await _rmtree(wt)
             if added and not pushed:
                 # nothing reached the remote: drop the local branch so a retry reuses the name
                 await self._git(git, "branch", "-D", branch)
+            _rmdir_quiet(wt_dir)
 
-        result = await self._create_pr(gh, branch, base, pr_title, pr_body)
+        await self._notify_pushed(on_pushed, branch, commit)
+        result = await self._create_pr(gh, branch, base, pr_title, pr_body, draft)
         result.commit = commit
         return result
 
     async def _remove_worktree(self, git: str, wt: Path) -> None:
         res = await self._git(git, "worktree", "remove", "--force", str(wt))
-        if res[0] != 0:
+        if res[0] != 0 or wt.exists():
             log.warning("git publisher: worktree remove failed (%s); deleting %s", self._msg(res, "?"), wt)
-            shutil.rmtree(wt, ignore_errors=True)
+            await _rmtree(wt)
             await self._git(git, "worktree", "prune")
+
+    async def _clean_stale(self, git: str) -> None:
+        """Remove worktrees an interrupted earlier run left under this repo's worktree folder."""
+        await self._git(git, "worktree", "prune")
+        wt_dir = self._wt_dir
+        if not wt_dir.is_dir():
+            return
+        rc, out, _ = await self._git(git, "worktree", "list", "--porcelain")
+        registered = set()
+        if rc == 0:
+            for line in out.splitlines():
+                if line.startswith("worktree "):
+                    registered.add(os.path.normcase(os.path.abspath(line[len("worktree "):].strip())))
+        for entry in list(wt_dir.iterdir()):
+            if os.path.normcase(os.path.abspath(entry)) in registered:
+                await self._git(git, "worktree", "remove", "--force", str(entry))
+            if entry.is_dir():
+                await _rmtree(entry)
+            else:
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+        await self._git(git, "worktree", "prune")
+        _rmdir_quiet(wt_dir)
 
     # -- pull request ----------------------------------------------------
 
-    async def open_pr(self, branch: str, pr: Mapping[str, Any], *, base: str | None = None) -> PublishResult:
-        """(Re)open the PR for an already pushed ``branch`` (after a ``pr_failed``). Never raises."""
+    async def open_pr(self, branch: str, pr: Mapping[str, Any], *, base: str | None = None,
+                      draft: bool | None = None) -> PublishResult:
+        """(Re)open the PR for an already pushed ``branch`` (after a ``pr_failed``). Never raises.
+
+        Returns the existing PR when the branch already has one.
+        """
         async with self._lock:
             try:
                 git = await self._require_repo()
                 gh = await self._require_gh()
                 base = base or await self._resolve_base(git)
+                url = await self._existing_pr(gh, branch)
+                if url:
+                    return PublishResult(ok=True, branch=branch, base=base, pr_url=url)
                 return await self._create_pr(gh, branch, base, str(pr.get("title") or branch),
-                                             str(pr.get("body") or ""))
+                                             str(pr.get("body") or ""), self.draft if draft is None else draft)
             except _Fail as f:
                 return PublishResult(ok=False, branch=branch, error=f.error, stage=f.stage, base=base)
             except Exception as exc:  # noqa: BLE001
                 log.exception("git publisher: unexpected failure opening PR for %s", branch)
                 return PublishResult(ok=False, branch=branch, error=str(exc), stage="error", base=base)
 
-    async def _create_pr(self, gh: str, branch: str, base: str, title: str, body: str) -> PublishResult:
+    async def _create_pr(self, gh: str, branch: str, base: str, title: str, body: str,
+                         draft: bool = False) -> PublishResult:
         fd, body_path = tempfile.mkstemp(prefix="foundry-pr-", suffix=".md")
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(body)
-            argv = [gh, "pr", "create", "--base", base, "--head", branch,
+            argv = [gh, "pr", "create", *self._repo_args(), "--base", base, "--head", branch,
                     "--title", title or branch, "--body-file", body_path]
-            if self.draft:
+            if draft:
                 argv.append("--draft")
             res = await self._run(argv, timeout=self.net_timeout)
         finally:
@@ -473,14 +599,44 @@ class GitPublisher:
                 os.unlink(body_path)
             except OSError:
                 pass
+        urls = _URL_RE.findall(res[1]) or _URL_RE.findall(res[2])
         if res[0] != 0:
+            if "already exists" in (res[1] + res[2]) and urls:
+                return PublishResult(ok=True, branch=branch, base=base, pr_url=urls[-1])
             return PublishResult(ok=False, branch=branch, base=base, stage="pr_failed",
                                  error=self._msg(res, "gh pr create failed"))
-        urls = _URL_RE.findall(res[1]) or _URL_RE.findall(res[2])
         return PublishResult(ok=True, branch=branch, base=base, pr_url=urls[-1] if urls else None)
+
+
+def task_prefix(task_id: str) -> str:
+    """Branch prefix every branch of ``task_id`` starts with (``foundry/f-012-``)."""
+    tid = re.sub(r"[^a-z0-9]+", "-", (task_id or "task").lower()).strip("-") or "task"
+    return f"{BRANCH_PREFIX}{tid}-"
+
+
+def _suffix_order(name: str) -> tuple[int, str]:
+    m = re.search(r"-(\d+)$", name)
+    return (int(m.group(1)) if m and int(m.group(1)) < 100 else 1, name)
+
+
+async def _rmtree(path: Path, attempts: int = 5) -> None:
+    """``shutil.rmtree`` with a few short retries (Windows keeps files locked briefly)."""
+    for i in range(attempts):
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return
+        await asyncio.sleep(0.2 * (i + 1))
+    log.warning("git publisher: could not delete %s", path)
+
+
+def _rmdir_quiet(path: Path) -> None:
+    try:
+        path.rmdir()  # only when empty
+    except OSError:
+        pass
 
 
 __all__ = [
     "BRANCH_PREFIX", "DEFAULT_WORKTREE_ROOT", "GitPublisher", "PublishResult", "STAGES",
-    "branch_name", "commit_message", "default_runner", "slugify",
+    "branch_name", "commit_message", "default_runner", "github_repo", "slugify", "task_prefix",
 ]
