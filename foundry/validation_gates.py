@@ -848,22 +848,14 @@ def _inside(path: str, root: Path) -> bool:
 _MYPY_LINE = re.compile(r"^(?P<path>[^:\n]+?):(?P<line>\d+)(?::\d+)?: (?P<kind>error|note|warning): ")
 
 
-def _gate_typecheck(
-    files: list[tuple[str, Path]], workspace: Path, mode: TypecheckMode, timeout: float
-) -> tuple[bool, str, str]:
-    if mode == "off":
-        return True, "typecheck skipped (FOUNDRY_TYPECHECK=off)", ""
-    py_files = [rel for rel, path in files if path.suffix.lower() in (".py", ".pyi")]
-    if not py_files:
-        return True, "no Python files to typecheck", ""
-    base = _mypy_command()
-    if base is not None and (not Path(base[0]).is_absolute() or _inside(base[0], workspace)):
-        # never run a mypy that lives in (or resolves into) the workspace
-        base = None
-    if base is None:
-        if mode == "mypy":
-            return False, "", "mypy requested but not installed (pip install mypy)"
-        return True, "typecheck skipped (mypy not installed)", ""
+_MYPY_LINE_REF = re.compile(r"\bline \d+\b")
+_MAX_PREEXISTING_LISTED = 20
+
+
+def _invoke_mypy(
+    base: Sequence[str], py_files: Sequence[str], cwd: Path, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """Run mypy on ``py_files`` (relative to ``cwd``) with the gate's fixed flags."""
     cmd = [
         *base,
         "--config-file=",
@@ -879,10 +871,211 @@ def _gate_typecheck(
         *py_files,
     ]
     env = {k: v for k, v in os.environ.items() if k not in ("MYPYPATH", "MYPY_CACHE_DIR")}
-    try:
-        proc = subprocess.run(
-            cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout, env=env
+    return subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
+    )
+
+
+def _mypy_errors(output: str, targets: set[str]) -> list[tuple[str, int, str]]:
+    """``(rel, line_number, raw_line)`` for each mypy error reported in ``targets``."""
+    found: list[tuple[str, int, str]] = []
+    for line in output.splitlines():
+        match = _MYPY_LINE.match(line)
+        if not match or match.group("kind") != "error":
+            continue
+        try:
+            rel = _normalise_rel(match.group("path"))
+        except DiffApplyError:
+            continue
+        if rel in targets:
+            found.append((rel, int(match.group("line")), line))
+    return found
+
+
+def _error_key(rel: str, line: str) -> tuple[str, str]:
+    """Identity of an error that survives line shifts: file plus message text."""
+    match = _MYPY_LINE.match(line)
+    message = line[match.end():] if match else line
+    return rel, _MYPY_LINE_REF.sub("line N", message)
+
+
+def _touches_python(patch: _FilePatch) -> bool:
+    paths = (patch.old_path, patch.new_path)
+    return any(
+        path is not None and posixpath.splitext(path)[1].lower() in (".py", ".pyi")
+        for path in paths
+    )
+
+
+def _reverse_patch(patch: _FilePatch) -> _FilePatch:
+    """The patch that turns the post-change file back into the pre-change file."""
+    flip = {"+": "-", "-": "+"}
+    hunks = [
+        _Hunk(
+            old_start=hunk.new_start,
+            old_count=hunk.new_count,
+            new_start=hunk.old_start,
+            new_count=hunk.old_count,
+            lines=[(flip.get(tag, tag), text) for tag, text in hunk.lines],
         )
+        for hunk in patch.hunks
+    ]
+    return _FilePatch(old_path=patch.new_path, new_path=patch.old_path, hunks=hunks)
+
+
+def _pre_change_files(
+    patches: Sequence[_FilePatch], workspace: Path
+) -> tuple[dict[str, str | None], dict[str, str]]:
+    """Undo ``patches`` in memory.
+
+    Returns ``(origins, texts)``: ``origins`` maps each post-change path to its
+    pre-change path (``None`` for an added file), ``texts`` maps each pre-change
+    path to its pre-change content.
+    """
+    origins: dict[str, str | None] = {}
+    texts: dict[str, str] = {}
+    for patch in patches:
+        new_rel = None if patch.new_path is None else _normalise_rel(patch.new_path)
+        old_rel = None if patch.old_path is None else _normalise_rel(patch.old_path)
+        if new_rel is not None:
+            origins[new_rel] = old_rel
+        if old_rel is None:
+            continue
+        current: str | None = None
+        if new_rel is not None:
+            current = _resolve_inside(workspace, new_rel).read_text(encoding="utf-8")
+        texts[old_rel], _ = _apply_hunks(current, _reverse_patch(patch), old_rel)
+    return origins, texts
+
+
+def _added_lines(patches: Sequence[_FilePatch]) -> dict[str, set[int]]:
+    """Post-change line numbers each patch added, per post-change path."""
+    added: dict[str, set[int]] = {}
+    for patch in patches:
+        if patch.new_path is None:
+            continue
+        numbers = added.setdefault(_normalise_rel(patch.new_path), set())
+        for hunk in patch.hunks:
+            number = hunk.new_start
+            for tag, _ in hunk.lines:
+                if tag == "+":
+                    numbers.add(number)
+                if tag in (" ", "+"):
+                    number += 1
+    return added
+
+
+def _baseline_counts(
+    base: Sequence[str],
+    py_files: Sequence[str],
+    patches: Sequence[_FilePatch],
+    workspace: Path,
+    timeout: float,
+) -> tuple[dict[tuple[str, str], int] | None, str]:
+    """Count mypy errors in a scratch copy of ``workspace`` with ``patches`` undone.
+
+    Returns ``(counts, "")`` on success, ``(None, "")`` when the pre-change tree
+    cannot be rebuilt, and ``(None, reason)`` when mypy could not finish on it.
+    The workspace itself is never modified.
+    """
+    try:
+        origins, texts = _pre_change_files(patches, workspace)
+    except (DiffApplyError, OSError, ValueError):
+        return None, ""
+    if not any(rel in origins for rel in py_files):
+        return None, ""
+    sources = [origins.get(rel, rel) for rel in py_files]
+    targets = [rel for rel in sources if rel is not None]
+    if not targets:
+        return {}, ""
+    try:
+        holder = Path(tempfile.mkdtemp(prefix="foundry-typecheck-"))
+    except OSError:
+        return None, ""
+    try:
+        tree = holder / "base"
+        try:
+            shutil.copytree(
+                workspace, tree, symlinks=True, ignore=copy_ignore(STACK_COPY_IGNORE, workspace)
+            )
+            for rel in origins:
+                _resolve_inside(tree, rel).unlink(missing_ok=True)
+            for rel, text in texts.items():
+                target = _resolve_inside(tree, rel)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+        except (DiffApplyError, OSError, ValueError):
+            return None, ""
+        present = [rel for rel in targets if (tree / rel).is_file()]
+        if not present:
+            return {}, ""
+        try:
+            proc = _invoke_mypy(base, present, tree, timeout)
+        except subprocess.TimeoutExpired:
+            return None, f"baseline mypy timed out after {timeout:g}s"
+        except OSError as exc:
+            return None, f"baseline mypy could not start: {exc}"
+        output = proc.stdout.strip()
+        if proc.returncode not in (0, 1):
+            reason = (proc.stderr.strip() or output).splitlines()
+            first = reason[0] if reason else f"exit code {proc.returncode}"
+            return None, f"baseline mypy could not run: {first}"
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+    renamed = {old: new for new, old in origins.items() if old is not None}
+    counts: dict[tuple[str, str], int] = {}
+    for rel, _, line in _mypy_errors(output, set(present)):
+        key = _error_key(renamed.get(rel, rel), line)
+        counts[key] = counts.get(key, 0) + 1
+    return counts, ""
+
+
+def _split_new_errors(
+    errors: Sequence[tuple[str, int, str]],
+    baseline: Mapping[tuple[str, str], int],
+    added: Mapping[str, set[int]],
+) -> tuple[list[tuple[str, int, str]], list[tuple[str, int, str]]]:
+    """Split post-change ``errors`` into ``(new, pre_existing)``, keeping their order.
+
+    Errors on untouched lines claim the baseline first, so when a message occurs
+    more often than before, the extra occurrence reported is the one on an added line.
+    """
+    budget = dict(baseline)
+    claimed: set[int] = set()
+    order = sorted(range(len(errors)), key=lambda i: errors[i][1] in added.get(errors[i][0], set()))
+    for index in order:
+        rel, _, line = errors[index]
+        key = _error_key(rel, line)
+        if budget.get(key, 0) > 0:
+            budget[key] -= 1
+            claimed.add(index)
+    new = [error for index, error in enumerate(errors) if index not in claimed]
+    pre_existing = [error for index, error in enumerate(errors) if index in claimed]
+    return new, pre_existing
+
+
+def _gate_typecheck(
+    files: list[tuple[str, Path]],
+    workspace: Path,
+    mode: TypecheckMode,
+    timeout: float,
+    diff: str = "",
+) -> tuple[bool, str, str]:
+    if mode == "off":
+        return True, "typecheck skipped (FOUNDRY_TYPECHECK=off)", ""
+    py_files = [rel for rel, path in files if path.suffix.lower() in (".py", ".pyi")]
+    if not py_files:
+        return True, "no Python files to typecheck", ""
+    base = _mypy_command()
+    if base is not None and (not Path(base[0]).is_absolute() or _inside(base[0], workspace)):
+        # never run a mypy that lives in (or resolves into) the workspace
+        base = None
+    if base is None:
+        if mode == "mypy":
+            return False, "", "mypy requested but not installed (pip install mypy)"
+        return True, "typecheck skipped (mypy not installed)", ""
+    try:
+        proc = _invoke_mypy(base, py_files, workspace, timeout)
     except subprocess.TimeoutExpired:
         return True, f"typecheck skipped (mypy timed out after {timeout:g}s)", ""
     except OSError as exc:
@@ -893,20 +1086,31 @@ def _gate_typecheck(
         first = reason[0] if reason else f"exit code {proc.returncode}"
         return True, f"typecheck skipped (mypy could not run: {first})\n{output}".rstrip(), proc.stderr
     changed = {_normalise_rel(rel) for rel in py_files}
-    errors: list[str] = []
-    for line in output.splitlines():
-        match = _MYPY_LINE.match(line)
-        if not match or match.group("kind") != "error":
-            continue
-        try:
-            rel = _normalise_rel(match.group("path"))
-        except DiffApplyError:
-            continue
-        if rel in changed:
-            errors.append(line)
-    if errors:
-        return False, "\n".join(errors), f"mypy: {len(errors)} type error(s) in changed files"
-    return True, "mypy: clean" + (f"\n{output}" if output else ""), ""
+    errors = _mypy_errors(output, changed)
+    if not errors:
+        return True, "mypy: clean" + (f"\n{output}" if output else ""), ""
+    all_lines = "\n".join(line for _, _, line in errors)
+    unfiltered = f"mypy: {len(errors)} type error(s) in changed files"
+    # Without a usable diff there is no baseline, so every error counts as new.
+    try:
+        patches = [patch for patch in _parse_diff(diff) if _touches_python(patch)]
+    except DiffApplyError:
+        return False, all_lines, unfiltered
+    baseline, skip_reason = _baseline_counts(base, py_files, patches, workspace, timeout)
+    if skip_reason:
+        return True, f"typecheck skipped ({skip_reason})\n{all_lines}", ""
+    if baseline is None:
+        return False, all_lines, unfiltered
+    new, pre_existing = _split_new_errors(errors, baseline, _added_lines(patches))
+    if new:
+        new_lines = "\n".join(line for _, _, line in new)
+        return False, new_lines, f"mypy: {len(new)} new type error(s) in changed files"
+    listed = [f"pre-existing: {line}" for _, _, line in pre_existing[:_MAX_PREEXISTING_LISTED]]
+    hidden = len(pre_existing) - _MAX_PREEXISTING_LISTED
+    if hidden > 0:
+        listed.append(f"pre-existing: ... and {hidden} more")
+    header = f"mypy: no new type errors, ignored {len(pre_existing)} pre-existing type error(s)"
+    return True, "\n".join([header, *listed]), ""
 
 
 def _split_cmd(test_cmd: str | Sequence[str]) -> list[str]:
@@ -1197,14 +1401,20 @@ def run_gates(
         elif check == "linter":
             passed, out, err = _gate_linter(files or [], root, linter)
         elif check == "typecheck":
-            passed, out, err = _gate_typecheck(files or [], root, typecheck, typecheck_timeout)
+            passed, out, err = _gate_typecheck(
+                files or [], root, typecheck, typecheck_timeout, submission.diff
+            )
         elif check == "tests":
             passed, out, err = _gate_tests(test_cmd, root, test_timeout)
         elif check == "schema":
             passed, out, err = _gate_schema(schema_targets, root)
         else:
             raise ValueError(f"unknown gate {check!r}")
-        skipped = [line for line in out.splitlines() if "skipped" in line]
+        skipped = [
+            line
+            for line in out.splitlines()
+            if "skipped" in line or (check == "typecheck" and "pre-existing" in line)
+        ]
         note = "; ".join(skipped) if skipped else None
         results.append(_result(submission, check, passed, started, out, err, note))
         if not passed and short_circuit:
