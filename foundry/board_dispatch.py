@@ -17,7 +17,7 @@ Foundry service on the user's PC runs one :class:`BatchWatcher`, which every
    all its dependencies are ``complete``; when a dependency ends any other way
    the subtask fails without being submitted;
 4. pushes each subtask's Foundry task id, state, PR record and error back with
-   ``updateBatch`` (plus a heartbeat every round) until every subtask is
+   ``updateBatch`` when something changed, else as a heartbeat at most every 2 minutes, until every subtask is
    finished and its PR settled.
 
 The mapping batch/subtask -> Foundry task id is kept in the queue's key-value

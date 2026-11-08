@@ -222,6 +222,37 @@ test('importState merges batches by id without loss', () => {
   assert.equal(ours.foundryBatches.length, 4);
 });
 
+test('dispatchBatch refuses with 409 once 200 batches are open', () => {
+  const s = fresh();
+  for (let i = 0; i < 200; i++) op(s, 'dispatchBatch', sample());
+  assert.throws(() => op(s, 'dispatchBatch', sample()), (e) => e.status === 409 && /200 open/.test(e.message));
+  op(s, 'cancelBatch', { id: 'S-001' });
+  assert.equal(op(s, 'dispatchBatch', sample()).id, 'S-201');
+  assert.equal(s.foundryBatches.length, 200, 'the finished one was pruned');
+});
+
+test('normalize drops junk subtasks so updateBatch still works', () => {
+  const s = fresh();
+  op(s, 'dispatchBatch', sample());
+  s.foundryBatches[0].subtasks.push(null, 'junk', { title: 'no key' }, { key: '' });
+  op(s, 'claimBatch', { id: 'S-001', host, service });
+  const b = op(s, 'updateBatch', { id: 'S-001', service, results: { 1: { state: 'complete' }, 2: { state: 'complete' } } }).batch;
+  assert.equal(b.subtasks.length, 2);
+  assert.equal(b.status, 'done');
+});
+
+test('result updates are not logged one by one; status changes and claims are', () => {
+  const s = fresh();
+  op(s, 'dispatchBatch', sample());
+  op(s, 'claimBatch', { id: 'S-001', host, service });
+  const n = s.log.length;
+  op(s, 'updateBatch', { id: 'S-001', service, results: { 1: { state: 'building' } } }); // claimed -> running
+  op(s, 'updateBatch', { id: 'S-001', service, results: { 1: { state: 'reviewing' } } });
+  op(s, 'updateBatch', { id: 'S-001', service, results: { 1: { state: 'complete' } } });
+  assert.equal(s.log.length, n + 1);
+  assert.match(s.log.at(-1).message, /S-001 running/);
+});
+
 // ---------- hub function ----------
 
 function fakeStore() {
@@ -278,6 +309,48 @@ test('hub function runs batch ops; a refused claim does not write; old stored st
   }
 });
 
+test('hub function: two concurrent claims, exactly one wins (compare-and-swap)', async () => {
+  const old = process.env.EDIT_KEY;
+  process.env.EDIT_KEY = 'k';
+  try {
+    const docs = new Map();
+    let n = 0;
+    let gate = null;
+    const store = {
+      async getWithMetadata(key) {
+        const d = docs.get(key);
+        const r = d ? { data: JSON.parse(d.body), etag: d.etag } : null;
+        if (gate) await gate; // both requests read the same revision
+        return r;
+      },
+      async setJSON(key, data, o = {}) {
+        const cur = docs.get(key);
+        if (o.onlyIfMatch && (!cur || cur.etag !== o.onlyIfMatch)) return { modified: false };
+        docs.set(key, { body: JSON.stringify(data), etag: `e${++n}` });
+        return { modified: true };
+      },
+    };
+    const h = makeHandler(() => store);
+    const post = (type, args) =>
+      h(new Request('https://x/api/department', { method: 'POST', headers: { 'x-edit-key': 'k' }, body: JSON.stringify({ type, args }) })).then((r) => r.json());
+    await post('dispatchBatch', { title: 't', repo: 'me/p', subtasks: [{ title: 'a' }] });
+    let release;
+    gate = new Promise((r) => (release = r));
+    const a = post('claimBatch', { id: 'S-001', host: 'A', service: 'fa' });
+    const b = post('claimBatch', { id: 'S-001', host: 'B', service: 'fb' });
+    setTimeout(() => { gate = null; release(); }, 50);
+    const [ra, rb] = await Promise.all([a, b]);
+    const wins = [ra, rb].filter((r) => r.result.ok);
+    assert.equal(wins.length, 1);
+    const loser = [ra, rb].find((r) => !r.result.ok);
+    assert.match(loser.result.reason, /already claimed/);
+    const final = JSON.parse(docs.get('state').body).state.foundryBatches[0].claimedBy;
+    assert.equal(final.service, wins[0].result.batch.claimedBy.service);
+  } finally {
+    if (old === undefined) delete process.env.EDIT_KEY; else process.env.EDIT_KEY = old;
+  }
+});
+
 // ---------- CLI (file mode) ----------
 
 test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
@@ -306,6 +379,7 @@ test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
     assert.match(out, /1\/2 complete/);
     assert.match(out, /F-007 +complete +Add X +PR https:\/\/github.com\/me\/planner\/pull\/9 \(open\)/);
     assert.equal(JSON.parse(cli('foundry', 'poll', 'S-001', '--json')).results['1'].foundryTask, 'F-007');
+    assert.equal(JSON.parse(cli('foundry', 'poll', '--json', 'S-001')).id, 'S-001');
     out = cli('foundry', 'list');
     assert.ok(out.indexOf('S-002') < out.indexOf('S-001'), 'newest first');
     assert.match(cli('foundry', 'cancel', 'S-002'), /S-002 cancelled/);

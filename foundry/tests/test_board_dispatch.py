@@ -777,3 +777,47 @@ def test_stale_claim_without_heartbeat_uses_the_claim_time(tmp_path: Path) -> No
 
     asyncio.run(go())
     assert board.get(b["id"])["claimedBy"]["host"] == "pc1"
+
+
+def test_heartbeat_only_updates_are_rate_limited(tmp_path: Path) -> None:
+    """Every poll reads the state, but an unchanged batch is written at most every 2 minutes."""
+    board = FakeBoard()
+    b = board.add(subtasks=[
+        {"key": "1", "title": "Add clamp helper", "description": "clamp", "files": ["shop/mathx.py"]},
+        {"key": "2", "title": "Use clamp", "description": "use", "dependsOn": ["1"]},
+    ])
+    clock = {"t": 1000.0}
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            # stop the builders: once sized, the order's state stays put, so only heartbeats are due
+            for pool in svc.factory.pools.values():
+                await pool.stop()
+            w = _watcher(svc, board, now=lambda: clock["t"])
+            await w.poll_once()
+            await _until_sized(svc)
+            await w.poll_once()  # pushes the sized state
+            sent = board.count("updateBatch")
+            for _ in range(5):
+                clock["t"] += 15
+                await w.poll_once()
+            assert board.count("updateBatch") == sent  # 75 s: nothing new, no write
+            clock["t"] += 60
+            await w.poll_once()
+            assert board.count("updateBatch") == sent + 1  # > 2 min: one heartbeat
+            assert board.ops[-1][1] == {"id": b["id"], "service": "foundry@pc1:me/shop", "heartbeat": True}
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
+async def _until_sized(svc: Service, timeout: float = 15.0) -> None:
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    m = svc.factory.manager
+    while not m.orders or any(m.is_sizing(t) for t in m.orders):
+        assert loop.time() < end, "sizing did not finish"
+        await asyncio.sleep(0.02)

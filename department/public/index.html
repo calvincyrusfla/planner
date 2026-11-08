@@ -338,6 +338,7 @@
   .batch-meta .stale { color: var(--warn); }
   .batch-goal { color: var(--muted); margin: 4px 0 0; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .batch .prow { margin-top: 8px; }
+  .batch .prow b.batch-count { width: auto; white-space: nowrap; }
   .pill.claimed, .pill.running { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 15%, transparent); }
   .pill.failed { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: color-mix(in srgb, var(--bad) 12%, transparent); }
   .sub-list { list-style: none; margin: 8px 0 0; padding: 0; }
@@ -983,6 +984,8 @@ function fmtAgoShort(iso) {
 function batchClaimText(b) {
   const c = b.claimedBy;
   if (!c || !c.host) return b.status === 'queued' ? 'Waiting for Foundry' : '';
+  // Heartbeat age (and its stale warning) only matters while Foundry holds the batch.
+  if (!['claimed', 'running'].includes(b.status)) return `Foundry on <code>${esc(c.host)}</code>`;
   const at = b.heartbeatAt || c.at;
   return `Foundry on <code>${esc(c.host)}</code>${at ? `, <span data-hb-at="${esc(at)}">${esc(fmtAgoShort(at))}</span>` : ''}`;
 }
@@ -1014,7 +1017,10 @@ function subtaskRow(b, st) {
 }
 function batchCard(b) {
   const subs = Array.isArray(b.subtasks) ? b.subtasks : [];
-  const done = subs.filter((st) => SUB_TERMINAL.includes((b.results && b.results[st.key] || {}).state)).length;
+  const stateOf = (st) => (b.results && b.results[st.key] || {}).state;
+  // "finished" = terminal (complete, failed or quarantined); "complete" matches the CLI's count.
+  const done = subs.filter((st) => SUB_TERMINAL.includes(stateOf(st))).length;
+  const complete = subs.filter((st) => stateOf(st) === 'complete').length;
   const pct = subs.length ? Math.round((done / subs.length) * 100) : 0;
   const status = BATCH_LABEL[b.status] ? b.status : 'queued';
   const claim = batchClaimText(b);
@@ -1032,7 +1038,7 @@ function batchCard(b) {
     </div>
     ${b.goal ? `<p class="batch-goal">${esc(b.goal)}</p>` : ''}
     ${b.note ? `<p class="batch-goal${b.status === 'failed' ? ' batch-err' : ''}">${esc(b.note)}</p>` : ''}
-    <div class="prow"><div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(b.id)} progress"><i style="width:${pct}%"></i></div><b>${done}/${subs.length}</b></div>
+    <div class="prow"><div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(b.id)} progress"><i style="width:${pct}%"></i></div><b class="batch-count">${done}/${subs.length} finished · ${complete} complete</b></div>
     <ul class="sub-list" aria-label="${esc(b.id)} subtasks">${subs.map((st) => subtaskRow(b, st)).join('')}</ul>
     ${['queued', 'claimed'].includes(b.status) ? `<div class="batch-actions"><button class="small danger" data-cancel-batch="${esc(b.id)}">Cancel</button></div>` : ''}
   </article>`;

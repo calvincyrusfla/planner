@@ -14,7 +14,8 @@
 //   results: {[key]: {foundryTask: "F-012"|null, state, pr: {state,url,branch,error}|null,
 //                     error: string|null, updatedAt}},
 // }
-// Log entries go to state.log with kind "foundry" and batchId.
+// Log entries go to state.log with kind "foundry" and batchId: dispatch, claims,
+// batch status changes and cancel only (not every result update).
 
 import { DeptError, clockNow } from './core.mjs';
 
@@ -188,7 +189,10 @@ export function normalizeBatches(state) {
   state.foundryBatches = state.foundryBatches.filter((b) => isObj(b) && typeof b.id === 'string');
   for (const b of state.foundryBatches) {
     if (!BATCH_STATUSES.includes(b.status)) b.status = 'queued';
-    if (!Array.isArray(b.subtasks)) b.subtasks = [];
+    // Junk subtasks (e.g. from an imported board) are dropped so updateBatch can't trip on them.
+    b.subtasks = (Array.isArray(b.subtasks) ? b.subtasks : []).filter(
+      (st) => isObj(st) && typeof st.key === 'string' && st.key !== '',
+    );
     if (!isObj(b.results)) b.results = {};
     b.claimedBy = isObj(b.claimedBy) ? b.claimedBy : null;
     b.heartbeatAt ??= null;
@@ -240,6 +244,9 @@ export function batchProgress(b) {
 
 export function dispatchBatch(state, { title, goal, repo, base, subtasks, by } = {}) {
   normalizeBatches(state);
+  if (state.foundryBatches.filter((b) => OPEN_BATCH.has(b.status)).length >= LIMITS.keep) {
+    throw new DeptError(`The board already holds ${LIMITS.keep} open Foundry batches; cancel or finish some first`, 409);
+  }
   const batch = {
     id: batchNumber(state.nextBatchNumber),
     title: text(title, 'title', LIMITS.title, { required: true }),
@@ -315,7 +322,6 @@ export function updateBatch(state, { id, service, host, status, results, heartbe
   for (const [key, patch] of cleaned) {
     const prev = b.results[key] || { foundryTask: null, state: 'queued', pr: null, error: null };
     const next = { ...prev, ...patch, updatedAt: iso };
-    if (prev.state !== next.state) log(state, b.id, `${b.id} #${key}${next.foundryTask ? ` (${next.foundryTask})` : ''}: ${next.state}`);
     b.results[key] = next;
   }
   if (noteText !== undefined) b.note = noteText;

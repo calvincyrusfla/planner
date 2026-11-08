@@ -65,7 +65,8 @@ const HELP = `Agent Department CLI
                                                        endpoint; at most every 30 s via the dashboard;
                                                        env DEPT_USAGE_DIRECT=off disables it)
   node department/dept.mjs foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."]
-                       --subtask "Title::description::file1,file2::S" (repeatable) | --json batch.json
+                       --subtask "Title::description::file1,file2::S" (repeatable; "::" separates
+                       the fields, so use --json batch.json for text containing "::")
                                                        Hand a batch of work to Foundry (S-###);
                                                        Foundry on the PC claims batches for its repo
   node department/dept.mjs foundry poll <S-id> [--json] Batch status: each subtask's F-id, state, PR
@@ -83,6 +84,8 @@ Shared board (one board for this PC and Claude sessions, stored on the Netlify s
   Env DEPT_HUB_URL (+ DEPT_HUB_KEY) selects a shared board without hub connect.
 `;
 
+// Options that never take a value (so `poll --json S-001` keeps S-001 positional).
+const FLAGS = new Set(['open']);
 function parse(argv) {
   const pos = [];
   const opt = {};
@@ -93,7 +96,7 @@ function parse(argv) {
     else if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith('--') || next === '-m') opt[key] = true;
+      if (next === undefined || next.startsWith('--') || next === '-m' || FLAGS.has(key)) opt[key] = true;
       else opt[key] = argv[++i];
     } else pos.push(a);
   }
@@ -550,7 +553,7 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S" ... | --json file.json\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id>';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S" ... | --json file.json\n         ("::" separates --subtask fields; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id>';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
 // "Title::description::file1,file2::S" → subtask. Empty parts are skipped.
@@ -586,8 +589,9 @@ function batchCounts(b) {
 }
 
 function claimLine(b, at) {
-  if (b.claimedBy) return `Foundry on ${b.claimedBy.host || '?'} (${b.claimedBy.service || '?'}), heartbeat ${ago(b.heartbeatAt || b.claimedBy.at, at)}`;
-  return b.status === 'queued' ? 'waiting for Foundry' : '—';
+  if (b.claimedBy && (b.status === 'claimed' || b.status === 'running')) return `Foundry on ${b.claimedBy.host || '?'} (${b.claimedBy.service || '?'}), heartbeat ${ago(b.heartbeatAt || b.claimedBy.at, at)}`;
+  if (b.status === 'queued') return 'waiting for Foundry';
+  return b.claimedBy ? `ran on Foundry on ${b.claimedBy.host || '?'} (${b.claimedBy.service || '?'})` : '—';
 }
 
 function printBatch(b) {
@@ -628,6 +632,11 @@ async function foundryCommand(sub, args, opt) {
       return;
     }
     case 'poll': {
+      // `poll --json S-001`: --json is a plain flag here, so its "value" is the id.
+      if (typeof opt.json === 'string') {
+        args = [opt.json, ...args];
+        opt.json = true;
+      }
       if (!args[0]) throw new core.DeptError(FOUNDRY_HELP);
       const s = await currentState();
       const id = String(args[0]).toUpperCase();
