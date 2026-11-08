@@ -631,14 +631,24 @@ class Service:
         fn = getattr(getattr(f, "manager", None), "actions", None) if f is not None else None
         if not callable(fn):
             return []
-        try:
-            rows = fn(limit=limit)
-        except TypeError:
-            rows = fn()
-        out = [_jsonable(dict(r)) for r in (rows or []) if isinstance(r, Mapping)]
+        rows = self._all_actions(fn)
+        out = [_jsonable(dict(r)) for r in rows]
         out = [r for r in out if not self._foreign(r.get("task_id"))]
         out.sort(key=lambda r: _at_key(r.get("at")), reverse=True)
         return out[: max(0, int(limit))]
+
+    @staticmethod
+    def _all_actions(fn: Callable[..., Any]) -> list[Mapping[str, Any]]:
+        """The whole action log (filtering by repo happens before the caller's limit is applied)."""
+        try:
+            from foundry.floor_manager import ACTION_LOG_MAX as cap
+        except ImportError:  # pragma: no cover - older manager
+            cap = 500
+        try:
+            rows = fn(limit=max(int(cap), 1))
+        except TypeError:
+            rows = fn()
+        return [r for r in (rows or []) if isinstance(r, Mapping)]
 
     def _foreign(self, tid: Any) -> bool:
         """True only when the task is known to belong to another repository (its actions stay hidden)."""
@@ -656,6 +666,11 @@ class Service:
         fn = getattr(getattr(f, "manager", None), "undo_action", None) if f is not None else None
         if not callable(fn):
             return {"ok": False, "reason": "This Foundry version cannot undo actions.", "code": "unsupported"}
+        lister = getattr(f.manager, "actions", None)
+        if callable(lister):
+            entry = next((r for r in self._all_actions(lister) if str(r.get("action_id")) == str(action_id)), None)
+            if entry is not None and self._foreign(entry.get("task_id")):
+                return {"ok": False, "action_id": action_id, "reason": "unknown action", "code": "not_found"}
         result = await _maybe_await(fn(action_id, by=by))
         out = _jsonable(dict(result)) if isinstance(result, Mapping) else {"ok": bool(result)}
         out["ok"] = bool(out.get("ok"))

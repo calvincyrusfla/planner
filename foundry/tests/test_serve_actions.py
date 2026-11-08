@@ -187,3 +187,37 @@ def test_service_without_manager_log(tmp_path):
     assert svc.actions() == []
     out = asyncio.run(svc.undo_action("A-1"))
     assert out["ok"] is False and out["code"] == "unsupported"
+
+
+def test_service_actions_filters_before_limit(tmp_path):
+    other = tmp_path.parent / "elsewhere"
+    m = FakeManager({"F-1": str(tmp_path), "F-2": None, "F-9": str(other)})
+    seen = []
+    orig = m.actions
+    m.actions = lambda limit=50: (seen.append(limit), orig(limit))[1]
+    svc = _service(tmp_path, m)
+    # the newest entry (A-9) is another repo's: limit=1 must still return this repo's newest
+    assert [r["action_id"] for r in svc.actions(limit=1)] == ["A-3"]
+    assert seen[-1] > 1
+
+
+def test_service_undo_refuses_another_repos_action(tmp_path):
+    other = tmp_path.parent / "elsewhere"
+    m = FakeManager({"F-1": str(tmp_path), "F-9": str(other)})
+    svc = _service(tmp_path, m)
+    out = asyncio.run(svc.undo_action("A-9"))
+    assert out == {"ok": False, "action_id": "A-9", "reason": "unknown action", "code": "not_found"}
+    assert m.calls == []
+    assert asyncio.run(svc.undo_action("A-1"))["ok"] is True
+
+
+def test_undo_not_found_and_not_running(api, svc):
+    async def foreign(action_id, by="user"):
+        return {"ok": False, "reason": "unknown action", "code": "not_found"}
+
+    svc.undo_action = foreign
+    resp, out = request(api, "POST", "/api/actions/A-9/undo")
+    assert resp.status == 404 and out["code"] == "not_found"
+    svc.running = False
+    resp, out = request(api, "POST", "/api/actions/A-2/undo")
+    assert resp.status == 503 and out["code"] == "not_running"

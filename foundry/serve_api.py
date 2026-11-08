@@ -21,7 +21,8 @@ in the background); 409 ``{ok: false, reason, code: "refused"}`` when the PR is
 open, already publishing or has no patch; 404 for an unknown task.
 ``POST /api/actions/<id>/undo`` -> ``{ok, action_id, ...}``; 409 ``{ok: false,
 reason, error, code: "refused"}`` when it cannot be undone (state moved on,
-not undoable, unknown id).
+not undoable); 404 ``code: "not_found"`` for an action of another repository's
+task; 503 ``not_running`` while the service is stopped.
 
 Errors are JSON ``{ok: false, error, code}``: 400 ``invalid``, 403 ``not_local``,
 404, 405 ``method``, 413 ``too_large``, 503 ``not_running`` (orders/ask while
@@ -556,6 +557,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _undo(self, action_id: str) -> None:
         self._read_json()  # body is optional and ignored, but must be valid JSON when present
         svc = self.service
+        if _not_running(svc):
+            return self._error(503, "Foundry is not running.", "not_running")
         fn = getattr(svc, "undo_action", None)
         if not callable(fn):
             return self._error(404, "This Foundry cannot undo actions.", "not_found")
@@ -568,7 +571,7 @@ class _Handler(BaseHTTPRequestHandler):
         reason = str(out.get("reason") or out.get("error") or "This action cannot be undone.")
         out.update({"ok": False, "reason": reason, "error": reason})
         out.setdefault("code", "refused")
-        self._send_json(409, out)
+        self._send_json(404 if out["code"] == "not_found" else 409, out)
 
     def _event(self, name: str | None, payload: dict[str, Any]) -> None:
         text = ""
