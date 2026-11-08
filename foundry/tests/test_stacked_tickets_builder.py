@@ -243,7 +243,8 @@ def test_tests_ticket_builds_on_the_approved_impl(tmp_path: Path, monkeypatch: p
     outcome = asyncio.run(rig.worker.process_ticket(ticket))
     assert outcome == "review", rig.worker.scratch.get("last_reply")
     # one repo copy per attempt: the stacked copy is also the gate workspace
-    assert [p.name.split("-")[1] for p in made] == ["stack"]
+    # ("norm" holds only the touched files, for normalising the diff: not a repo copy)
+    assert [p.name.split("-")[1] for p in made if not p.name.startswith("foundry-norm-")] == ["stack"]
 
     prompt = rig.client.prompts_for("alpha-2")[0]
     assert "## Your files\n- tests/test_calc.py\n" in prompt
@@ -393,3 +394,54 @@ def test_queue_release_later_tickets_is_preferred() -> None:
     w = BuilderWorker(TEAM, 1, q, SimulatedClaudeClient(), None, None, None, None, None, None)
     assert w._send_back(dict(q.get_ticket("A")), "fix", reason="revise") == "retry"
     assert calls == ["A"] and q.events == []
+
+
+# ---------------------------------------------------------------------------
+# approved diffs are normalised, so strict stacking never stalls later tickets
+# ---------------------------------------------------------------------------
+
+#: Claude's raw impl diff with wrong hunk counts: the gates' lenient applier takes it,
+#: ``git apply`` calls it a corrupt patch.
+LOOSE_IMPL_DIFF = IMPL_DIFF.replace("@@ -3,3 +3,7 @@", "@@ -3,9 +3,2 @@")
+
+
+def test_normalize_diff_makes_a_loose_diff_strict(tmp_path: Path) -> None:
+    base = make_repo(tmp_path / "base")
+    from foundry.validation_gates import apply_diff, normalize_diff
+
+    work = tmp_path / "lenient"
+    shutil.copytree(base, work)
+    apply_diff(LOOSE_IMPL_DIFF, work)  # the gates accept it
+    if shutil.which("git"):
+        with pytest.raises(DiffApplyError):
+            prepare_stacked_workspace(base, tmp_path / "raw", [LOOSE_IMPL_DIFF])
+    norm = normalize_diff(LOOSE_IMPL_DIFF, {CALC: BASE_CALC})
+    assert norm.startswith(f"diff --git a/{CALC} b/{CALC}\n--- a/{CALC}\n+++ b/{CALC}\n@@ -3,3 +3,7 @@")
+    root = prepare_stacked_workspace(base, tmp_path / "norm", [norm])
+    assert (root / CALC).read_text(encoding="utf-8") == (work / CALC).read_text(encoding="utf-8")
+    # new and deleted files
+    created = normalize_diff(f"--- /dev/null\n+++ b/{OTHER}\n@@ -0,0 +1,1 @@\n+X = 1\n", {OTHER: None})
+    assert f"new file mode 100644\n--- /dev/null\n+++ b/{OTHER}\n" in created and "+X = 1\n" in created
+    gone = normalize_diff(
+        f"--- a/{CALC}\n+++ /dev/null\n@@ -1,5 +0,0 @@\n" + "".join(f"-{ln}\n" for ln in BASE_CALC.splitlines()),
+        {CALC: BASE_CALC})
+    assert f"deleted file mode 100644\n--- a/{CALC}\n+++ /dev/null\n" in gone
+
+
+def test_loose_raw_diff_is_stored_normalised_and_the_next_ticket_stacks(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, "```diff\n" + LOOSE_IMPL_DIFF + "```\n")
+    t1 = rig.ticket("T-9.1")
+    claimed = rig.queue.claim_ticket(TEAM, t1.slot)
+    builder = BuilderWorker(TEAM, t1.slot, rig.queue, rig.client, None, None, rig.engine, rig.gates, None, _Foreman())
+    assert asyncio.run(builder.process_ticket(claimed)) == "review"
+    item = builder.review_inbox.get_nowait()
+    stored = item.submission.diff
+    assert stored != LOOSE_IMPL_DIFF and "@@ -3,3 +3,7 @@" in stored  # exact counts
+    # what the reviewer approves is what the queue keeps (ReviewerWorker -> record_approved_diff)
+    rig.queue.record_approved_diff(t1.ticket_id, stored)
+    rig.queue.complete_ticket(t1.ticket_id)
+
+    rig.client.script = lambda _p, _a: stacked_reply()
+    ticket = rig.claim_tests()
+    assert asyncio.run(rig.worker.process_ticket(ticket)) == "review"  # stacked, no stack_failed
+    assert "def mul(a: int, b: int) -> int:" in rig.client.prompts_for("alpha-2")[0]

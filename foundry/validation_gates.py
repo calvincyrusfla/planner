@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import difflib
 import fnmatch
 import importlib.util
 import json
@@ -47,6 +48,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -68,6 +70,7 @@ __all__ = [
     "STACK_COPY_IGNORE",
     "apply_diff",
     "builtin_lint",
+    "normalize_diff",
     "prepare_stacked_workspace",
     "run_gates",
     "run_gates_outcome",
@@ -426,6 +429,66 @@ def prepare_stacked_workspace(
         except DiffApplyError as exc:
             raise DiffApplyError(f"earlier approved diff {label} does not apply: {exc}") from exc
     return out
+
+
+def _keep_ends(text: str) -> list[str]:
+    """Split on ``\\n`` only (like git), keeping line endings."""
+    parts = text.split("\n")
+    out = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        out.append(parts[-1])
+    return out
+
+
+def _file_diff(rel: str, old: str | None, new: str | None) -> str:
+    """Git-style diff of one file (same format as :mod:`foundry.edits` produces)."""
+    if old == new:
+        return ""
+    if old is None:
+        head = f"diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n"
+    elif new is None:
+        head = f"diff --git a/{rel} b/{rel}\ndeleted file mode 100644\n--- a/{rel}\n+++ /dev/null\n"
+    else:
+        head = f"diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n"
+    body: list[str] = []
+    for line in list(difflib.unified_diff(_keep_ends(old or ""), _keep_ends(new or ""), n=3, lineterm="\n"))[2:]:
+        body.append(line)
+        if not line.endswith("\n"):
+            body.append("\n\\ No newline at end of file\n")
+    return head + "".join(body) if body else ""
+
+
+def normalize_diff(diff: str, before: Mapping[str, str | None]) -> str:
+    """Re-derive ``diff`` as an exact git-style diff of what it really changes.
+
+    ``before`` maps each path the diff touches to its content before the
+    change (None = absent), e.g. the stacked workspace's files.  The diff is
+    applied with the same lenient :func:`apply_diff` the gates use (offsets
+    tolerated) in a scratch directory, and the result is diffed against
+    ``before`` with exact context, so the stored/approved diff applies
+    strictly (``git apply``) where the raw one only applied leniently.
+
+    Raises:
+        DiffApplyError: the diff does not apply on ``before``.
+    """
+    old = {_normalise_rel(rel): text for rel, text in before.items()}
+    tmp = Path(tempfile.mkdtemp(prefix="foundry-norm-"))
+    try:
+        for rel, text in old.items():
+            if text is None:
+                continue
+            target = _resolve_inside(tmp, rel)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(text.encode("utf-8"))
+        applied = apply_diff(diff, tmp)
+        parts: list[str] = []
+        for a in applied:
+            target = tmp / a.path
+            new = target.read_bytes().decode("utf-8") if target.is_file() else None
+            parts.append(_file_diff(a.path, old.get(a.path), new))
+        return "".join(parts)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 #: ``git`` options for stacking (same as ``floor_manager.stack_diffs``): no CRLF rewriting.

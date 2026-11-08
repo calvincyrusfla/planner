@@ -56,7 +56,7 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from foundry import claude_client as _claude_client
-from foundry.validation_gates import DiffApplyError, prepare_stacked_workspace
+from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
 from foundry.schemas import (
     MAX_RETRIES,
     MAX_RETRIES_LIMIT,
@@ -1954,6 +1954,7 @@ class BuilderWorker(_WorkerBase):
         # 4. deterministic gates, short-circuit before any reviewer
         self._set_state(task_id, TaskState.VALIDATING)
         snapshot = self._snapshot(submission.diff)
+        before = self._before_change(submission.diff)
         try:
             gates = await self._run_gates(submission, assignment)
         except Exception as exc:
@@ -1973,6 +1974,8 @@ class BuilderWorker(_WorkerBase):
             hint = await self._condense(trace, gates.summary or getattr(failure, "note", None), task_id=task_id)
             check = getattr(failure, "check_type", "gate")
             return self._send_back(ticket, f"[{check}] {hint}", reason=f"gate_{check}")
+        # what reviewer, cache, queue and patch see: the exact diff of the change
+        submission = self._normalized(ticket, submission, before)
 
         # 5. Gemma pre-review: may send obvious problems back once per ticket (gate mode).
         send_back, notes, review = await self._pre_review(ticket, assignment, submission, gates.results)
@@ -2183,6 +2186,7 @@ class BuilderWorker(_WorkerBase):
         )
         self._set_state(task_id, TaskState.VALIDATING)
         snapshot = self._snapshot(cached)
+        before = self._before_change(cached)
         try:
             gates = await self._run_gates(submission, assignment)
         except Exception as exc:
@@ -2195,6 +2199,8 @@ class BuilderWorker(_WorkerBase):
             _restore_files(self.workspace, snapshot)
             self._event("cache_stale", task_id, {"ticket_id": _get(ticket, "ticket_id")})
             return None
+        submission = self._normalized(ticket, submission, before)
+        cached = submission.diff
         prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
                                       focus_files=self._focus_files(ticket, assignment))
         self._tm("record_tokens_saved", task_id, "cache", _estimate_tokens(prompt) + _estimate_tokens(cached))
@@ -2211,6 +2217,45 @@ class BuilderWorker(_WorkerBase):
             return "cached"
         await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta)
         return "review"
+
+    # -- diff normalisation --------------------------------------------------------
+    def _before_root(self) -> Path | None:
+        """Where the files stand before this ticket's change (stacked copy, workspace or base)."""
+        if self._stack is not None and self._stack.root is not None:
+            return self._stack.root
+        if self.workspace is not None:
+            return self.workspace
+        return self._stack_base()
+
+    def _before_change(self, diff: str) -> dict[str, str | None] | None:
+        """Contents of the files ``diff`` touches before the gates apply it (None: unknown)."""
+        root = self._before_root()
+        if root is None or not root.is_dir():
+            return None
+        return _snapshot_files(root, extract_diff_paths(diff))
+
+    def _normalized(self, ticket: Any, submission: BuilderSubmission,
+                    before: dict[str, str | None] | None) -> BuilderSubmission:
+        """``submission`` with its diff re-derived exactly (see ``validation_gates.normalize_diff``).
+
+        Claude's raw diff passed the gates' lenient applier (offsets, loose
+        context); the normalised diff has exact context, so it stacks
+        strictly (``git apply``) under later tickets and in the combined
+        patch.  The raw diff is kept when normalising fails or yields nothing.
+        """
+        raw = submission.diff
+        if before is None or not raw.strip():
+            return submission
+        try:
+            norm = normalize_diff(raw, before)
+        except (DiffApplyError, OSError, UnicodeDecodeError) as exc:
+            log.warning("%s: could not normalise the diff of %s: %s", self.agent_id, _get(ticket, "ticket_id"), exc)
+            return submission
+        if not norm.strip() or _hunk_lines(norm) == _hunk_lines(raw):
+            return submission  # already exact (only the headers differ): keep Claude's diff
+        self._event("diff_normalized", submission.task_id,
+                    {"ticket_id": _get(ticket, "ticket_id"), "raw_bytes": len(raw), "bytes": len(norm)})
+        return submission.model_copy(update={"diff": norm, "modified_files": extract_diff_paths(norm)})
 
     async def _infra_release(self, ticket: Any, exc: BaseException) -> str:
         """E1 for builders: pause/back off, then release the ticket or quarantine at the cap."""
@@ -2256,6 +2301,17 @@ _SHORT_CONTRACT = (
     "Reply with exactly one ```edits block (JSON ops such as replace_symbol) or one ```diff "
     "block, touching only the allowed files."
 )
+
+
+def _hunk_lines(diff: str) -> list[str]:
+    """A diff's hunk headers and body lines (file headers dropped), for comparing two diffs."""
+    out: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith(("diff --git ", "--- ", "+++ ", "index ", "new file mode", "deleted file mode")):
+            continue
+        if line[:1] in ("@", "+", "-", " ", "\\"):
+            out.append(line)
+    return out
 
 
 @dataclass

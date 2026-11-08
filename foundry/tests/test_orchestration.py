@@ -999,7 +999,9 @@ def test_two_subtasks_on_one_file_give_one_honest_output(tmp_path: Path) -> None
         r = _sp.run(["git", "apply", "--check", str(tmp_path / "patches" / "F-001.patch")], cwd=repo, capture_output=True)
         assert r.returncode == 0
     if _sh.which("git"):
-        assert names == ["F-001.md", "F-001.patch.rejected"]  # both append at the same line: conflict
+        # stacked: part 2 is built on part 1 and its diff is normalised against that
+        # stacked workspace, so the two fold into one patch that applies on the base
+        assert names == ["F-001.md", "F-001.patch"]
     f.close()
 
 
