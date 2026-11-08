@@ -292,6 +292,7 @@ _SIZING_SCHEMA: dict[str, Any] = {
                     "title": {"type": "string"},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                     "allowed_files": {"type": "array", "items": {"type": "string"}},
+                    "independent": {"type": "boolean"},
                 },
                 "required": ["title", "acceptance_criteria", "allowed_files"],
             },
@@ -1472,6 +1473,10 @@ class ShopForeman:
                     "You are the Shop Foreman of a software factory. Size the work order: "
                     "S = one builder, M = two builders, L or XL = a full team of five. "
                     "Split it into exactly one subtask per builder with no file in two subtasks. "
+                    "Order the subtasks in build order (tests and docs last); each builder sees the "
+                    "earlier subtasks' finished work. Set \"independent\": true on a subtask only "
+                    "when it needs nothing (no function, file or setting) from any other subtask; "
+                    "otherwise false. "
                     "Reply with JSON only."
                 ),
             },
@@ -1510,6 +1515,8 @@ class ShopForeman:
                         "title": str(item.get("title") or "").strip(),
                         "acceptance_criteria": _str_list(item.get("acceptance_criteria")),
                         "allowed_files": _str_list(item.get("allowed_files")),
+                        # only a literal JSON true counts: anything else keeps the subtask sequential
+                        "independent": item.get("independent") is True,
                     }
                 )
             directive = self._build_directive(
@@ -1551,6 +1558,7 @@ class ShopForeman:
                 target = subtasks[k % n]
                 target["acceptance_criteria"] += extra["acceptance_criteria"]
                 target["allowed_files"] += extra["allowed_files"]
+                target["independent"] = bool(target.get("independent")) and bool(extra.get("independent"))
             if files:
                 allowed, seen = set(files), set()
                 for sub in subtasks:
@@ -1598,6 +1606,7 @@ class ShopForeman:
                     title=sub["title"],
                     acceptance_criteria=sub["acceptance_criteria"],
                     allowed_files=sub["allowed_files"],
+                    independent=bool(sub.get("independent", False)),  # heuristic split: never
                 )
                 for k, sub in enumerate(subtasks)
             ],

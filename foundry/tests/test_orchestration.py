@@ -40,7 +40,7 @@ from foundry.foreman_probe import probe
 from foundry.gemma_client import GemmaRequest, SimulatedGemmaClient
 from foundry.main import append_diff, demo_claude, run_demo, write_demo_repo
 from foundry.rate_limiter import RateLimiter
-from foundry.schemas import ClaudeResult, DeterministicGateResult, ForemanEscalation, TaskState
+from foundry.schemas import MAX_RETRIES, ClaudeResult, DeterministicGateResult, ForemanEscalation, TaskState
 
 
 # --------------------------------------------------------------------------- helpers
@@ -266,14 +266,14 @@ def test_broken_diff_never_reaches_the_reviewer_and_third_failure_quarantines(tm
     # 4: the reviewer never saw the broken diff
     assert claude.calls["alpha-6"] == 0
     assert claude.role_calls["reviewer"] == 0
-    # 5: attempts 1, 2, 3 -> quarantined, no 4th build call
+    # 5: attempts 1 .. MAX_RETRIES + 1 -> quarantined, no extra build call
     assert states[tid] == TaskState.QUARANTINED.value
-    assert claude.calls["alpha-1"] == 3
+    assert claude.calls["alpha-1"] == MAX_RETRIES + 1
     prompts = claude.prompts_for("alpha-1")
     assert "## Fix required" not in prompts[0]
     assert all("## Fix required" in p and "[syntax]" in p for p in prompts[1:])
     retries = [e for e in f.queue.events() if e["kind"] == "retry"]
-    assert len(retries) == 2
+    assert len(retries) == MAX_RETRIES
     for e in retries:  # every hint is one line naming file:line
         hint = e["payload"]["fix_hint"]
         assert "\n" not in hint and re.search(r"shop/mathx\.py:\d+", hint)
@@ -999,7 +999,9 @@ def test_two_subtasks_on_one_file_give_one_honest_output(tmp_path: Path) -> None
         r = _sp.run(["git", "apply", "--check", str(tmp_path / "patches" / "F-001.patch")], cwd=repo, capture_output=True)
         assert r.returncode == 0
     if _sh.which("git"):
-        assert names == ["F-001.md", "F-001.patch.rejected"]  # both append at the same line: conflict
+        # stacked: part 2 is built on part 1 and its diff is normalised against that
+        # stacked workspace, so the two fold into one patch that applies on the base
+        assert names == ["F-001.md", "F-001.patch"]
     f.close()
 
 

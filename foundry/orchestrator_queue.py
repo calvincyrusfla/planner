@@ -32,16 +32,18 @@ import asyncio
 import json
 import os
 import sqlite3
+import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from foundry.schemas import MAX_RETRIES, TaskSizingDirective, TaskState
+from foundry.schemas import MAX_RETRIES, MAX_RETRIES_LIMIT, TaskSizingDirective, TaskState
 from foundry.sizing_outcomes import SIZES, actual_complexity
 
 __all__ = [
@@ -127,7 +129,7 @@ class Ticket(BaseModel):
     subtask_id: str
     slot: int = Field(ge=1, le=5)
     status: TicketStatus
-    attempt: int = Field(ge=0, le=MAX_RETRIES)
+    attempt: int = Field(ge=0, le=MAX_RETRIES_LIMIT)
     title: str = ""
     acceptance_criteria: list[str] = Field(default_factory=list)
     allowed_files: list[str] = Field(default_factory=list)
@@ -139,6 +141,12 @@ class Ticket(BaseModel):
     claimed_at: str | None = None
     created_at: str
     updated_at: str
+    #: Position of the ticket within its task (0 = first); see :meth:`FoundryQueue.claim_ticket`.
+    order_index: int = Field(default=0, ge=0)
+    #: True when the ticket may be built alongside earlier, unfinished tickets of its task.
+    parallel_ok: bool = True
+    #: The ticket's own subtask files (``allowed_files`` is the task-wide union, these first).
+    focus_files: list[str] = Field(default_factory=list)
 
 
 _SCHEMA = """
@@ -179,6 +187,10 @@ CREATE TABLE IF NOT EXISTS tickets (
     claimed_at           TEXT,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
+    order_index          INTEGER NOT NULL DEFAULT 0,
+    parallel_ok          INTEGER NOT NULL DEFAULT 1,
+    focus_files          TEXT NOT NULL DEFAULT '[]',
+    approved_diff        TEXT,
     UNIQUE (task_id, subtask_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_claim ON tickets(team_id, slot, status);
@@ -275,6 +287,12 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "in_review": "INTEGER NOT NULL DEFAULT 0",
         "infra_failures": "INTEGER NOT NULL DEFAULT 0",
         "infra_last_error": "TEXT",
+        # Stacked tickets: tickets of old dbs keep running in parallel
+        # (order 0, parallel_ok 1) so nothing in flight stalls.
+        "order_index": "INTEGER NOT NULL DEFAULT 0",
+        "parallel_ok": "INTEGER NOT NULL DEFAULT 1",
+        "focus_files": "TEXT NOT NULL DEFAULT '[]'",
+        "approved_diff": "TEXT",
     },
     "escalations": {"result": "TEXT"},
     "tasks": {"repo_root": "TEXT"},
@@ -284,6 +302,125 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         "excluded_from_calibration": "INTEGER NOT NULL DEFAULT 0",
     },
 }
+
+
+@dataclass(frozen=True)
+class TicketPlan:
+    """Where one subtask goes in its task's build order (see :func:`plan_tickets`)."""
+
+    order_index: int
+    parallel_ok: bool
+    focus_files: list[str]
+    allowed_files: list[str]
+
+
+_TEST_DIRS = frozenset({"test", "tests", "__tests__", "spec", "specs", "testing"})
+_DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+_DEPENDS_RE = re.compile(r"\b(depends? on|after|builds? on|requires?|uses?)\b", re.IGNORECASE)
+
+
+def is_test_file(path: str) -> bool:
+    """True for test files (``tests/...``, ``test_x.py``, ``x_test.py``, ``x.test.js``, ``conftest.py``)."""
+    parts = [p for p in str(path).replace("\\", "/").lower().split("/") if p]
+    if not parts:
+        return False
+    name = parts[-1]
+    if any(p in _TEST_DIRS for p in parts[:-1]):
+        return True
+    stem = name.rsplit(".", 1)[0]
+    return (name == "conftest.py" or stem.startswith("test_") or stem.endswith("_test")
+            or ".test." in name or ".spec." in name)
+
+
+def is_doc_file(path: str) -> bool:
+    """True for documentation files (``docs/...``, ``*.md``, ``*.rst``, ``*.txt``, ``*.adoc``)."""
+    norm = str(path).replace("\\", "/").lower()
+    return norm.endswith(_DOC_SUFFIXES) or norm.startswith(("docs/", "doc/")) or "/docs/" in norm
+
+
+def _norm_file(path: str) -> str:
+    text = str(path).strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _marks_dependency(sub: Any, earlier: list[Any]) -> bool:
+    """True when the Foreman marked ``sub`` as depending on an earlier subtask.
+
+    Uses an explicit ``depends_on`` list when the subtask carries one, else
+    looks for an earlier subtask id named in its title/criteria.
+    """
+    deps = getattr(sub, "depends_on", None)
+    if deps:
+        return True
+    text = " ".join([str(getattr(sub, "title", ""))] + [str(c) for c in getattr(sub, "acceptance_criteria", [])])
+    for e in earlier:
+        sid = str(getattr(e, "subtask_id", ""))
+        if sid and re.search(rf"(?<![\w.-]){re.escape(sid)}(?![\w-]|\.\d)", text) and _DEPENDS_RE.search(text):
+            return True
+    return False
+
+
+def plan_tickets(subtasks: list[Any]) -> list[TicketPlan]:
+    """Order a task's subtasks into stacked tickets; one :class:`TicketPlan` per subtask (same order).
+
+    * ``order_index``: the directive's subtask order, with tests/docs
+      subtasks (every file a test or doc file) moved last, order kept.
+    * ``parallel_ok``: sequential by default. Only when the subtask is
+      explicitly marked ``independent`` by the Foreman, its files are known
+      and disjoint from every earlier subtask's files, no test file is
+      involved on either side, and no dependency on an earlier subtask is
+      marked (``depends_on`` or an earlier id named in its text). Otherwise
+      the ticket waits until every earlier ticket is done (approved).
+    * ``allowed_files``: the subtask's own files first (its "focus"). A
+      sequential ticket then gets every other file of the task except those
+      of later parallel_ok tickets (which may be built at the same time); a
+      parallel_ok ticket gets only its own files. So two tickets that may
+      run concurrently never share a file and their diffs never collide.
+    """
+    own = [[_norm_file(f) for f in getattr(s, "allowed_files", []) if str(f).strip()] for s in subtasks]
+
+    def trailing(files: list[str]) -> bool:
+        return bool(files) and all(is_test_file(f) or is_doc_file(f) for f in files)
+
+    order = sorted(range(len(subtasks)), key=lambda i: (trailing(own[i]), i))
+    # pass 1: who may run alongside earlier tickets
+    parallel: list[bool] = []
+    seen: set[str] = set()
+    seen_tests = False
+    earlier: list[Any] = []
+    for pos, i in enumerate(order):
+        files = own[i]
+        has_tests = any(is_test_file(f) for f in files)
+        parallel.append(
+            pos > 0 and bool(getattr(subtasks[i], "independent", False)) and bool(files)
+            and not seen_tests and not has_tests and not (set(files) & seen)
+            and not _marks_dependency(subtasks[i], earlier)
+        )
+        seen.update(files)
+        seen_tests = seen_tests or has_tests
+        earlier.append(subtasks[i])
+    # pass 2: allowed files = own files + files of tickets that never run at the same time
+    plans: dict[int, TicketPlan] = {}
+    for pos, i in enumerate(order):
+        focus = list(dict.fromkeys(own[i]))
+        if not focus:  # a subtask without files stays unrestricted (as before)
+            plans[i] = TicketPlan(order_index=pos, parallel_ok=parallel[pos], focus_files=[],
+                                  allowed_files=[])
+            continue
+        extra: list[str] = []
+        if not parallel[pos]:
+            # a parallel_ok ticket keeps to its own files (earlier tickets may be running and
+            # may touch any later file); a sequential one may touch every file of the task
+            # except those of later parallel_ok tickets, which may be built at the same time
+            busy = {f for q, j in enumerate(order) if q > pos and parallel[q] for f in own[j]}
+            for q, j in enumerate(order):
+                if q != pos and not (q > pos and parallel[q]):
+                    extra += [f for f in own[j] if f not in focus and f not in extra and f not in busy]
+        plans[i] = TicketPlan(order_index=pos, parallel_ok=parallel[pos], focus_files=focus,
+                              allowed_files=focus + extra)
+    return [plans[i] for i in range(len(subtasks))]
 
 
 def _seconds_between(start: str | None, end: str | None) -> float:
@@ -338,6 +475,9 @@ class FoundryQueue:
         clock: optional callable returning an aware UTC ``datetime``; used for
             every timestamp so tests can control dwell/stall times.
         busy_timeout_ms: SQLite busy timeout.
+        max_retries: retries after a ticket's first attempt before its task is
+            quarantined (``FoundryConfig.max_retries``; clamped to
+            1..:data:`MAX_RETRIES_LIMIT`, default :data:`MAX_RETRIES`).
     """
 
     def __init__(
@@ -346,11 +486,14 @@ class FoundryQueue:
         *,
         clock: Callable[[], datetime] | None = None,
         busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+        max_retries: int = MAX_RETRIES,
     ) -> None:
         self.path: str = str(path)
         if self.path != ":memory:" and not self.path.startswith("file:"):
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
+        #: Retry cap for :meth:`reopen_ticket` (workers read it for prompts/policy).
+        self.max_retries: int = max(1, min(int(max_retries), MAX_RETRIES_LIMIT))
         #: Re-entrant lock guarding :attr:`conn`; other modules sharing the
         #: connection (telemetry) must hold it while they use ``conn``.
         self.lock: threading.RLock = threading.RLock()
@@ -689,19 +832,26 @@ class FoundryQueue:
                 (directive.complexity, n, _dump(directive), directive.team_id, now,
                  directive.task_id),
             )
+            plan = plan_tickets(directive.subtasks)
             for i, sub in enumerate(directive.subtasks):
+                p = plan[i]
                 conn.execute(
                     "INSERT INTO tickets (ticket_id, task_id, team_id, subtask_id, slot, status,"
-                    " attempt, title, acceptance_criteria, allowed_files, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,'open',0,?,?,?,?,?)",
+                    " attempt, title, acceptance_criteria, allowed_files, created_at, updated_at,"
+                    " order_index, parallel_ok, focus_files)"
+                    " VALUES (?,?,?,?,?,'open',0,?,?,?,?,?,?,?,?)",
                     (self.ticket_id_for(directive.task_id, sub.subtask_id), directive.task_id,
                      directive.team_id, sub.subtask_id, i % n + 1, sub.title,
-                     _dump(list(sub.acceptance_criteria)), _dump(list(sub.allowed_files)),
-                     now, now),
+                     _dump(list(sub.acceptance_criteria)), _dump(p.allowed_files),
+                     now, now, p.order_index, 1 if p.parallel_ok else 0, _dump(p.focus_files)),
                 )
             self._event(conn, "sized", directive.task_id,
                         {"complexity": directive.complexity, "allocated_builders": n,
                          "subtasks": [s.subtask_id for s in directive.subtasks],
+                         "order": [s.subtask_id for s in sorted(
+                             directive.subtasks, key=lambda x: plan[directive.subtasks.index(x)].order_index)],
+                         "parallel_ok": [s.subtask_id for i, s in enumerate(directive.subtasks)
+                                         if plan[i].parallel_ok and plan[i].order_index > 0],
                          "override_reason": directive.override_reason})
             self._transition(conn, directive.task_id, TaskState.BUILDING,
                              f"sized {directive.complexity} -> {n} builder(s)")
@@ -778,6 +928,11 @@ class FoundryQueue:
         are eligible (tasks with no repo_root are then never handed out);
         with None every repo's tasks are (simulate/tests). Returns None when
         there is nothing for this slot; the caller must then not call Claude.
+
+        Stacked tickets: a ticket is eligible only when every earlier ticket
+        of its task (lower ``order_index``) is ``done``, unless it is marked
+        ``parallel_ok`` (see :func:`plan_tickets`). Tickets of databases
+        created before ordering existed all have order 0 and stay parallel.
         """
         root = normalize_repo_root(repo_root)
         sql = (
@@ -785,12 +940,14 @@ class FoundryQueue:
             " WHERE t.team_id=? AND t.slot=? AND t.status='open'"
             " AND t.slot <= k.allocated_builders"
             " AND k.state NOT IN ('complete','quarantined','failed')"
+            " AND (t.parallel_ok=1 OR NOT EXISTS (SELECT 1 FROM tickets e"
+            " WHERE e.task_id=t.task_id AND e.order_index < t.order_index AND e.status!='done'))"
         )
         args: list[Any] = [team_id, int(builder_slot)]
         if root is not None:
             sql += f" AND k.repo_root = ?{_REPO_COLLATE}"
             args.append(root)
-        sql += " ORDER BY k.created_at, k.rowid, t.rowid LIMIT 1"
+        sql += " ORDER BY k.created_at, k.rowid, t.order_index, t.rowid LIMIT 1"
         now = self.now()
         with self.transaction() as conn:
             row = conn.execute(sql, args).fetchone()
@@ -847,6 +1004,63 @@ class FoundryQueue:
             ).fetchall()
         return [self._ticket_from_row(r) for r in rows]
 
+    def tickets_in_order(self, task_id: str) -> list[Ticket]:
+        """All tickets of a task in build order (``order_index``, then creation)."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM tickets WHERE task_id=? ORDER BY order_index, rowid", (task_id,)
+            ).fetchall()
+        return [self._ticket_from_row(r) for r in rows]
+
+    def record_approved_diff(self, ticket_id: str, diff: str | None) -> None:
+        """Store the diff a reviewer approved for a ticket (replaces an earlier one).
+
+        The diff is relative to the ticket's stacked workspace: the base plus
+        the approved diffs of the earlier tickets of its task, in order.
+        KeyError for an unknown ticket.
+        """
+        with self.transaction() as conn:
+            t = self._require_ticket(conn, ticket_id)
+            conn.execute("UPDATE tickets SET approved_diff=?, updated_at=? WHERE ticket_id=?",
+                         (diff if diff else None, self.now(), ticket_id))
+            self._event(conn, "approved_diff", t["task_id"],
+                        {"ticket_id": ticket_id, "bytes": len(diff or "")})
+
+    def approved_diff(self, ticket_id: str) -> str | None:
+        """The approved diff stored for a ticket, or None."""
+        with self.lock:
+            row = self.conn.execute("SELECT approved_diff FROM tickets WHERE ticket_id=?",
+                                    (ticket_id,)).fetchone()
+        return row["approved_diff"] if row else None
+
+    def approved_diffs_before(self, ticket_id: str) -> list[tuple[str, str]]:
+        """``(subtask_id, diff)`` of every earlier, done ticket of the ticket's task, in build order.
+
+        "Earlier" means a lower ``order_index``. Apply them in this order on
+        the base to get the workspace this ticket builds on. Done tickets
+        without a stored diff (nothing changed, or approved before diffs were
+        stored) are skipped. KeyError for an unknown ticket.
+        """
+        with self.lock:
+            t = self._require_ticket(self.conn, ticket_id)
+            rows = self.conn.execute(
+                "SELECT subtask_id, approved_diff FROM tickets WHERE task_id=? AND order_index < ?"
+                " AND status='done' AND approved_diff IS NOT NULL AND approved_diff != ''"
+                " ORDER BY order_index, rowid",
+                (t["task_id"], int(t["order_index"] or 0)),
+            ).fetchall()
+        return [(r["subtask_id"], r["approved_diff"]) for r in rows]
+
+    def approved_diffs(self, task_id: str) -> list[tuple[str, str]]:
+        """``(subtask_id, diff)`` of every done ticket of a task with a stored diff, in build order."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT subtask_id, approved_diff FROM tickets WHERE task_id=? AND status='done'"
+                " AND approved_diff IS NOT NULL AND approved_diff != '' ORDER BY order_index, rowid",
+                (task_id,),
+            ).fetchall()
+        return [(r["subtask_id"], r["approved_diff"]) for r in rows]
+
     def tickets(
         self,
         *,
@@ -873,17 +1087,20 @@ class FoundryQueue:
             rows = self.conn.execute(sql + " ORDER BY rowid", args).fetchall()
         return [self._ticket_from_row(r) for r in rows]
 
-    def complete_ticket(self, ticket_id: str) -> bool:
+    def complete_ticket(self, ticket_id: str, diff: str | None = None) -> bool:
         """Mark a ticket done. Returns True when every ticket of its task is done.
 
         When the last ticket finishes the task is moved to ``complete``
         (from any non-terminal state: the reviewer's approval is what closes it).
+        A given ``diff`` is stored as the ticket's approved diff (None keeps
+        one recorded earlier with :meth:`record_approved_diff`).
         """
         now = self.now()
         with self.transaction() as conn:
             t = self._require_ticket(conn, ticket_id)
-            conn.execute("UPDATE tickets SET status='done', in_review=0, updated_at=?"
-                         " WHERE ticket_id=?", (now, ticket_id))
+            conn.execute("UPDATE tickets SET status='done', in_review=0, updated_at=?,"
+                         " approved_diff=COALESCE(?, approved_diff) WHERE ticket_id=?",
+                         (now, diff if diff else None, ticket_id))
             self._event(conn, "ticket_done", t["task_id"], {"ticket_id": ticket_id})
             left = conn.execute(
                 "SELECT COUNT(*) FROM tickets WHERE task_id=? AND status!='done'",
@@ -911,7 +1128,7 @@ class FoundryQueue:
     def reopen_ticket(self, ticket_id: str, fix_hint: str | None) -> bool:
         """Send a ticket back to its builder with ``fix_hint`` (attempt + 1).
 
-        If the new attempt would exceed :data:`MAX_RETRIES` the task is
+        If the new attempt would exceed :attr:`max_retries` the task is
         quarantined instead (its tickets blocked) and False is returned; the
         ticket is not reopened, so no further build happens. Otherwise the
         ticket is open again (moved onto a slot within the current allocation
@@ -938,7 +1155,7 @@ class FoundryQueue:
             if cur in TERMINAL_STATES:
                 return False
             attempt = int(t["attempt"]) + 1
-            if attempt > MAX_RETRIES:
+            if attempt > self.max_retries:
                 self._event(conn, "retry_exhausted", t["task_id"],
                             {"ticket_id": ticket_id, "attempts": attempt, "fix_hint": fix_hint})
                 self._quarantine(conn, t["task_id"],
@@ -955,6 +1172,7 @@ class FoundryQueue:
             )
             self._event(conn, "ticket_reopened", t["task_id"],
                         {"ticket_id": ticket_id, "attempt": attempt, "fix_hint": fix_hint})
+            self._release_later(conn, t, now)
             if cur != TaskState.BUILDING:
                 if TaskState.BUILDING in ALLOWED_TRANSITIONS[cur]:
                     self._transition(conn, t["task_id"], TaskState.BUILDING,
@@ -1586,6 +1804,29 @@ class FoundryQueue:
                      " WHERE task_id=? AND status IN ('open','claimed')", (now, task_id))
         self._event(conn, "quarantined", task_id, {"reason": reason})
 
+    def _release_later(self, conn: sqlite3.Connection, t: sqlite3.Row, now: str) -> list[str]:
+        """Earlier ticket ``t`` was reopened: release later, claimed, sequential tickets of its task.
+
+        They were built on ``t``'s old diff; back to ``open`` (attempt
+        unchanged) so they wait for ``t`` and rebuild on its new diff.
+        """
+        rows = conn.execute(
+            "SELECT ticket_id, claimed_by, attempt FROM tickets WHERE task_id=? AND order_index > ?"
+            " AND parallel_ok=0 AND status='claimed'",
+            (t["task_id"], int(t["order_index"] or 0)),
+        ).fetchall()
+        released = []
+        for r in rows:
+            conn.execute(
+                "UPDATE tickets SET status='open', claimed_by=NULL, claimed_at=NULL, in_review=0,"
+                " updated_at=? WHERE ticket_id=?", (now, r["ticket_id"]))
+            self._event(conn, "ticket_released", t["task_id"],
+                        {"ticket_id": r["ticket_id"], "was_claimed_by": r["claimed_by"],
+                         "attempt": int(r["attempt"]),
+                         "reason": f"earlier ticket {t['ticket_id']} reopened"})
+            released.append(r["ticket_id"])
+        return released
+
     def _least_loaded_slot(self, conn: sqlite3.Connection, task_id: str, alloc: int) -> int:
         load = {s: 0 for s in range(1, alloc + 1)}
         for r in conn.execute("SELECT slot FROM tickets WHERE task_id=? AND status IN"
@@ -1612,6 +1853,9 @@ class FoundryQueue:
             claimed_by=row["claimed_by"],
             claimed_at=row["claimed_at"], created_at=row["created_at"],
             updated_at=row["updated_at"],
+            order_index=int(row["order_index"] or 0),
+            parallel_ok=bool(row["parallel_ok"]),
+            focus_files=json.loads(row["focus_files"] or "[]"),
         )
 
     @staticmethod
