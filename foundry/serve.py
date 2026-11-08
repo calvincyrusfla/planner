@@ -55,6 +55,10 @@ __all__ = [
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4310
 DEFAULT_MONITOR_S = 60.0
+#: How long :meth:`Service.stop` waits for background sizing (a CPU Gemma can
+#: take a minute; the Foreman gives up after its own timeout and falls back to a
+#: heuristic) before cancelling it. A cancelled order is sized again on the next start.
+DEFAULT_SIZING_STOP_S = 90.0
 #: Upper bounds for user input on POST /api/orders.
 MAX_TITLE = 200
 MAX_DESCRIPTION = 20_000
@@ -169,6 +173,7 @@ class Service:
         self.resumed: list[str] = []
         self.closed_factory: Any = None
         self.api: Any = None
+        self.sizing_stop_s = DEFAULT_SIZING_STOP_S
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -221,6 +226,12 @@ class Service:
                     t.add_done_callback(self._resume_tasks.discard)
             elif state not in _TERMINAL:
                 self.resumed.append(tid)
+        resize = getattr(m, "resume_sizing", None)
+        if callable(resize):
+            # orders recorded but never sized (e.g. cut off by an old API timeout)
+            for tid in resize(self._mine):
+                if tid not in self.resumed:
+                    self.resumed.append(tid)
         if self.resumed:
             log.info("foundry serve: resuming %s", ", ".join(self.resumed))
 
@@ -243,6 +254,12 @@ class Service:
             self._monitor_task = None
         f = self.factory
         try:
+            stop_sizing = getattr(f.manager, "stop_sizing", None)
+            if callable(stop_sizing):
+                try:
+                    await stop_sizing(self.sizing_stop_s)
+                except Exception as exc:  # shutdown must go on
+                    log.warning("foundry serve: background sizing did not stop cleanly: %s", exc)
             # also after a start that failed half-way: stopping an unstarted pool is a no-op
             if self._resume_tasks:
                 await asyncio.wait(set(self._resume_tasks), timeout=f.manager.finish_timeout)
@@ -339,6 +356,9 @@ class Service:
         except Exception:  # pragma: no cover - defensive, a status call must not fail
             files = {"patch": None, "rejected": None, "md": None}
         state = _state(task)
+        is_sizing = getattr(f.manager, "is_sizing", None)
+        if state in ("backlog", "sizing") and callable(is_sizing) and is_sizing(tid):
+            state = "sizing"  # the Shop Foreman is sizing it in the background
         reason = task.get("quarantine_reason") if state in ("quarantined", "failed") else None
         return {
             "id": tid,
@@ -437,7 +457,11 @@ class Service:
         return {"title": title, "description": desc, "files": clean, "size": size}
 
     async def submit(self, payload: Any = None, **fields: Any) -> str:
-        """Submit a work order for the service's repo; returns the Foundry task id.
+        """Submit a work order for the service's repo; returns the Foundry task id at once.
+
+        The Shop Foreman sizes the order in the background (a CPU Gemma can take
+        longer than the HTTP call may wait); :meth:`status` shows it as
+        ``sizing`` until its tickets exist.
 
         Takes a body dict (``submit({...})``) or keywords
         (``submit(title=, description=, files=, size=)``, as ``serve_api`` calls it).
@@ -456,7 +480,11 @@ class Service:
             # sizing is the Shop Foreman's call; the requested size is passed on as a hint
             desc = (desc + "\n\n" if desc else "") + f"Requested size: {fields['size']}"
         order = WorkOrder(title=fields["title"], description=desc, files=fields["files"], repo_root=str(self.repo))
-        return await self.factory.manager.submit(order)
+        manager = self.factory.manager
+        accept = getattr(manager, "accept", None)
+        if callable(accept):
+            return accept(order)
+        return await manager.submit(order)
 
     async def ask(self, question: str) -> AsyncIterator[str]:
         """Stream the Shop Foreman's answer (``foreman.answer_question``)."""
