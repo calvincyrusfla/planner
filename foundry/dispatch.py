@@ -32,10 +32,12 @@ Command line::
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -57,6 +59,9 @@ __all__ = [
     "SprintStatus",
     "BoardClient",
     "BoardError",
+    "BoardUnavailable",
+    "BoardOutcomeUnknown",
+    "SprintNotFound",
     "DashboardBoard",
     "HubBoard",
     "CliBoard",
@@ -351,7 +356,33 @@ class BoardError(RuntimeError):
 
 
 class BoardUnavailable(BoardError):
-    """This transport cannot reach the board at all (try the next one)."""
+    """This transport could not get an answer from the board.
+
+    ``sent`` is False only when the request certainly never reached the board
+    (connection refused, unknown host, no node/CLI): then another transport may
+    safely be tried. When it is True the board may have applied the op.
+    """
+
+    def __init__(self, message: str, *, sent: bool = True) -> None:
+        super().__init__(message)
+        self.sent = sent
+
+
+class SprintNotFound(BoardError):
+    """The board has no batch with that id."""
+
+
+class BoardOutcomeUnknown(BoardError):
+    """An op may have reached the board but no answer came back; it was not resent."""
+
+
+def _not_sent(exc: BaseException) -> bool:
+    """True when a urllib/socket error means the request never left this machine."""
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+        return True
+    return isinstance(reason, OSError) and reason.errno in (
+        errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EADDRNOTAVAIL)
 
 
 class BoardClient(Protocol):
@@ -386,12 +417,13 @@ def _request(opener: urllib.request.OpenerDirector, url: str, *, method: str, bo
         except ValueError:
             payload = {}
         if exc.code >= 500 and not payload:
-            raise BoardUnavailable(f"{url}: HTTP {exc.code}") from exc
+            raise BoardUnavailable(f"{url}: HTTP {exc.code}", sent=True) from exc
         if exc.code == 404 and not payload.get("error"):
-            raise BoardUnavailable(f"{url}: not found") from exc
+            # No such route: nothing was applied, another transport may be tried.
+            raise BoardUnavailable(f"{url}: not found", sent=False) from exc
         raise BoardError(str(payload.get("error") or f"HTTP {exc.code}")) from exc
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise BoardUnavailable(f"{url}: {getattr(exc, 'reason', exc)}") from exc
+        raise BoardUnavailable(f"{url}: {getattr(exc, 'reason', exc)}", sent=not _not_sent(exc)) from exc
     try:
         payload = json.loads(raw or b"{}")
     except ValueError as exc:
@@ -486,13 +518,15 @@ class CliBoard:
     def _run(self, *argv: str) -> str:
         node = shutil.which(self.node)
         if node is None or not self.cli.exists():
-            raise BoardUnavailable("node or department/dept.mjs not available")
+            raise BoardUnavailable("node or department/dept.mjs not available", sent=False)
         try:
             proc = subprocess.run([node, str(self.cli), *argv], capture_output=True, text=True,
                                   encoding="utf-8", errors="replace", timeout=self.timeout,
                                   cwd=str(self.cli.parent.parent))
+        except subprocess.TimeoutExpired as exc:
+            raise BoardUnavailable(f"dept.mjs: no answer in {self.timeout:g}s", sent=True) from exc
         except (OSError, subprocess.SubprocessError) as exc:
-            raise BoardUnavailable(f"dept.mjs: {exc}") from exc
+            raise BoardUnavailable(f"dept.mjs: {exc}", sent=False) from exc
         if proc.returncode != 0:
             raise BoardError((proc.stderr or proc.stdout).strip() or f"dept.mjs exited {proc.returncode}")
         return proc.stdout
@@ -527,7 +561,7 @@ class CliBoard:
         if type == "cancelBatch":
             self._run("foundry", "cancel", str(args.get("id")))
             return _find_batch(self.state(), str(args.get("id")))
-        raise BoardUnavailable(f"op {type} has no CLI equivalent")
+        raise BoardUnavailable(f"op {type} has no CLI equivalent", sent=False)
 
 
 class AutoBoard:
@@ -545,24 +579,34 @@ class AutoBoard:
         self.clients = clients
         self.active: Any = None
 
-    def _call(self, fn: Callable[[Any], Any]) -> Any:
+    def _call(self, fn: Callable[[Any], Any], *, write: str | None = None) -> Any:
         order = [self.active] + [c for c in self.clients if c is not self.active] if self.active else self.clients
         errors: list[str] = []
         for c in order:
             try:
                 r = fn(c)
             except BoardUnavailable as exc:
-                errors.append(f"{getattr(c, 'name', c)}: {exc}")
+                name = getattr(c, "name", c)
+                if write and exc.sent:
+                    # The board may already have applied it (e.g. the hub timed out after
+                    # writing): replaying it through another transport could apply it twice.
+                    hint = ("check with `python -m foundry.dispatch poll <S-id>` or "
+                            "`node department/dept.mjs foundry list` before retrying"
+                            if write == "dispatchBatch" else "read the board before retrying")
+                    raise BoardOutcomeUnknown(
+                        f"{write} via {name}: {exc}; it may have reached the board and was not resent; {hint}"
+                    ) from exc
+                errors.append(f"{name}: {exc}")
                 continue
             self.active = c
             return r
-        raise BoardUnavailable("no board reachable (" + "; ".join(errors) + ")")
+        raise BoardUnavailable("no board reachable (" + "; ".join(errors) + ")", sent=False)
 
     def state(self) -> dict[str, Any]:
         return self._call(lambda c: c.state())  # type: ignore[no-any-return]
 
     def op(self, type: str, args: dict[str, Any]) -> Any:
-        return self._call(lambda c: c.op(type, args))
+        return self._call(lambda c: c.op(type, args), write=type)
 
 
 def default_board() -> AutoBoard:
@@ -617,7 +661,7 @@ def poll_foundry_sprint(sprint_id: str, *, board: BoardClient | None = None) -> 
     board = board or default_board()
     found = _find_batch(board.state(), sprint_id)
     if found is None:
-        raise BoardError(f"sprint {sprint_id} not found on the board")
+        raise SprintNotFound(f"sprint {sprint_id} not found on the board")
     return SprintStatus.from_board(found)
 
 
@@ -628,16 +672,21 @@ def wait_for_sprint(sprint_id: str, *, board: BoardClient | None = None, timeout
     """Poll until the sprint is done/failed/cancelled or ``timeout`` seconds pass.
 
     Returns the last status seen (check ``.terminal``). ``on_update`` is called
-    whenever the status changes. Transient board outages are retried.
+    whenever the status changes. Board errors (outages, a busy hub answering
+    409, a 502 with a JSON error) are retried until ``timeout``; an unknown
+    sprint id raises :class:`SprintNotFound` at once.
     """
     board = board or default_board()
     deadline = monotonic() + timeout
     last: SprintStatus | None = None
+    last_error: BoardError | None = None
     while True:
         try:
             cur = poll_foundry_sprint(sprint_id, board=board)
-        except BoardUnavailable:
-            cur = None
+        except SprintNotFound:
+            raise
+        except BoardError as exc:
+            cur, last_error = None, exc
         if cur is not None:
             if on_update and (last is None or cur.model_dump() != last.model_dump()):
                 on_update(cur)
@@ -646,7 +695,8 @@ def wait_for_sprint(sprint_id: str, *, board: BoardClient | None = None, timeout
                 return cur
         if monotonic() >= deadline:
             if last is None:
-                raise BoardUnavailable(f"sprint {sprint_id}: board not reachable within {timeout:g}s")
+                raise BoardUnavailable(f"sprint {sprint_id}: no answer from the board within {timeout:g}s"
+                                       + (f" (last error: {last_error})" if last_error else "")) from last_error
             return last
         sleep(max(0.0, min(interval, deadline - monotonic())))
 

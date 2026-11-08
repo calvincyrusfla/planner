@@ -55,6 +55,8 @@ DEFAULT_BATCH_POLL_S = 15.0
 #: A claim whose heartbeat is older than this may be taken over (the board enforces it too).
 STALE_HEARTBEAT_S = 600.0
 KV_PREFIX = "foundry_batch:"
+#: Board limit for error texts (department/lib/foundry-batches.mjs LIMITS.error).
+LIMIT_ERROR = 2000
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
 
 #: Foundry task state -> batch subtask state.
@@ -196,9 +198,18 @@ def _parse_time(value: Any) -> float | None:
     return dt.timestamp()
 
 
-def marker(batch_id: str, key: str) -> str:
-    """The line every batch order carries (restart recovery and context for the builders)."""
-    return f"(Foundry batch {batch_id}, subtask {key})"
+def marker(batch_id: str, key: str, created_at: str | None = None) -> str:
+    """The line every batch order carries (restart recovery and context for the builders).
+
+    ``created_at`` tells two batches with the same S-id apart (another board, a reset board).
+    """
+    of = f" of {created_at}" if created_at else ""
+    return f"(Foundry batch {batch_id}{of}, subtask {key})"
+
+
+def _cap(value: Any, limit: int) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text[:limit] or None
 
 
 def subtask_state(manager: Any, queue: Any, tid: str) -> dict[str, Any]:
@@ -215,11 +226,12 @@ def subtask_state(manager: Any, queue: Any, tid: str) -> dict[str, Any]:
     out: dict[str, Any] = {"foundryTask": tid, "state": state}
     error = task.get("quarantine_reason") or (getattr(manager, "sizing_errors", {}) or {}).get(tid)
     if error and state != "complete":
-        out["error"] = str(error)[:500]
+        out["error"] = _cap(error, LIMIT_ERROR)
     pr_fn = getattr(manager, "pr_state", None)
     pr = pr_fn(tid) if callable(pr_fn) else None
     if pr:
-        rec = {k: pr.get(k) for k in ("state", "url", "branch", "error")}
+        rec = {"state": _cap(pr.get("state"), 40), "url": _cap(pr.get("url"), 1000),
+               "branch": _cap(pr.get("branch"), 300), "error": _cap(pr.get("error"), LIMIT_ERROR)}
         is_pub = getattr(manager, "is_publishing", None)
         if callable(is_pub) and is_pub(tid):
             rec["state"] = "pending"
@@ -350,7 +362,7 @@ class BatchWatcher:
                 break  # the service stopped meanwhile: never claim or submit
             bid = str(batch["id"])
             if self._is_ours(batch):
-                if not self._record(bid).get("closed"):
+                if not self._record(bid, batch.get("createdAt")).get("closed"):
                     await self._advance(batch)
                     handled.append(bid)
             elif self._claimable(batch):
@@ -375,7 +387,8 @@ class BatchWatcher:
         if status == "queued":
             return True
         if status in _OPEN_BATCH:
-            beat = _parse_time(batch.get("heartbeatAt"))
+            by = batch.get("claimedBy") if isinstance(batch.get("claimedBy"), dict) else {}
+            beat = _parse_time(batch.get("heartbeatAt") or by.get("at"))
             return beat is not None and self._now() - beat > STALE_HEARTBEAT_S
         return False
 
@@ -405,11 +418,14 @@ class BatchWatcher:
     def _queue(self) -> Any:
         return self.service.factory.queue
 
-    def _record(self, bid: str) -> dict[str, Any]:
+    def _record(self, bid: str, created_at: str | None = None) -> dict[str, Any]:
+        """The saved record of a batch; a record of another batch with the same id starts over."""
         fn = getattr(self._queue(), "kv_get", None)
         rec = fn(KV_PREFIX + bid) if callable(fn) else None
-        if not isinstance(rec, dict):
+        if not isinstance(rec, dict) or (created_at and rec.get("createdAt") not in (None, created_at)):
             rec = {}
+        if created_at:
+            rec["createdAt"] = created_at
         rec.setdefault("tasks", {})
         rec.setdefault("failed", {})
         rec.setdefault("pushed", {})
@@ -420,9 +436,9 @@ class BatchWatcher:
         if callable(fn):
             fn(KV_PREFIX + bid, dict(rec))
 
-    def _find_order(self, bid: str, key: str) -> str | None:
+    def _find_order(self, bid: str, key: str, created_at: str | None) -> str | None:
         """An order already submitted for this subtask (submitted, then cut off before the kv write)."""
-        mark = marker(bid, key)
+        mark = marker(bid, key, created_at)
         for tid, order in (getattr(self.service.factory.manager, "orders", {}) or {}).items():
             if mark in (getattr(order, "description", "") or ""):
                 return str(tid)
@@ -432,49 +448,67 @@ class BatchWatcher:
 
     async def _advance(self, batch: Mapping[str, Any]) -> None:
         bid = str(batch["id"])
-        rec = self._record(bid)
+        created = batch.get("createdAt")
+        rec = self._record(bid, created)
         f = self.service.factory
         manager, queue = f.manager, f.queue
         subtasks = [s for s in (batch.get("subtasks") or []) if isinstance(s, dict)]
         keys = [str(s.get("key") or i + 1) for i, s in enumerate(subtasks)]
+        by_key = dict(zip(keys, subtasks))
         cancelled = batch.get("status") == "cancelled"
+        can_submit = not cancelled and batch.get("status") in (None, "claimed", "running")
         first = not rec["tasks"] and not rec["failed"]
         results: dict[str, dict[str, Any]] = {}
 
-        for key, sub in zip(keys, subtasks):
+        # 1) every subtask already submitted or failed, whatever its position
+        for key in keys:
             if key in rec["failed"]:
                 results[key] = {"state": "failed", "error": rec["failed"][key]}
                 continue
-            tid = rec["tasks"].get(key) or self._find_order(bid, key)
+            tid = rec["tasks"].get(key) or self._find_order(bid, key, created)
             if tid:
                 rec["tasks"][key] = tid
                 results[key] = subtask_state(manager, queue, tid)
-                continue
-            if cancelled or batch.get("status") not in (None, "claimed", "running"):
-                continue
-            deps = [str(d) for d in (sub.get("dependsOn") or [])]
-            dep_states = {d: (results.get(d) or {}).get("state") for d in deps}
-            bad = [d for d, s in dep_states.items() if (s in TERMINAL and s != "complete") or d not in keys]
-            if bad:
-                reason = f"not started: dependency {', '.join(bad)} did not complete"
-                rec["failed"][key] = reason
-                results[key] = {"state": "failed", "error": reason}
-                continue
-            if any(s != "complete" for s in dep_states.values()):
-                results[key] = {"state": "queued"}  # waits for its dependencies
-                continue
-            try:
-                tid = self._submit(batch, key, sub)
-            except Exception as exc:
-                reason = f"could not be submitted: {exc}"[:500]
-                log.warning("board dispatch: %s subtask %s %s", bid, key, reason)
-                rec["failed"][key] = reason
-                results[key] = {"state": "failed", "error": reason}
-                continue
-            rec["tasks"][key] = tid
-            self._save(bid, rec)  # right away: a restart must not submit it again
-            log.info("board dispatch: %s subtask %s -> %s", bid, key, tid)
-            results[key] = subtask_state(manager, queue, tid)
+
+        # 2) the rest, judged against those states (repeated so failures and
+        #    submissions propagate along dependsOn in any order)
+        def fail(key: str, reason: str) -> None:
+            rec["failed"][key] = reason
+            results[key] = {"state": "failed", "error": reason}
+
+        progress = can_submit
+        while progress:
+            progress = False
+            for key in keys:
+                if key in rec["tasks"] or key in rec["failed"]:
+                    continue
+                deps = [str(d) for d in (by_key[key].get("dependsOn") or [])]
+                if key in self._dep_closure(key, by_key):
+                    fail(key, "not started: its dependsOn forms a cycle")
+                    progress = True
+                    continue
+                dep_states = {d: (results.get(d) or {}).get("state") for d in deps}
+                bad = [d for d, st in dep_states.items() if (st in TERMINAL and st != "complete") or d not in by_key]
+                if bad:
+                    fail(key, f"not started: dependency {', '.join(bad)} did not complete")
+                    progress = True
+                    continue
+                if any(st != "complete" for st in dep_states.values()):
+                    results[key] = {"state": "queued"}  # waits for its dependencies
+                    continue
+                try:
+                    tid = self._submit(batch, key, by_key[key])
+                except Exception as exc:
+                    reason = f"could not be submitted: {exc}"[:LIMIT_ERROR]
+                    log.warning("board dispatch: %s subtask %s %s", bid, key, reason)
+                    fail(key, reason)
+                    progress = True
+                    continue
+                rec["tasks"][key] = tid
+                self._save(bid, rec)  # right away: a restart must not submit it again
+                log.info("board dispatch: %s subtask %s -> %s", bid, key, tid)
+                results[key] = subtask_state(manager, queue, tid)
+                progress = True
 
         # The board closes a batch (and refuses further updates) once every subtask is
         # terminal, so "complete" is only reported once the subtask's PR is settled.
@@ -490,9 +524,22 @@ class BatchWatcher:
         try:
             await asyncio.to_thread(self.board.op, "updateBatch", args)
         except BoardRefused as exc:
-            if exc.code not in (404, 409):
-                log.warning("board dispatch: %s update refused: %s", bid, exc)
-                return  # tried again next round
+            if exc.code == 400 and "results" in args:
+                # the board rejected a result (a limit we did not know): keep the heartbeat going
+                log.warning("board dispatch: %s results refused (%s); sending the heartbeat only", bid, exc)
+                args.pop("results")
+                args.pop("status", None)
+                changed = {}
+                try:
+                    await asyncio.to_thread(self.board.op, "updateBatch", args)
+                except BoardRefused as again:
+                    exc = again
+                else:
+                    return
+            if exc.code not in (404, 409) or not await self._gone(bid):
+                # e.g. 409 {"error": "busy"} from the hub: transient, tried again next round
+                log.info("board dispatch: %s update refused (%s); retrying next round", bid, exc)
+                return
             # cancelled, finished, deleted or taken over by another Foundry: stop pushing
             log.info("board dispatch: %s update refused (%s); no longer followed", bid, exc)
             rec["closed"] = True
@@ -504,9 +551,32 @@ class BatchWatcher:
             log.info("board dispatch: %s finished", bid)
         self._save(bid, rec)
 
+    @staticmethod
+    def _dep_closure(key: str, by_key: Mapping[str, Mapping[str, Any]]) -> set[str]:
+        """Every subtask ``key`` depends on, directly or not."""
+        seen: set[str] = set()
+        todo = [str(d) for d in (by_key.get(key, {}).get("dependsOn") or [])]
+        while todo:
+            d = todo.pop()
+            if d in seen:
+                continue
+            seen.add(d)
+            todo.extend(str(x) for x in (by_key.get(d, {}).get("dependsOn") or []))
+        return seen
+
+    async def _gone(self, bid: str) -> bool:
+        """After a refused update: True when a fresh board state shows the batch is no longer ours to run."""
+        try:
+            state = await asyncio.to_thread(self.board.state)
+        except BoardUnavailable:
+            return False
+        batches = state.get("foundryBatches") if isinstance(state, dict) else None
+        b = next((x for x in batches or [] if isinstance(x, dict) and x.get("id") == bid), None)
+        return b is None or not self._is_ours(b) or b.get("status") not in _OPEN_BATCH
+
     def _auto_pr(self) -> bool:
-        return bool(getattr(self.service.config, "auto_pr", False)) and getattr(
-            self.service.factory.manager, "publisher", None) is not None
+        m = self.service.factory.manager
+        return bool(getattr(m, "auto_pr", False)) and getattr(m, "publisher", None) is not None
 
     @staticmethod
     def _pr_pending(result: Mapping[str, Any]) -> bool:
@@ -549,7 +619,7 @@ class BatchWatcher:
             desc = (desc + "\n\n" if desc else "") + f"Requested size: {fields['size']}"
         goal = str(batch.get("goal") or "").strip()
         context = f"Part of \"{batch.get('title')}\"" + (f": {goal}" if goal else "")
-        desc = (desc + "\n\n" if desc else "") + f"{context}\n{marker(str(batch['id']), key)}"
+        desc = (desc + "\n\n" if desc else "") + f"{context}\n{marker(str(batch['id']), key, batch.get('createdAt'))}"
         acceptance = [str(a) for a in (sub.get("acceptance") or sub.get("acceptance_criteria") or []) if str(a).strip()]
         base = str(batch.get("base") or "").strip() or None  # else the publisher's (FOUNDRY_PR_BASE / repo default)
         order = WorkOrder(title=fields["title"], description=desc, files=fields["files"],

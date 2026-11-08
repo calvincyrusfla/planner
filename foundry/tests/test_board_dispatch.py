@@ -42,6 +42,8 @@ class FakeBoard:
         self.batches: list[dict[str, Any]] = []
         self.ops: list[tuple[str, dict[str, Any]]] = []
         self.down = False
+        self.busy = 0  # updateBatch answers 409 "busy" this many times (hub CAS exhaustion)
+        self.reject_results = 0  # updateBatch with results answers 400 this many times
         self.lock = threading.Lock()
 
     def add(self, repo: str = SLUG, subtasks: list[dict[str, Any]] | None = None, **kw: Any) -> dict[str, Any]:
@@ -50,7 +52,7 @@ class FakeBoard:
             {"key": "1", "title": "Add clamp helper", "description": "Add clamp(x, lo, hi).", "files": ["shop/mathx.py"]},
             {"key": "2", "title": "Add lerp helper", "description": "Add lerp(a, b, t).", "files": ["shop/mathx.py"]},
         ]
-        b = {"id": f"S-{n:03d}", "title": f"Batch {n}", "goal": "", "repo": repo, "base": None, "status": "queued",
+        b = {"id": f"S-{n:03d}", "createdAt": f"2026-11-08T10:00:{n:02d}.000Z", "title": f"Batch {n}", "goal": "", "repo": repo, "base": None, "status": "queued",
              "claimedBy": None, "heartbeatAt": None, "note": "", "subtasks": subs, "results": {}, **kw}
         self.batches.append(b)
         return b
@@ -85,6 +87,12 @@ class FakeBoard:
                 b["heartbeatAt"] = now
                 return {"ok": True, "batch": copy.deepcopy(b)}
             if type_ == "updateBatch":
+                if self.busy:
+                    self.busy -= 1
+                    raise BoardRefused("busy", 409)
+                if self.reject_results and args.get("results"):
+                    self.reject_results -= 1
+                    raise BoardRefused("pr error is too long", 400)
                 if (b.get("claimedBy") or {}).get("service") != args["service"]:
                     raise BoardRefused(f"{b['id']} is not claimed by {args['service']}", 409)
                 if b["status"] not in ("queued", "claimed", "running"):
@@ -366,7 +374,7 @@ def test_lost_mapping_is_recovered_from_the_order_marker(tmp_path: Path) -> None
             assert len(svc.factory.manager.orders) == n
             assert w._record(b["id"])["tasks"] == tasks
             order = svc.factory.manager.orders[tasks["1"]]
-            assert marker(b["id"], "1") in order.description
+            assert marker(b["id"], "1", b["createdAt"]) in order.description
         finally:
             await svc.stop()
 
@@ -603,3 +611,169 @@ def test_dashboard_board_client() -> None:
         DashboardBoard(f"http://127.0.0.1:{srv.server_address[1]}", timeout=1).state()
 
 
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+def test_forward_dependency_is_submitted_once_its_dependency_completes(tmp_path: Path) -> None:
+    board = FakeBoard()
+    b = board.add(subtasks=[
+        {"key": "1", "title": "Use clamp", "description": "use it", "files": ["shop/mathx.py"], "dependsOn": ["2"]},
+        {"key": "2", "title": "Add clamp helper", "description": "clamp", "files": ["shop/mathx.py"]},
+    ])
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            w = _watcher(svc, board)
+            await w.poll_once()
+            assert set(w._record(b["id"])["tasks"]) == {"2"}
+            await _pump(w, lambda: board.get(b["id"])["status"] == "done")
+            assert set(w._record(b["id"])["tasks"]) == {"1", "2"}
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
+def test_failed_forward_dependency_and_cycles_fail_without_submitting(tmp_path: Path) -> None:
+    board = FakeBoard()
+    b = board.add(subtasks=[
+        {"key": "1", "title": "After bad", "description": "y", "dependsOn": ["2"]},
+        {"key": "2", "title": "Bad paths", "description": "x", "files": ["../outside.py"]},
+        {"key": "3", "title": "Loop a", "description": "a", "dependsOn": ["4"]},
+        {"key": "4", "title": "Loop b", "description": "b", "dependsOn": ["3"]},
+    ])
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            await _watcher(svc, board).poll_once()
+            assert not svc.factory.manager.orders
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+    got = board.get(b["id"])
+    assert got["status"] == "failed"
+    assert "dependency 2" in got["results"]["1"]["error"]
+    assert "cycle" in got["results"]["3"]["error"] and "cycle" in got["results"]["4"]["error"]
+
+
+def test_busy_409_is_transient_not_the_end_of_the_batch(tmp_path: Path) -> None:
+    board = FakeBoard()
+    b = board.add()
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            w = _watcher(svc, board)
+            board.busy = 2
+            await w.poll_once()
+            await w.poll_once()
+            rec = w._record(b["id"])
+            assert not rec.get("closed") and set(rec["tasks"]) == {"1", "2"}
+            n = len(svc.factory.manager.orders)
+            await _pump(w, lambda: board.get(b["id"])["status"] == "done")
+            assert len(svc.factory.manager.orders) == n == 2
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
+def test_rejected_results_still_send_the_heartbeat(tmp_path: Path) -> None:
+    board = FakeBoard()
+    b = board.add()
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            w = _watcher(svc, board)
+            board.reject_results = 1
+            await w.poll_once()
+            assert not w._record(b["id"]).get("closed")
+            assert board.ops[-1][0] == "updateBatch" and "results" not in board.ops[-1][1]
+            assert board.ops[-1][1]["heartbeat"] is True
+            await _pump(w, lambda: board.get(b["id"])["status"] == "done")  # pushed again later
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
+def test_pr_fields_are_capped_to_the_board_limits() -> None:
+    from foundry.board_dispatch import subtask_state
+
+    class Q:
+        def get_task(self, tid: str) -> dict[str, Any]:
+            return {"state": "failed", "quarantine_reason": "q" * 5000}
+
+    class M:
+        sizing_errors: dict[str, str] = {}
+
+        def pr_state(self, tid: str) -> dict[str, Any]:
+            return {"state": "s" * 100, "url": "https://x/" + "u" * 2000, "branch": "b" * 500, "error": "e" * 5000}
+
+    r = subtask_state(M(), Q(), "F-001")
+    assert len(r["error"]) == 2000
+    assert len(r["pr"]["state"]) == 40 and len(r["pr"]["url"]) == 1000
+    assert len(r["pr"]["branch"]) == 300 and len(r["pr"]["error"]) == 2000
+
+
+def test_record_of_another_batch_with_the_same_id_is_ignored(tmp_path: Path) -> None:
+    board = FakeBoard()
+    b = board.add()
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            w = _watcher(svc, board)
+            await w.poll_once()
+            old = dict(w._record(b["id"])["tasks"])
+            # the board was reset: a new S-001 (other createdAt) arrives
+            board.batches = []
+            nb = board.add(subtasks=[{"key": "1", "title": "Add lerp helper", "description": "lerp",
+                                      "files": ["shop/mathx.py"]}])
+            nb["createdAt"] = "2026-11-09T00:00:00.000Z"
+            assert nb["id"] == b["id"]
+            await w.poll_once()
+            rec = w._record(nb["id"], nb["createdAt"])
+            assert rec["createdAt"] == nb["createdAt"]
+            assert rec["tasks"]["1"] != old["1"]  # submitted fresh, not mistaken for the old order
+            assert svc.factory.manager.orders[rec["tasks"]["1"]].title == "Add lerp helper"
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
+def test_stale_claim_without_heartbeat_uses_the_claim_time(tmp_path: Path) -> None:
+    board = FakeBoard()
+    old = _iso(datetime.now(timezone.utc) - timedelta(minutes=30))
+    b = board.add(status="claimed", claimedBy={"host": "pc2", "service": "foundry@pc2:me/shop", "at": old},
+                  heartbeatAt=None)
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            w = _watcher(svc, board)
+            board_claim = board.op  # the fake board judges staleness by heartbeatAt; mirror the real rule
+            def op(type_: str, args: dict[str, Any]) -> Any:
+                if type_ == "claimBatch":
+                    board.get(b["id"])["heartbeatAt"] = old
+                return board_claim(type_, args)
+            board.op = op  # type: ignore[method-assign]
+            assert await w.poll_once() == [b["id"]]
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+    assert board.get(b["id"])["claimedBy"]["host"] == "pc1"
