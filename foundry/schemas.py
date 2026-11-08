@@ -32,7 +32,9 @@ __all__ = [
     "MAX_RETRIES_LIMIT",
     "MAX_SNIPPET_LINES",
     "MAX_DIAGNOSIS_SENTENCES",
+    "MAX_OBJECTIVE_CHARS",
     "MAX_OBJECTIVE_SENTENCES",
+    "MAX_PART_NOTE_CHARS",
     "ALERT_ID_PATTERN",
     # literals
     "Complexity",
@@ -94,8 +96,14 @@ MAX_RETRIES_LIMIT: int = 5
 MAX_SNIPPET_LINES: int = 50
 """Maximum number of text lines in a single ``CodeSnippet``."""
 
+MAX_OBJECTIVE_CHARS: int = 6000
+"""Maximum characters in ``ContextSlice.objective``; a longer order is cut here."""
+
+MAX_PART_NOTE_CHARS: int = 200
+"""Maximum characters in ``SubtaskAllocation.part_note``."""
+
 MAX_OBJECTIVE_SENTENCES: int = 2
-"""Maximum sentences in ``ContextSlice.objective``."""
+"""Sentence limit for callers that want a short summary; objectives are no longer limited by it."""
 
 MAX_DIAGNOSIS_SENTENCES: int = 2
 """Maximum sentences in ``ForemanEscalation.diagnosis``."""
@@ -268,6 +276,13 @@ class SubtaskAllocation(FoundryModel):
 
     subtask_id: str = Field(min_length=1, description="Unique within the task, e.g. 'T-1.1'.")
     title: str = Field(min_length=1)
+    part_note: str = Field(
+        default="",
+        description=(
+            "One line saying which part of the order this subtask covers. It accompanies "
+            "the order's full text and never replaces it. Empty = no note."
+        ),
+    )
     acceptance_criteria: list[str] = Field(default_factory=list)
     allowed_files: list[str] = Field(
         default_factory=list, description="Repo-relative paths the builder may modify."
@@ -291,6 +306,16 @@ class SubtaskAllocation(FoundryModel):
         default=None,
         description="This ticket's own instructions, shown to its builder and reviewer; None = none given.",
     )
+
+    @field_validator("part_note", mode="before")
+    @classmethod
+    def _one_line_part_note(cls, value: Any) -> Any:
+        """Accept None as no note; squeeze a note onto one line of ``MAX_PART_NOTE_CHARS``."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return " ".join(value.split())[:MAX_PART_NOTE_CHARS].rstrip()
+        return value
 
     @field_validator("depends_on", mode="before")
     @classmethod
@@ -392,7 +417,9 @@ class CodeSnippet(FoundryModel):
 class ContextSlice(FoundryModel):
     """The minimal context a builder receives instead of whole files."""
 
-    objective: str = Field(min_length=1, description="At most two sentences.")
+    objective: str = Field(
+        min_length=1, description="The order's full text, capped at MAX_OBJECTIVE_CHARS characters."
+    )
     acceptance_criteria: list[str] = Field(default_factory=list)
     snippets: list[CodeSnippet] = Field(default_factory=list)
     source_line_count: int = Field(
@@ -401,16 +428,11 @@ class ContextSlice(FoundryModel):
 
     @field_validator("objective")
     @classmethod
-    def _objective_short(cls, value: str) -> str:
-        """Keep the objective to ``MAX_OBJECTIVE_SENTENCES`` sentences."""
-        n = count_sentences(value)
-        if n == 0:
+    def _objective_capped(cls, value: str) -> str:
+        """Reject a blank objective and cut a long one at ``MAX_OBJECTIVE_CHARS``."""
+        if count_sentences(value) == 0:
             raise ValueError("objective must not be blank")
-        if n > MAX_OBJECTIVE_SENTENCES:
-            raise ValueError(
-                f"objective has {n} sentences; max is {MAX_OBJECTIVE_SENTENCES}"
-            )
-        return value
+        return value[:MAX_OBJECTIVE_CHARS]
 
     @property
     def snippet_line_count(self) -> int:
