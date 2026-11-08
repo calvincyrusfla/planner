@@ -1906,7 +1906,9 @@ def _git_check(patch: str, repo_root: Path | None) -> str | None:
         _copy_workspace(repo_root, ws)
         (tmp / "combined.patch").write_text(patch, encoding="utf-8", newline="\n")
         proc = subprocess.run(
-            [git, "apply", "--check", str(tmp / "combined.patch")],
+            # no EOL conversion: the user's core.autocrlf=true must never change what is checked
+            [git, "-c", "core.autocrlf=false", "-c", "core.eol=lf", "-c", "core.safecrlf=false",
+             "apply", "--check", str(tmp / "combined.patch")],
             cwd=str(ws), capture_output=True, text=True, timeout=60,
         )
         return None if proc.returncode == 0 else (proc.stderr or proc.stdout or "git apply --check failed").strip()
@@ -1956,7 +1958,7 @@ def stack_diffs(diffs: list[str], repo_root: Path | None) -> str | None:
     for ps in paths_per:
         every += [p for p in ps if p not in every]
     tmp = Path(tempfile.mkdtemp(prefix="foundry-stack-"))
-    cfg = ["-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.quotepath=false",
+    cfg = ["-c", "core.autocrlf=false", "-c", "core.eol=lf", "-c", "core.safecrlf=false", "-c", "core.quotepath=false",
            "-c", "user.name=foundry", "-c", "user.email=foundry@localhost", "-c", "commit.gpgsign=false"]
 
     def run(*args: str) -> subprocess.CompletedProcess[str]:
