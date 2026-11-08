@@ -326,6 +326,32 @@
   .fa-list li.undone .fa-text { color: var(--muted); }
   .fa-list .fa-err { flex-basis: 100%; font-size: 12px; color: var(--bad); overflow-wrap: anywhere; }
 </style>
+<style>
+  /* "Foundry batches": sprints the Floor Manager dispatched through the board for Foundry to build. Text is --text/--muted on
+     --surface (>= 6:1); chips reuse the .pill tints; links are --accent; errors --bad. Rows wrap at 390 px. */
+  .batches { display: grid; gap: 10px; }
+  .batch { padding: 12px 14px; min-width: 0; }
+  .batch-top { display: flex; align-items: baseline; gap: 6px 8px; flex-wrap: wrap; }
+  .batch-title { font-weight: 600; flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; }
+  .batch-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .batch-meta code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); overflow-wrap: anywhere; }
+  .batch-meta .stale { color: var(--warn); }
+  .batch-goal { color: var(--muted); margin: 4px 0 0; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .batch .prow { margin-top: 8px; }
+  .pill.claimed, .pill.running { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 15%, transparent); }
+  .pill.failed { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+  .sub-list { list-style: none; margin: 8px 0 0; padding: 0; }
+  .sub-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 13px; }
+  .sub-list .sub-key { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--faint); }
+  .sub-list .sub-title { flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; }
+  .sub-list .sub-fid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  .sub-list .fo-badge.complete { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
+  .sub-list .fo-badge.building, .sub-list .fo-badge.reviewing, .sub-list .fo-badge.sizing { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+  .sub-list .fo-badge.failed, .sub-list .fo-badge.quarantined { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, transparent); }
+  .sub-list .sub-err { flex-basis: 100%; font-size: 12px; color: var(--bad); overflow-wrap: anywhere; }
+  .batch-goal.batch-err { color: var(--bad); }
+  .batch-actions { display: flex; gap: 6px; margin-top: 8px; }
+</style>
 </head>
 <body>
 <div class="wrap">
@@ -384,6 +410,12 @@
       <ul class="fo-list" id="fo-list" aria-label="Foundry tasks"></ul><p class="fo-empty" id="fo-empty" hidden>No Foundry tasks yet.</p></details>
     <details class="fo-actions" id="fo-actions" open hidden><summary id="fa-sum"><b>Foreman actions</b></summary>
       <ul class="fo-list fa-list" id="fa-list" aria-label="Foreman actions, newest first" aria-live="polite"></ul><p class="fo-empty" id="fa-empty" hidden>The Foreman hasn't had to step in yet.</p></details>
+  </section>
+
+  <section id="batches-wrap" aria-labelledby="batches-h" hidden>
+    <h2 id="batches-h">Foundry batches</h2>
+    <div class="batches" id="batches" aria-live="polite"></div>
+    <details class="finished" id="batches-done-wrap" hidden><summary id="batches-done-sum">Finished batches</summary><div class="batches" id="batches-done"></div></details>
   </section>
 
   <h2>Teams</h2>
@@ -927,9 +959,95 @@ function renderLog() {
   $('#log').innerHTML = items.length ? items.map((e) => {
     const team = e.teamId && teamName[e.teamId];
     const who = e.agentId || (e.kind === 'progress' && team ? team.name : '');
-    return `<div class="log-item"><time datetime="${e.at}" title="${new Date(e.at).toLocaleString()}">${ago(e.at)}${e.taskId ? ` · ${esc(e.taskId)}` : ''}</time>
+    return `<div class="log-item"><time datetime="${e.at}" title="${new Date(e.at).toLocaleString()}">${ago(e.at)}${e.taskId || e.batchId ? ` · ${esc(e.taskId || e.batchId)}` : ''}</time>
       ${who ? `<span class="who"${team ? ` style="--team:${team.color}"` : ''}>${esc(who)}:</span> ` : ''}${esc(e.message)}</div>`;
   }).join('') : '<div class="log-item none">Nothing yet.</div>';
+}
+
+// ---- Foundry batches (state.foundryBatches; Foundry on the user's PC claims them and reports per-subtask results) ----
+const BATCH_OPEN = ['queued', 'claimed', 'running'];
+const BATCH_LABEL = { queued: 'Queued', claimed: 'Claimed', running: 'Running', done: 'Done', failed: 'Failed', cancelled: 'Cancelled' };
+const SUB_TERMINAL = ['complete', 'failed', 'quarantined'];
+const BATCH_STALE_MS = 10 * 60 * 1000; // matches the claimBatch takeover window
+const safeHref = (u) => { try { const x = new URL(String(u)); return /^https?:$/.test(x.protocol) ? x.href : ''; } catch { return ''; } };
+function fmtAgoShort(iso) {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return `${s} s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return new Date(iso).toLocaleDateString();
+}
+// "Foundry on <host>, 12 s ago" (ticks every second via [data-hb-at]) or "Waiting for Foundry".
+function batchClaimText(b) {
+  const c = b.claimedBy;
+  if (!c || !c.host) return b.status === 'queued' ? 'Waiting for Foundry' : '';
+  const at = b.heartbeatAt || c.at;
+  return `Foundry on <code>${esc(c.host)}</code>${at ? `, <span data-hb-at="${esc(at)}">${esc(fmtAgoShort(at))}</span>` : ''}`;
+}
+function tickHeartbeats() {
+  for (const el of document.querySelectorAll('[data-hb-at]')) {
+    const txt = fmtAgoShort(el.dataset.hbAt);
+    if (el.textContent !== txt) el.textContent = txt;
+    const stale = Date.now() - new Date(el.dataset.hbAt).getTime() > BATCH_STALE_MS;
+    el.classList.toggle('stale', stale);
+    el.title = stale ? 'No heartbeat for over 10 minutes: another Foundry may take this batch over' : '';
+  }
+}
+setInterval(tickHeartbeats, 1000);
+function subtaskRow(b, st) {
+  const r = (b.results && b.results[st.key]) || {};
+  const state_ = String(r.state || 'waiting');
+  const pr = r.pr && typeof r.pr === 'object' ? r.pr : null;
+  const href = pr ? safeHref(pr.url) : '';
+  const err = r.error || (pr && pr.error) || '';
+  return `<li>
+    <span class="sub-key">${esc(st.key)}</span>
+    <span class="sub-title">${esc(st.title)}</span>
+    ${r.foundryTask ? `<span class="sub-fid">${esc(r.foundryTask)}</span>` : ''}
+    <span class="fo-badge ${esc(state_.replace(/[^a-z]/g, ''))}">${esc(state_)}</span>
+    ${href ? `<a class="fo-pr" href="${esc(href)}" target="_blank" rel="noopener noreferrer">PR${pr.state ? ` (${esc(pr.state)})` : ''}</a>`
+      : pr && pr.state ? `<span class="none">PR ${esc(pr.state)}</span>` : ''}
+    ${err ? `<span class="sub-err">${esc(err)}</span>` : ''}
+  </li>`;
+}
+function batchCard(b) {
+  const subs = Array.isArray(b.subtasks) ? b.subtasks : [];
+  const done = subs.filter((st) => SUB_TERMINAL.includes((b.results && b.results[st.key] || {}).state)).length;
+  const pct = subs.length ? Math.round((done / subs.length) * 100) : 0;
+  const status = BATCH_LABEL[b.status] ? b.status : 'queued';
+  const claim = batchClaimText(b);
+  return `<article class="card batch" data-batch="${esc(b.id)}">
+    <div class="batch-top">
+      <span class="task-id">${esc(b.id)}</span>
+      <span class="batch-title">${esc(b.title)}</span>
+      <span class="pill ${status}">${BATCH_LABEL[status]}</span>
+    </div>
+    <div class="batch-meta">
+      <span>Repo <code>${esc(b.repo)}</code>${b.base ? ` · base <code>${esc(b.base)}</code>` : ''}</span>
+      ${claim ? `<span>${claim}</span>` : ''}
+      ${b.createdBy ? `<span>by ${esc(b.createdBy)}</span>` : ''}
+      <span>${esc(ago(b.createdAt))}</span>
+    </div>
+    ${b.goal ? `<p class="batch-goal">${esc(b.goal)}</p>` : ''}
+    ${b.note ? `<p class="batch-goal${b.status === 'failed' ? ' batch-err' : ''}">${esc(b.note)}</p>` : ''}
+    <div class="prow"><div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(b.id)} progress"><i style="width:${pct}%"></i></div><b>${done}/${subs.length}</b></div>
+    <ul class="sub-list" aria-label="${esc(b.id)} subtasks">${subs.map((st) => subtaskRow(b, st)).join('')}</ul>
+    ${['queued', 'claimed'].includes(b.status) ? `<div class="batch-actions"><button class="small danger" data-cancel-batch="${esc(b.id)}">Cancel</button></div>` : ''}
+  </article>`;
+}
+function renderBatches() {
+  const all = (Array.isArray(state.foundryBatches) ? state.foundryBatches : []).slice()
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')) || String(b.id).localeCompare(String(a.id)));
+  const open = all.filter((b) => BATCH_OPEN.includes(b.status));
+  const finished = all.filter((b) => !BATCH_OPEN.includes(b.status));
+  $('#batches-wrap').hidden = !all.length;
+  $('#batches').innerHTML = open.length ? open.map(batchCard).join('') : '<div class="empty-state">No open batches.</div>';
+  $('#batches-done-wrap').hidden = !finished.length;
+  $('#batches-done-sum').textContent = `Finished batches (${finished.length})`;
+  $('#batches-done').innerHTML = finished.map(batchCard).join('');
+  tickHeartbeats();
 }
 
 let pending = false;
@@ -943,7 +1061,7 @@ function render() {
     return;
   }
   pending = false;
-  renderStats(); renderTeams(); renderTime(); renderTasks(); renderLog();
+  renderStats(); renderTeams(); renderTime(); renderTasks(); renderBatches(); renderLog();
 }
 document.addEventListener('focusout', () => setTimeout(() => pending && render(), 0));
 
@@ -1320,6 +1438,11 @@ document.addEventListener('click', async (e) => {
     }
   } else if (el.dataset.status) {
     await api('PATCH', `/api/tasks/${el.dataset.task}`, { status: el.dataset.status });
+  } else if (el.dataset.cancelBatch) {
+    const id = el.dataset.cancelBatch;
+    if (!confirm(`Cancel Foundry batch ${id}?`)) return;
+    await api('POST', '/api/op', { type: 'cancelBatch', args: { id } });
+    toast(`${id} cancelled`);
   } else if (el.dataset.delete) {
     if (confirm(`Delete ${el.dataset.delete}? Its teams are freed.`)) await api('DELETE', `/api/tasks/${el.dataset.delete}`);
   }

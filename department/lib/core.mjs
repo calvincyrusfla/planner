@@ -94,6 +94,9 @@ export function createInitialState() {
     log: [],
     // Latest Claude usage report (see reportUsage), or null when none yet.
     usage: null,
+    // Foundry batches (lib/foundry-batches.mjs): work handed to Foundry. Not tasks.
+    foundryBatches: [],
+    nextBatchNumber: 1,
   };
 }
 
@@ -732,6 +735,9 @@ export function normalize(state) {
   state.log ||= [];
   state.usage = normalizeUsage(state.usage);
   state.nextTaskNumber ||= state.tasks.length + 1;
+  // Boards from before Foundry batches have none.
+  if (!Array.isArray(state.foundryBatches)) state.foundryBatches = [];
+  if (!Number.isInteger(state.nextBatchNumber) || state.nextBatchNumber < 1) state.nextBatchNumber = state.foundryBatches.length + 1;
   for (const task of state.tasks) {
     // Tasks from before crew sizing get their size's default.
     if (!isCrewSize(task.builders)) task.builders = crewFor({ size: task.size });

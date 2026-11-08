@@ -4,6 +4,7 @@
 // board behaves the same whether it lives on this PC or on the hub.
 
 import * as core from './core.mjs';
+import * as batches from './foundry-batches.mjs';
 
 const LOG_LIMIT = 500;
 const OPEN = new Set(['queued', 'active', 'review', 'paused']);
@@ -39,6 +40,13 @@ const OPS = {
     return { ok: true };
   },
   importState: (state, { state: other } = {}) => importState(state, other),
+  // Foundry batches (see lib/foundry-batches.mjs for the shape).
+  dispatchBatch: (state, { title, goal, repo, base, subtasks, by } = {}) =>
+    batches.dispatchBatch(state, { title, goal, repo, base, subtasks, by }),
+  claimBatch: (state, { id, host, service } = {}) => batches.claimBatch(state, { id, host, service }),
+  updateBatch: (state, { id, service, host, status, results, heartbeat, note } = {}) =>
+    batches.updateBatch(state, { id, service, host, status, results, heartbeat, note }),
+  cancelBatch: (state, { id, by } = {}) => batches.cancelBatch(state, { id, by }),
 };
 
 export const OP_TYPES = Object.keys(OPS);
@@ -64,6 +72,8 @@ export function applyOp(state, op) {
 //   added tasks only (teamIssues[team], all rounds), so a re-push can't double count.
 // - Logs are merged (duplicates dropped), sorted by `at` and capped at 500.
 // - Usage: the newer report (by reportedAt) wins; an older or invalid one is ignored.
+// - Foundry batches merge by id (lib/foundry-batches.mjs importBatches): same
+//   id + createdAt keeps the newer copy, a clashing id gets a fresh S-###.
 // - Finally dispatch runs so queued work picks up free teams.
 
 const TEAM_IDENTITY = new Set(['id', 'name', 'color', 'taskId', 'totalMs', 'issuesFound', 'agents']);
@@ -164,6 +174,8 @@ export function importState(state, other) {
     state.usage = theirUsage;
   } else state.usage = ourUsage;
 
+  const batchResult = batches.importBatches(state, incoming.foundryBatches);
+
   core.dispatch(state);
-  return { added: addedTasks.length, skipped: skippedIds.size, idMap };
+  return { added: addedTasks.length, skipped: skippedIds.size, idMap, batches: batchResult };
 }

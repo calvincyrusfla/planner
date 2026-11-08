@@ -1885,7 +1885,7 @@ def build_factory(
         bridge: a :class:`~foundry.board_bridge.BoardBridge` (default from
             ``config.board_bridge_mode``).
         gates: the gate runner the workers use; default
-            ``WorkspaceGates(ValidationGates(checks=("syntax", "linter")), workspace)``.
+            ``WorkspaceGates(ValidationGates(checks=("syntax", "linter", "typecheck")), workspace)``.
         queue_clock / telemetry_clock: fake clocks for tests (datetime / epoch).
         trust_cache: overrides ``config.trust_cache`` (default False: a cache
             hit still goes through the gates and the reviewer).
@@ -1933,7 +1933,13 @@ def build_factory(
     foreman.outcomes_provider = queue.sizing_outcomes
     cache = SolutionCache(db)
     if gates is None:
-        gates = WorkspaceGates(ValidationGates(checks=("syntax", "linter")), workspace or repo_root)
+        gates = WorkspaceGates(
+            ValidationGates(
+                checks=("syntax", "linter", "typecheck"),
+                typecheck=getattr(config, "typecheck", "auto"),
+            ),
+            workspace or repo_root,
+        )
     bridge = bridge if bridge is not None else BoardBridge(config.board_bridge_mode)
     if trust_cache is None:
         trust_cache = bool(getattr(config, "trust_cache", False))

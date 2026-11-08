@@ -324,6 +324,35 @@ node department/dept.mjs usage report --five 42 --five-reset 2026-11-07T15:10:00
 
 The dashboard server passes `/api/foundry/*` on to the service at `http://127.0.0.1:4310/api/*` (another port if `FOUNDRY_SERVE_PORT` is set when the dashboard starts; use the same value for Foundry). It only does so for requests from this PC; when Foundry is down it answers 503 with how to start it. Everything else on the dashboard works the same with or without Foundry. To stop Foundry, press Ctrl+C in its window or close it. See [Run Foundry in the background](../foundry/README.md#run-foundry-in-the-background) and [Dashboard integration](../foundry/README.md#dashboard-integration).
 
+### Foundry batches
+
+A **Foundry batch** (or sprint) is how a Claude session hands engineering work to Foundry when it can only reach the board, for example a cloud session that can't see your PC. The session puts a batch on the board; Foundry on your PC picks up batches for the repository it works on, builds each subtask as a normal Foundry order and writes its progress back onto the batch. Batches are not board tasks, so they never take an agent team.
+
+Each batch has an id (`S-001`, `S-002`, …), a title, the repository it is for (`owner/name`), an optional base branch and up to 20 subtasks. Its status moves from **Queued** (waiting for Foundry) to **Claimed** and **Running** once a Foundry service takes it, and ends **Done** when every subtask is complete, **Failed** when any subtask failed or was quarantined, or **Cancelled**. A Foundry that stops sending heartbeats for 10 minutes loses its claim, and another one can take the batch over.
+
+The dashboard lists them in a **Foundry batches** panel (it only appears once there is a batch), newest first. Each card shows:
+
+- the id, title, repository and status;
+- who has it: "Foundry on *host*, 12 s ago" with the time since its last heartbeat (yellow after 10 minutes), or "Waiting for Foundry";
+- how many subtasks are finished (for example 1/3), and one row per subtask with its Foundry task id (`F-012`), its state, a link to its pull request and any error;
+- a **Cancel** button while the batch is queued or claimed.
+
+Finished batches fold into **Finished batches** below the open ones. The panel updates live, like the rest of the board.
+
+From the CLI (it works through the dashboard, the shared board or the state file, like every other command):
+
+```bash
+node department/dept.mjs foundry dispatch --title "CSV export" --repo owner/name [--base main] [--goal "..."] \
+  --subtask "Add the export endpoint::Return tasks as CSV::api/export.py,api/routes.py::M" \
+  --subtask "Add the export button::::web/app.js::S"
+node department/dept.mjs foundry dispatch --json batch.json
+node department/dept.mjs foundry poll S-001 [--json]
+node department/dept.mjs foundry list [--open]
+node department/dept.mjs foundry cancel S-001
+```
+
+Each `--subtask` is `title::description::files::size`: files are comma separated paths inside the repository, size is `S`, `M`, `L` or `XL`, and any part after the title can be left empty. From Python, `foundry.dispatch` has `dispatch_to_foundry(batch)` and `poll_foundry_sprint("S-001")`; see [Dispatching work through the board](../foundry/README.md#dispatching-work-through-the-board).
+
 ## How the agents use it
 
 `CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here with a crew size, staffed with that many of the assigned team's builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.

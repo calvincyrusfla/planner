@@ -202,6 +202,8 @@ class Service:
         probe: Callable[[], Any] | None = None,
         claude_ok: bool | None = None,
         factory_kwargs: Mapping[str, Any] | None = None,
+        batch_board: Any = None,
+        batch_watcher: Any = None,
     ) -> None:
         self.config = config
         self.repo = Path(repo).resolve()
@@ -229,6 +231,11 @@ class Service:
         #: ``GitPublisher.preflight()`` result from the last start (None before it ran).
         self.pr_preflight: dict[str, Any] | None = None
         self._preflight_task: asyncio.Task | None = None
+        #: Board batches (``foundry.board_dispatch``): watched when a board client is given,
+        #: or when the service builds its own factory with the board bridge in ``auto`` mode.
+        self._batch_board = batch_board
+        self._own_factory = factory is None
+        self.batch_watcher: Any = batch_watcher
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -264,8 +271,24 @@ class Service:
         self._preflight_task = self.loop.create_task(self.check_pr_ready())
         await self.refresh_gemma()
         self._monitor_task = self.loop.create_task(self._monitor_loop())
+        self._start_batches()
         log.info("foundry serve: running for %s (%d pool(s))", self.repo, len(self.factory.pools))
         return self
+
+    def _start_batches(self) -> None:
+        """Watch the board for Foundry batches of this repo (see :mod:`foundry.board_dispatch`)."""
+        if self.batch_watcher is None:
+            auto = getattr(self.config, "board_bridge_mode", "auto") == "auto"
+            if self._batch_board is None and not (self._own_factory and auto):
+                return
+            from foundry.board_dispatch import BatchWatcher
+
+            try:
+                self.batch_watcher = BatchWatcher(self, self._batch_board)
+            except Exception as exc:  # batches are optional: the service runs without them
+                log.warning("foundry serve: board batches are off: %s", exc)
+                return
+        self.batch_watcher.start()
 
     def _resume(self) -> None:
         """Open tickets of this repo are claimed by the pools; finish approved tasks without a patch."""
@@ -313,6 +336,8 @@ class Service:
         if self.factory is None:
             return
         self.running = False
+        if self.batch_watcher is not None:
+            await self.batch_watcher.stop()
         if self._monitor_task is not None:
             self._monitor_task.cancel()
             try:
@@ -462,7 +487,8 @@ class Service:
         """
         stats = self._gemma_stats()
         pre = self.pr_preflight or {}
-        return {
+        watcher = self.batch_watcher
+        out = {
             "pr_ready": bool(pre.get("ok")),
             "pr_reason": None if pre.get("ok") else (pre.get("reason") or "not checked yet"),
             "ok": bool(self.running),
@@ -478,6 +504,9 @@ class Service:
                 "calls": _count(stats.get("calls")),
             },
         }
+        if watcher is not None:
+            out["batches"] = watcher.summary()
+        return out
 
     def _gemma_stats(self) -> dict[str, Any]:
         """The Shop Foreman's ``gemma_stats()`` (``{}`` when absent or failing)."""

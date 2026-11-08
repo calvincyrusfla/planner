@@ -629,6 +629,73 @@ Run `npm run dashboard` to watch Foundry tasks appear live. If a shared board (h
 
 Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match the department roster.
 
+## Dispatching work through the board
+
+The Floor Manager (a Claude session) sends engineering work to Foundry through the board. It doesn't need to reach your PC: a cloud session that can only reach the shared board works the same way as a session on the PC.
+
+1. The Floor Manager sends a **Foundry batch** (also called a sprint) to the board. A batch has a title, the repository it's for (`owner/name`), an optional base branch and 1 to 20 subtasks.
+2. Foundry, running on your PC, watches the board. It claims queued batches for **its own** repository and sends each subtask in as a normal Foundry order (`F-0xx`). From there the subtask is sized, built, reviewed and gets a pull request as usual.
+3. Foundry writes progress back onto the batch: for each subtask the F-id, its state, the PR link and any error. The Floor Manager reads that with `poll_foundry_sprint`.
+
+Batches are not board tasks and never take agent teams. Each subtask's F-task still appears on the board as a normal task once Foundry accepts it. The dashboard's **Foundry batches** panel shows every batch with its status, who claimed it and per-subtask progress.
+
+### Send a batch
+
+From Python (the Floor Manager's tools, `foundry/dispatch.py`):
+
+```python
+from foundry.dispatch import DispatchFoundryBatch, SubtaskPayload, dispatch_to_foundry, poll_foundry_sprint
+
+sprint = dispatch_to_foundry(DispatchFoundryBatch(
+    title="Math helpers",
+    repo="owner/shop",
+    base="main",
+    subtasks=[
+        SubtaskPayload(title="Add clamp", description="Add clamp(x, lo, hi).", files=["shop/mathx.py"], size="S"),
+        SubtaskPayload(title="Use clamp", files=["shop/strings.py"], depends_on=["1"]),
+    ],
+))
+print(sprint.id)                     # S-001
+status = poll_foundry_sprint(sprint.id)
+```
+
+Subtasks get the keys `1`, `2`, … in order unless you give a `key`. `depends_on` lists keys that must be complete before Foundry sends this subtask in. `wait_for_sprint(...)` polls until the batch is finished.
+
+The board client tries, in order: the local dashboard (`http://127.0.0.1:4300`), the shared board (`DEPT_HUB_URL`, passcode from `DEPT_HUB_KEY`; in cloud sessions the network proxy supplies it), then `node department/dept.mjs`.
+
+From the command line:
+
+```bash
+python -m foundry.dispatch send --json batch.json
+python -m foundry.dispatch poll S-001
+
+node department/dept.mjs foundry dispatch --title "Math helpers" --repo owner/shop --base main \
+  --subtask "Add clamp::Add clamp(x, lo, hi).::shop/mathx.py::S" \
+  --subtask "Use clamp::Use it in strings.::shop/strings.py::S"
+node department/dept.mjs foundry dispatch --json batch.json
+node department/dept.mjs foundry poll S-001          # add --json for the raw batch
+node department/dept.mjs foundry list --open
+node department/dept.mjs foundry cancel S-001
+```
+
+`--subtask` is `Title::description::file1,file2::size` (the parts after the title are optional). Limits: at most 20 subtasks, titles up to 200 characters, descriptions up to 20 000, up to 50 files per subtask, and file paths must be relative without `..`.
+
+### What Foundry does with a batch
+
+- **Which batches it claims.** Only queued batches whose `repo` matches the service's repository: the `owner/name` of its `origin` remote, compared without case. Set `FOUNDRY_BATCH_REPO=owner/name` when `origin` isn't a GitHub URL. A batch for another repository is left alone for the Foundry that owns it.
+- **Claiming.** The claim is atomic on the board, so two Foundry services never both take a batch. The batch shows `claimed`, then `running`, with the host name and a heartbeat that Foundry refreshes every poll. If a claimed batch gets no heartbeat for 10 minutes (the PC was switched off), another Foundry for that repository may take it over.
+- **Orders.** Each subtask becomes one order with its title, description, files, size hint and acceptance criteria. The pull request goes against the batch's `base` branch, or the configured one. A subtask with `depends_on` waits until those subtasks are complete.
+- **Restarts.** Foundry stores which F-id belongs to which batch subtask. After a restart it picks the batch up again and sends in only the subtasks that never got an order.
+- **The end.** The batch is `done` when every subtask is complete, and `failed` when every subtask has finished and one of them failed or was quarantined (or a subtask couldn't be sent in; the reason is on the batch). You can cancel a queued or claimed batch from the dashboard or with `foundry cancel`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FOUNDRY_BATCHES` | on | `off` stops Foundry from claiming batches. |
+| `FOUNDRY_BATCH_POLL_S` | `15` | Seconds between board checks and heartbeats. |
+| `FOUNDRY_BATCH_REPO` | the `origin` remote | The `owner/name` this Foundry claims batches for. |
+
+Foundry only claims batches while the service is running. If the batch stays on `waiting for Foundry`, check that Foundry is running, that the dashboard is running (Foundry reads the board through it) and that the batch's `repo` is the one Foundry works on.
+
 ## Configuration
 
 `FoundryConfig.from_env()` (`config.py`) reads the following variables. Empty values count as unset.
