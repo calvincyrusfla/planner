@@ -623,7 +623,7 @@ async def run_real(
     if gemma is None:
         from foundry.gemma_client import OllamaGemmaClient
 
-        gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model)
+        gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model, timeout=config.gemma_timeout_s)
     repo = Path(args.repo).resolve()
     factory = build_factory(
         config, claude=claude, gemma=gemma, repo_root=repo, workspace=repo, dispatch_repo=repo

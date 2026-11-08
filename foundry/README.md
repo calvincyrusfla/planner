@@ -437,6 +437,7 @@ Foundry teams and agent ids (`alpha-1` … `alpha-5`, reviewer `alpha-6`) match 
 | `FOUNDRY_DB_PATH` | `foundry/data/foundry.db` |
 | `FOUNDRY_GEMMA_BASE_URL` | `http://localhost:11434/v1` |
 | `FOUNDRY_GEMMA_MODEL` | `gemma4:e4b` (falls back to `FOREMAN_MODEL`) |
+| `FOUNDRY_GEMMA_TIMEOUT_S` | `180` seconds one Gemma request may take before the Foreman falls back to its heuristic (sizing runs in the background, so a slow CPU Gemma is fine) |
 | `FOUNDRY_CLAUDE_BIN` | `claude` |
 | `FOUNDRY_RPM` / `FOUNDRY_TPM` / `FOUNDRY_MAX_CONCURRENT` | `20` / `100000` / `3` |
 | `FOUNDRY_REVIEW_DWELL_S` | `600` (REVIEW_BOTTLENECK → PROMOTE_PEER_REVIEWER) |

@@ -16,6 +16,9 @@ Environment variable               Field (default)
 ``FOUNDRY_GEMMA_MODEL``            ``gemma_model`` (``gemma4:e4b``); falls back
                                    to ``FOREMAN_MODEL`` (used by the setup
                                    scripts) when unset
+``FOUNDRY_GEMMA_TIMEOUT_S``        ``gemma_timeout_s`` (``180``): seconds one
+                                   Gemma request may take (a CPU Gemma is slow;
+                                   sizing runs in the background)
 ``FOUNDRY_CLAUDE_BIN``             ``claude_bin`` (``claude``)
 ``FOUNDRY_RPM``                    ``rpm`` (``20``)
 ``FOUNDRY_TPM``                    ``tpm`` (``100000``)
@@ -193,6 +196,11 @@ class FoundryConfig(BaseModel):
             "a hit only skips the builder's Claude call."
         ),
     )
+    gemma_timeout_s: float = Field(
+        default=180.0,
+        gt=0,
+        description="Seconds one Gemma (Shop Foreman) request may take before the heuristic fallback.",
+    )
     limit_cooldown_s: float = Field(
         default=1200.0,
         gt=0,
@@ -332,6 +340,7 @@ class FoundryConfig(BaseModel):
             "BOARD_BRIDGE_MODE": "board_bridge_mode",
             "TRUST_CACHE": "trust_cache",
             "LIMIT_COOLDOWN_S": "limit_cooldown_s",
+            "GEMMA_TIMEOUT_S": "gemma_timeout_s",
             "PATCHES_DIR": "patches_dir",
             "INFRA_FAILURE_CAP": "infra_failure_cap",
         }

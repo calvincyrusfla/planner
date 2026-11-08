@@ -396,9 +396,10 @@ class FloorManager:
         directive = await self._size(order)
         if self.queue.tickets_for_task(task_id):
             return  # sized meanwhile by someone else (a second resume)
+        self.queue.apply_sizing(directive)
+        # recorded only once the tickets exist: a directive without tickets would look applied
         self.directives[task_id] = directive
         self.allocations[task_id] = directive.allocated_builders
-        self.queue.apply_sizing(directive)
         self.queue.record_event(
             "sized",
             task_id,
@@ -433,36 +434,62 @@ class FloorManager:
             out.append(tid)
         return out
 
+    def _rebuild_order(self, tid: str) -> WorkOrder:
+        """A work order for a queue task whose saved order is missing (title/description/team/repo only)."""
+        task = self.queue.get_task(tid) or {}
+        order = WorkOrder(
+            title=str(task.get("title") or tid),
+            description=str(task.get("description") or ""),
+            task_id=tid,
+            team_id=task.get("team_id") or self._pick_team(WorkOrder(title=tid)),
+            repo_root=task.get("repo_root") or (str(self.repo_root.resolve()) if self.repo_root else None),
+        )
+        log.warning(
+            "floor manager: %s has no saved order; rebuilt it from the queue row without its files "
+            "(the Foreman sizes it from the title and description only)", tid,
+        )
+        return order
+
     def resume_sizing(self, only: Any = None) -> list[str]:
         """Size again, in the background, every open task left without tickets.
 
         This repairs orders whose sizing was cancelled half-way (before the
         fix, an HTTP timeout did that). A task with no saved order is rebuilt
-        from its queue row. ``only(task_id) -> bool`` limits it (e.g. to one
-        repo). Returns the task ids being sized; call on the event loop.
+        from its queue row. Identical unsized orders (same repo, title,
+        description and files: the user resent the order after a timeout) are
+        sized once, as the newest of them; the others are quarantined as
+        duplicates. ``only(task_id) -> bool`` limits it (e.g. to one repo).
+        Returns the task ids being sized; call on the event loop.
         """
-        started = []
+        groups: dict[tuple[Any, ...], list[str]] = {}
         for tid in self.unsized_tasks(only):
+            if self.is_sizing(tid):
+                continue
             if tid not in self.orders:
-                task = self.queue.get_task(tid) or {}
                 try:
-                    self.orders[tid] = WorkOrder(
-                        title=str(task.get("title") or tid),
-                        description=str(task.get("description") or ""),
-                        task_id=tid,
-                        team_id=task.get("team_id") or self._pick_team(WorkOrder(title=tid)),
-                        repo_root=task.get("repo_root") or (str(self.repo_root.resolve()) if self.repo_root else None),
-                    )
+                    self.orders[tid] = self._rebuild_order(tid)
                 except Exception as exc:  # cannot be rebuilt: say so instead of leaving it stuck
                     reason = f"order could not be recovered for sizing: {exc}"[:500]
                     log.warning("floor manager: %s %s", tid, reason)
                     self.queue.quarantine(tid, reason)
                     continue
-            self.directives.pop(tid, None)  # a directive without tickets was never applied
-            self._start_sizing(tid)
-            started.append(tid)
-        if started:
+            groups.setdefault(_order_key(self.orders[tid]), []).append(tid)
+        started = []
+        for ids in groups.values():
+            ids.sort(key=_task_number)
+            keep, dupes = ids[-1], ids[:-1]
+            for tid in dupes:
+                reason = f"duplicate of {keep} (resent after the old 30 s timeout)"
+                log.warning("floor manager: %s is a %s; quarantined, %s is sized instead", tid, reason, keep)
+                self.queue.quarantine(tid, reason)
+                self._reported_quarantine.add(tid)  # never on the board: nothing to report
+            self.directives.pop(keep, None)  # a directive without tickets was never applied
+            self._start_sizing(keep)
+            started.append(keep)
+        started.sort(key=_task_number)
+        if groups:
             self.save()
+        if started:
             log.info("floor manager: sizing again %s", ", ".join(started))
         return started
 
@@ -976,6 +1003,20 @@ def _params(fn: Any) -> set[str]:
         return set(inspect.signature(fn).parameters)
     except (TypeError, ValueError):
         return set()
+
+
+def _order_key(order: WorkOrder) -> tuple[Any, ...]:
+    """What makes two orders the same request (repo, title, description, files; whitespace/case folded)."""
+    def norm(text: str) -> str:
+        return " ".join(str(text or "").split()).casefold()
+
+    repo = str(Path(order.repo_root).resolve()).casefold() if order.repo_root else None
+    return (repo, norm(order.title), norm(order.description), tuple(sorted(f.strip() for f in order.files)))
+
+
+def _task_number(task_id: str) -> tuple[int, str]:
+    m = _TASK_ID_RE.match(task_id)
+    return (int(m.group(1)) if m else -1, task_id)
 
 
 def _with_newline(text: str) -> str:

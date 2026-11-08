@@ -211,3 +211,92 @@ def test_service_without_accept_falls_back_to_awaiting_submit(tmp_path: Path) ->
 
     svc.factory, svc.running = F(), True
     assert asyncio.run(svc.submit(**ORDER)) == "F-777"
+
+
+def test_identical_stuck_orders_are_sized_once_and_the_rest_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The user resent the same order 3 times after the old 30 s timeout: size only the newest."""
+    repo = write_demo_repo(tmp_path / "repo")
+    config = _config(tmp_path)
+
+    async def seed() -> list[str]:
+        f = build_factory(config, claude=demo_claude(repo), gemma=None, repo_root=repo,
+                          bridge=BoardBridge("dry"), patches_dir=tmp_path / "patches")
+        _slow_sizing(f.foreman, gate=asyncio.Event())  # never answers (old timeout behaviour)
+        for desc in (ORDER["description"], "  " + ORDER["description"], ORDER["description"] + "\n"):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    f.manager.submit(WorkOrder(**{**ORDER, "description": desc}, repo_root=str(repo))), 0.05)
+        # a different order is not a duplicate
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(f.manager.submit(
+                WorkOrder(**{**ORDER, "title": "Something else"}, repo_root=str(repo))), 0.05)
+        ids = sorted(f.manager.orders)
+        f.close()
+        return ids
+
+    ids = asyncio.run(seed())
+    assert len(ids) == 4
+    first, second, newest, other = ids
+
+    async def go() -> None:
+        svc = _service(tmp_path, repo=repo, monitor_s=3600)
+        with caplog.at_level("WARNING", logger="foundry.floor_manager"):
+            await svc.start()
+        try:
+            assert svc.resumed == [newest, other]
+            for tid in (first, second):
+                row = next(t for t in svc.status()["tasks"] if t["id"] == tid)
+                assert row["state"] == "quarantined"
+                assert row["reason"] == f"duplicate of {newest} (resent after the old 30 s timeout)"
+                assert any(tid in r.getMessage() and "duplicate" in r.getMessage() for r in caplog.records)
+            await _until(lambda: _state(svc, newest) == "complete" and _state(svc, other) == "complete")
+            titles = [op["args"]["title"] for op in svc.factory.bridge.ops if op["type"] == "addTask"]
+            assert sorted(titles) == sorted([ORDER["title"], "Something else"]), titles
+            assert not svc.factory.queue.tickets_for_task(first) and not svc.factory.queue.tickets_for_task(second)
+            assert first not in svc.factory.manager.directives and second not in svc.factory.manager.directives
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
+def test_rebuilt_order_logs_a_warning_and_failed_apply_records_no_directive(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+
+    async def go() -> None:
+        f = build_factory(_config(tmp_path), claude=demo_claude(repo), gemma=None, repo_root=repo,
+                          bridge=BoardBridge("dry"), patches_dir=tmp_path / "patches")
+        try:
+            f.queue.add_task("F-009", "Lost order", "", "alpha", repo_root=str(repo))
+            with caplog.at_level("WARNING", logger="foundry.floor_manager"):
+                assert f.manager.resume_sizing() == ["F-009"]
+            assert any("F-009" in r.getMessage() and "without its files" in r.getMessage() for r in caplog.records)
+            await _until(lambda: not f.manager.is_sizing("F-009"))
+            assert f.queue.tickets_for_task("F-009")
+
+            def refuse(directive: Any, *a: Any, **k: Any) -> Any:
+                raise ValueError("queue refused")
+
+            f.queue.apply_sizing = refuse
+            before = set(f.manager.orders)
+            with pytest.raises(ValueError):
+                await f.manager.submit(WorkOrder(**ORDER))
+            (tid,) = set(f.manager.orders) - before
+            assert tid not in f.manager.directives and tid not in f.manager.allocations
+        finally:
+            f.close()
+
+    asyncio.run(go())
+
+
+def test_gemma_timeout_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from foundry.config import FoundryConfig
+
+    monkeypatch.delenv("FOUNDRY_GEMMA_TIMEOUT_S", raising=False)
+    assert FoundryConfig.from_env().gemma_timeout_s == 180
+    monkeypatch.setenv("FOUNDRY_GEMMA_TIMEOUT_S", "240")
+    assert FoundryConfig.from_env().gemma_timeout_s == 240
