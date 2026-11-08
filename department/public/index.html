@@ -1248,6 +1248,7 @@ function actionWords(a) {
     case 'THROTTLE_DISPATCH': words = 'Slowed down starting new work'; break;
     case 'PROMOTE_PEER_REVIEWER': words = `Made a builder peer reviewer${a.team ? ` on ${teamName(a.team)}` : ''}`; break;
     case 'RESET_BUILDER_CONTEXT': words = `Restarted a builder on ${task} with a clean slate`; break;
+    case 'WIDEN_CONTEXT': words = `Showed more of the code to the builders on ${task}`; break;
     default: words = `${kind ? kind.toLowerCase().replace(/_/g, ' ') : 'Action'}${a.task_id ? ` on ${task}` : ''}`;
   }
   // "reason" is the Foreman's diagnosis (e.g. "stuck 14 min"); "detail" (what was changed) goes in the tooltip.
