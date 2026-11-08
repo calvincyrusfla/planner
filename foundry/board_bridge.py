@@ -62,6 +62,9 @@ log = logging.getLogger(__name__)
 
 BridgeMode = Literal["auto", "off", "dry"]
 
+#: At most one activity update per agent is sent in this many seconds.
+AGENT_STATUS_INTERVAL = 10.0
+
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
 #: The dashboard forwards every op to the shared board when one is configured;
 #: a cold Netlify function can take several seconds, so op POSTs get this long.
@@ -149,6 +152,7 @@ class BoardBridge:
         cli_path: str | Path = DEPT_CLI,
         dry_autoassign: tuple[str, ...] | list[str] = (),
         dry_busy: tuple[str, ...] | list[str] = (),
+        agent_status_interval: float = AGENT_STATUS_INTERVAL,
     ) -> None:
         if mode not in ("auto", "off", "dry"):
             raise ValueError(f"unknown board bridge mode {mode!r}")
@@ -179,6 +183,14 @@ class BoardBridge:
         #: Foundry task id -> the board teams left on its board task (who must sign off).
         self.board_teams: dict[str, list[str]] = {}
         self._dry_live: dict[str, list[str]] = {}
+        #: Seconds between two activity updates of one agent (see :meth:`agent_status`).
+        self.agent_status_interval = max(0.0, float(agent_status_interval))
+        self._agent_lock = threading.Lock()
+        #: agent id -> when its last activity update was sent (monotonic clock).
+        self._agent_sent: dict[str, float] = {}
+        #: agent id -> its newest update waiting for the end of the interval.
+        self._agent_held: dict[str, BoardOp] = {}
+        self._agent_timers: dict[str, threading.Timer] = {}
 
     # ------------------------------------------------------------------ events
 
@@ -348,6 +360,78 @@ class BoardBridge:
         team = team_id or (agent_id.rsplit("-", 1)[0] if agent_id and "-" in agent_id else None)
         self._emit(BoardOp("reportProgress", args, foundry_task=task_id, task_key="taskId", team_id=team))
 
+    def agent_status(
+        self,
+        task_id: str,
+        agent_id: str,
+        work: str,
+        *,
+        status: str = "working",
+        team_id: str | None = None,
+    ) -> None:
+        """Report what one agent is doing (no progress message), coalesced per agent.
+
+        At most one update per agent is sent every ``agent_status_interval`` seconds.
+        An update inside the interval is held and replaced by any newer one, and the
+        newest is sent when the interval ends (or at :meth:`flush`), so a final idle
+        status is never lost.
+        """
+        if self.mode == "off":
+            return
+        args: dict[str, Any] = {"taskId": None, "agentId": agent_id, "work": work, "status": status}
+        if team_id:
+            args["teamId"] = team_id
+        team = team_id or (agent_id.rsplit("-", 1)[0] if "-" in agent_id else None)
+        op = BoardOp("reportProgress", args, foundry_task=task_id, task_key="taskId", team_id=team)
+        now = time.monotonic()
+        with self._agent_lock:
+            last = self._agent_sent.get(agent_id)
+            wait = 0.0 if last is None else last + self.agent_status_interval - now
+            if wait > 0 or agent_id in self._agent_held:
+                self._agent_held[agent_id] = op
+                self._schedule_agent_update(agent_id, max(0.0, wait))
+                return
+            self._agent_sent[agent_id] = now
+        self._emit(op)
+
+    def _schedule_agent_update(self, agent_id: str, delay: float) -> None:
+        """Start the agent's timer unless one is running. Call with ``_agent_lock`` held."""
+        if agent_id in self._agent_timers:
+            return
+        try:
+            timer = threading.Timer(delay, self._send_agent_update, args=(agent_id,))
+            timer.daemon = True
+            timer.start()
+        except Exception as exc:  # pragma: no cover - interpreter shutting down; flush() still sends it
+            log.warning("board bridge: no timer for %s's activity (%s)", agent_id, exc)
+            return
+        self._agent_timers[agent_id] = timer
+
+    def _send_agent_update(self, agent_id: str) -> None:
+        """The agent's interval ended: send its newest held update."""
+        with self._agent_lock:
+            self._agent_timers.pop(agent_id, None)
+            op = self._agent_held.pop(agent_id, None)
+            if op is None:
+                return
+            self._agent_sent[agent_id] = time.monotonic()
+        self._emit(op)
+
+    def _send_held_agent_updates(self) -> None:
+        """Send every held activity update now, so a final idle status survives a shutdown."""
+        with self._agent_lock:
+            held = dict(self._agent_held)
+            self._agent_held.clear()
+            timers = list(self._agent_timers.values())
+            self._agent_timers.clear()
+            now = time.monotonic()
+            for agent_id in held:
+                self._agent_sent[agent_id] = now
+        for timer in timers:
+            timer.cancel()
+        for op in held.values():
+            self._emit(op)
+
     def escalation(self, alert: Any) -> None:
         """Post a Foreman escalation as ``[Foreman] <severity> <category>: <diagnosis>``."""
         target = _get(alert, "target_entity")
@@ -424,10 +508,12 @@ class BoardBridge:
     def flush(self, timeout: float | None = None) -> bool:
         """Wait until every queued op was sent (or failed). Returns True when drained.
 
-        Waits as long as ops keep completing, up to ``timeout`` seconds in total
+        Held agent activity updates are queued first. Waits as long as ops keep
+        completing, up to ``timeout`` seconds in total
         (default :data:`DEFAULT_FLUSH_TIMEOUT`); gives up early when no op
         completes for :attr:`stall_timeout` seconds. Never raises.
         """
+        self._send_held_agent_updates()
         if self.mode != "auto":
             return True
         thread = self._thread

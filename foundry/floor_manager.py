@@ -228,6 +228,12 @@ class FloorManager:
         self.teams = dict(teams)
         self.telemetry = telemetry
         self.bridge = bridge
+        report_activity = getattr(bridge, "agent_status", None)
+        if callable(report_activity):
+            for pool in self.teams.values():
+                attach = getattr(pool, "set_on_activity", None)
+                if callable(attach):
+                    attach(report_activity)
         self.claude = claude
         self.limiter = limiter
         self.builders_per_team = builders_per_team
@@ -1461,6 +1467,28 @@ class FloorManager:
         if all(t.status == "done" for t in others):
             self._spawn(self._complete_when_closed(task_id))
 
+    def report_task_progress(self, task_id: str, *, team_id: str | None = None) -> None:
+        """Send the task's progress percent to the board; a board error never reaches the build.
+
+        ``round(100 * approved / total)`` of the task's tickets, at most 95 until the
+        patch is written (:meth:`_finish` records that in ``_completed``), then 100.
+        """
+        try:
+            if task_id in self._completed:
+                pct = 100
+                note = "[Foundry] task finished"
+            else:
+                tickets = list(self.queue.tickets_for_task(task_id))
+                if not tickets:
+                    return
+                approved = sum(1 for t in tickets if t.status == "done")
+                pct = min(round(100 * approved / len(tickets)), 95)
+                note = f"[Foundry] {approved}/{len(tickets)} tickets approved"
+            d = self.directives.get(task_id)
+            self.bridge.progress(task_id, note, team_id=d.team_id if d else team_id, pct=pct)
+        except Exception as exc:
+            log.warning("could not report the progress of %s: %s", task_id, exc)
+
     async def _complete_when_closed(self, task_id: str) -> None:
         for _ in range(200):  # the worker completes the ticket right after on_approved returns
             task = self.queue.get_task(task_id)
@@ -1614,6 +1642,7 @@ class FloorManager:
             self.queue.store_pr_summary(task_id, summary)
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
             log.debug("store_pr_summary failed: %s", exc)
+        self.report_task_progress(task_id)
         d = self.directives.get(task_id)
         if d is not None:
             self.bridge.review(task_id, d.team_id, "APPROVED", note="Foundry reviewer approved")
@@ -2392,4 +2421,8 @@ def build_factory(
         for team in config.teams
     }
     manager.teams = dict(pools)
+    for pool in pools.values():
+        attach = getattr(pool, "set_on_ticket_change", None)
+        if callable(attach):
+            attach(manager.report_task_progress)
     return Factory(config, queue, telemetry, limiter, context, foreman, cache, gates, pools, manager, bridge, claude, gemma)
