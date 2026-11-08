@@ -1482,6 +1482,7 @@ class BuilderWorker(_WorkerBase):
         pre_review_breaker: PreReviewBreaker | None = None,
         approved_diffs_before: Callable[[str], Any] | None = None,
         base_for: Callable[[str], Any] | None = None,
+        base_lease: Callable[[str], Any] | None = None,
     ) -> None:
         super().__init__(
             team_id,
@@ -1538,6 +1539,9 @@ class BuilderWorker(_WorkerBase):
         self._stack: _Stack | None = None
         #: The base snapshot of the ticket being processed (None: the user's folder).
         self._base: Path | None = None
+        #: ``base_lease(task_id)`` -> async context manager yielding the task's snapshot and keeping
+        #: it from being pruned while the ticket runs (``FloorManager.base_lease``); else ``base_for``.
+        self.base_lease = base_lease
         #: Outcomes of processed tickets, in order ("review", "retry", "quarantined", "cached", ...).
         self.outcomes: list[str] = []
         self._backoff_s = 0.0
@@ -1832,7 +1836,20 @@ class BuilderWorker(_WorkerBase):
             return "skipped"
         # everything for this ticket reads the task's snapshot of the publish branch
         # (context, gates' base, stacked copy, normalisation), never the user's folder
-        self._base = await self._resolve_base(_get(ticket, "task_id"))
+        task_id = _get(ticket, "task_id")
+        if self.base_lease is not None and task_id:
+            # held for the whole ticket: the snapshot is never pruned under this worker
+            async with self.base_lease(str(task_id)) as base:
+                if base:
+                    self._bases[str(task_id)] = Path(base)
+                else:
+                    self._bases.pop(str(task_id), None)
+                return await self._process_on_base(ticket, Path(base) if base else None)
+        return await self._process_on_base(ticket, await self._resolve_base(task_id))
+
+    async def _process_on_base(self, ticket: Any, base: Path | None) -> str:
+        """:meth:`process_ticket` with the task's base snapshot (None: the user's folder) resolved."""
+        self._base = base
         try:
             self._stack = await self._prepare_stack(ticket)
         except asyncio.CancelledError:
@@ -2707,6 +2724,7 @@ class TeamPool:
         pre_review_breaker: PreReviewBreaker | None = None,
         approved_diffs_before: Callable[[str], Any] | None = None,
         base_for: Callable[[str], Any] | None = None,
+        base_lease: Callable[[str], Any] | None = None,
     ) -> None:
         if not 1 <= builders <= 5:
             raise ValueError("a team has 1..5 builder slots")
@@ -2773,6 +2791,7 @@ class TeamPool:
                 pre_review_breaker=self.pre_review_breaker,
                 approved_diffs_before=approved_diffs_before,
                 base_for=base_for,
+                base_lease=base_lease,
             )
             for slot in range(1, builders + 1)
         ]

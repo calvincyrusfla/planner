@@ -43,6 +43,7 @@ from foundry.schemas import (
     PrescribedAction,
     TaskSizingDirective,
 )
+from foundry.validation_gates import copy_ignore
 
 log = logging.getLogger(__name__)
 
@@ -208,6 +209,10 @@ class FloorManager:
         self._snapshot_warned: set[str] = set()
         #: held while a snapshot is created and recorded, and while snapshots are pruned
         self._snapshot_lock = asyncio.Lock()
+        #: sha -> number of blocks using its snapshot right now (:meth:`base_lease`); never pruned.
+        self._snapshot_users: dict[str, int] = {}
+        #: sha -> snapshot path verified clean by ``checkout()`` in this run (no git status per ticket).
+        self._snapshot_paths: dict[str, Path] = {}
         #: :class:`~foundry.git_publisher.GitPublisher` (or a fake): pushes an
         #: approved task's patch to its own branch and opens the PR.
         self.publisher = publisher
@@ -645,8 +650,10 @@ class FloorManager:
             base, sha = await _maybe_await(self.snapshots.resolve(self._publish_base(task_id)))
             pin = {"base": str(base), "sha": str(sha)}
             async with self._snapshot_lock:  # recorded under the lock: a concurrent prune keeps it
-                await _maybe_await(self.snapshots.checkout(pin["sha"]))
+                path = await _maybe_await(self.snapshots.checkout(pin["sha"]))
                 self.task_bases[task_id] = pin
+                if path:
+                    self._snapshot_paths[pin["sha"]] = Path(path)
         except Exception as exc:  # SnapshotUnavailable, or anything else: fall back, never stop the line
             self._warn_user_folder(task_id, f"no snapshot of the publish branch: {exc}")
             return None
@@ -658,24 +665,49 @@ class FloorManager:
         self.save()
         return dict(pin)
 
+    def _can_pin_late(self, task_id: str) -> bool:
+        """True when an unpinned task may still be pinned now: nothing of it was approved yet
+        (approved diffs are relative to what they were built on, so they never switch base)."""
+        if not self.snapshots_enabled or task_id in self._completed:
+            return False
+        try:
+            return not self._ordered_diffs(task_id)
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     async def task_base(self, task_id: str) -> Path | None:
         """The snapshot directory the task is built from (may re-create it), or None.
 
         None means "use the user's folder" (snapshots off/unavailable, or a task
-        pinned before snapshots existed). A snapshot pruned meanwhile (a retry
-        or undo after the task finished) is checked out again at the pinned commit.
+        pinned before snapshots existed). A task whose pin failed at sizing (e.g.
+        offline) is pinned again here as long as none of its work is approved yet.
+        A snapshot pruned meanwhile (a retry or undo after the task finished) is
+        checked out again at the pinned commit. A snapshot already verified clean
+        in this run is reused without asking git again.
         """
-        pin = self.task_bases.get(str(task_id))
-        if pin is None or self.snapshots is None:
-            if self.snapshots_enabled:
-                self._warn_user_folder(str(task_id), "the task has no pinned base commit")
+        tid = str(task_id)
+        if self.snapshots is None:
             return None
+        if tid not in self.task_bases and self._can_pin_late(tid):
+            await self.pin_base(tid)
+        pin = self.task_bases.get(tid)
+        if pin is None:
+            if self.snapshots_enabled:
+                self._warn_user_folder(tid, "the task has no pinned base commit")
+            return None
+        sha = pin["sha"]
+        known = self._snapshot_paths.get(sha)
+        if known is not None and not self._snapshot_lock.locked() and known.is_dir():
+            return known
         try:
             async with self._snapshot_lock:
-                return Path(await _maybe_await(self.snapshots.checkout(pin["sha"])))
+                path = Path(await _maybe_await(self.snapshots.checkout(sha)))
         except Exception as exc:
-            self._warn_user_folder(str(task_id), f"the snapshot of {pin['sha'][:12]} is unavailable: {exc}")
+            self._snapshot_paths.pop(sha, None)
+            self._warn_user_folder(tid, f"the snapshot of {sha[:12]} is unavailable: {exc}")
             return None
+        self._snapshot_paths[sha] = path  # verified clean by checkout(): trusted for this run
+        return path
 
     async def build_root(self, task_id: str) -> Path | None:
         """Where the task's files stand before its change: its snapshot, else its repo (user's folder)."""
@@ -685,31 +717,93 @@ class FloorManager:
         repo = self.task_repo(task_id)
         return Path(repo) if repo else self.repo_root
 
+    @asynccontextmanager
+    async def base_lease(self, task_id: str) -> AsyncIterator[Path | None]:
+        """``async with manager.base_lease(tid) as root``: the task's snapshot (None: the user's folder),
+        never pruned while the block runs (stacking, the patch check, a worker's ticket)."""
+        root = await self.task_base(task_id)
+        pin = self.task_bases.get(str(task_id)) if root is not None else None
+        sha = pin["sha"] if pin else None
+        if sha:
+            self._snapshot_users[sha] = self._snapshot_users.get(sha, 0) + 1
+        try:
+            yield root
+        finally:
+            if sha:
+                left = self._snapshot_users.get(sha, 1) - 1
+                if left > 0:
+                    self._snapshot_users[sha] = left
+                else:
+                    self._snapshot_users.pop(sha, None)
+
+    async def _leased_root(self, task_id: str, fn: Any, *args: Any) -> Any:
+        """Run ``fn(*args, root)`` in a thread on the task's build root, holding its snapshot."""
+        async with self.base_lease(task_id) as snap:
+            if snap is None:
+                repo = self.task_repo(task_id)
+                snap = Path(repo) if repo else self.repo_root
+            return await asyncio.to_thread(lambda: fn(*args, snap))
+
+    def _pin_done(self, tid: str) -> bool:
+        """True when the task's snapshot is no longer needed (finished or given up)."""
+        task = self.queue.get_task(tid)
+        if task is None:
+            return True
+        state = _val(task.get("state"))
+        if state in ("quarantined", "failed"):
+            return True
+        if tid not in self._completed:
+            return False  # still building, or complete in the queue but its patch not yet written
+        return not (self.is_publishing(tid) or (self.pr_states.get(tid) or {}).get("state") == "pending")
+
     def _snapshot_keep(self) -> set[str]:
-        """Commits of tasks that can still build (not complete/quarantined/failed)."""
-        keep: set[str] = set()
+        """Commits whose snapshot is still needed: unfinished tasks and snapshots in use right now."""
+        keep = {sha for sha, n in self._snapshot_users.items() if n > 0}
         for tid, pin in self.task_bases.items():
-            task = self.queue.get_task(tid)
-            state = _val(task.get("state")) if task else None
-            if task is not None and state not in _TERMINAL and tid not in self._completed:
+            if not self._pin_done(tid):
                 keep.add(pin["sha"])
         return keep
+
+    def _trim_pins(self) -> bool:
+        """Forget the pins nothing will read again: tasks whose PR is settled (opened/skipped,
+        or no publisher) and failed tasks. Quarantined tasks keep theirs: an undo or retry rebuilds
+        on the same commit, and a failed/retryable PR still needs it (``base_sha``)."""
+        drop = []
+        for tid in self.task_bases:
+            task = self.queue.get_task(tid)
+            state = _val(task.get("state")) if task else None
+            pr = (self.pr_states.get(tid) or {}).get("state")
+            if task is None or state == "failed":
+                drop.append(tid)
+            elif tid in self._completed and not self.is_publishing(tid) and (
+                    self.publisher is None or not self.auto_pr or pr in ("opened", "skipped")):
+                drop.append(tid)
+        for tid in drop:
+            self.task_bases.pop(tid, None)
+        return bool(drop)
 
     async def prune_snapshots(self) -> list[Any]:
         """Remove the snapshots no open task uses (never touches the user's folder).
 
         Finished and quarantined tasks lose theirs; a retry or undo re-creates
         it from the pinned commit (:meth:`task_base`). Also removes snapshots of
-        commits this manager does not know (an earlier database, a crash).
+        commits this manager does not know (an earlier database, a crash), and
+        forgets the pins of settled tasks.
         """
         if self.snapshots is None:
             return []
         try:
             async with self._snapshot_lock:
-                removed = await _maybe_await(self.snapshots.prune(keep=self._snapshot_keep()))
+                keep = self._snapshot_keep()
+                removed = await _maybe_await(self.snapshots.prune(keep=keep))
+                for sha in list(self._snapshot_paths):
+                    if sha not in keep:
+                        self._snapshot_paths.pop(sha, None)  # verify again on the next use
         except Exception as exc:  # pruning is housekeeping only
             log.warning("floor manager: could not prune base snapshots: %s", exc)
             return []
+        if self._trim_pins():
+            self.save()
         return list(removed or [])
 
     def _prune_later(self) -> None:
@@ -1481,8 +1575,7 @@ class FloorManager:
         diffs = self._ordered_diffs(task_id)
         if len(diffs) < 2:
             return self._approved_diff(task_id)
-        root = await self.build_root(task_id)
-        stacked = await asyncio.to_thread(stack_diffs, diffs, root)
+        stacked = await self._leased_root(task_id, stack_diffs, diffs)
         return stacked if stacked is not None else self._approved_diff(task_id)
 
     async def _finish(self, task_id: str, diff: str | None) -> dict[str, str]:
@@ -1595,6 +1688,9 @@ class FloorManager:
         self._pr_tasks[task_id] = t
         self._pending.add(t)  # drain() (shutdown) waits for it
         t.add_done_callback(self._pending.discard)
+        if self.snapshots is not None:
+            # once the PR is settled the task's snapshot (and pin) are no longer needed
+            t.add_done_callback(lambda _t: self._prune_later())
         return t
 
     def pr_request(self, task_id: str) -> dict[str, Any]:
@@ -1772,8 +1868,7 @@ class FloorManager:
         text = _with_newline(diff) if diff else ""
         # checked against what the task was built on: its snapshot of the publish branch
         # (as stored, LF), else the user's folder
-        root = await self.build_root(task_id) if text else None
-        problem = await asyncio.to_thread(_git_check, text, root) if text else None
+        problem = await self._leased_root(task_id, _git_check, text) if text else None
         md = f"{summary.get('commit_message', '').strip()}\n\n{summary.get('pr_body', '').strip()}\n"
         try:
             self.patches_dir.mkdir(parents=True, exist_ok=True)
@@ -1885,7 +1980,7 @@ def _copy_workspace(src: Path, dst: Path) -> None:
     try:
         if src.is_dir():
             # symlinks are copied as links: never follow them out of the repo (or loop on them)
-            shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(*SCRATCH_IGNORE))
+            shutil.copytree(src, dst, symlinks=True, ignore=copy_ignore(SCRATCH_IGNORE, src))
         else:
             dst.mkdir(parents=True)
     except (OSError, shutil.Error) as exc:
@@ -2270,6 +2365,8 @@ def build_factory(
         pool_extra["repo_root"] = str(Path(dispatch_repo).resolve())
     if snapshots is not None and "base_for" in _params(TeamPool):
         pool_extra["base_for"] = manager.task_base
+        if "base_lease" in _params(TeamPool):
+            pool_extra["base_lease"] = manager.base_lease
     pools = {
         team: TeamPool(
             team,

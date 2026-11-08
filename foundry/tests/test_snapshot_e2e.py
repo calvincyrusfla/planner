@@ -164,7 +164,9 @@ def test_crlf_folder_on_another_branch_still_builds_and_publishes_from_origin_ma
         assert pr["state"] == "opened", row
         branch = pr["branch"]
         manager = service.factory.manager
-        pin = dict(manager.task_bases.get(tid) or {})
+        # the pin is forgotten once the PR is settled; the queue keeps the event
+        pins = [e["payload"] for e in manager.queue.events(task_id=tid, kind="base_pinned")]
+        pin = dict(pins[-1]) if pins else {}
         _on_loop(service, manager.prune_snapshots())  # the finished task's snapshot goes
         patches = sorted((tmp_path / "patches").glob(f"{tid}*.patch"))
 

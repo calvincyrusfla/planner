@@ -50,7 +50,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -67,7 +67,9 @@ __all__ = [
     "SolutionCache",
     "TypecheckMode",
     "ValidationGates",
+    "SCRATCH_SKIP_DIRS",
     "STACK_COPY_IGNORE",
+    "copy_ignore",
     "apply_diff",
     "builtin_lint",
     "normalize_diff",
@@ -391,6 +393,27 @@ STACK_COPY_IGNORE: tuple[str, ...] = (
     ".mypy_cache", ".ruff_cache", "*.db", "*.db-wal", "*.db-shm",
 )
 
+#: Relative directories never copied into scratch workspaces, besides the name patterns:
+#: Foundry's own data (base snapshots, publish worktrees, patches, database), so a copy of
+#: a repo that contains Foundry never sweeps whole snapshots of itself in.
+SCRATCH_SKIP_DIRS: tuple[str, ...] = ("foundry/data",)
+
+
+def copy_ignore(patterns: tuple[str, ...], root: str | Path,
+                skip_dirs: tuple[str, ...] = SCRATCH_SKIP_DIRS) -> Callable[[str, list[str]], set[str]]:
+    """A ``shutil.copytree`` ``ignore=``: the name ``patterns`` plus ``skip_dirs`` (relative to ``root``)."""
+    by_name = shutil.ignore_patterns(*patterns)
+    base = os.path.normcase(os.path.abspath(root))
+    skip = {os.path.normcase(os.path.join(base, *d.split("/"))) for d in skip_dirs}
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        out = set(by_name(directory, names))
+        here = os.path.normcase(os.path.abspath(directory))
+        out.update(n for n in names if os.path.normcase(os.path.join(here, n)) in skip)
+        return out
+
+    return ignore
+
 
 def prepare_stacked_workspace(
     base: str | Path,
@@ -417,7 +440,7 @@ def prepare_stacked_workspace(
     src, out = Path(base), Path(dst)
     if src.is_dir():
         # symlinks stay links: never follow them out of the repo (or loop on them)
-        shutil.copytree(src, out, symlinks=True, ignore=shutil.ignore_patterns(*STACK_COPY_IGNORE))
+        shutil.copytree(src, out, symlinks=True, ignore=copy_ignore(STACK_COPY_IGNORE, src))
     else:
         out.mkdir(parents=True)
     for n, item in enumerate(diffs, 1):

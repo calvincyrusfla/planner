@@ -142,7 +142,8 @@ def test_task_is_built_checked_and_published_from_the_pinned_snapshot(world: dic
     f = _factory(tmp, repo, pub, world["snapshots"], claude)
     tid = asyncio.run(_run(f))
     m = f.manager
-    assert m.task_bases[tid] == {"base": "main", "sha": world["sha"]}
+    pinned = [e["payload"] for e in m.queue.events(task_id=tid, kind="base_pinned")]
+    assert pinned == [{"base": "main", "sha": world["sha"]}]
     snap = world["snapshots"].path_for(world["sha"])
     # Claude (builder and reviewer) read the snapshot, never the user's folder
     cwds = {c.cwd for c in claude.history}
@@ -164,12 +165,9 @@ def test_task_is_built_checked_and_published_from_the_pinned_snapshot(world: dic
     assert (repo / "shop/mathx.py").read_bytes() == world["mathx"]
     assert _git(repo, "symbolic-ref", "--short", "HEAD") == "my-work"
     assert _git(repo, "status", "--porcelain") == "M shop/mathx.py"  # only the CRLF bytes we wrote
+    # the PR is open: nothing reads the pin again, so it is forgotten
+    assert tid not in m.task_bases
     f.close()
-
-    # the pin survives a restart
-    g = _factory(tmp, repo, FakePublisher(), world["snapshots"])
-    assert g.manager.task_bases[tid] == {"base": "main", "sha": world["sha"]}
-    g.close()
 
 
 @needs_git
@@ -294,6 +292,134 @@ def test_pin_uses_the_orders_pr_base_and_is_idempotent(tmp_path: Path) -> None:
 
     asyncio.run(go())
     f.close()
+
+    # pins survive a restart
+    g = _factory(tmp_path, repo, FakePublisher(), FakeSnapshots(repo, tmp_path / "base"))
+    assert set(g.manager.task_bases) == {"F-001", "F-002"}
+    g.close()
+
+
+def _mark_complete(m: Any, tid: str) -> None:
+    with m.queue.transaction() as conn:
+        conn.execute("UPDATE tasks SET state='complete' WHERE task_id=?", (tid,))
+
+
+def test_a_task_still_finishing_keeps_its_snapshot(tmp_path: Path) -> None:
+    """The queue marks a task complete before _finish stacks and checks its patch: never prune then."""
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, repo, FakePublisher(), FakeSnapshots(repo, tmp_path / "base"))
+    m = f.manager
+
+    async def go() -> None:
+        tid = m._prepare(WorkOrder(**ORDER))
+        await m.pin_base(tid)
+        root = await m.build_root(tid)
+        _mark_complete(m, tid)
+        assert tid not in m._completed
+        assert await m.prune_snapshots() == []
+        assert root.is_dir()
+        # a pending PR keeps it too, even once the patch is written
+        m._completed.add(tid)
+        m._set_pr(tid, "pending")
+        assert await m.prune_snapshots() == []
+        m._set_pr(tid, "opened")
+        assert await m.prune_snapshots() == ["a" * 12]
+        assert tid not in m.task_bases  # settled: the pin is forgotten
+
+    asyncio.run(go())
+    f.close()
+
+
+def test_a_leased_snapshot_is_never_pruned(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    f = _factory(tmp_path, repo, FakePublisher(), FakeSnapshots(repo, tmp_path / "base"))
+    m = f.manager
+
+    async def go() -> None:
+        tid = m._prepare(WorkOrder(**ORDER))
+        await m.pin_base(tid)
+        async with m.base_lease(tid) as root:
+            m.queue.quarantine(tid, "test")  # e.g. quarantined while a worker copies its snapshot
+            assert await m.prune_snapshots() == []
+            assert root is not None and root.is_dir()
+        assert m._snapshot_users == {}
+        assert await m.prune_snapshots() == ["a" * 12]
+        assert tid in m.task_bases  # quarantined: kept for an undo / retry
+
+    asyncio.run(go())
+    f.close()
+
+
+class FlakySnapshots(FakeSnapshots):
+    """Offline at first (resolve fails), online later."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        self.online = False
+
+    async def resolve(self, base: str | None = None) -> tuple[str, str]:
+        if not self.online:
+            raise SnapshotUnavailable("fetch_failed", "offline")
+        return await super().resolve(base)
+
+
+def test_a_failed_pin_is_retried_until_work_is_approved(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    snaps = FlakySnapshots(repo, tmp_path / "base")
+    f = _factory(tmp_path, repo, FakePublisher(), snaps)
+    m = f.manager
+
+    async def go() -> None:
+        tid = m._prepare(WorkOrder(**ORDER))
+        assert await m.pin_base(tid) is None
+        assert await m.task_base(tid) is None  # still offline
+        snaps.online = True
+        assert await m.task_base(tid) == tmp_path / "base" / ("a" * 12)
+        assert m.task_bases[tid]["sha"] == "a" * 40
+        # once work is approved on the user's folder, it never switches base
+        tid2 = m._prepare(WorkOrder(title="two", description="x", files=["shop/mathx.py"]))
+        m.diffs[tid2] = {f"{tid2}.1": "--- a/x\n+++ b/x\n"}
+        assert await m.task_base(tid2) is None and tid2 not in m.task_bases
+
+    asyncio.run(go())
+    f.close()
+
+
+def test_checkout_runs_once_per_commit_per_run(tmp_path: Path) -> None:
+    repo = write_demo_repo(tmp_path / "repo")
+    snaps = FakeSnapshots(repo, tmp_path / "base")
+    f = _factory(tmp_path, repo, FakePublisher(), snaps)
+    m = f.manager
+
+    async def go() -> None:
+        tid = m._prepare(WorkOrder(**ORDER))
+        await m.pin_base(tid)
+        for _ in range(3):
+            await m.task_base(tid)
+        assert [c for c in snaps.calls if c[0] == "checkout"] == [("checkout", "a" * 40)]
+        shutil.rmtree(tmp_path / "base" / ("a" * 12))  # gone: checked out (and verified) again
+        assert (await m.task_base(tid)).is_dir()
+        assert len([c for c in snaps.calls if c[0] == "checkout"]) == 2
+
+    asyncio.run(go())
+    f.close()
+
+
+def test_scratch_copies_skip_foundry_data(tmp_path: Path) -> None:
+    from foundry.floor_manager import _copy_workspace
+    from foundry.validation_gates import prepare_stacked_workspace
+
+    src = tmp_path / "src"
+    (src / "foundry/data/base/x").mkdir(parents=True)
+    (src / "foundry/data/base/x/big.py").write_text("x = 1\n", encoding="utf-8")
+    (src / "foundry/core.py").write_text("y = 1\n", encoding="utf-8")
+    (src / "data").mkdir()
+    (src / "data/keep.txt").write_text("k\n", encoding="utf-8")
+    _copy_workspace(src, tmp_path / "a")
+    out = prepare_stacked_workspace(src, tmp_path / "b", [])
+    for d in (tmp_path / "a", Path(out)):
+        assert (d / "foundry/core.py").is_file() and (d / "data/keep.txt").is_file()
+        assert not (d / "foundry/data").exists()
 
 
 def test_old_publisher_without_base_sha_still_publishes(tmp_path: Path) -> None:
