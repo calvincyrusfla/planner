@@ -635,7 +635,7 @@ The Floor Manager (a Claude session) sends engineering work to Foundry through t
 
 1. The Floor Manager sends a **Foundry batch** (also called a sprint) to the board. A batch has a title, the repository it's for (`owner/name`), an optional base branch and 1 to 20 subtasks.
 2. Foundry, running on your PC, watches the board. It claims queued batches for **its own** repository and sends each subtask in as a normal Foundry order (`F-0xx`). From there the subtask is sized, built, reviewed and gets a pull request as usual.
-3. Foundry writes progress back onto the batch: for each subtask the F-id, its state, the PR link and any error. While the PR of a finished subtask is still being opened, the subtask shows `reviewing`. The Floor Manager reads that with `poll_foundry_sprint`.
+3. Foundry writes progress back onto the batch: for each subtask the F-id, its state, the PR link and any error. A subtask whose build and review are finished shows `reviewing` until its PR is settled (opened, failed or skipped), and then `complete`. The Floor Manager reads that with `poll_foundry_sprint`.
 
 Batches are not board tasks and never take agent teams. Each subtask's F-task still appears on the board as a normal task once Foundry accepts it. The dashboard's **Foundry batches** panel shows every batch with its status, who claimed it and per-subtask progress.
 
@@ -685,7 +685,7 @@ node department/dept.mjs foundry cancel S-001
 - **Which batches it claims.** Only queued batches whose `repo` matches the service's repository: the `owner/name` of its `origin` remote, compared without case. Set `FOUNDRY_BATCH_REPO=owner/name` when `origin` isn't a GitHub URL. A batch for another repository is left alone for the Foundry that owns it.
 - **Claiming.** The claim is atomic on the board, so two Foundry services never both take a batch. The batch shows `claimed`, then `running`, with the host name and a heartbeat that Foundry refreshes every poll. If a claimed batch gets no heartbeat for 10 minutes (the PC was switched off), another Foundry for that repository may take it over.
 - **Orders.** Each subtask becomes one order with its title, description, files, size hint and acceptance criteria. The description also names the batch and the subtask, for example `(Foundry batch S-001, subtask 2)`. A subtask with `depends_on` waits until those subtasks are complete.
-- **Base branch.** Pull requests go against Foundry's own base branch (`FOUNDRY_PR_BASE`, else the repository's default branch). When the batch asks for a different `base`, Foundry says so in a note on the batch.
+- **Base branch.** Each subtask's pull request targets the batch's `base` branch: Foundry fetches it, branches from it and opens the PR with `--base` set to it. A batch without `base` uses `FOUNDRY_PR_BASE`, else the repository's default branch.
 - **Restarts.** Foundry stores which F-id belongs to which batch subtask. After a restart it picks the batch up again and sends in only the subtasks that never got an order.
 - **The end.** The batch is `done` when every subtask is complete, and `failed` when every subtask has finished and one of them failed or was quarantined (or a subtask couldn't be sent in; the reason is on the batch). You can cancel a queued or claimed batch from the dashboard or with `foundry cancel`.
 

@@ -114,13 +114,16 @@ class FakeBoard:
 class FakePublisher:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.bases: dict[str, str | None] = {}
 
     async def preflight(self) -> dict[str, Any]:
         return {"ok": True, "reason": None}
 
-    async def publish(self, task_id: str, title: str, patch_path: Any, pr: dict[str, Any]) -> dict[str, Any]:
+    async def publish(self, task_id: str, title: str, patch_path: Any, pr: dict[str, Any], *,
+                      base: str | None = None) -> dict[str, Any]:
         self.calls.append(task_id)
-        return {"ok": True, "branch": f"foundry/{task_id.lower()}-x", "commit": "abc123",
+        self.bases[task_id] = base
+        return {"ok": True, "branch": f"foundry/{task_id.lower()}-x", "commit": "abc123", "base": base or "main",
                 "pr_url": f"https://github.com/me/shop/pull/{len(self.calls)}", "error": None, "stage": None}
 
 
@@ -234,6 +237,31 @@ def test_complete_waits_for_the_pr_before_the_board_closes_the_batch(tmp_path: P
         for r in (a.get("results") or {}).values():
             if r.get("state") == "complete":
                 assert r["pr"]["state"] not in (None, "pending")
+
+
+def test_batch_base_is_the_pr_base(tmp_path: Path) -> None:
+    board = FakeBoard()
+    one = [{"key": "1", "title": "Add clamp helper", "description": "clamp", "files": ["shop/mathx.py"]}]
+    with_base = board.add(subtasks=one, base="develop")
+    without = board.add(subtasks=[{**one[0], "title": "Add lerp helper"}])
+    pub = FakePublisher()
+
+    async def go() -> None:
+        svc = _service(tmp_path, publisher=pub)
+        await svc.start()
+        try:
+            w = _watcher(svc, board)
+            await _pump(w, lambda: all(board.get(b["id"])["status"] == "done" for b in (with_base, without)))
+            t1 = w._record(with_base["id"])["tasks"]["1"]
+            t2 = w._record(without["id"])["tasks"]["1"]
+            assert svc.factory.manager.orders[t1].pr_base == "develop"
+            assert svc.factory.manager.orders[t2].pr_base is None
+            assert pub.bases == {t1: "develop", t2: None}  # None: the publisher's own base
+            assert svc.factory.manager.pr_state(t1)["base"] == "develop"
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
 
 
 def test_depends_on_waits_for_completion(tmp_path: Path) -> None:

@@ -282,6 +282,16 @@ def test_draft_and_explicit_base(world) -> None:
 
 
 @needs_sh
+def test_per_call_base_overrides_the_publisher_base(world) -> None:
+    repo = world["repo"]
+    _git(repo, "push", "-q", "origin", "main:develop")
+    res = asyncio.run(world["pub"].publish("F-2", "x", world["patch"], PR, base="develop"))
+    assert res.ok and res.base == "develop"
+    argv = Path(str(world["log"]) + ".argv").read_text(encoding="utf-8").splitlines()
+    assert argv[argv.index("--base") + 1] == "develop"
+
+
+@needs_sh
 def test_apply_failed_cleans_up(world) -> None:
     bad = world["tmp"] / "bad.patch"
     bad.write_text("diff --git a/nope.txt b/nope.txt\n--- a/nope.txt\n+++ b/nope.txt\n@@ -1 +1 @@\n-a\n+b\n",
