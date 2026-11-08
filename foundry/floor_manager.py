@@ -1246,10 +1246,11 @@ class FloorManager:
         """Why the task's context may not be widened yet, from the action log; ``None`` when it may.
 
         A timestamp in the future (clock mismatch) counts as recent; an
-        unreadable one is ignored.
+        unreadable one is ignored. A manager without an action log has
+        nothing to refuse on.
         """
         now = _parse_utc(_utc_now()) or datetime.now(timezone.utc)
-        for row in reversed(self.action_log):
+        for row in reversed(getattr(self, "action_log", None) or []):
             if row.get("action") != "WIDEN_CONTEXT" or row.get("task_id") != task_id:
                 continue
             undone = _parse_utc(row.get("undone_at"))
