@@ -248,11 +248,11 @@ def _start(tmp_path: Path, fake: FakeOllama, *, gemma_timeout: float, ask_timeou
 
     thread = threading.Thread(target=lambda: asyncio.run(main()), name="foundry-g1-e2e", daemon=True)
     thread.start()
-    assert ready.wait(20), f"service did not start: {lines}"
-    assert "error" not in holder, holder.get("error")
-    m = re.search(r"http://127\.0\.0\.1:(\d+)", " ".join(lines))
-    assert m, lines
     try:
+        assert ready.wait(20), f"service did not start: {lines}"
+        assert "error" not in holder, holder.get("error")
+        m = re.search(r"http://127\.0\.0\.1:(\d+)", " ".join(lines))
+        assert m, lines
         yield _Running(service, int(m.group(1)))
     finally:
         fake.closing.set()  # release any hanging Gemma reply so shutdown is quick
@@ -332,6 +332,7 @@ def test_ask_with_slow_gemma_returns_fallback_within_ask_timeout(
             assert took < ask_timeout + 8, took  # one ask-timeout call, not the 60 s Gemma timeout
 
 
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX signals / sh fake claude")
 def test_service_exit_does_not_wait_for_in_flight_gemma(tmp_path: Path) -> None:
     from foundry.main import write_demo_repo
 

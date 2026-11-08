@@ -116,7 +116,7 @@ The scripts are idempotent and need no admin rights. They:
 4. start `ollama serve` if the API isn't answering;
 5. run `ollama pull` for the model;
 6. finish with the probe;
-7. run the speed check, `python -m foundry.gemma_doctor` (see [Make Gemma fast](#make-gemma-fast)). A slow Gemma or one on the CPU is reported but doesn't fail the setup: Foundry still works and falls back to its built-in sizing when Gemma is too slow. Without a `.venv` the script prints the command to run once the venv exists.
+7. run the speed check, `python -m foundry.gemma_doctor` (see [Make Gemma fast](#make-gemma-fast)). A slow Gemma or one on the CPU is reported but doesn't fail the setup: Foundry still works and falls back to its built-in sizing when Gemma is too slow. Without a `.venv` it runs with the system Python (the check needs only the standard library).
 
 Environment variables:
 
