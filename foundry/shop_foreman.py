@@ -183,7 +183,9 @@ _RETRY_MAX_AGE_S = 6 * 3600.0
 #: After the user undoes one of these actions, the Foreman does not prescribe it
 #: again for the same task for this long (seconds).
 _UNDO_SUPPRESS_S = 2 * 3600.0
-_UNDO_SUPPRESSED = frozenset({"REASSIGN_TEAM", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "PROMOTE_PEER_REVIEWER"})
+_UNDO_SUPPRESSED = frozenset({
+    "REASSIGN_TEAM", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "PROMOTE_PEER_REVIEWER", "WIDEN_CONTEXT",
+})
 #: kv key the Floor Manager stores its action log under (read only here).
 _ACTIONS_KV_KEY = "floor_manager.actions"
 #: Gemma decisions (REASSIGN/RETRY choices) asked per ``evaluate_line_anomaly`` call.
@@ -223,6 +225,14 @@ def classify_quarantine(reason: str | None) -> str:
         return "transient"
     return "unclear"
 _UNKNOWN_TASK = "unknown"
+#: Failed gate output showing the builder could not see code it needed.
+_VISIBILITY_FAILURE_RE = re.compile(
+    r"\bNameError\b|\bBLOCKED\b|\bF821\b|[Uu]ndefined name\b|\bis not defined\b|cannot import name"
+)
+#: Visibility failures on one task (at its current level) before its context is widened.
+_WIDEN_AFTER_FAILURES = 2
+#: Similar past tasks that must have needed a level before new tasks start at it.
+_LEARN_LEVEL_MIN_OUTCOMES = 2
 
 # --------------------------------------------------------------------------- tools
 
@@ -647,6 +657,31 @@ def similar_outcomes(
     return [item[3] for item in scored[:limit]]
 
 
+def _outcome_context_level(outcome: Any) -> int:
+    """The context level a past task finished at (1 when missing or unusable)."""
+    try:
+        return int(_field(outcome, "context_level") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def learned_context_level(
+    outcomes: Sequence[Any], title: str, files: Sequence[str], *, task_id: str | None = None, ceiling: int = 3,
+) -> int:
+    """The level a new task should start at: the highest one most of its similar past tasks needed.
+
+    A level counts only when at least ``_LEARN_LEVEL_MIN_OUTCOMES`` similar
+    tasks reached it and they are more than half of the similar tasks.
+    """
+    levels = [_outcome_context_level(o) for o in similar_outcomes(outcomes, title, files, task_id=task_id)]
+    best = 1
+    for level in range(2, ceiling + 1):
+        reached = sum(1 for value in levels if value >= level)
+        if reached >= _LEARN_LEVEL_MIN_OUTCOMES and reached * 2 > len(levels):
+            best = level
+    return best
+
+
 def _example_line(outcome: Any) -> str:
     title = _clip(str(_field(outcome, "title") or _field(outcome, "task_id") or "?"), 80)
     files = _outcome_files(outcome)
@@ -772,7 +807,9 @@ class Anomaly:
     @property
     def key(self) -> str:
         """Identity used for the re-alert cooldown."""
-        return f"{self.category.value}|{self.team_id}|{self.task_id}|{self.agent_id}"
+        base = f"{self.category.value}|{self.team_id}|{self.task_id}|{self.agent_id}"
+        # A widen shares LINE_JAM with quarantine: its cooldown must not hold a quarantine back.
+        return f"{base}|widen" if self.action == PrescribedAction.WIDEN_CONTEXT else base
 
 
 # --------------------------------------------------------------------------- the foreman
@@ -1415,6 +1452,27 @@ class ShopForeman:
 
     # ------------------------------------------------------------------ sizing
     async def size_task_scope(self, task: Any) -> TaskSizingDirective:
+        """Size a work order and start it at the context level similar past tasks needed."""
+        directive = await self._size_task_scope(task)
+        self._seed_context_level(directive.task_id, task)
+        return directive
+
+    def _seed_context_level(self, task_id: str, task: Any) -> None:
+        """Raise a new task's context level to the learned starting level (best effort, never lowers it)."""
+        try:
+            repo = str(_field(task, "repo_root") or _field(task, "repo") or "").strip() or None
+            files = _str_list(_field(task, "files") or _field(task, "allowed_files"))
+            level = learned_context_level(
+                self._outcomes(repo), str(_field(task, "title") or ""), files,
+                task_id=task_id, ceiling=int(self.queue.MAX_CONTEXT_LEVEL),
+            )
+            before = self.queue.task_context_level(task_id)
+            if self.queue.raise_task_context_level(task_id, level) > before:
+                log.info("%s starts at context level %d (learned from similar tasks)", task_id, level)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("seeding the context level failed: %s", exc)
+
+    async def _size_task_scope(self, task: Any) -> TaskSizingDirective:
         """Size a work order into a validated :class:`TaskSizingDirective`.
 
         ``task`` is a mapping or object with ``task_id``, ``team_id``,
@@ -2099,7 +2157,7 @@ class ShopForeman:
     def detect_anomalies(self) -> list[Anomaly]:
         """Deterministically detect every current anomaly, most urgent first.
 
-        Order: LINE_JAM, TOKEN_VELOCITY_SPIKE, AGENT_STALLED,
+        Order: LINE_JAM, WIDEN_CONTEXT, TOKEN_VELOCITY_SPIKE, AGENT_STALLED,
         REVIEW_BOTTLENECK, CAPACITY_REBALANCE. Thresholds come from
         ``config.thresholds``.
         """
@@ -2137,6 +2195,8 @@ class ShopForeman:
                                        "last attempt. Quarantine the task before more builder calls are spent.",
                 )
             )
+
+        found.extend(self._widen_anomalies(tasks))
 
         # TOKEN_VELOCITY_SPIKE: burn above the configured share of the TPM cap.
         if self.telemetry is not None:
@@ -2333,7 +2393,7 @@ class ShopForeman:
     def _undone_recently(self, anomaly: Anomaly, now: datetime) -> bool:
         """True when the user undid the same action for the same target within ``_UNDO_SUPPRESS_S``.
 
-        Applies to REASSIGN_TEAM, RESIZE_ALLOCATION, THROTTLE_DISPATCH and
+        Applies to REASSIGN_TEAM, RESIZE_ALLOCATION, THROTTLE_DISPATCH, WIDEN_CONTEXT and
         PROMOTE_PEER_REVIEWER (a task-less THROTTLE matches any undone throttle).
         QUARANTINE_TASK needs new gate evidence instead (see ``_ticket_gate_failures``).
         """
@@ -2364,6 +2424,51 @@ class ShopForeman:
             if str(row.get("action")) == PrescribedAction.RETRY_TASK.value and row.get("task_id"):
                 done.add(str(row["task_id"]))
         return done
+
+    def _visibility_failures(self, task_id: str) -> int:
+        """Failed gate results of a task showing missing code, since its context level last changed.
+
+        Reads the output stored in ``gate_results``; tickets already done are
+        left out, and so are failures from before the last widen or undo.
+        """
+        key = f"{self.queue.CONTEXT_LEVEL_KV_PREFIX}{task_id}"
+        changed = self._sql("SELECT updated_at FROM kv WHERE key=?", (key,))
+        sql = "SELECT subtask_id, stdout, stderr FROM gate_results WHERE task_id=? AND passed=0"
+        params: list[Any] = [task_id]
+        if changed:
+            sql += " AND ts>?"
+            params.append(changed[0][0])
+        done = {t.subtask_id for t in self.queue.tickets_for_task(task_id) if t.status == "done"}
+        return sum(
+            1 for sub, out, err in self._sql(sql, params)
+            if sub not in done and _VISIBILITY_FAILURE_RE.search(f"{out or ''}\n{err or ''}")
+        )
+
+    def _widen_anomalies(self, tasks: Mapping[str, Any]) -> list[Anomaly]:
+        """WIDEN_CONTEXT: tasks whose builders repeatedly could not see the code they needed."""
+        found: list[Anomaly] = []
+        for tid, task in tasks.items():
+            level = self.queue.task_context_level(tid)
+            if level >= self.queue.MAX_CONTEXT_LEVEL:
+                continue
+            n = self._visibility_failures(tid)
+            if n < _WIDEN_AFTER_FAILURES:
+                continue
+            found.append(
+                Anomaly(
+                    EscalationCategory.LINE_JAM,
+                    Severity.MEDIUM,
+                    PrescribedAction.WIDEN_CONTEXT,
+                    team_id=task["team_id"],
+                    task_id=tid,
+                    gate_failure_count=n,
+                    action_parameters={"level": level + 1, "from": level},
+                    extra_metrics={"threshold": _WIDEN_AFTER_FAILURES, "context_level": level},
+                    fallback_diagnosis=f"{tid} failed {n} times because its builder could not see code it needed. "
+                                       f"Widen its context from level {level} to {level + 1}.",
+                )
+            )
+        return found
 
     def _retry_anomalies(self, now: datetime) -> list[Anomaly]:
         """RETRY_TASK: recently quarantined tasks whose reason is transient (or unclear, for Gemma)."""
