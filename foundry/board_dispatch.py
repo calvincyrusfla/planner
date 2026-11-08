@@ -31,6 +31,7 @@ submission errors are logged and retried on the next round.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -40,6 +41,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -638,6 +640,58 @@ class BatchWatcher:
                 return False
         return True
 
+    _MAX_RELATED_TESTS = 3
+    _RELATED_TESTS_SKIP = frozenset({"node_modules", "__pycache__", "venv", "env", "build", "dist", "data"})
+
+    @staticmethod
+    def _imported_modules(source: str) -> set[str]:
+        """The absolute modules ``source`` imports (``from a import b`` counts as ``a`` and ``a.b``)."""
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            return set()
+        found: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                found.add(node.module)
+                found.update(f"{node.module}.{alias.name}" for alias in node.names)
+        return found
+
+    def _related_tests(self, files: list[str]) -> list[str]:
+        """Up to three test files of the repo that import a module in ``files``, ``test_<name>.py`` first."""
+        editable = [str(f).strip().replace("\\", "/").removeprefix("./") for f in files]
+        modules: set[str] = set()
+        stems: set[str] = set()
+        for path in editable:
+            name = path.rpartition("/")[2]
+            if not name.endswith(".py") or name.startswith("test_") or any(c in path for c in "*?["):
+                continue
+            stems.add(f"test_{name}")
+            modules.add(path[:-3].removesuffix("/__init__").replace("/", "."))
+        if not modules:
+            return []
+        root = Path(str(self.service.repo))
+        found: list[str] = []
+        for folder, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in self._RELATED_TESTS_SKIP]
+            for name in names:
+                if not name.endswith(".py") or not (name.startswith("test_") or name.endswith("_test.py")):
+                    continue
+                full = Path(folder, name)
+                rel = full.relative_to(root).as_posix()
+                if any(rel == e or fnmatchcase(rel, e) for e in editable):
+                    continue  # the task may edit it, so it cannot be read-only
+                try:
+                    source = full.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if any(m.rpartition(".")[2] in source for m in modules) and modules & self._imported_modules(source):
+                    found.append(rel)
+        found.sort(key=lambda rel: (rel.rpartition("/")[2] not in stems, rel))
+        return found[: self._MAX_RELATED_TESTS]
+
     def _submit(self, batch: Mapping[str, Any], key: str, sub: Mapping[str, Any]) -> str:
         from foundry.floor_manager import WorkOrder
         from foundry.git_publisher import valid_ref
@@ -658,8 +712,11 @@ class BatchWatcher:
         if base is not None and not valid_ref(base):
             # the board checks this too; never hand git anything that could read as an option
             raise ValueError(f"the batch base {base[:80]!r} is not a plain branch name")
+        explicit = [str(f).strip() for f in (sub.get("read_files") or []) if str(f).strip()]
+        read_files = list(dict.fromkeys(explicit + self._related_tests(fields["files"])))
         order = WorkOrder(title=fields["title"], description=desc, files=fields["files"],
-                          acceptance_criteria=acceptance, repo_root=str(self.service.repo), pr_base=base)
+                          read_files=read_files, acceptance_criteria=acceptance,
+                          repo_root=str(self.service.repo), pr_base=base)
         manager = self.service.factory.manager
         accept = getattr(manager, "accept", None)
         if not callable(accept):
