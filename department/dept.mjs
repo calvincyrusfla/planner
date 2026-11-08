@@ -74,6 +74,9 @@ const HELP = `Agent Department CLI
   node department/dept.mjs foundry poll <S-id> [--json] Batch status: each subtask's F-id, state, PR
   node department/dept.mjs foundry list [--open]       Foundry batches, newest first
   node department/dept.mjs foundry cancel <S-id>       Cancel a batch that hasn't finished
+  node department/dept.mjs foundry help                Subtasks stuck in needs_help and their questions
+  node department/dept.mjs foundry answer <S-id> <key> --guidance "..."
+                                                       Answer a subtask in needs_help
   node department/dept.mjs foundry metrics [--json]    Latest metrics report of each Foundry service:
                                                        totals and per-task rows
   node department/dept.mjs json                        Dump the full state
@@ -565,7 +568,7 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json]';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..."';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
 // "Title::description::file1,file2::S::read1,read2" → subtask. Empty parts are skipped.
@@ -622,6 +625,27 @@ function printBatch(b) {
     console.log(`  #${st.key.padEnd(3)} ${(r.foundryTask || '—').padEnd(6)} ${(r.state || 'queued').padEnd(11)} ${st.title}${pr}`);
     if (r.error) console.log(`        error: ${r.error}`);
   }
+}
+
+// `foundry help`: every subtask waiting for an answer. Finished or cancelled
+// batches are left out because answerHelp refuses them.
+async function foundryHelpCommand() {
+  const s = await currentState();
+  let found = 0;
+  for (const b of s.foundryBatches || []) {
+    if (!OPEN_BATCH.has(b.status)) continue;
+    for (const st of b.subtasks || []) {
+      const r = (b.results || {})[st.key];
+      if (r?.state !== 'needs_help') continue;
+      found++;
+      console.log(`${b.id} #${st.key} ${r.foundryTask || '—'} ${st.title}`);
+      console.log(`  question  ${r.help?.question || '—'}`);
+      if (r.help?.context) console.log(`  context   ${r.help.context}`);
+      if (r.help?.options?.length) console.log(`  options   ${r.help.options.join(' | ')}`);
+      console.log(`  answer    node department/dept.mjs foundry answer ${b.id} ${st.key} --guidance "..."`);
+    }
+  }
+  if (!found) console.log('No Foundry subtasks need help');
 }
 
 // `foundry metrics [--json]`: the latest metrics report of each Foundry service.
@@ -681,6 +705,14 @@ async function foundryCommand(sub, args, opt) {
         const c = batchCounts(b);
         console.log(`${b.id} [${b.status}] ${b.title} · ${b.repo} · ${c.complete}/${c.total} complete · ${claimLine(b, at)}`);
       }
+      return;
+    }
+    case 'help':
+      return foundryHelpCommand();
+    case 'answer': {
+      if (!args[0] || !args[1] || typeof opt.guidance !== 'string') throw new core.DeptError(FOUNDRY_HELP);
+      const r = await batchOp('answerHelp', { id: String(args[0]).toUpperCase(), key: args[1], answer: opt.guidance, by: typeof opt.by === 'string' ? opt.by : 'cli' });
+      console.log(`${r.batch.id} subtask ${args[1]} answered`);
       return;
     }
     case 'cancel': {

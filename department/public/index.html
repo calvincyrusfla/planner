@@ -318,6 +318,7 @@
   .fo-list .fo-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
   .fo-list .fo-title { flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
   .fo-list .fo-meta { font-size: 12px; color: var(--muted); }
+  .fo-badge.needshelp { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); cursor: help; }
   .fo-badge { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; white-space: nowrap;
     background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); }
   .fo-badge.gemma { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
@@ -1020,12 +1021,22 @@ function subtaskRow(b, st) {
     <span class="sub-key">${esc(st.key)}</span>
     <span class="sub-title">${esc(st.title)}</span>
     ${r.foundryTask ? `<span class="sub-fid">${esc(r.foundryTask)}</span>` : ''}
-    <span class="fo-badge ${esc(state_.replace(/[^a-z]/g, ''))}">${esc(state_)}</span>
+    <span class="fo-badge ${esc(state_.replace(/[^a-z]/g, ''))}"${state_ === 'needs_help' ? ` title="${esc(r.help?.question || '')}"` : ''}>${esc(state_ === 'needs_help' ? 'needs help' : state_)}</span>
     ${href ? `<a class="fo-pr" href="${esc(href)}" target="_blank" rel="noopener noreferrer">PR${pr.state ? ` (${esc(pr.state)})` : ''}</a>`
       : pr && pr.state ? `<span class="none">PR ${esc(pr.state)}</span>` : ''}
     ${err ? `<span class="sub-err">${esc(err)}</span>` : ''}
     ${Array.isArray(st.readFiles) && st.readFiles.length ? `<span class="sub-read">${st.readFiles.map((f) => `<code>${esc(f)}</code> (read-only)`).join(', ')}</span>` : ''}
   </li>`;
+}
+// Finished or cancelled batches get no badge: answerHelp refuses them.
+function batchHelpBadge(b) {
+  if (!['queued', 'claimed', 'running'].includes(b.status)) return '';
+  const waiting = (Array.isArray(b.subtasks) ? b.subtasks : [])
+    .map((st) => (b.results && b.results[st.key]) || {})
+    .filter((r) => r.state === 'needs_help');
+  if (!waiting.length) return '';
+  const questions = waiting.map((r) => r.help?.question || '').filter(Boolean).join('\n');
+  return `<span class="fo-badge needshelp" title="${esc(questions)}">needs help</span>`;
 }
 function batchCard(b) {
   const subs = Array.isArray(b.subtasks) ? b.subtasks : [];
@@ -1040,6 +1051,7 @@ function batchCard(b) {
     <div class="batch-top">
       <span class="task-id">${esc(b.id)}</span>
       <span class="batch-title">${esc(b.title)}</span>
+      ${batchHelpBadge(b)}
       <span class="pill ${status}">${BATCH_LABEL[status]}</span>
     </div>
     <div class="batch-meta">
