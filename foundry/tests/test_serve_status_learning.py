@@ -94,7 +94,8 @@ def test_real_calibration_summary_is_passed_through(tmp_path: Path) -> None:
         if not hasattr(svc.factory.foreman, "calibration_summary"):
             assert cal == {}
             return
-        assert cal["n"] >= 0 and cal["accuracy_pct"] in (None,) or isinstance(cal["accuracy_pct"], float)
+        assert cal["n"] >= 0
+        assert cal["accuracy_pct"] is None or isinstance(cal["accuracy_pct"], float)
         assert isinstance(cal["shift_rules"], list)
         json.dumps(cal)
 
