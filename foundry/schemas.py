@@ -271,6 +271,32 @@ class SubtaskAllocation(FoundryModel):
     allowed_files: list[str] = Field(
         default_factory=list, description="Repo-relative paths the builder may modify."
     )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Subtask ids (same task) this subtask builds on; a marked dependency keeps "
+            "its ticket sequential (never parallel_ok). Empty = no explicit dependency."
+        ),
+    )
+
+    @field_validator("depends_on", mode="before")
+    @classmethod
+    def _clean_depends_on(cls, value: Any) -> Any:
+        """Accept None as no dependencies; drop blank ids and duplicates (order kept)."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, (list, tuple)):
+            return list(dict.fromkeys(str(v).strip() for v in value if v is not None and str(v).strip()))
+        return value
+
+    @model_validator(mode="after")
+    def _no_self_dependency(self) -> SubtaskAllocation:
+        """A subtask can't depend on itself; such an entry is dropped."""
+        if self.subtask_id in self.depends_on:
+            self.depends_on = [d for d in self.depends_on if d != self.subtask_id]
+        return self
 
 
 class TaskSizingDirective(FoundryModel):
