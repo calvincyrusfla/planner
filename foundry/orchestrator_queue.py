@@ -1569,6 +1569,32 @@ class FoundryQueue:
         clamped = max(self.MIN_CONTEXT_LEVEL, min(int(level), self.MAX_CONTEXT_LEVEL))
         self.kv_set(f"{self.CONTEXT_LEVEL_KV_PREFIX}{task_id}", clamped)
 
+    def raise_task_context_level(self, task_id: str, level: int) -> int:
+        """Atomically raise the task's context level to ``level``; never lowers it.
+
+        Returns the level in force afterwards. Used to start a new task at the
+        level similar past tasks needed, so a widen landing at the same moment
+        is not overwritten by a lower learned level.
+        """
+        key = f"{self.CONTEXT_LEVEL_KV_PREFIX}{task_id}"
+        target = min(int(level), self.MAX_CONTEXT_LEVEL)
+        with self.transaction() as conn:
+            row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            current = self.MIN_CONTEXT_LEVEL
+            if row is not None:
+                try:
+                    current = max(self.MIN_CONTEXT_LEVEL, min(int(json.loads(row["value"])), self.MAX_CONTEXT_LEVEL))
+                except (TypeError, ValueError):
+                    current = self.MIN_CONTEXT_LEVEL
+            if target <= current:
+                return current
+            conn.execute(
+                "INSERT INTO kv (key, value, updated_at) VALUES (?,?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (key, json.dumps(target), self.now()),
+            )
+        return target
+
     def restore_task_context_level(self, task_id: str, expected: int, level: int) -> str | None:
         """Atomically put the task's context level back to ``level`` (undo of a widen).
 
@@ -1731,7 +1757,9 @@ class FoundryQueue:
         actual (``S``/``M``/``L``/``XL``, see
         :func:`foundry.sizing_outcomes.actual_complexity`), raw_predicted
         (size before calibration, may be None), quarantine_kind and
-        excluded_from_calibration (bool).
+        excluded_from_calibration (bool) and context_level (1..3, the highest
+        level any of the task's tickets was built at; the Foreman starts
+        similar new tasks from it).
 
         Rows marked ``excluded_from_calibration`` (quarantined for a reason
         other than exhausted retries) are left out unless ``include_excluded``.
@@ -1758,6 +1786,12 @@ class FoundryQueue:
         d = {k: row[k] for k in row.keys()}
         d["files"] = json.loads(d.get("files") or "[]")
         d["excluded_from_calibration"] = bool(d.get("excluded_from_calibration"))
+        low, high = FoundryQueue.MIN_CONTEXT_LEVEL, FoundryQueue.MAX_CONTEXT_LEVEL
+        try:
+            level = int(d.get("context_level") or low)
+        except (TypeError, ValueError):
+            level = low
+        d["context_level"] = max(low, min(level, high))
         if d.get("actual") not in SIZES:
             d["actual"] = actual_complexity(d)
         return d
