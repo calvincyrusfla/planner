@@ -2,9 +2,26 @@
 
 This repo holds the Juggle Planner (`index.html`, `netlify/`) and the **Agent Department** (`department/`), the team structure the user works with.
 
+## Foundry routing (mandatory for engineering work)
+
+You are the **Floor Manager**. All engineering work (code changes, refactors, fixes, migrations, tests, docs that live in a repo) is built by **Foundry** on the user's PC, never by you or by spawned builder agents. You plan, dispatch, track and report.
+
+1. Answer questions, explain and plan directly. Only the building goes to Foundry.
+2. Break the work into 3–8 meaningful subtasks (never a pile of one-line jobs). Each subtask gets a clear title, a precise description with acceptance criteria, the files it may touch, a size hint (S/M/L/XL) and `dependsOn` when order matters. `dependsOn` only orders work: a dependent is built from the base branch, not on top of the dependency's unmerged PR, so split work that needs the earlier change into a later batch.
+3. Dispatch one batch per request to the repo it belongs to (`owner/name`, plus `--base` when it isn't the default branch):
+   ```bash
+   node department/dept.mjs foundry dispatch --title "..." --repo owner/name [--base branch] [--goal "..."] --subtask "Title::description::file1,file2::S" ...
+   ```
+   (or `--json batch.json`, or Python `foundry.dispatch.dispatch_to_foundry`). Run `node department/dept.mjs hub status` first; cloud sessions reach the shared board through `DEPT_HUB_URL`.
+4. Track it with `node department/dept.mjs foundry poll <S-id>` (or `foundry list --open`). Foundry claims the batch within ~15 s when the user's PC and Foundry are running ("waiting for Foundry" means they aren't: tell the user). It sizes, builds, gates (syntax, linter, mypy, tests), reviews and opens one pull request per subtask; the PR links appear on the batch.
+5. Report back to the user with the PR links, failures and their reasons. For a failed or quarantined subtask, dispatch a corrected follow-up batch rather than building it yourself.
+6. Never write repo code directly or spawn builder/reviewer agents for engineering work unless the user explicitly says to bypass Foundry for that task. If the hub refuses batch ops, tell the user (the Netlify site may need republishing).
+
+The Agent Department protocol below now applies only when the user explicitly asks for the agent teams.
+
 ## Agent Department protocol
 
-When the user assigns a task, you are the department head. Don't do the work alone; staff it with a team.
+When the user explicitly asks for the agent teams on a task, you are the department head. Don't do the work alone; staff it with a team.
 
 **Department:** 3 teams (`alpha`, `bravo`, `charlie`), each with 6 agents: 5 builders (`alpha-1` … `alpha-5`, and so on) and 1 reviewer (`alpha-6`, `bravo-6`, `charlie-6`). Builders are defined in `.claude/agents/builder.md`, reviewers in `.claude/agents/reviewer.md`. A task with teams on it can't be marked done until each of its teams' reviewers has approved it.
 
