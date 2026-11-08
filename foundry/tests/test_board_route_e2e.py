@@ -343,7 +343,7 @@ def test_batches_from_cli_and_python_run_to_done_and_other_repo_is_left_alone(
     _git_env(tmp_path, mp)
     mp.setattr(git_publisher, "DEFAULT_WORKTREE_ROOT", tmp_path / "worktrees")
     repo, _bare = _git_repo(tmp_path)
-    _fake_gh(tmp_path, mp)
+    gh_log = _fake_gh(tmp_path, mp)
 
     with _board(tmp_path) as (board, env):
         _watch_env(mp, board, tmp_path)
@@ -391,6 +391,12 @@ def test_batches_from_cli_and_python_run_to_done_and_other_repo_is_left_alone(
                 assert re.fullmatch(r"F-\d+", res["foundryTask"]), res
                 assert (res.get("pr") or {}).get("state") == "opened", res
                 assert res["pr"]["url"] == PR_URL, res
+
+        # Every PR targets the batch's base branch.
+        creates = [json.loads(ln)["argv"] for ln in gh_log.read_text(encoding="utf-8").splitlines()
+                   if json.loads(ln)["argv"][:2] == ["pr", "create"]]
+        assert len(creates) == 4, creates
+        assert all(a[a.index("--base") + 1] == "main" for a in creates), creates
 
         # Four subtasks, four distinct F-tasks, each sent in once.
         fids = [r["foundryTask"] for b in (done_cli, done_py) for r in b["results"].values()]
