@@ -507,7 +507,8 @@ def test_real_foreman_line_jam_drives_quarantine(tmp_path: Path) -> None:
     async def go() -> None:
         tid = await f.manager.submit(WorkOrder(**S_ORDER))
         sub = f.manager.directives[tid].subtasks[0].subtask_id
-        for _ in range(2):  # the ticket failed its gates twice (D8: counted per ticket)
+        # Every attempt (max_retries + 1, the default LINE_JAM limit) failed its gates (D8: counted per ticket).
+        for _ in range(f.foreman._gate_fail_limit()):
             f.queue.record_gate_result(
                 DeterministicGateResult(task_id=tid, subtask_id=sub, passed=False, check_type="syntax", stderr="SyntaxError")
             )

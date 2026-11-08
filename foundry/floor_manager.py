@@ -196,8 +196,18 @@ class FloorManager:
         publisher: Any = None,
         auto_pr: bool | None = None,
         pr_draft: bool = False,
+        snapshots: Any = None,
     ) -> None:
         self.queue = queue
+        #: :class:`~foundry.base_snapshot.BaseSnapshots` (or a fake): clean checkouts of the
+        #: publish branch that every task is built, gated, stacked and checked on.
+        self.snapshots = snapshots
+        #: task id -> ``{"base": branch, "sha": commit}`` the task is built on (pinned at sizing).
+        self.task_bases: dict[str, dict[str, str]] = {}
+        #: tasks already warned about building from the user's folder (one WARNING per task).
+        self._snapshot_warned: set[str] = set()
+        #: held while a snapshot is created and recorded, and while snapshots are pruned
+        self._snapshot_lock = asyncio.Lock()
         #: :class:`~foundry.git_publisher.GitPublisher` (or a fake): pushes an
         #: approved task's patch to its own branch and opens the PR.
         self.publisher = publisher
@@ -296,6 +306,7 @@ class FloorManager:
             "patch_names": dict(self.patch_names),
             "sizing_meta": {t: dict(m) for t, m in self.sizing_meta.items()},
             "pr_states": {t: dict(v) for t, v in self.pr_states.items()},
+            "task_bases": {t: dict(v) for t, v in self.task_bases.items()},
         }
         try:
             fn(_KV_KEY, state)
@@ -320,6 +331,10 @@ class FloorManager:
             }
             self.pr_states = {
                 str(t): dict(v) for t, v in (state.get("pr_states") or {}).items() if isinstance(v, dict)
+            }
+            self.task_bases = {
+                str(t): {"base": str(v.get("base") or ""), "sha": str(v["sha"])}
+                for t, v in (state.get("task_bases") or {}).items() if isinstance(v, dict) and v.get("sha")
             }
             self.diffs = {}
             for t, v in (state.get("diffs") or {}).items():
@@ -450,6 +465,7 @@ class FloorManager:
         fully sized and registered.
         """
         order = self.orders[task_id]
+        await self.pin_base(task_id)
         directive = await self._size(order)
         if self.queue.tickets_for_task(task_id):
             return  # sized meanwhile by someone else (a second resume)
@@ -586,6 +602,125 @@ class FloorManager:
         if not repo and task_id in self.orders:
             repo = self.orders[task_id].repo_root
         return str(repo) if repo else None
+
+    # ------------------------------------------------------- base snapshots
+
+    @property
+    def snapshots_enabled(self) -> bool:
+        """True when tasks are built on a clean snapshot of the publish branch (auto PRs + snapshots)."""
+        return self.snapshots is not None and self.auto_pr and self.publisher is not None
+
+    def _publish_base(self, task_id: str) -> str | None:
+        """The branch the task's PR targets: the order's ``pr_base``, else the publisher's base (None: remote default)."""
+        order = self.orders.get(task_id)
+        base = getattr(order, "pr_base", None) if order is not None else None
+        return base or getattr(self.publisher, "base", None) or None
+
+    def _warn_user_folder(self, task_id: str, why: str) -> None:
+        if task_id in self._snapshot_warned:
+            return
+        self._snapshot_warned.add(task_id)
+        log.warning(
+            "floor manager: %s is built from your working folder (%s); its patch may not apply to the "
+            "remote branch (e.g. on Windows with core.autocrlf=true, or when the folder is on another branch)",
+            task_id, why,
+        )
+
+    async def pin_base(self, task_id: str) -> dict[str, str] | None:
+        """Pin the task to the current commit of its publish branch and create the snapshot.
+
+        Idempotent: an already pinned task keeps its commit (a restart, a second
+        sizing). Returns ``{"base", "sha"}``, or None when snapshots are off or
+        unavailable (no git, no remote, fetch failed): the task is then built
+        from the user's folder as before, with one warning.
+        """
+        pin = self.task_bases.get(task_id)
+        if pin is not None:
+            return dict(pin)
+        if not self.snapshots_enabled:
+            if self.auto_pr and self.publisher is not None:
+                self._warn_user_folder(task_id, "base snapshots are not set up")
+            return None
+        try:
+            base, sha = await _maybe_await(self.snapshots.resolve(self._publish_base(task_id)))
+            pin = {"base": str(base), "sha": str(sha)}
+            async with self._snapshot_lock:  # recorded under the lock: a concurrent prune keeps it
+                await _maybe_await(self.snapshots.checkout(pin["sha"]))
+                self.task_bases[task_id] = pin
+        except Exception as exc:  # SnapshotUnavailable, or anything else: fall back, never stop the line
+            self._warn_user_folder(task_id, f"no snapshot of the publish branch: {exc}")
+            return None
+        log.info("floor manager: %s builds on %s @ %s", task_id, base, str(sha)[:12])
+        try:
+            self.queue.record_event("base_pinned", task_id, dict(pin))
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.debug("floor manager: could not record the pinned base: %s", exc)
+        self.save()
+        return dict(pin)
+
+    async def task_base(self, task_id: str) -> Path | None:
+        """The snapshot directory the task is built from (may re-create it), or None.
+
+        None means "use the user's folder" (snapshots off/unavailable, or a task
+        pinned before snapshots existed). A snapshot pruned meanwhile (a retry
+        or undo after the task finished) is checked out again at the pinned commit.
+        """
+        pin = self.task_bases.get(str(task_id))
+        if pin is None or self.snapshots is None:
+            if self.snapshots_enabled:
+                self._warn_user_folder(str(task_id), "the task has no pinned base commit")
+            return None
+        try:
+            async with self._snapshot_lock:
+                return Path(await _maybe_await(self.snapshots.checkout(pin["sha"])))
+        except Exception as exc:
+            self._warn_user_folder(str(task_id), f"the snapshot of {pin['sha'][:12]} is unavailable: {exc}")
+            return None
+
+    async def build_root(self, task_id: str) -> Path | None:
+        """Where the task's files stand before its change: its snapshot, else its repo (user's folder)."""
+        snap = await self.task_base(task_id)
+        if snap is not None:
+            return snap
+        repo = self.task_repo(task_id)
+        return Path(repo) if repo else self.repo_root
+
+    def _snapshot_keep(self) -> set[str]:
+        """Commits of tasks that can still build (not complete/quarantined/failed)."""
+        keep: set[str] = set()
+        for tid, pin in self.task_bases.items():
+            task = self.queue.get_task(tid)
+            state = _val(task.get("state")) if task else None
+            if task is not None and state not in _TERMINAL and tid not in self._completed:
+                keep.add(pin["sha"])
+        return keep
+
+    async def prune_snapshots(self) -> list[Any]:
+        """Remove the snapshots no open task uses (never touches the user's folder).
+
+        Finished and quarantined tasks lose theirs; a retry or undo re-creates
+        it from the pinned commit (:meth:`task_base`). Also removes snapshots of
+        commits this manager does not know (an earlier database, a crash).
+        """
+        if self.snapshots is None:
+            return []
+        try:
+            async with self._snapshot_lock:
+                removed = await _maybe_await(self.snapshots.prune(keep=self._snapshot_keep()))
+        except Exception as exc:  # pruning is housekeeping only
+            log.warning("floor manager: could not prune base snapshots: %s", exc)
+            return []
+        return list(removed or [])
+
+    def _prune_later(self) -> None:
+        """Start :meth:`prune_snapshots` in the background (needs a running loop; else skipped)."""
+        if self.snapshots is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # the next start prunes
+        self._spawn(self.prune_snapshots())
 
     async def _size(self, order: WorkOrder) -> TaskSizingDirective:
         task = {
@@ -769,6 +904,7 @@ class FloorManager:
         self._reported_quarantine.add(task_id)
         self.record_outcome(task_id)
         self.bridge.quarantined(task_id, reason)
+        self._prune_later()
 
     def record_outcome(self, task_id: str) -> dict[str, Any] | None:
         """Record the task's sizing outcome in the queue (predicted vs actual effort).
@@ -1345,8 +1481,7 @@ class FloorManager:
         diffs = self._ordered_diffs(task_id)
         if len(diffs) < 2:
             return self._approved_diff(task_id)
-        repo = self.task_repo(task_id)
-        root = Path(repo) if repo else self.repo_root
+        root = await self.build_root(task_id)
         stacked = await asyncio.to_thread(stack_diffs, diffs, root)
         return stacked if stacked is not None else self._approved_diff(task_id)
 
@@ -1393,6 +1528,7 @@ class FloorManager:
         self._queue_publish(task_id)
         self.save()
         self._start_publish(task_id)
+        self._prune_later()  # the publisher branches from the pinned commit, not the snapshot
         return summary
 
     # ------------------------------------------------------- pull requests
@@ -1499,9 +1635,12 @@ class FloorManager:
                 kwargs["draft"] = self.pr_draft
             if "on_pushed" in params:
                 kwargs["on_pushed"] = lambda branch, commit=None: self._pushed(task_id, branch, commit)
-            order_base = getattr(order, "pr_base", None) if order else None
+            pin = self.task_bases.get(task_id) or {}
+            order_base = (getattr(order, "pr_base", None) if order else None) or pin.get("base") or None
             if order_base and "base" in params:
                 kwargs["base"] = order_base
+            if pin.get("sha") and "base_sha" in params:
+                kwargs["base_sha"] = pin["sha"]  # build == publish: branch from the commit it was built on
             if pushed:
                 # only the PR step failed last time: open it for the branch already pushed
                 result = await _maybe_await(
@@ -1631,8 +1770,10 @@ class FloorManager:
         if self.patches_dir is None:
             return True
         text = _with_newline(diff) if diff else ""
-        repo = self.task_repo(task_id)
-        problem = await asyncio.to_thread(_git_check, text, Path(repo) if repo else self.repo_root) if text else None
+        # checked against what the task was built on: its snapshot of the publish branch
+        # (as stored, LF), else the user's folder
+        root = await self.build_root(task_id) if text else None
+        problem = await asyncio.to_thread(_git_check, text, root) if text else None
         md = f"{summary.get('commit_message', '').strip()}\n\n{summary.get('pr_body', '').strip()}\n"
         try:
             self.patches_dir.mkdir(parents=True, exist_ok=True)
@@ -1898,13 +2039,18 @@ class WorkspaceGates:
         self.base_workspace = Path(base_workspace)
         self.calls = 0
 
-    async def run(self, submission: Any, assignment: Any, *, workspace: str | Path | None = None) -> Any:
+    async def run(self, submission: Any, assignment: Any, *, workspace: str | Path | None = None,
+                  base: str | Path | None = None) -> Any:
         """Validate ``submission`` in a scratch copy of the workspace.
 
         ``workspace`` (stacked tickets): a scratch directory the caller owns
         and already prepared (the repo plus the task's earlier approved
         diffs); the diff is applied and checked there directly, without a
         second copy.  It must never be the user's working tree.
+
+        ``base``: copy this directory instead of ``base_workspace`` (the
+        task's clean snapshot of the publish branch, see
+        :meth:`FloorManager.task_base`); it is only read, never patched.
         """
         self.calls += 1
         allowed = list(assignment.allowed_files) or None
@@ -1917,7 +2063,8 @@ class WorkspaceGates:
         try:
             ws = tmp / "ws"
             # copying a real repo is slow: keep it off the event loop
-            await asyncio.to_thread(_copy_workspace, self.base_workspace, ws)
+            src = Path(base) if base is not None else self.base_workspace
+            await asyncio.to_thread(_copy_workspace, src, ws)
             return await self.gates.validate_async(submission, ws, allowed_files=allowed)
         finally:
             await asyncio.to_thread(shutil.rmtree, tmp, True)
@@ -2016,6 +2163,7 @@ def build_factory(
     finish_timeout: float | None = None,
     dispatch_repo: str | Path | None = None,
     publisher: Any = None,
+    snapshots: Any = None,
 ) -> Factory:
     """Build queue, telemetry, limiter, context engine, Foreman, cache, gates, pools and manager.
 
@@ -2044,6 +2192,10 @@ def build_factory(
             each approved task to its own branch and opens a PR (only used
             when ``config.auto_pr``). None (default) publishes nothing; the
             service (``foundry.serve``) passes one.
+        snapshots: a :class:`~foundry.base_snapshot.BaseSnapshots`: with automatic
+            PRs on, each task is pinned to the commit of its publish branch and
+            built (context, gates, stacking, patch check) from a clean checkout
+            of it, and published from that commit. None builds from ``repo_root``.
 
     The target repository is never modified: gates patch scratch copies only,
     Claude runs with ``cwd=repo_root`` (it reads, it does not write: diff-only
@@ -2105,6 +2257,7 @@ def build_factory(
         publisher=publisher,
         auto_pr=bool(getattr(config, "auto_pr", True)) and publisher is not None,
         pr_draft=bool(getattr(config, "pr_draft", False)),
+        snapshots=snapshots,
     )
     # the Foreman reads the action log so it never prescribes RETRY_TASK twice for one task
     foreman.actions_provider = manager.actions
@@ -2113,6 +2266,8 @@ def build_factory(
         if "repo_root" not in _params(TeamPool):
             raise TypeError("this TeamPool cannot scope dispatch to one repository (no repo_root)")
         pool_extra["repo_root"] = str(Path(dispatch_repo).resolve())
+    if snapshots is not None and "base_for" in _params(TeamPool):
+        pool_extra["base_for"] = manager.task_base
     pools = {
         team: TeamPool(
             team,

@@ -1151,7 +1151,7 @@ class ShopForeman:
             }
         return {
             "teams": teams,
-            "thresholds": self.config.thresholds.model_dump(),
+            "thresholds": {**self.config.thresholds.model_dump(), "gate_fail_quarantine": self._gate_fail_limit()},
             "current_tpm": float(self.telemetry.current_tpm()) if self.telemetry is not None else 0.0,
         }
 
@@ -2007,6 +2007,16 @@ class ShopForeman:
             yield chunk
 
     # ---------------------------------------------------------------- anomalies
+    def _gate_fail_limit(self) -> int:
+        """The effective LINE_JAM limit (explicit threshold, else ``max_retries + 1``)."""
+        effective = getattr(self.config, "effective_gate_fail_quarantine", None)
+        if callable(effective):
+            return int(effective())
+        explicit = getattr(self.config.thresholds, "gate_fail_quarantine", None)
+        if explicit is not None:
+            return int(explicit)
+        return int(getattr(self.config, "max_retries", 3)) + 1
+
     def detect_anomalies(self) -> list[Anomaly]:
         """Deterministically detect every current anomaly, most urgent first.
 
@@ -2020,28 +2030,30 @@ class ShopForeman:
         tasks = {t["task_id"]: t for t in self.queue.all_tasks() if _jsonable(t["state"]) not in _TERMINAL}
 
         # LINE_JAM: one ticket failed its gates repeatedly (per ticket, like the retry policy) -> quarantine.
+        # Default limit is max_retries + 1, so a ticket with attempts left is never quarantined here.
+        jam_limit = self._gate_fail_limit()
         for tid, task in tasks.items():
             per_ticket = self._ticket_gate_failures(tid)
             if not per_ticket:
                 continue
             subtask_id, n = max(per_ticket.items(), key=lambda kv: (kv[1], kv[0]))
-            if n < th.gate_fail_quarantine:
+            if n < jam_limit:
                 continue
             ticket = next((t for t in self.queue.tickets_for_task(tid) if t.subtask_id == subtask_id), None)
             ticket_id = ticket.ticket_id if ticket is not None else f"{tid}:{subtask_id}"
             found.append(
                 Anomaly(
                     EscalationCategory.LINE_JAM,
-                    Severity.CRITICAL if n > th.gate_fail_quarantine else Severity.HIGH,
+                    Severity.CRITICAL if n > jam_limit else Severity.HIGH,
                     PrescribedAction.QUARANTINE_TASK,
                     team_id=task["team_id"],
                     task_id=tid,
                     agent_id=ticket.claimed_by if ticket is not None else None,
                     gate_failure_count=n,
                     action_parameters={"reason": f"ticket {ticket_id} failed its gates {n} times "
-                                                 f"(limit {th.gate_fail_quarantine})",
+                                                 f"(limit {jam_limit})",
                                        "gate_failure_count": n, "ticket_id": ticket_id},
-                    extra_metrics={"threshold": th.gate_fail_quarantine, "ticket_id": ticket_id},
+                    extra_metrics={"threshold": jam_limit, "ticket_id": ticket_id},
                     fallback_diagnosis=f"Ticket {ticket_id} failed its deterministic gates {n} times and is on its "
                                        "last attempt. Quarantine the task before more builder calls are spent.",
                 )

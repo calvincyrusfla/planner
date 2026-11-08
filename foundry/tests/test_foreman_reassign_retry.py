@@ -17,7 +17,8 @@ INFRA = "infrastructure: claude CLI timed out after 600 s"
 
 
 def foreman_for(line: dict[str, Any], gemma: Any = None, builders: int = 1, **kwargs: Any) -> ShopForeman:  # noqa: F811
-    config = FoundryConfig(db_path=line["config"].db_path, builders_per_team=builders)
+    config = FoundryConfig(db_path=line["config"].db_path, builders_per_team=builders,
+                           thresholds=line["config"].thresholds)  # explicit LINE_JAM limit 2
     return ShopForeman(gemma, line["queue"], line["telemetry"], line["engine"], config, **kwargs)
 
 
