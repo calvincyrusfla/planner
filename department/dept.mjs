@@ -65,8 +65,9 @@ const HELP = `Agent Department CLI
                                                        endpoint; at most every 30 s via the dashboard;
                                                        env DEPT_USAGE_DIRECT=off disables it)
   node department/dept.mjs foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."]
-                       --subtask "Title::description::file1,file2::S" (repeatable; "::" separates
+                       --subtask "Title::description::file1,file2::S::read1,read2" (repeatable; "::" separates
                        the fields, so use --json batch.json for text containing "::")
+                       The optional last field lists extra files the builder may read but not change.
                                                        Hand a batch of work to Foundry (S-###);
                                                        Foundry on the PC claims batches for its repo
   node department/dept.mjs foundry poll <S-id> [--json] Batch status: each subtask's F-id, state, PR
@@ -561,18 +562,20 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S" ... | --json file.json\n         ("::" separates --subtask fields; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id>';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id>';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
-// "Title::description::file1,file2::S" → subtask. Empty parts are skipped.
+// "Title::description::file1,file2::S::read1,read2" → subtask. Empty parts are skipped.
 function subtaskArg(spec, i) {
   if (typeof spec !== 'string' || !spec.trim()) throw new core.DeptError(`--subtask ${i + 1} is empty\n${FOUNDRY_HELP}`);
-  const [title, description = '', files = '', size = ''] = spec.split('::');
+  const [title, description = '', files = '', size = '', readFiles = ''] = spec.split('::');
   const st = { title: title.trim() };
   if (description.trim()) st.description = description.trim();
   const list = files.split(',').map((f) => f.trim()).filter(Boolean);
   if (list.length) st.files = list;
   if (size.trim()) st.size = size.trim();
+  const read = readFiles.split(',').map((f) => f.trim()).filter(Boolean);
+  if (read.length) st.readFiles = read;
   return st;
 }
 

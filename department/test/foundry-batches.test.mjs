@@ -67,7 +67,7 @@ test('dispatchBatch builds the batch shape and does not take a team', () => {
   assert.equal(b.claimedBy, null);
   assert.deepEqual(b.results, {});
   assert.deepEqual(b.subtasks[0], {
-    key: '1', title: 'Add X', description: 'do x', files: ['a.py', 'b/c.py'], size: 'S', acceptance: ['x works'], dependsOn: [],
+    key: '1', title: 'Add X', description: 'do x', files: ['a.py', 'b/c.py'], readFiles: [], size: 'S', acceptance: ['x works'], dependsOn: [],
   });
   assert.deepEqual(b.subtasks[1].dependsOn, ['1']);
   assert.deepEqual(b.subtasks[1].acceptance, ['y works']);
@@ -101,6 +101,42 @@ test('dispatchBatch validates', () => {
   bad({ subtasks: [{ key: 'a', title: 'a' }, { key: 'a', title: 'b' }] }, /duplicate/);
   assert.equal(s.foundryBatches.length, 0);
   assert.equal(s.nextBatchNumber, 1);
+});
+
+test('dispatchBatch stores readFiles cleaned, deduplicated and apart from files', () => {
+  const s = fresh();
+  const b = op(s, 'dispatchBatch', sample({ subtasks: [
+    { title: 'A', files: ['x.py'], readFiles: ['a/b.py', 'a\\b.py', 'c.py'] },
+    { title: 'B', read_files: 'd.py, e/f.py' },
+    { title: 'C' },
+  ] }));
+  assert.deepEqual(b.subtasks[0].readFiles, ['a/b.py', 'c.py']);
+  assert.deepEqual(b.subtasks[0].files, ['x.py']);
+  assert.deepEqual(b.subtasks[1].readFiles, ['d.py', 'e/f.py']);
+  assert.deepEqual(b.subtasks[1].files, []);
+  assert.deepEqual(b.subtasks[2].readFiles, []);
+});
+
+test('dispatchBatch validates readFiles and writes nothing when they are bad', () => {
+  const s = fresh();
+  const bad = (readFiles, re) => assert.throws(() => op(s, 'dispatchBatch', sample({ subtasks: [{ title: 'a', readFiles }] })), re);
+  bad(['/etc/passwd'], /relative/);
+  bad(['C:\\x'], /relative/);
+  bad(['a/../../x'], /\.\./);
+  bad(Array.from({ length: 51 }, (_, i) => `f${i}`), /at most 50/);
+  bad(5, /must be a list/);
+  assert.equal(s.foundryBatches.length, 0);
+  assert.equal(s.nextBatchNumber, 1);
+});
+
+test('readFiles survive a save/load and an importState', () => {
+  const s = fresh();
+  op(s, 'dispatchBatch', sample({ subtasks: [{ title: 'A', readFiles: ['a/b.py', 'c.py'] }] }));
+  const loaded = core.normalize(JSON.parse(JSON.stringify(s)));
+  assert.deepEqual(loaded.foundryBatches[0].subtasks[0].readFiles, ['a/b.py', 'c.py']);
+  const ours = fresh();
+  op(ours, 'importState', { state: s });
+  assert.deepEqual(ours.foundryBatches[0].subtasks[0].readFiles, ['a/b.py', 'c.py']);
 });
 
 test('claimBatch: first claimer wins, others refused without a write, own re-claim ok', () => {

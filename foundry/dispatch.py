@@ -126,6 +126,7 @@ class SubtaskPayload(_Model):
     size: Literal["S", "M", "L", "XL"] | None = None
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=MAX_ACCEPTANCE)
     depends_on: list[str] = Field(default_factory=list, max_length=MAX_SUBTASKS)
+    read_files: list[str] = Field(default_factory=list, max_length=MAX_FILES)
 
     @field_validator("key")
     @classmethod
@@ -136,7 +137,7 @@ class SubtaskPayload(_Model):
             raise ValueError("key must be 1-40 letters, digits, '_', '.' or '-'")
         return v
 
-    @field_validator("files")
+    @field_validator("files", "read_files")
     @classmethod
     def _files(cls, v: list[str]) -> list[str]:
         out: list[str] = []
@@ -166,6 +167,8 @@ class SubtaskPayload(_Model):
             d["description"] = self.description
         if self.files:
             d["files"] = list(self.files)
+        if self.read_files:
+            d["readFiles"] = list(self.read_files)
         if self.size:
             d["size"] = self.size
         if self.acceptance_criteria:

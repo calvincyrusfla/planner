@@ -500,3 +500,71 @@ def test_wait_gives_up_with_last_error() -> None:
     with pytest.raises(d.BoardUnavailable) as ei:
         d.wait_for_sprint("S-001", board=board, timeout=3, interval=1, sleep=sleep, monotonic=lambda: t[0])
     assert "busy" in str(ei.value)
+
+
+def test_read_files_validated_deduplicated_and_sent() -> None:
+    batch = d.DispatchFoundryBatch(title="T", repo="o/r", subtasks=[
+        d.SubtaskPayload(title="A", read_files=["a/b.py", "a/b.py", "c.py"]),
+        d.SubtaskPayload(title="B"),
+    ])
+    first, second = batch.to_board_args()["subtasks"]
+    assert first["readFiles"] == ["a/b.py", "c.py"]
+    assert "readFiles" not in second
+
+
+def test_read_files_rejects_unsafe_path() -> None:
+    with pytest.raises(ValidationError):
+        d.SubtaskPayload(title="A", read_files=["../secret.py"])
+
+
+class _CapturingBoard:
+    """Records the write, then refuses it: these tests only look at what was sent."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def state(self) -> dict[str, Any]:
+        return {"foundryBatches": []}
+
+    def op(self, type: str, args: dict[str, Any]) -> Any:
+        self.calls.append((type, args))
+        raise d.BoardError("captured")
+
+
+def test_read_files_reach_the_board_from_a_model() -> None:
+    board = _CapturingBoard()
+    batch = d.DispatchFoundryBatch(title="T", repo="o/r", subtasks=[
+        d.SubtaskPayload(title="A", files=["x.py"], read_files=["a/b.py", "a/b.py", "c.py"]),
+    ])
+    with pytest.raises(d.BoardError):
+        d.dispatch_to_foundry(batch, board=board)
+    assert len(board.calls) == 1
+    op_type, args = board.calls[0]
+    assert op_type == "dispatchBatch"
+    assert args["subtasks"][0]["readFiles"] == ["a/b.py", "c.py"]
+    assert args["subtasks"][0]["files"] == ["x.py"]
+
+
+def test_read_files_reach_the_board_from_a_dict() -> None:
+    board = _CapturingBoard()
+    batch: dict[str, Any] = {
+        "title": "T",
+        "repo": "o/r",
+        "subtasks": [{"title": "A", "read_files": ["a/b.py"]}, {"title": "B"}],
+    }
+    with pytest.raises(d.BoardError):
+        d.dispatch_to_foundry(batch, board=board)
+    first, second = board.calls[0][1]["subtasks"]
+    assert first["readFiles"] == ["a/b.py"]
+    assert "readFiles" not in second
+
+
+@pytest.mark.parametrize("path", ["/etc/passwd", "a/../../x"])
+def test_read_files_rejects_paths_outside_the_repo(path: str) -> None:
+    with pytest.raises(ValidationError):
+        d.SubtaskPayload(title="A", read_files=[path])
+
+
+def test_read_files_rejects_too_many() -> None:
+    with pytest.raises(ValidationError):
+        d.SubtaskPayload(title="A", read_files=[f"f{i}.py" for i in range(d.MAX_FILES + 1)])
