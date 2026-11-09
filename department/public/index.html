@@ -172,6 +172,9 @@
   .log-item time { display: block; font-size: 11px; color: var(--faint); }
   .log-item .who { font-weight: 600; }
 
+  .fo-answer { font-size: 12px; padding: 2px 8px; border-color: var(--accent); color: var(--accent); white-space: normal; max-width: 100%; }
+  .fo-answer:disabled { opacity: .6; cursor: progress; }
+  .sub-help { display: block; flex-basis: 100%; width: 100%; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
   .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--surface-2); color: var(--text);
     border: 1px solid var(--border); box-shadow: 0 6px 24px rgba(0,0,0,.45);
     padding: 9px 14px; border-radius: 8px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100% - 32px); }
@@ -1011,6 +1014,24 @@ function tickHeartbeats() {
   }
 }
 setInterval(tickHeartbeats, 1000);
+// True while the request runs, so a live re-render of the rows keeps the buttons disabled.
+let answeringHelp = false;
+function setAnsweringHelp(on) {
+  answeringHelp = on;
+  document.querySelectorAll('[data-answer-help]').forEach((btn) => { btn.disabled = on; });
+}
+document.addEventListener('click', async (e) => {
+  if (!e.target.closest('[data-answer-help]') || answeringHelp) return;
+  setAnsweringHelp(true);
+  try {
+    await api('POST', '/api/claude/answer-help', {});
+    toast('Claude opened in a new window');
+  } catch {
+    // api() has already shown the error text.
+  } finally {
+    setAnsweringHelp(false);
+  }
+});
 function subtaskRow(b, st) {
   const r = (b.results && b.results[st.key]) || {};
   const state_ = String(r.state || 'waiting');
@@ -1022,9 +1043,11 @@ function subtaskRow(b, st) {
     <span class="sub-title">${esc(st.title)}</span>
     ${r.foundryTask ? `<span class="sub-fid">${esc(r.foundryTask)}</span>` : ''}
     <span class="fo-badge ${esc(state_.replace(/[^a-z]/g, ''))}"${state_ === 'needs_help' ? ` title="${esc(r.help?.question || '')}"` : ''}>${esc(state_ === 'needs_help' ? 'needs help' : state_)}</span>
+    ${state_ === 'needs_help' && state.capabilities && state.capabilities.claudeLaunch ? `<button type="button" class="fo-answer" data-answer-help${answeringHelp ? ' disabled' : ''}>Answer with Claude</button>` : ''}
     ${href ? `<a class="fo-pr" href="${esc(href)}" target="_blank" rel="noopener noreferrer">PR${pr.state ? ` (${esc(pr.state)})` : ''}</a>`
       : pr && pr.state ? `<span class="none">PR ${esc(pr.state)}</span>` : ''}
     ${err ? `<span class="sub-err">${esc(err)}</span>` : ''}
+    ${state_ === 'needs_help' && r.help?.question ? `<span class="sub-help">${esc(r.help.question)}</span>` : ''}
     ${Array.isArray(st.readFiles) && st.readFiles.length ? `<span class="sub-read">${st.readFiles.map((f) => `<code>${esc(f)}</code> (read-only)`).join(', ')}</span>` : ''}
   </li>`;
 }
