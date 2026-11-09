@@ -157,7 +157,8 @@ REVIEWER_CONTRACT = (
     '{"verdict": "APPROVED" | "REVISE" | "REJECTED", "directives": [{"path": "<file>", '
     '"line": <int, 0 = whole file>, "instruction": "<what to change>"}]}. Use APPROVED when '
     "every acceptance criterion is met, REVISE with at least one directive when the diff "
-    "can be fixed, REJECTED when the approach is wrong and the task should be quarantined."
+    "can be fixed, REJECTED when the approach is wrong and the task should be quarantined. "
+    "Approve only when the acceptance criteria and every plan-checklist item this part is responsible for are met."
 )
 """The reviewer output contract quoted verbatim in every reviewer prompt."""
 
@@ -492,6 +493,54 @@ def _order_details_section(description: str | None, part_description: str | None
     return ["", "## Order details", *lines] if lines else []
 
 
+#: A backticked span (group 1), or a quoted token that looks like a name, state or path (group 3).
+_PLAN_ITEM_RE = re.compile(r"`([^`\n]+)`|(?<!\w)(['\"])([A-Za-z_][\w.:/-]{1,80})\2(?!\w)")
+#: Common words an order may quote without naming anything (compared in lower case).
+_PLAN_STOP_WORDS = frozenset({"a", "an", "and", "or", "not", "the", "true", "false", "none", "null"})
+
+
+def plan_checklist(order_description: str | None, limit: int = 25) -> list[str]:
+    """The distinct items ``order_description`` names exactly, in order of first appearance, at most ``limit``.
+
+    An item is a backticked span (without the backticks) or a single- or
+    double-quoted token that looks like an identifier, op name, state or file
+    path. Very common words are skipped.
+    """
+    items: list[str] = []
+    if not order_description or limit <= 0:
+        return items
+    for match in _PLAN_ITEM_RE.finditer(order_description):
+        item = (match.group(1) or match.group(3)).strip()
+        if not item or item.lower() in _PLAN_STOP_WORDS or item in items:
+            continue
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _plan_checklist_section(order_description: str | None, *, last_part: bool = False) -> list[str]:
+    """Prompt lines listing the order's named items for the reviewer; empty when it names none."""
+    items = plan_checklist(order_description)
+    if not items:
+        return []
+    lines = [
+        "",
+        "## Plan checklist",
+        "The order names these exactly. For each one this part is responsible for, check the diff "
+        "(or the already-done parts) implements it with exactly this name and shape. If any of this "
+        "part's items is missing, renamed or shaped differently from the order, reply REVISE with a "
+        "directive naming it.",
+    ]
+    lines += [f"- {item}" for item in items]
+    if last_part:
+        lines.append(
+            "This is the last part of the task: every item above must now be covered by this diff "
+            "or the parts already done."
+        )
+    return lines
+
+
 def build_builder_prompt(
     assignment: TaskAssignment,
     *,
@@ -615,6 +664,7 @@ def build_reviewer_prompt(
     max_retries: int = MAX_RETRIES,
     order_description: str | None = None,
     part_description: str | None = None,
+    last_part: bool = False,
 ) -> str:
     """Return the exact, diff-only prompt a reviewer sends to Claude.
 
@@ -623,8 +673,10 @@ def build_reviewer_prompt(
     gate stdout are deliberately left out.  ``pre_review_notes`` (Gemma's
     pre-review findings, if any) are added as advisory text the reviewer
     is told may be wrong.
-    ``order_description`` (the original work order, capped) is quoted under "## Order details".
+    ``order_description`` (the original work order, capped) is quoted under "## Order details";
+    the items it names exactly (:func:`plan_checklist`) are listed under "## Plan checklist".
     ``part_description`` (the ticket's own description, capped) is quoted under "### This part".
+    ``last_part``: this is the task's last ticket, so every checklist item must now be covered.
     """
     who = f"You are reviewer {reviewer_id}. " if reviewer_id else "You are the reviewer. "
     parts: list[str] = [
@@ -636,6 +688,7 @@ def build_reviewer_prompt(
     ]
     parts += [f"- {c.strip()}" for c in acceptance_criteria] or ["- (none given)"]
     parts += _order_details_section(order_description, part_description)
+    parts += _plan_checklist_section(order_description, last_part=last_part)
     parts += ["", "## Deterministic gates (already run)"]
     if gate_results:
         for g in gate_results:
@@ -3025,6 +3078,7 @@ class ReviewerWorker(_WorkerBase):
             max_retries=self.max_retries,
             order_description=(item.cache_meta or {}).get("description"),
             part_description=item.assignment.ticket_description,
+            last_part=self._is_last_ticket(item),
         )
         started = time.monotonic()
         error: BaseException | None = None
@@ -3099,6 +3153,20 @@ class ReviewerWorker(_WorkerBase):
             except Exception:  # pragma: no cover - defensive
                 log.exception("record_verdict failed")
         self._event("verdict", verdict.task_id, {**verdict.model_dump(), "ticket_id": item.ticket_id})
+
+    def _is_last_ticket(self, item: ReviewItem) -> bool:
+        """True when no later ticket of the task is open, claimed or awaiting help; False if that can't be told."""
+        listing = getattr(self.queue, "tickets_for_task", None)
+        if not callable(listing):
+            return False
+        try:
+            tickets = list(listing(item.assignment.task_id))
+            ids = [str(ticket.ticket_id) for ticket in tickets]
+            later = tickets[ids.index(str(item.ticket_id)) + 1:]
+            return not any(ticket.status in ("open", "claimed", "awaiting_help") for ticket in later)
+        except Exception:  # the checklist line is optional: never let it break a review
+            log.debug("could not tell whether %s is its task's last ticket", item.ticket_id, exc_info=True)
+            return False
 
 
 # ---------------------------------------------------------------------------
