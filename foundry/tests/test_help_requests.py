@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from foundry.builder_worker import BuilderWorker
+from foundry.builder_worker import BuilderWorker, _is_missing_information, _WorkerBase
 from foundry.schemas import TaskState
 from foundry.tests.test_builder_worker import TEAM, Rig
 
@@ -192,3 +192,109 @@ def test_help_after_zero_never_pauses(tmp_path: Path) -> None:
     assert ticket.status == "open"
     assert ticket.attempt == 2
     assert rig.queue.help_requests() == []
+
+
+PRE_REVIEW_MISSING_HINT = "[pre-review] blocking: The core requirement is missing from the provided diff"
+REPLY_BLOCKED_HINT = "Fix the reply: builder reported BLOCKED: need the body of `helper`."
+
+
+class _PauseRuleWorker(_WorkerBase):
+    """Just the pause bookkeeping of a worker, on an in-memory kv store."""
+
+    agent_id = "alpha-1"
+    role = "builder"
+    kv: dict[str, Any]
+
+    @property
+    def help_after(self) -> int:
+        return 2
+
+    @property
+    def max_retries(self) -> int:
+        return 5
+
+    def _kv_read(self, key: Any, *_args: Any, **_kwargs: Any) -> Any:
+        return self.kv.get(key)
+
+    def _kv_write(self, key: Any, value: Any, *_args: Any, **_kwargs: Any) -> None:
+        self.kv[key] = value
+
+
+def _pause_rule_worker() -> _PauseRuleWorker:
+    client: Any = None
+    queue = SimpleNamespace(pause_for_help=lambda *_args, **_kwargs: True)
+    worker = _PauseRuleWorker("alpha", queue, client, None, None)
+    worker.kv = {}
+    return worker
+
+
+def test_pre_review_between_blocked_replies_resets_the_count() -> None:
+    worker = _pause_rule_worker()
+    assert worker._help_request("t-1", 0, REPLY_BLOCKED_HINT, "blocked") is None
+    assert worker._help_request("t-1", 1, PRE_REVIEW_MISSING_HINT, "pre_review") is None
+    assert worker._help_request("t-1", 2, REPLY_BLOCKED_HINT, "blocked") is None
+    assert worker._help_request("t-1", 3, REPLY_BLOCKED_HINT, "blocked") is not None
+
+
+@pytest.mark.parametrize(
+    ("reason", "hint"),
+    [
+        ("pre_review", PRE_REVIEW_MISSING_HINT),
+        ("pre_review", "BLOCKED: the body is not shown"),
+        ("revise", "the helper is not shown"),
+        ("review_error", "cannot see the file"),
+        ("worker_error", "no context"),
+        ("gate_tests", "[tests] expected value not shown in the output"),
+    ],
+)
+def test_judgements_of_the_work_are_not_missing_information(reason: str, hint: str) -> None:
+    assert not _is_missing_information(reason, hint)
+
+
+def test_blocked_reply_is_missing_information() -> None:
+    assert _is_missing_information("blocked", REPLY_BLOCKED_HINT)
+
+
+def test_phrases_match_the_hint_only_and_is_missing_is_gone() -> None:
+    assert _is_missing_information("claude_error", "the body is not shown")
+    assert not _is_missing_information("not shown", "all fine")
+    assert not _is_missing_information("claude_error", "a semicolon is missing")
+
+
+def test_pre_review_send_back_resets_the_count_on_the_real_queue(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    assert _fail_once(rig, BLOCKED_HINT) == "retry"
+    assert _fail_once(rig, PRE_REVIEW_MISSING_HINT, reason="pre_review") == "retry"
+    assert _fail_once(rig, BLOCKED_HINT) == "retry"
+
+    ticket = _ticket(rig)
+    assert ticket.status == "open"
+    assert ticket.attempt == 3
+    assert rig.queue.help_requests() == []
+
+
+def test_two_blocked_in_a_row_after_a_pre_review_pause(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    assert _fail_once(rig, PRE_REVIEW_MISSING_HINT, reason="pre_review") == "retry"
+    assert _fail_once(rig, BLOCKED_HINT) == "retry"
+    assert _fail_once(rig, BLOCKED_HINT) == "awaiting_help"
+
+    assert _ticket(rig).status == "awaiting_help"
+    assert len(rig.queue.help_requests()) == 1
+
+
+def test_gate_failures_mentioning_not_shown_do_not_pause(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    hint = "[tests] expected value not shown in the output"
+    assert _fail_once(rig, hint, reason="gate_tests") == "retry"
+    assert _fail_once(rig, hint, reason="gate_tests") == "retry"
+
+    ticket = _ticket(rig)
+    assert ticket.status == "open"
+    assert ticket.attempt == 2
+    assert rig.queue.help_requests() == []
+
+
+def test_blocked_prefix_counts_without_any_phrase() -> None:
+    assert _is_missing_information("blocked", "BLOCKED: stuck on the build")
+    assert not _is_missing_information("blocked", "the edits changed nothing")
