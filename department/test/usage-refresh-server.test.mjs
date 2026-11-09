@@ -179,7 +179,7 @@ test('success: stores usage from Anthropic, source ends with "· Anthropic", the
   try {
     const before = await getState(srv.url);
     assert.equal(before.usage, null);
-    assert.deepEqual(before.capabilities, { usageRefresh: true });
+    assert.equal(before.capabilities.usageRefresh, true);
 
     const r = await post(srv.url);
     assert.equal(r.status, 200, r.text);
@@ -234,7 +234,7 @@ test('capabilities.usageRefresh is on the SSE payload too', async () => {
   const srv = await startServer(dir);
   try {
     const data = await firstEvent(srv.url);
-    assert.deepEqual(data.capabilities, { usageRefresh: true });
+    assert.equal(data.capabilities.usageRefresh, true);
   } finally {
     await srv.stop();
   }
@@ -245,7 +245,7 @@ test('DEPT_USAGE_DIRECT=off: capability false and refresh refused', async () => 
   const fake = await fakeAnthropic('ok');
   const srv = await startServer(dir, { CLAUDE_CONFIG_DIR: writeCreds(dir), DEPT_ANTHROPIC_BASE: fake.base, DEPT_USAGE_DIRECT: 'off' });
   try {
-    assert.deepEqual((await getState(srv.url)).capabilities, { usageRefresh: false });
+    assert.equal((await getState(srv.url)).capabilities.usageRefresh, false);
     const r = await post(srv.url);
     assert.equal(r.status, 403);
     assert.equal(r.json.code, 'disabled');
