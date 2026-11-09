@@ -53,6 +53,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 __all__ = [
     "MAX_SUBTASKS",
+    "MAX_BUILDER_ORDER",
     "SubtaskPayload",
     "DispatchFoundryBatch",
     "SubtaskStatus",
@@ -80,6 +81,10 @@ MAX_DESCRIPTION = 20_000
 MAX_FILES = 50
 MAX_ACCEPTANCE = 50
 MAX_GOAL = 20_000
+# Equal to foundry.builder_worker.MAX_ORDER_DETAILS_CHARS (a test checks it); not imported so that
+# this module, used from cloud sessions, does not load the builder at import time.
+MAX_BUILDER_ORDER = 6000
+_MARKER_PLACEHOLDER = "x" * 100  # stands in for the batch marker line, unknown until the board assigns an id
 
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -238,6 +243,17 @@ class DispatchFoundryBatch(_Model):
             if not ready:
                 raise ValueError("subtask dependencies form a cycle")
             done.update(k for k in ready if k is not None)
+        # refuse orders the builder would only see cut off
+        from foundry.board_dispatch import order_text
+
+        for s in self.subtasks:
+            length = len(order_text(s.description, s.size, self.title, self.goal, _MARKER_PLACEHOLDER))
+            if length > MAX_BUILDER_ORDER:
+                raise ValueError(
+                    f"subtask {s.key!r}: the order text is {length} characters, over the builder's limit of "
+                    f"{MAX_BUILDER_ORDER}; shorten the description or goal, move detail to read_files, "
+                    "or split the subtask"
+                )
         return self
 
     def to_board_args(self, by: str | None = None) -> dict[str, Any]:

@@ -568,3 +568,76 @@ def test_read_files_rejects_paths_outside_the_repo(path: str) -> None:
 def test_read_files_rejects_too_many() -> None:
     with pytest.raises(ValidationError):
         d.SubtaskPayload(title="A", read_files=[f"f{i}.py" for i in range(d.MAX_FILES + 1)])
+
+
+# --------------------------------------------------------------------------- builder order limit
+
+
+# What the composed order adds to a description for batch title "T", no size, no goal.
+_ORDER_OVERHEAD = len('\n\nPart of "T"\n') + 100
+
+
+def _order_batch(description: str, *, goal: str = "", size: Any = None) -> d.DispatchFoundryBatch:
+    return d.DispatchFoundryBatch(
+        title="T", repo="o/r", goal=goal,
+        subtasks=[d.SubtaskPayload(key="big", title="Sub", description=description, size=size)],
+    )
+
+
+def test_builder_order_limit_matches_the_builder() -> None:
+    from foundry.builder_worker import MAX_ORDER_DETAILS_CHARS
+
+    assert d.MAX_BUILDER_ORDER == MAX_ORDER_DETAILS_CHARS
+    assert "MAX_BUILDER_ORDER" in d.__all__
+
+
+def test_largest_accepted_order_reaches_the_builder_whole() -> None:
+    from foundry.board_dispatch import marker, order_text
+    from foundry.builder_worker import _capped_order_text
+
+    batch = _order_batch("x" * (d.MAX_BUILDER_ORDER - _ORDER_OVERHEAD))
+    sub = batch.subtasks[0]
+    line = marker("S-999", "big", "2026-11-09T03:49:18.361Z")
+    text = order_text(sub.description, sub.size, batch.title, batch.goal, line)
+    assert _capped_order_text(text, "order description") == text
+    over = "x" * (d.MAX_BUILDER_ORDER + 1)
+    assert _capped_order_text(over, "order description") != over
+
+
+def test_order_at_the_builder_limit_passes() -> None:
+    batch = _order_batch("x" * (d.MAX_BUILDER_ORDER - _ORDER_OVERHEAD))
+    assert batch.subtasks[0].key == "big"
+
+
+def test_order_one_over_the_builder_limit_fails_naming_the_key() -> None:
+    limit = d.MAX_BUILDER_ORDER
+    with pytest.raises(ValidationError) as err:
+        _order_batch("x" * (limit - _ORDER_OVERHEAD + 1))
+    message = str(err.value)
+    assert "'big'" in message
+    assert f"{limit + 1} characters" in message
+    assert f"limit of {limit}" in message
+    assert "read_files" in message
+    assert "split" in message
+
+
+def test_long_goal_pushes_subtasks_over_the_builder_limit() -> None:
+    _order_batch("short", goal="g" * 100)
+    with pytest.raises(ValidationError, match="'big'"):
+        _order_batch("short", goal="g" * d.MAX_BUILDER_ORDER)
+
+
+def test_size_line_counts_towards_the_builder_limit() -> None:
+    description = "x" * (d.MAX_BUILDER_ORDER - _ORDER_OVERHEAD)
+    _order_batch(description)
+    with pytest.raises(ValidationError, match="'big'"):
+        _order_batch(description, size="M")
+
+
+def test_dispatch_to_foundry_refuses_a_too_long_order_before_reaching_the_board() -> None:
+    board = _CapturingBoard()
+    order = {"title": "T", "repo": "o/r",
+             "subtasks": [{"key": "big", "title": "Sub", "description": "x" * d.MAX_BUILDER_ORDER}]}
+    with pytest.raises(ValidationError, match="'big'"):
+        d.dispatch_to_foundry(order, board=board)
+    assert board.calls == []
