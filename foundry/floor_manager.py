@@ -24,6 +24,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -39,6 +40,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from foundry import suite_check
 from foundry.schemas import (
     ForemanEscalation,
     PrescribedAction,
@@ -1825,6 +1827,10 @@ class FloorManager:
             rec = self._set_pr(task_id, "skipped", error="no patch to publish", stage="no_patch", attempts=attempts)
             self.save()
             return rec
+        if not pushed and patch is not None:
+            held = await self._suite_hold(task_id, patch, attempts)
+            if held is not None:
+                return held
         order = self.orders.get(task_id)
         req = self.pr_request(task_id)
         try:
@@ -1881,6 +1887,45 @@ class FloorManager:
         except Exception as exc:  # pragma: no cover - bookkeeping is best effort
             log.debug("floor manager: could not record the PR event: %s", exc)
         self.save()
+        return rec
+
+    async def _suite_hold(self, task_id: str, patch: Path, attempts: int) -> dict[str, Any] | None:
+        """Run the whole-suite check; the failed PR record when the patch breaks tests, else None.
+
+        An error in the check itself is logged and never holds the PR.
+        """
+        if os.environ.get("FOUNDRY_SUITE_GATE", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return None
+        try:
+            timeout_s = float(os.environ.get("FOUNDRY_SUITE_TIMEOUT_S", "900"))
+            workdir = (self.patches_dir or patch.parent).parent / "suite"
+            async with self.base_lease(task_id) as snap:
+                root = snap
+                if root is None:
+                    repo = self.task_repo(task_id)
+                    root = Path(repo) if repo else self.repo_root
+                if root is None:
+                    log.warning("floor manager: %s has no repository to run the whole suite on", task_id)
+                    return None
+                result = await asyncio.to_thread(
+                    suite_check.check_patch, root, patch, timeout_s=timeout_s, workdir=workdir)
+        except Exception as exc:  # the check must never stop a PR
+            log.warning("floor manager: whole-suite check of %s failed: %s: %s", task_id, type(exc).__name__, exc)
+            return None
+        if result.ok:
+            log.info("floor manager: %s %s", task_id, result.summary)
+            return None
+        listed = ", ".join(result.new_failures[:10])
+        rec = self._set_pr(task_id, "failed", error=("new test failures: " + listed)[:500], stage="suite",
+                           attempts=attempts)
+        self.save()
+        log.warning("floor manager: %s PR held: %s", task_id, result.summary)
+        d = self.directives.get(task_id)
+        try:
+            self.bridge.progress(task_id, f"[Foundry] PR held: new test failures: {listed}",
+                                 team_id=d.team_id if d else None)
+        except Exception as exc:  # pragma: no cover - the board is best effort
+            log.debug("floor manager: PR note failed: %s", exc)
         return rec
 
     def _pushed(self, task_id: str, branch: Any, commit: Any = None) -> None:
