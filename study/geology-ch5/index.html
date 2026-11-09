@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Study Guide</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="study.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1 id="guide-title">Study Guide</h1>
+    <p id="guide-source" class="guide-source" hidden></p>
+  </header>
+
+  <noscript>
+    <p class="load-error">This study guide needs JavaScript. Please enable it and reload the page.</p>
+  </noscript>
+
+  <div id="load-error" class="load-error" role="alert" hidden>
+    <h2>The study data could not be loaded</h2>
+    <p>The file <code>data.js</code> is missing or incomplete. Keep it in the same folder as <code>index.html</code>, then reload this page.</p>
+  </div>
+
+  <main id="app" hidden>
+    <div id="tablist" class="tabs" role="tablist" aria-label="Study modes">
+      <button type="button" class="tab" role="tab" id="tab-notes" aria-controls="panel-notes" aria-selected="true">Notes</button>
+      <button type="button" class="tab" role="tab" id="tab-flashcards" aria-controls="panel-flashcards" aria-selected="false" tabindex="-1">Flashcards</button>
+      <button type="button" class="tab" role="tab" id="tab-quiz" aria-controls="panel-quiz" aria-selected="false" tabindex="-1">Practice quiz</button>
+    </div>
+
+    <section id="panel-notes" class="panel" role="tabpanel" aria-labelledby="tab-notes">
+      <div id="notes-root"><p class="placeholder">Notes are not available yet.</p></div>
+    </section>
+
+    <section id="panel-flashcards" class="panel" role="tabpanel" aria-labelledby="tab-flashcards" hidden>
+      <div class="fc-status">
+        <p id="fc-position" class="fc-position"></p>
+        <p id="fc-tally" class="fc-tally"></p>
+      </div>
+      <label class="fc-filter"><input type="checkbox" id="fc-only-learning"> Show only &ldquo;Still learning&rdquo;</label>
+
+      <p id="fc-empty" class="placeholder" hidden></p>
+
+      <div id="fc-deck">
+        <button type="button" id="fc-card" class="fc-card">
+          <span class="fc-face" aria-live="polite" aria-atomic="true">
+            <span id="fc-side" class="fc-side"></span>
+            <span id="fc-text" class="fc-text"></span>
+          </span>
+          <span class="fc-hint">Click or press Space to flip</span>
+        </button>
+
+        <div class="fc-row">
+          <button type="button" id="fc-got" class="btn fc-mark fc-mark-got" aria-pressed="false">Got it</button>
+          <button type="button" id="fc-learning" class="btn fc-mark fc-mark-learning" aria-pressed="false">Still learning</button>
+        </div>
+
+        <div class="fc-row">
+          <button type="button" id="fc-prev" class="btn" aria-keyshortcuts="ArrowLeft">Prev</button>
+          <button type="button" id="fc-shuffle" class="btn">Shuffle</button>
+          <button type="button" id="fc-next" class="btn" aria-keyshortcuts="ArrowRight">Next</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-quiz" class="panel" role="tabpanel" aria-labelledby="tab-quiz" hidden>
+      <div id="quiz-root"><p class="placeholder">The practice quiz is not available yet.</p></div>
+    </section>
+  </main>
+
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
