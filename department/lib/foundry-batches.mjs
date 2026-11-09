@@ -31,6 +31,9 @@ export const LIMITS = Object.freeze({
   title: 200,
   goal: 20000,
   description: 20000,
+  // Longest order text the builder sees whole; must match MAX_ORDER_DETAILS_CHARS
+  // in foundry/builder_worker.py. Checked on new dispatches only.
+  builderOrder: 6000,
   files: 50,
   path: 500,
   acceptance: 50,
@@ -263,6 +266,36 @@ export function batchProgress(b) {
   return { total, complete, failed, terminal: complete + failed };
 }
 
+// Room for the marker line board_dispatch.py ends every order with.
+const ORDER_MARKER_ALLOWANCE = 100;
+const plainText = (v) => (typeof v === 'string' ? v : '');
+
+// Length of the order text as _submit in foundry/board_dispatch.py composes it.
+// Counts code points, as Python's len() does when the builder prompt is capped.
+export function orderTextLength(batch, subtask) {
+  const size = String(subtask?.size ?? subtask?.size_hint ?? '').trim();
+  const goal = plainText(batch?.goal).trim();
+  let order = plainText(subtask?.description);
+  if (size) order = `${order ? `${order}\n\n` : ''}Requested size: ${size}`;
+  const context = `Part of "${plainText(batch?.title)}"${goal ? `: ${goal}` : ''}`;
+  order = `${order ? `${order}\n\n` : ''}${context}\n`;
+  return [...order].length + ORDER_MARKER_ALLOWANCE;
+}
+
+// Subtasks whose order text the builder would get cut off: [{key, title, length, limit}].
+export function oversizedOrders(batch) {
+  const subtasks = Array.isArray(batch?.subtasks) ? batch.subtasks : [];
+  return subtasks.flatMap((st, i) => {
+    const length = orderTextLength(batch, st);
+    if (length <= LIMITS.builderOrder) return [];
+    const key = st?.key === undefined || st?.key === null || st?.key === '' ? String(i + 1) : String(st.key).trim();
+    return [{ key, title: plainText(st?.title), length, limit: LIMITS.builderOrder }];
+  });
+}
+
+export const oversizedOrderMessage = ({ key, title, length, limit }) =>
+  `subtask ${key} ("${title}") order is ${length} characters; the builder sees only ${limit} (description + goal + title). Shorten it, move detail into readFiles, or split the subtask.`;
+
 // ---------- ops ----------
 
 export function dispatchBatch(state, { title, goal, repo, base, subtasks, by } = {}) {
@@ -287,6 +320,8 @@ export function dispatchBatch(state, { title, goal, repo, base, subtasks, by } =
     subtasks: cleanSubtasks(subtasks),
     results: {},
   };
+  const oversized = oversizedOrders(batch);
+  if (oversized.length) throw bad(oversized.map(oversizedOrderMessage).join('\n'));
   state.nextBatchNumber++;
   state.foundryBatches.push(batch);
   prune(state);

@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
+import { oversizedOrders, oversizedOrderMessage } from './lib/foundry-batches.mjs';
 import { metricLines } from './lib/foundry-metrics.mjs';
 import { watchEvents } from './lib/foundry-watch.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
@@ -98,7 +99,7 @@ Shared board (one board for this PC and Claude sessions, stored on the Netlify s
 `;
 
 // Options that never take a value (so `poll --json S-001` keeps S-001 positional).
-const FLAGS = new Set(['open']);
+const FLAGS = new Set(['open', 'allow-truncation']);
 function parse(argv) {
   const pos = [];
   const opt = {};
@@ -574,7 +575,7 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..." | foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] [--allow-truncation] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n         (--allow-truncation skips only the local check for orders longer than the builder sees, and warns instead)\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..." | foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
 // "Title::description::file1,file2::S::read1,read2" → subtask. Empty parts are skipped.
@@ -753,6 +754,9 @@ async function foundryCommand(sub, args, opt) {
       for (const k of ['title', 'repo', 'base', 'goal']) if (typeof opt[k] === 'string') batch[k] = opt[k];
       if (opt.subtask) batch.subtasks = [...(Array.isArray(batch.subtasks) ? batch.subtasks : []), ...opt.subtask.map(subtaskArg)];
       if (!batch.title || !batch.repo || !Array.isArray(batch.subtasks) || !batch.subtasks.length) throw new core.DeptError(FOUNDRY_HELP);
+      const oversized = oversizedOrders(batch).map(oversizedOrderMessage);
+      if (oversized.length && !opt['allow-truncation']) throw new core.DeptError(oversized.join('\n'));
+      for (const message of oversized) console.log(`WARN ${message}`);
       const b = await batchOp('dispatchBatch', { ...batch, by: typeof opt.by === 'string' ? opt.by : batch.by || 'cli' });
       console.log(`${b.id} dispatched to Foundry (${b.repo}, ${plural(b.subtasks.length, 'subtask')}): ${b.title}`);
       console.log(`  Poll with: node department/dept.mjs foundry poll ${b.id}`);

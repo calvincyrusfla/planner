@@ -476,3 +476,99 @@ test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------- order length: what the builder sees whole ----------
+
+import { test as orderLimitTest } from 'node:test';
+import orderAssert from 'node:assert/strict';
+import {
+  LIMITS as ORDER_LIMITS,
+  dispatchBatch as orderDispatchBatch,
+  getBatch as orderGetBatch,
+  importBatches as orderImportBatches,
+  orderTextLength,
+  oversizedOrders,
+} from '../lib/foundry-batches.mjs';
+
+const ORDER_MARKER = 100;
+const orderBatch = (subtasks, extra = {}) => ({ title: 'Batch', repo: 'owner/name', subtasks, ...extra });
+// A description that brings the subtask's order text to exactly `total` characters.
+const descriptionFor = (batch, total) => 'x'.repeat(total - (orderTextLength(batch, { description: 'x' }) - 1));
+
+orderLimitTest('builderOrder is 6000 and the stored limits stay at 20000', () => {
+  orderAssert.equal(ORDER_LIMITS.builderOrder, 6000);
+  orderAssert.equal(ORDER_LIMITS.description, 20000);
+  orderAssert.equal(ORDER_LIMITS.goal, 20000);
+});
+
+orderLimitTest('orderTextLength follows the composition in _submit', () => {
+  const plain = 'abc\n\nPart of "Batch"\n';
+  orderAssert.equal(orderTextLength({ title: 'Batch' }, { description: 'abc' }), plain.length + ORDER_MARKER);
+
+  const sized = 'abc\n\nRequested size: M\n\nPart of "Batch"\n';
+  orderAssert.equal(orderTextLength({ title: 'Batch' }, { description: 'abc', size: 'M' }), sized.length + ORDER_MARKER);
+
+  const full = 'abc\n\nRequested size: M\n\nPart of "Batch": the goal\n';
+  orderAssert.equal(orderTextLength({ title: 'Batch', goal: '  the goal  ' }, { description: 'abc', size: 'M' }), full.length + ORDER_MARKER);
+
+  const bare = 'Part of "Batch"\n';
+  orderAssert.equal(orderTextLength({ title: 'Batch' }, {}), bare.length + ORDER_MARKER);
+
+  const onlySize = 'Requested size: S\n\nPart of "Batch"\n';
+  orderAssert.equal(orderTextLength({ title: 'Batch' }, { size: 'S' }), onlySize.length + ORDER_MARKER);
+});
+
+orderLimitTest('a subtask at exactly the limit passes', () => {
+  const batch = orderBatch([]);
+  const description = descriptionFor(batch, ORDER_LIMITS.builderOrder);
+  batch.subtasks = [{ title: 'Fits', description }];
+  orderAssert.equal(orderTextLength(batch, batch.subtasks[0]), ORDER_LIMITS.builderOrder);
+  orderAssert.deepEqual(oversizedOrders(batch), []);
+  const stored = orderDispatchBatch({}, batch);
+  orderAssert.equal(stored.subtasks[0].description, description);
+});
+
+orderLimitTest('one character over is listed and refused, naming the subtask', () => {
+  const batch = orderBatch([]);
+  batch.subtasks = [
+    { title: 'Small', description: 'short' },
+    { key: 'big', title: 'Big', description: descriptionFor(batch, ORDER_LIMITS.builderOrder + 1) },
+  ];
+  orderAssert.deepEqual(oversizedOrders(batch), [{ key: 'big', title: 'Big', length: 6001, limit: 6000 }]);
+  const state = {};
+  orderAssert.throws(
+    () => orderDispatchBatch(state, batch),
+    (err) => err.status === 400 || /subtask big \("Big"\) order is 6001 characters; the builder sees only 6000/.test(err.message),
+  );
+  orderAssert.throws(() => orderDispatchBatch(state, batch), /subtask big \("Big"\) order is 6001 characters; the builder sees only 6000/);
+  orderAssert.deepEqual(state.foundryBatches, []);
+  orderAssert.equal(state.nextBatchNumber, 1);
+});
+
+orderLimitTest('the key of an oversized subtask defaults to its 1-based position', () => {
+  const batch = orderBatch([{ title: 'A' }, { title: 'B', description: 'y'.repeat(7000) }]);
+  orderAssert.deepEqual(oversizedOrders(batch).map((o) => o.key), ['2']);
+});
+
+orderLimitTest('a long goal alone pushes every subtask over', () => {
+  const batch = orderBatch([{ title: 'A', description: 'a' }, { title: 'B', description: 'b' }], { goal: 'g'.repeat(ORDER_LIMITS.builderOrder) });
+  orderAssert.deepEqual(oversizedOrders(batch).map((o) => o.key), ['1', '2']);
+  orderAssert.throws(() => orderDispatchBatch({}, batch), (err) => /subtask 1 /.test(err.message) && /subtask 2 /.test(err.message));
+});
+
+orderLimitTest('stored batches with long descriptions still load', () => {
+  const state = {};
+  const at = '2026-01-01T00:00:00.000Z';
+  const result = orderImportBatches(state, [{
+    id: 'S-007',
+    status: 'done',
+    title: 'Old batch',
+    repo: 'owner/name',
+    createdAt: at,
+    updatedAt: at,
+    subtasks: [{ key: '1', title: 'Long', description: 'd'.repeat(13500) }],
+  }]);
+  orderAssert.deepEqual(result.rejected, []);
+  orderAssert.equal(result.added, 1);
+  orderAssert.equal(orderGetBatch(state, 'S-007').subtasks[0].description.length, 13500);
+});
