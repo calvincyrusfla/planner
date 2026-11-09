@@ -9,6 +9,7 @@ import path from 'node:path';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { metricLines } from './lib/foundry-metrics.mjs';
+import { watchEvents } from './lib/foundry-watch.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
 
 // Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY is set
@@ -79,6 +80,11 @@ const HELP = `Agent Department CLI
                                                        Answer a subtask in needs_help
   node department/dept.mjs foundry metrics [--json]    Latest metrics report of each Foundry service:
                                                        totals and per-task rows
+  node department/dept.mjs foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]
+                                                       Wait until a batch needs attention: prints
+                                                       HELP/DONE/FAIL/BATCH/STALE lines and exits.
+                                                       Without ids: every open batch and new ones
+                                                       (--interval default 30, min 5; --timeout 6900)
   node department/dept.mjs json                        Dump the full state
   node department/dept.mjs reset                       Wipe all tasks and reset the teams
 
@@ -568,7 +574,7 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..."';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..." | foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
 // "Title::description::file1,file2::S::read1,read2" → subtask. Empty parts are skipped.
@@ -660,8 +666,78 @@ async function foundryMetricsCommand(opt) {
   }
 }
 
+const WATCH_INTERVAL_S = 30;
+const WATCH_MIN_INTERVAL_S = 5;
+const WATCH_TIMEOUT_S = 6900; // 1 h 55 min, so it fits a 2-hour background job limit
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A positive number of seconds, or the default when the option is absent.
+function secondsArg(value, fallback, name) {
+  if (value === undefined) return fallback;
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+  if (!Number.isFinite(n) || n <= 0) throw new core.DeptError(`${name} must be a number of seconds\n${FOUNDRY_HELP}`);
+  return n;
+}
+
+// `foundry watch`: polls the board and exits on the first poll with an event.
+// The first successful read is the snapshot and also the first poll, so a
+// question already waiting ends the watch at once. watchEvents decides what
+// counts; this only polls and prints.
+async function foundryWatchCommand(args, opt) {
+  // `watch --json S-001`: --json is a plain flag here, so its "value" is an id.
+  if (typeof opt.json === 'string') {
+    args = [opt.json, ...args];
+    opt.json = true;
+  }
+  const intervalMs = Math.max(WATCH_MIN_INTERVAL_S, secondsArg(opt.interval, WATCH_INTERVAL_S, '--interval')) * 1000;
+  const timeoutS = secondsArg(opt.timeout, WATCH_TIMEOUT_S, '--timeout');
+  const wanted = new Set(args.map((id) => String(id).toUpperCase()));
+  const isOpen = (b) => OPEN_BATCH.has(b.status);
+  const finish = (events, message) => {
+    if (opt.json) console.log(JSON.stringify(message ? { events, message } : { events }, null, 2));
+    else console.log(message || events.map((e) => e.line).join('\n'));
+  };
+
+  const deadline = Date.now() + timeoutS * 1000;
+  let before = null;
+  let isWatched = null;
+  let watched = [];
+  let warned = false;
+  for (;;) {
+    let all = null;
+    try {
+      all = (await currentState()).foundryBatches || [];
+    } catch (err) {
+      if (!warned) (opt.json ? console.error : console.log)(`WARN could not read the board: ${err.message}; still watching`);
+      warned = true;
+    }
+    if (all) {
+      if (!before) {
+        before = all;
+        const missing = [...wanted].find((id) => !all.some((b) => b.id === id));
+        if (missing) throw new core.DeptError(`No Foundry batch ${missing}`, 404);
+        const known = new Set(all.map((b) => b.id));
+        const openAtStart = new Set(all.filter(isOpen).map((b) => b.id));
+        isWatched = (b) => (wanted.size ? wanted.has(b.id) : openAtStart.has(b.id) || !known.has(b.id));
+        // A closed batch can't change any more, so waiting on one would only time out.
+        if (!all.filter(isWatched).some(isOpen)) return finish([], 'No open Foundry batches');
+      }
+      watched = all.filter(isWatched);
+      const events = watchEvents(before, watched, core.clockNow());
+      if (events.length) return finish(events);
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(intervalMs, left));
+  }
+  const open = before ? watched.filter(isOpen).map((b) => b.id) : [...wanted];
+  finish([], `TIMEOUT no events in ${Math.round(timeoutS / 60)} min; still open: ${open.join(', ') || '—'}`);
+}
+
 async function foundryCommand(sub, args, opt) {
   if (sub === 'metrics') return foundryMetricsCommand(opt);
+  if (sub === 'watch') return foundryWatchCommand(args, opt);
   switch (sub) {
     case 'dispatch': {
       let batch;
