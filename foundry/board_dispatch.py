@@ -712,7 +712,7 @@ class BatchWatcher:
         if base is not None and not valid_ref(base):
             # the board checks this too; never hand git anything that could read as an option
             raise ValueError(f"the batch base {base[:80]!r} is not a plain branch name")
-        explicit = [str(f).strip() for f in (sub.get("read_files") or []) if str(f).strip()]
+        explicit = [str(f).strip() for f in (sub.get("readFiles") or sub.get("read_files") or []) if str(f).strip()]
         read_files = list(dict.fromkeys(explicit + self._related_tests(fields["files"])))
         order = WorkOrder(title=fields["title"], description=desc, files=fields["files"],
                           read_files=read_files, acceptance_criteria=acceptance,
