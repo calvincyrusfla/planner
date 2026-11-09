@@ -1,0 +1,578 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f6f2;
+  --surface: #ffffff;
+  --surface-alt: #e8f0fb;
+  --text: #1f2328;
+  --muted: #565e66;
+  --border: #c9cdd2;
+  --accent: #1f5fbf;
+  --on-mark: #ffffff;
+  --got: #1b7a43;
+  --learning: #a35600;
+  --error-bg: #fdecea;
+  --error-border: #b3261e;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181c;
+    --surface: #20252b;
+    --surface-alt: #1f3350;
+    --text: #eceef0;
+    --muted: #a9b1b9;
+    --border: #424a52;
+    --accent: #8ab8ff;
+    --on-mark: #14171a;
+    --got: #6fd39b;
+    --learning: #f5b562;
+    --error-bg: #3b1f1d;
+    --error-border: #f2a59f;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0 auto;
+  padding: 1rem;
+  max-width: 44rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 1rem/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow-wrap: anywhere;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.4rem;
+  line-height: 1.25;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.guide-source,
+.fc-position,
+.fc-tally,
+.placeholder {
+  color: var(--muted);
+}
+
+.guide-source {
+  margin: 0.25rem 0 0;
+}
+
+.load-error {
+  padding: 1rem;
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 8px;
+}
+
+.load-error h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin: 1rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  flex: 1 1 0;
+  min-height: 44px;
+  padding: 0.25rem;
+  background: none;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  cursor: pointer;
+}
+
+.tab[aria-selected="true"] {
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.btn {
+  flex: 1 1 0;
+  min-height: 44px;
+  padding: 0.25rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.fc-status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0 1rem;
+}
+
+.fc-status p {
+  margin: 0;
+}
+
+.fc-filter {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.fc-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1rem;
+  width: 100%;
+  min-height: 14rem;
+  padding: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.fc-card.is-flipped {
+  background: var(--surface-alt);
+}
+
+.fc-side {
+  display: block;
+  margin-bottom: 0.75rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.fc-text {
+  display: block;
+  font-size: 1.2rem;
+}
+
+.fc-hint {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.fc-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.fc-mark-got.is-active {
+  background: var(--got);
+  border-color: var(--got);
+  color: var(--on-mark);
+}
+
+.fc-mark-learning.is-active {
+  background: var(--learning);
+  border-color: var(--learning);
+  color: var(--on-mark);
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Notes */
+.note-card {
+  margin: 0 0 0.75rem;
+  padding: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  scroll-margin-top: 1rem;
+}
+
+.note-card.is-target {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.note-term {
+  margin: 0 0 0.25rem;
+  font-size: 1.125rem;
+}
+
+.note-definition {
+  margin: 0;
+}
+
+.note-details {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+}
+
+/* Practice quiz */
+.quiz-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 1.25rem;
+  margin-bottom: 0.5rem;
+}
+
+.quiz-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  cursor: pointer;
+}
+
+.quiz-option input,
+.quiz-choice input {
+  flex: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+}
+
+.quiz-options-note,
+.quiz-status,
+.quiz-best {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.quiz-options-note {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.quiz-status {
+  margin: 0.5rem 0;
+}
+
+.quiz-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.quiz-prompt {
+  max-width: 100%;
+  margin-bottom: 0.75rem;
+  padding: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+}
+
+.quiz-choice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.625rem;
+  min-height: 2.75rem;
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.quiz-choice-text {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.quiz-choice.is-correct {
+  border-color: var(--got);
+  box-shadow: inset 0 0 0 1px var(--got);
+}
+
+.quiz-choice.is-wrong {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+}
+
+.quiz-tag {
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.is-correct .quiz-tag {
+  color: var(--got);
+}
+
+.quiz-message {
+  margin: 0.25rem 0;
+  color: var(--error-border);
+}
+
+.quiz-message:empty {
+  display: none;
+}
+
+.quiz-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.quiz-btn {
+  min-height: 2.75rem;
+  padding: 0.5rem 1rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.quiz-btn-primary {
+  background: var(--accent);
+  color: var(--on-mark);
+}
+
+.quiz-feedback {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 0.5rem;
+}
+
+.quiz-feedback.is-right {
+  border-left-color: var(--got);
+}
+
+.quiz-feedback.is-wrong {
+  border-left-color: var(--error-border);
+}
+
+.quiz-result {
+  margin: 0 0 0.25rem;
+  font-weight: 700;
+}
+
+.is-right .quiz-result {
+  color: var(--got);
+}
+
+.is-wrong .quiz-result {
+  color: var(--error-border);
+}
+
+.quiz-explanation {
+  margin: 0 0 0.5rem;
+}
+
+.quiz-verify {
+  margin: 0 0 0.5rem;
+  color: var(--learning);
+  font-size: 0.875rem;
+}
+
+.quiz-concepts-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.quiz-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 1rem;
+}
+
+.quiz-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  color: var(--accent);
+}
+
+.quiz-end-title {
+  margin: 0.5rem 0;
+}
+
+.quiz-score {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+.quiz-percent {
+  margin: 0 0 0.25rem;
+  font-size: 1.25rem;
+}
+
+.quiz-best {
+  margin: 0 0 0.75rem;
+}
+
+.quiz-missed-title {
+  margin: 1rem 0 0.5rem;
+  font-size: 1rem;
+}
+
+.quiz-missed {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.quiz-missed li {
+  margin-bottom: 0.5rem;
+}
+
+.quiz-missed-prompt,
+.quiz-missed-answer {
+  margin: 0;
+}
+
+.quiz-missed-answer {
+  color: var(--muted);
+}
+
+/* Only printed: see the print rules below. */
+.answer-key {
+  display: none;
+}
+
+@media (max-width: 30rem) {
+  .quiz-actions .quiz-btn {
+    flex: 1 1 100%;
+  }
+}
+
+@media print {
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --surface: #ffffff;
+    --surface-alt: #ffffff;
+    --text: #000000;
+    --muted: #333333;
+    --border: #999999;
+    --accent: #000000;
+    --learning: #000000;
+  }
+
+  body {
+    max-width: none;
+    padding: 0;
+    font-size: 11pt;
+  }
+
+  .tabs,
+  #panel-flashcards,
+  #panel-quiz {
+    display: none !important;
+  }
+
+  #panel-notes,
+  #panel-notes[hidden] {
+    display: block !important;
+  }
+
+  .panel {
+    padding: 0;
+    border: 0;
+    box-shadow: none;
+  }
+
+  .note-card {
+    padding: 0.5rem 0;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
+    box-shadow: none;
+    break-inside: avoid;
+  }
+
+  .answer-key {
+    display: block;
+    break-before: page;
+  }
+
+  .answer-key-list {
+    padding-left: 1.5rem;
+  }
+
+  .answer-key-list li {
+    margin-bottom: 0.75rem;
+    break-inside: avoid;
+  }
+
+  .answer-key-list p {
+    margin: 0;
+  }
+
+  .answer-key-prompt,
+  .answer-key-answer {
+    font-weight: 700;
+  }
+}
+
+.notes-search {
+  margin-bottom: 1rem;
+}
+
+.notes-search-label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-weight: 600;
+}
+
+.notes-search-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.notes-search-input:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.notes-search-status {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+@media print {
+  .notes-search {
+    display: none !important;
+  }
+
+  /* A printout always has every note, whatever the search box last filtered. */
+  .note-card[hidden] {
+    display: block !important;
+  }
+}
