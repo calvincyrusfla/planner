@@ -1,21 +1,28 @@
-// Validates a study guide data file against the data contract.
-// Usage: node study/geology-ch5/check-data.mjs [path/to/data.js]
+// Validates a study guide's data files, loaded in order, against the data contract.
+// Usage: node study/geology-ch5/check-data.mjs [path/to/data.js [path/to/data-2.js ...]]
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 const EXPECTED_QUESTIONS = 25;
+const DEFAULT_FILES = ['data.js', 'data-2.js', 'data-3.js', 'data-4.js'];
 
 function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function loadData(file) {
-  const source = readFileSync(file, 'utf8');
+function loadData(files) {
   const sandbox = { window: {} };
   vm.createContext(sandbox);
-  vm.runInContext(source, sandbox, { filename: file, timeout: 5000 });
+  for (const file of files) {
+    try {
+      const source = readFileSync(file, 'utf8');
+      vm.runInContext(source, sandbox, { filename: file, timeout: 5000 });
+    } catch (err) {
+      throw new Error(`could not load ${file}: ${err && err.message ? err.message : err}`);
+    }
+  }
   return sandbox.window.STUDY_DATA;
 }
 
@@ -106,15 +113,18 @@ function validate(data) {
 
 function main() {
   const here = dirname(fileURLToPath(import.meta.url));
-  const file = process.argv[2] ? resolve(process.argv[2]) : join(here, 'data.js');
+  const args = process.argv.slice(2);
+  const files = args.length > 0
+    ? args.map((arg) => resolve(arg))
+    : DEFAULT_FILES.map((name) => join(here, name));
 
   let data;
   let problems;
   try {
-    data = loadData(file);
+    data = loadData(files);
     problems = validate(data);
   } catch (err) {
-    problems = [`could not load ${file}: ${err && err.message ? err.message : err}`];
+    problems = [err && err.message ? err.message : String(err)];
   }
 
   if (problems.length > 0) {

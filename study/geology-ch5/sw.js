@@ -4,13 +4,16 @@
 // a pre-cached file changes: serving is cache-first, so returning visitors
 // only get new files when a new cache is installed.
 const CACHE_PREFIX = 'geology-ch5-';
-const CACHE_NAME = CACHE_PREFIX + 'v1';
+const CACHE_NAME = CACHE_PREFIX + 'v2';
 const PRECACHE_URLS = [
   './',
   'index.html',
   'study.css',
   'app.js',
   'data.js',
+  'data-2.js',
+  'data-3.js',
+  'data-4.js',
   'manifest.webmanifest',
   'icon.svg',
 ];

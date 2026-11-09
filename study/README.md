@@ -16,7 +16,7 @@ Service workers do not run on pages opened from disk, and they are not needed th
 ## Adding a new guide
 
 1. Copy `study/geology-ch5/` to a new folder, for example `study/biology-ch2/`.
-2. Replace `data.js` in the new folder with the new guide's content. Keep the same `window.STUDY_DATA` format.
+2. Replace `data.js` in the new folder with the new guide's content. Keep the same `window.STUDY_DATA` format. Questions can be split across `data.js` plus extra `data-N.js` files that push onto `window.STUDY_DATA.questions`. Each extra file must be listed in `index.html` (after `data.js` and before `app.js`), in `PRECACHE_URLS` in `sw.js` and in `DEFAULT_FILES` in `check-data.mjs`. If the new guide does not need one of the copied extra files, delete it and remove it from those three lists.
 3. In the new folder's `sw.js`, change `CACHE_PREFIX` to a name unique to the guide, for example `'biology-ch2-'`. Guides on the same site share cache storage, so this keeps them from deleting each other's files.
 4. In `manifest.webmanifest`, change `name`, `short_name` and `description`. Update any chapter-specific text in `index.html`.
 5. If the guide does not have 25 questions, change `EXPECTED_QUESTIONS` at the top of the new folder's `check-data.mjs`.
@@ -30,8 +30,8 @@ The check script needs Node and no other dependencies. From the repository root,
 
     node study/geology-ch5/check-data.mjs
 
-To validate another data file, pass its path, either absolute or relative to the folder you run the command from. The file is held to the question count set in the check script you run:
+With no arguments, the script loads `data.js` and the guide's extra `data-N.js` files in order and validates the combined data. To validate other data files, pass one or more paths, either absolute or relative to the folder you run the command from. They are loaded in the order given and held together to the question count set in the check script you run:
 
     node study/geology-ch5/check-data.mjs path/to/data.js
 
-The script prints `OK: 25 questions, N concepts` and exits with code 0 when the data is valid. Otherwise it prints each problem and exits with code 1, including when the file is missing or cannot be parsed.
+The script prints `OK: 25 questions, N concepts` and exits with code 0 when the data is valid. Otherwise it prints each problem and exits with code 1, including when a file is missing or cannot be parsed, and it names that file.
