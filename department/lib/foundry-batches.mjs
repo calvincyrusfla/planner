@@ -38,6 +38,7 @@ export const LIMITS = Object.freeze({
   error: 2000,
   note: 2000,
   help: 4000,
+  answer: 6000,
   helpOptions: 20,
   keep: 200, // batches kept on the board; the oldest finished ones go first
 });
@@ -375,7 +376,7 @@ export function answerHelp(state, { id, key, answer, by } = {}) {
   if (!b.subtasks.some((s) => s.key === k)) throw bad(`batch ${b.id} has no subtask ${k}`);
   const result = b.results[k];
   if (result?.state !== 'needs_help') throw new DeptError(`${b.id} subtask ${k} is ${result?.state || 'queued'}, not needs_help`, 409);
-  const reply = text(answer, 'answer', LIMITS.help, { required: true });
+  const reply = text(answer, 'answer', LIMITS.answer, { required: true });
   const who = text(by, 'by', 100) || 'user';
   const iso = now();
   result.state = 'answered';
@@ -453,7 +454,7 @@ function validateImported(raw) {
       const help = clean.help && {
         ...clean.help,
         ...(r.help.answer ? {
-          answer: text(r.help.answer, 'help answer', LIMITS.help),
+          answer: text(r.help.answer, 'help answer', LIMITS.answer),
           answeredBy: text(r.help.answeredBy, 'help answeredBy', 100) || 'user',
           answeredAt: iso(r.help.answeredAt, 'help answeredAt'),
         } : {}),

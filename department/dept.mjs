@@ -11,6 +11,7 @@ import { applyOp } from './lib/ops.mjs';
 import { metricLines } from './lib/foundry-metrics.mjs';
 import { watchEvents } from './lib/foundry-watch.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
+import { LIMITS as BATCH_LIMITS } from './lib/foundry-batches.mjs';
 
 // Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY is set
 // (Node 22.21+). Behind a proxy, as in Claude cloud sessions, re-run this
@@ -787,6 +788,11 @@ async function foundryCommand(sub, args, opt) {
       return foundryHelpCommand();
     case 'answer': {
       if (!args[0] || !args[1] || typeof opt.guidance !== 'string') throw new core.DeptError(FOUNDRY_HELP);
+      // Trimmed, because that is the length the board checks.
+      const answerLength = opt.guidance.trim().length;
+      if (answerLength > BATCH_LIMITS.answer) {
+        throw new core.DeptError(`The answer is too long: ${answerLength} characters (max ${BATCH_LIMITS.answer} characters). Name repo-relative files for the builder to read instead of pasting code.`);
+      }
       const r = await batchOp('answerHelp', { id: String(args[0]).toUpperCase(), key: args[1], answer: opt.guidance, by: typeof opt.by === 'string' ? opt.by : 'cli' });
       console.log(`${r.batch.id} subtask ${args[1]} answered`);
       return;

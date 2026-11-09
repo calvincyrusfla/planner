@@ -1,6 +1,8 @@
 // The needs_help / answered result states and the answerHelp operation.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { DeptError } from '../lib/core.mjs';
 import {
   LIMITS,
@@ -131,7 +133,7 @@ test('answerHelp refuses bad requests and leaves the subtask waiting', () => {
   refuses(() => answerHelp(state, { id, key: 'b', answer: 'go' }), /subtask b is queued, not needs_help/);
   refuses(() => answerHelp(state, { id, key: 'a', answer: '   ' }), /answer is required/);
   refuses(() => answerHelp(state, { id, key: 'a' }), /answer is required/);
-  refuses(() => answerHelp(state, { id, key: 'a', answer: 'x'.repeat(LIMITS.help + 1) }), /answer is too long/);
+  refuses(() => answerHelp(state, { id, key: 'a', answer: 'x'.repeat(LIMITS.answer + 1) }), /answer is too long/);
   assert.equal(resultOf(state, id).state, 'needs_help');
   assert.deepEqual(resultOf(state, id).help, HELP);
 });
@@ -199,4 +201,46 @@ test('import rejects needs_help without a help object', () => {
   assert.equal(result.added, 0);
   assert.equal(result.rejected.length, 1);
   assert.match(result.rejected[0].reason, /needs_help requires a help object/);
+});
+
+test('an answer of 6000 characters is accepted and stored', () => {
+  const { state, id } = waiting();
+  const answer = 'x'.repeat(6000);
+  answerHelp(state, { id, key: 'a', answer });
+  assert.equal(resultOf(state, id).state, 'answered');
+  assert.equal(resultOf(state, id).help.answer, answer);
+});
+
+test('an answer of 6001 characters is refused', () => {
+  const { state, id } = waiting();
+  refuses(() => answerHelp(state, { id, key: 'a', answer: 'x'.repeat(6001) }), /max 6000/);
+  assert.equal(resultOf(state, id).state, 'needs_help');
+});
+
+test('import keeps a stored answer longer than the help limit', () => {
+  const state = {};
+  const answer = 'x'.repeat(5000);
+  const help = { question: 'q', answer, answeredBy: 'cal', answeredAt: '2026-01-02T00:00:00.000Z' };
+  const result = importBatches(state, [importedBatch({ state: 'answered', help })]);
+  assert.equal(result.added, 1);
+  assert.deepEqual(result.rejected, []);
+  assert.equal(resultOf(state, 'S-007').help.answer, answer);
+});
+
+test('the help question limit stays 4000', () => {
+  const { state, id } = claimed();
+  assert.equal(LIMITS.help, 4000);
+  refuses(() => report(state, id, { a: { state: 'needs_help', help: { question: 'x'.repeat(4001) } } }), /max 4000/);
+  assert.equal(resultOf(state, id), undefined);
+  report(state, id, { a: { state: 'needs_help', help: { question: 'x'.repeat(4000) } } });
+  assert.equal(resultOf(state, id).state, 'needs_help');
+});
+
+test('the CLI refuses an answer over the limit before it reaches the board', () => {
+  const cli = fileURLToPath(new URL('../dept.mjs', import.meta.url));
+  const run = spawnSync(process.execPath, [cli, 'foundry', 'answer', 'S-001', 'a', '--guidance', 'x'.repeat(6001)], { encoding: 'utf8' });
+  assert.notEqual(run.status, 0);
+  const output = `${run.stderr}${run.stdout}`;
+  assert.match(output, /too long: 6001 characters \(max 6000 characters\)/);
+  assert.match(output, /repo-relative files/);
 });
