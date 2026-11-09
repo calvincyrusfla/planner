@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as core from '../lib/core.mjs';
 import { applyOp, OP_TYPES } from '../lib/ops.mjs';
-import { TAKEOVER_MS } from '../lib/foundry-batches.mjs';
+import { TAKEOVER_MS, LIMITS, importBatches, normalizeBatches, orderTextLength, oversizedOrderMessage, oversizedOrders } from '../lib/foundry-batches.mjs';
 import { makeHandler } from '../../netlify/functions/department.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -475,4 +475,82 @@ test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------- order length limit ----------
+
+test('LIMITS: builderOrder is 6000; description and goal stay 20000', () => {
+  assert.equal(LIMITS.builderOrder, 6000);
+  assert.equal(LIMITS.description, 20000);
+  assert.equal(LIMITS.goal, 20000);
+});
+
+test('orderTextLength matches the order text Foundry composes', () => {
+  const marker = '\n' + 'm'.repeat(100); // the allowance for the marker line
+  const full = 'do it\n\nRequested size: M\n\nPart of "T": the goal' + marker;
+  assert.equal(orderTextLength({ title: 'T', goal: 'the goal' }, { description: 'do it', size: 'm' }), full.length);
+  const bare = 'do it\n\nPart of "T"' + marker;
+  assert.equal(orderTextLength({ title: 'T' }, { description: 'do it' }), bare.length);
+});
+
+test('dispatchBatch takes an order of exactly 6000 characters and refuses 6001', () => {
+  const empty = orderTextLength({ title: 'Two things' }, { description: '' });
+  const subtasks = (n) => [{ key: 'big', title: 'Big', description: 'x'.repeat(n - empty - 2) }];
+  const s = fresh();
+  const b = op(s, 'dispatchBatch', sample({ subtasks: subtasks(6000) }));
+  assert.equal(b.id, 'S-001');
+  assert.equal(orderTextLength(b, b.subtasks[0]), 6000);
+  assert.throws(
+    () => op(s, 'dispatchBatch', sample({ subtasks: subtasks(6001) })),
+    (e) => e.status === 400 && /big/.test(e.message) && /6000/.test(e.message),
+  );
+  assert.equal(s.foundryBatches.length, 1);
+  assert.equal(s.nextBatchNumber, 2);
+});
+
+test('a 6000-character goal makes every subtask oversized', () => {
+  const goal = 'g'.repeat(6000);
+  const over = oversizedOrders(sample({ goal }));
+  assert.deepEqual(over.map((o) => o.key), ['1', '2']);
+  assert.ok(over.every((o) => o.limit === 6000 && o.length > 6000));
+  const s = fresh();
+  assert.throws(() => op(s, 'dispatchBatch', sample({ goal })), /subtask 1 [\s\S]*subtask 2 /);
+  assert.equal(s.foundryBatches.length, 0);
+});
+
+test('stored batches with long descriptions still load', () => {
+  const stored = () => ({
+    id: 'S-001', title: 'Old', repo: 'me/planner', status: 'queued',
+    createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    subtasks: [{ key: '1', title: 'Long', description: 'x'.repeat(13500) }],
+    results: {},
+  });
+  const imported = fresh();
+  const r = importBatches(imported, [stored()]);
+  assert.equal(r.added, 1);
+  assert.deepEqual(r.rejected, []);
+  assert.equal(imported.foundryBatches[0].subtasks[0].description.length, 13500);
+  const loaded = fresh();
+  loaded.foundryBatches = [stored()];
+  normalizeBatches(loaded);
+  assert.equal(loaded.foundryBatches.length, 1);
+  assert.equal(loaded.foundryBatches[0].subtasks[0].description.length, 13500);
+});
+
+test('orderTextLength handles size only, goal only and a missing description', () => {
+  const marker = '\n' + 'm'.repeat(100);
+  const len = (s) => (s + marker).length;
+  assert.equal(orderTextLength({ title: 'T' }, { description: 'do it', size: 'l' }), len('do it\n\nRequested size: L\n\nPart of "T"'));
+  assert.equal(orderTextLength({ title: 'T' }, { description: 'do it', size_hint: 'xl' }), len('do it\n\nRequested size: XL\n\nPart of "T"'));
+  assert.equal(orderTextLength({ title: 'T', goal: 'the goal' }, { description: 'do it' }), len('do it\n\nPart of "T": the goal'));
+  assert.equal(orderTextLength({ title: 'T', goal: '  the goal  ' }, { description: 'do it' }), len('do it\n\nPart of "T": the goal'));
+  assert.equal(orderTextLength({ title: 'T' }, { size: 'S' }), len('Requested size: S\n\nPart of "T"'));
+  assert.equal(orderTextLength({ title: 'T' }, {}), len('Part of "T"'));
+});
+
+test('oversizedOrderMessage names the subtask, its length and the limit', () => {
+  assert.equal(
+    oversizedOrderMessage({ key: 'big', title: 'Big', length: 6001, limit: 6000 }),
+    'subtask big ("Big") order is 6001 characters; the builder sees only 6000 (description + goal + title). Shorten it, move detail into readFiles, or split the subtask.',
+  );
 });
