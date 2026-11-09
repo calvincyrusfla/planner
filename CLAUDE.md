@@ -25,7 +25,7 @@ When the prompt is `answer the dashboard help request` (the dashboard's "Answer 
 
 1. Run `node department/dept.mjs foundry help`. It lists every subtask in `needs_help` with its batch id, key, question and context.
 2. For each one, read the order (`node department/dept.mjs foundry poll <S-id> --json`) and the code the builder asks about. The builder cannot use tools; it only sees what Foundry puts in its prompt.
-3. Answer with `node department/dept.mjs foundry answer <S-id> <key> --guidance "..."`. Give the facts it lacks directly: exact names, signatures, where things are, what to leave alone, a simpler approach when the one it is stuck on needs code it cannot see. Name repo-relative file paths in the answer when the builder should read a file: Foundry adds files named there to its read-only files. Keep it under 6,000 characters.
+3. Answer with `node department/dept.mjs foundry answer <S-id> <key> --guidance "..."`. Give the facts it lacks directly: exact names, signatures, where things are, what to leave alone, a simpler approach when the one it is stuck on needs code it cannot see. Name repo-relative file paths in the answer when the builder should read a file: Foundry adds files named there to its read-only files. Keep it under 6,000 characters (the board refuses longer answers).
 4. Do not build the piece yourself and do not dispatch a new batch for it: answering resumes the same piece at its next attempt. If the order itself is wrong, say so to the user instead of answering.
 5. When done, tell the user in a few lines which pieces you answered and what you told them.
 
