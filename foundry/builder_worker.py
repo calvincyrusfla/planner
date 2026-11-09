@@ -461,7 +461,7 @@ def _read_only_touched(files: Iterable[str], assignment: TaskAssignment) -> list
     return [f for f in files if _read_only_path(f) in protected]
 
 
-MAX_ORDER_DETAILS_CHARS = 6000  # cap on the work-order text quoted in builder and reviewer prompts
+MAX_ORDER_DETAILS_CHARS = 24000  # cap on the work-order text quoted in builder and reviewer prompts; equals LIMITS.builderOrder in department/lib/foundry-batches.mjs
 
 
 def _capped_order_text(text: str, label: str) -> str:

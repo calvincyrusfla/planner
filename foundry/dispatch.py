@@ -83,7 +83,7 @@ MAX_ACCEPTANCE = 50
 MAX_GOAL = 20_000
 # Equal to foundry.builder_worker.MAX_ORDER_DETAILS_CHARS (a test checks it); not imported so that
 # this module, used from cloud sessions, does not load the builder at import time.
-MAX_BUILDER_ORDER = 6000
+MAX_BUILDER_ORDER = 24000
 _MARKER_PLACEHOLDER = "x" * 100  # stands in for the batch marker line, unknown until the board assigns an id
 
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
