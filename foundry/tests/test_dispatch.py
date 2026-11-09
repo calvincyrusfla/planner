@@ -573,8 +573,19 @@ def test_read_files_rejects_too_many() -> None:
 # --------------------------------------------------------------------------- builder order limit
 
 
-# What the composed order adds to a description for batch title "T", no size, no goal.
-_ORDER_OVERHEAD = len('\n\nPart of "T"\n') + 100
+def _parts_for(total: int, *, size: Any = None) -> tuple[str, str]:
+    """A description and goal whose composed order (batch title "T") is exactly ``total`` characters."""
+    from foundry.board_dispatch import order_text
+
+    description = "x" * d.MAX_DESCRIPTION
+
+    def length(goal: str) -> int:
+        return len(order_text(description, size, "T", goal, d._MARKER_PLACEHOLDER))
+
+    goal = "g" * (total - (length("g") - 1))
+    assert 0 < len(goal) <= d.MAX_GOAL
+    assert length(goal) == total
+    return description, goal
 
 
 def _order_batch(description: str, *, goal: str = "", size: Any = None) -> d.DispatchFoundryBatch:
@@ -595,24 +606,27 @@ def test_largest_accepted_order_reaches_the_builder_whole() -> None:
     from foundry.board_dispatch import marker, order_text
     from foundry.builder_worker import _capped_order_text
 
-    batch = _order_batch("x" * (d.MAX_BUILDER_ORDER - _ORDER_OVERHEAD))
+    description, goal = _parts_for(d.MAX_BUILDER_ORDER)
+    batch = _order_batch(description, goal=goal)
     sub = batch.subtasks[0]
-    line = marker("S-999", "big", "2026-11-09T03:49:18.361Z")
-    text = order_text(sub.description, sub.size, batch.title, batch.goal, line)
-    assert _capped_order_text(text, "order description") == text
+    for line in (d._MARKER_PLACEHOLDER, marker("S-999", "big", "2026-11-09T03:49:18.361Z")):
+        text = order_text(sub.description, sub.size, batch.title, batch.goal, line)
+        assert _capped_order_text(text, "order description") == text
     over = "x" * (d.MAX_BUILDER_ORDER + 1)
     assert _capped_order_text(over, "order description") != over
 
 
 def test_order_at_the_builder_limit_passes() -> None:
-    batch = _order_batch("x" * (d.MAX_BUILDER_ORDER - _ORDER_OVERHEAD))
+    description, goal = _parts_for(d.MAX_BUILDER_ORDER)
+    batch = _order_batch(description, goal=goal)
     assert batch.subtasks[0].key == "big"
 
 
 def test_order_one_over_the_builder_limit_fails_naming_the_key() -> None:
     limit = d.MAX_BUILDER_ORDER
+    description, goal = _parts_for(limit + 1)
     with pytest.raises(ValidationError) as err:
-        _order_batch("x" * (limit - _ORDER_OVERHEAD + 1))
+        _order_batch(description, goal=goal)
     message = str(err.value)
     assert "'big'" in message
     assert f"{limit + 1} characters" in message
@@ -622,22 +636,24 @@ def test_order_one_over_the_builder_limit_fails_naming_the_key() -> None:
 
 
 def test_long_goal_pushes_subtasks_over_the_builder_limit() -> None:
-    _order_batch("short", goal="g" * 100)
+    description, goal = _parts_for(d.MAX_BUILDER_ORDER + 1)
+    _order_batch(description, goal=goal[:-1])
     with pytest.raises(ValidationError, match="'big'"):
-        _order_batch("short", goal="g" * d.MAX_BUILDER_ORDER)
+        _order_batch(description, goal=goal)
 
 
 def test_size_line_counts_towards_the_builder_limit() -> None:
-    description = "x" * (d.MAX_BUILDER_ORDER - _ORDER_OVERHEAD)
-    _order_batch(description)
+    description, goal = _parts_for(d.MAX_BUILDER_ORDER)
+    _order_batch(description, goal=goal)
     with pytest.raises(ValidationError, match="'big'"):
-        _order_batch(description, size="M")
+        _order_batch(description, goal=goal, size="M")
 
 
 def test_dispatch_to_foundry_refuses_a_too_long_order_before_reaching_the_board() -> None:
     board = _CapturingBoard()
-    order = {"title": "T", "repo": "o/r",
-             "subtasks": [{"key": "big", "title": "Sub", "description": "x" * d.MAX_BUILDER_ORDER}]}
+    description, goal = _parts_for(d.MAX_BUILDER_ORDER + 1)
+    order = {"title": "T", "repo": "o/r", "goal": goal,
+             "subtasks": [{"key": "big", "title": "Sub", "description": description}]}
     with pytest.raises(ValidationError, match="'big'"):
         d.dispatch_to_foundry(order, board=board)
     assert board.calls == []
