@@ -11,7 +11,7 @@ import { applyOp } from './lib/ops.mjs';
 import { metricLines } from './lib/foundry-metrics.mjs';
 import { watchEvents } from './lib/foundry-watch.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
-import { LIMITS as BATCH_LIMITS } from './lib/foundry-batches.mjs';
+import { LIMITS as BATCH_LIMITS, oversizedOrders, oversizedOrderMessage } from './lib/foundry-batches.mjs';
 
 // Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY is set
 // (Node 22.21+). Behind a proxy, as in Claude cloud sessions, re-run this
@@ -754,6 +754,9 @@ async function foundryCommand(sub, args, opt) {
       for (const k of ['title', 'repo', 'base', 'goal']) if (typeof opt[k] === 'string') batch[k] = opt[k];
       if (opt.subtask) batch.subtasks = [...(Array.isArray(batch.subtasks) ? batch.subtasks : []), ...opt.subtask.map(subtaskArg)];
       if (!batch.title || !batch.repo || !Array.isArray(batch.subtasks) || !batch.subtasks.length) throw new core.DeptError(FOUNDRY_HELP);
+      // Refuse here, before anything is sent: the builder only sees the first LIMITS.builderOrder characters.
+      const over = oversizedOrders(batch);
+      if (over.length) throw new core.DeptError(over.map(oversizedOrderMessage).join('\n'));
       const b = await batchOp('dispatchBatch', { ...batch, by: typeof opt.by === 'string' ? opt.by : batch.by || 'cli' });
       console.log(`${b.id} dispatched to Foundry (${b.repo}, ${plural(b.subtasks.length, 'subtask')}): ${b.title}`);
       console.log(`  Poll with: node department/dept.mjs foundry poll ${b.id}`);
