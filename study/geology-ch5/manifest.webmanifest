@@ -1,0 +1,17 @@
+{
+  "name": "Ch. 5 Earthquakes Study Guide",
+  "short_name": "Ch5 Quakes",
+  "description": "Key-concept notes, flashcards and a practice quiz for Chapter 5: Earthquakes and Earth's Interior.",
+  "start_url": "index.html",
+  "scope": "./",
+  "display": "standalone",
+  "theme_color": "#1f3a5f",
+  "background_color": "#f7f4ee",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
