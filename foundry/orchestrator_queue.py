@@ -380,6 +380,9 @@ def plan_tickets(subtasks: list[Any]) -> list[TicketPlan]:
       of later parallel_ok tickets (which may be built at the same time); a
       parallel_ok ticket gets only its own files. So two tickets that may
       run concurrently never share a file and their diffs never collide.
+      A subtask without files of its own gets all the task's files (no
+      focus, never parallel_ok); only when no subtask of the task has files
+      does it stay unrestricted (``[]``).
     """
     own = [[_norm_file(f) for f in getattr(s, "allowed_files", []) if str(f).strip()] for s in subtasks]
 
@@ -407,9 +410,10 @@ def plan_tickets(subtasks: list[Any]) -> list[TicketPlan]:
     plans: dict[int, TicketPlan] = {}
     for pos, i in enumerate(order):
         focus = list(dict.fromkeys(own[i]))
-        if not focus:  # a subtask without files stays unrestricted (as before)
+        if not focus:  # no files of its own: all the task's files ([] only if no subtask has any)
+            task_files = list(dict.fromkeys(f for j in order for f in own[j]))
             plans[i] = TicketPlan(order_index=pos, parallel_ok=parallel[pos], focus_files=[],
-                                  allowed_files=[])
+                                  allowed_files=task_files)
             continue
         extra: list[str] = []
         if not parallel[pos]:
