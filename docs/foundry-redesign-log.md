@@ -42,3 +42,6 @@ Lessons from running the prototype (Nov 2026). Each entry: what happened, what i
 - **One name per field across the whole system.** The board stored `readFiles` and Foundry read `read_files`, so every reference file in every batch was silently dropped (fixed in #39). v2: one shared schema, generated for both JavaScript and Python, with a test that sends a real batch end to end.
 - **Check a PR against the plan, not just the tests.** #38 merged with the help answer in a different shape from the plan and its board operation never registered, so the feature could not be used. v2: the reviewer checks every point of the order's contract.
 - **Keep what the builder actually saw.** Without saved prompts we could only guess why builders said information was missing (#40 now saves them). v2: every prompt and reply is kept and linked from the task.
+
+## Agency Warehouse (v2) ideas
+- **Answer help requests from the phone.** The PC dashboard's "Answer with Claude" button opens Claude Code on the PC. v2: the online board gets the same button, opening a claude.ai Claude Code session with the prompt filled in (or a notification plus a copy-the-prompt button if pre-filled links are not supported).
