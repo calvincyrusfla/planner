@@ -424,6 +424,49 @@ test('hub function: two concurrent claims, exactly one wins (compare-and-swap)',
 });
 
 // ---------- CLI (file mode) ----------
+test('CLI foundry dispatch refuses an over-long order before sending anything', () => {
+  const cli = fileURLToPath(new URL('../dept.mjs', import.meta.url));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dept-oversize-'));
+  const dead = 'http://127.0.0.1:9'; // nothing listens there
+  // DEPT_URL too, so a dashboard running on this PC is never used.
+  const base = { ...process.env, DEPT_URL: dead, HTTPS_PROXY: '', https_proxy: '' };
+  const hubEnv = { ...base, DEPT_HUB: '', DEPT_HUB_URL: dead, DEPT_DATA: path.join(dir, 'hub-run.json') };
+  const fileEnv = { ...base, DEPT_HUB: 'off', DEPT_DATA: path.join(dir, 'file-run.json') };
+  const cmd = (env, ...args) => spawnSync(process.execPath, [cli, ...args], { env, encoding: 'utf8' });
+  const dispatch = (env, title, description) => cmd(env, 'foundry', 'dispatch', '--title', 'T', '--repo', 'me/p', '--subtask', `${title}::${description}`);
+  const longText = 'x'.repeat(7000);
+  try {
+    // (a) Dead hub, long order: refused without trying the hub.
+    const refused = dispatch(hubEnv, 'Long', longText);
+    const refusedOut = refused.stdout + refused.stderr;
+    assert.notEqual(refused.status, 0);
+    assert.match(refusedOut, /subtask 1 \("Long"\) order is \d+ characters/);
+    assert.ok(refusedOut.includes('6000'), refusedOut);
+    assert.doesNotMatch(refusedOut, /unreachable|ECONNREFUSED|fetch failed/i);
+
+    // (b) Dead hub, short order: fails on the hub, so (a) stopped before it.
+    const shortOnDeadHub = dispatch(hubEnv, 'Short', 'short description');
+    const shortOut = shortOnDeadHub.stdout + shortOnDeadHub.stderr;
+    assert.notEqual(shortOnDeadHub.status, 0);
+    assert.ok(!shortOut.includes('order is'), shortOut);
+    assert.match(shortOut, /unreachable/i);
+
+    // (c) File mode: the long order leaves the board empty, a short one dispatches.
+    const refusedLocal = dispatch(fileEnv, 'Long', longText);
+    assert.notEqual(refusedLocal.status, 0);
+    assert.ok((refusedLocal.stdout + refusedLocal.stderr).includes('order is'));
+    const after = cmd(fileEnv, 'json');
+    assert.equal(after.status, 0, after.stderr);
+    assert.equal((JSON.parse(after.stdout).foundryBatches || []).length, 0);
+
+    const accepted = dispatch(fileEnv, 'Short', 'short description');
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.stdout, /S-001 dispatched/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 
 test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dept-foundry-'));
