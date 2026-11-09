@@ -44,6 +44,7 @@ import copy
 import inspect
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -206,6 +207,35 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, Mapping):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+#: Where builder prompts are saved unless ``FOUNDRY_PROMPT_DIR`` says otherwise.
+_DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent / "data" / "prompts"
+#: Only this many saved prompts are kept; the oldest are deleted first.
+_MAX_SAVED_PROMPTS = 200
+_PROMPT_SAVE_OFF = frozenset({"0", "false", "no", "off"})
+
+
+def _save_prompt(prompt: str, ticket_id: str, attempt: int) -> None:
+    """Best effort: save a builder prompt for debugging; a failure here never breaks the build.
+
+    ``FOUNDRY_SAVE_PROMPTS`` (``0``/``false``/``no``/``off``) turns it off and ``FOUNDRY_PROMPT_DIR``
+    picks the directory.  Writes ``<ticket>_attempt<n>.txt`` and keeps the newest 200 ``.txt`` files.
+    """
+    try:
+        if os.environ.get("FOUNDRY_SAVE_PROMPTS", "").strip().lower() in _PROMPT_SAVE_OFF:
+            return
+        directory = Path(os.environ.get("FOUNDRY_PROMPT_DIR") or _DEFAULT_PROMPT_DIR)
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_id = re.sub(r"[^A-Za-z0-9._-]+", "_", str(ticket_id)).strip("._")[:100] or "ticket"
+        path = directory / f"{safe_id}_attempt{attempt}.txt"
+        path.write_text(prompt, encoding="utf-8", errors="replace")
+        others = [p for p in directory.glob("*.txt") if p != path]
+        others.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in others[_MAX_SAVED_PROMPTS - 1:]:
+            old.unlink(missing_ok=True)
+    except Exception as exc:
+        log.warning("could not save the prompt of ticket %s: %s", ticket_id, exc)
 
 
 _KW_CACHE: dict[tuple[Any, str], bool] = {}
@@ -2226,6 +2256,7 @@ class BuilderWorker(_WorkerBase):
                                       focus_files=self._focus_files(ticket, assignment),
                                       order_description=meta.get("description"))
         self.scratch["last_prompt"] = prompt
+        _save_prompt(prompt, str(_get(ticket, "ticket_id")), assignment.attempt)
         try:
             result = await self._call_claude(prompt, task_id=task_id)
         except asyncio.CancelledError:
