@@ -14,6 +14,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,7 +22,7 @@ import pytest
 from foundry.board_bridge import BoardBridge
 from foundry.board_dispatch import (
     BatchWatcher, BoardRefused, BoardUnavailable, DashboardBoard, batch_poll_interval, batches_enabled,
-    marker, repo_slug_for,
+    marker, order_text, repo_slug_for,
 )
 from foundry.config import FoundryConfig
 from foundry.main import demo_claude, demo_gemma, write_demo_repo
@@ -862,3 +863,36 @@ def test_option_like_batch_base_fails_the_subtask_without_submitting(tmp_path: P
     got = board.get(b["id"])
     assert got["status"] == "failed"
     assert all("not a plain branch name" in got["results"][k]["error"] for k in ("1", "2"))
+
+
+def test_order_text_keeps_the_submitted_layout() -> None:
+    line = marker("S-1", "a", "2026-01-01T00:00:00Z")
+    assert line == "(Foundry batch S-1 of 2026-01-01T00:00:00Z, subtask a)"
+    assert order_text("Do it.", "M", "Batch", "  the goal  ", line) == (
+        f'Do it.\n\nRequested size: M\n\nPart of "Batch": the goal\n{line}'
+    )
+    assert order_text("Do it.", None, "Batch", "", line) == f'Do it.\n\nPart of "Batch"\n{line}'
+    assert order_text("", "S", "Batch", None, line) == f'Requested size: S\n\nPart of "Batch"\n{line}'
+    assert order_text("", None, "Batch", "", line) == f'Part of "Batch"\n{line}'
+
+
+def test_submit_sends_exactly_the_order_text(tmp_path: Path) -> None:
+    (tmp_path / "shop").mkdir()
+    (tmp_path / "shop" / "mathx.py").write_text("X = 1\n", encoding="utf-8")
+    orders: list[Any] = []
+
+    def accept(order: Any) -> str:
+        orders.append(order)
+        return "F-1"
+
+    factory = SimpleNamespace(manager=SimpleNamespace(accept=accept), queue=SimpleNamespace())
+    service = SimpleNamespace(running=True, factory=factory, repo=tmp_path)
+    watcher = BatchWatcher(service, board=FakeBoard(), repo_slug=SLUG, host="pc", interval=1.0, enabled=True)
+    batch = {"id": "S-1", "title": "Batch", "goal": "  the goal  ", "createdAt": "2026-01-01T00:00:00Z"}
+    sub = {"key": "a", "title": "A", "description": "Do it.", "files": ["shop/mathx.py"], "size": "M"}
+
+    assert watcher._submit(batch, "a", sub) == "F-1"
+
+    line = marker("S-1", "a", "2026-01-01T00:00:00Z")
+    assert orders[0].description == f'Do it.\n\nRequested size: M\n\nPart of "Batch": the goal\n{line}'
+    assert orders[0].description == order_text("Do it.", "M", "Batch", "  the goal  ", line)

@@ -53,7 +53,7 @@ log = logging.getLogger("foundry.board_dispatch")
 __all__ = [
     "HEARTBEAT_S", "BatchWatcher", "BoardRefused", "BoardUnavailable", "DashboardBoard",
     "DEFAULT_BATCH_POLL_S", "STALE_HEARTBEAT_S", "batch_poll_interval", "batches_enabled",
-    "repo_slug_for", "subtask_state",
+    "order_text", "repo_slug_for", "subtask_state",
 ]
 
 DEFAULT_BATCH_POLL_S = 15.0
@@ -217,6 +217,16 @@ def marker(batch_id: str, key: str, created_at: str | None = None) -> str:
     """
     of = f" of {created_at}" if created_at else ""
     return f"(Foundry batch {batch_id}{of}, subtask {key})"
+
+
+def order_text(description: str, size: str | None, batch_title: Any, goal: Any, marker_line: str) -> str:
+    """The text of a batch subtask's order: description, requested size, batch context, marker line."""
+    text = description
+    if size:
+        text = (text + "\n\n" if text else "") + f"Requested size: {size}"
+    goal_text = str(goal or "").strip()
+    context = f'Part of "{batch_title}"' + (f": {goal_text}" if goal_text else "")
+    return (text + "\n\n" if text else "") + f"{context}\n{marker_line}"
 
 
 def _cap(value: Any, limit: int) -> str | None:
@@ -859,12 +869,8 @@ class BatchWatcher:
             "title": sub.get("title"), "description": sub.get("description") or "",
             "files": list(sub.get("files") or []), "size": sub.get("size"),
         })
-        desc = fields["description"]
-        if fields["size"]:
-            desc = (desc + "\n\n" if desc else "") + f"Requested size: {fields['size']}"
-        goal = str(batch.get("goal") or "").strip()
-        context = f"Part of \"{batch.get('title')}\"" + (f": {goal}" if goal else "")
-        desc = (desc + "\n\n" if desc else "") + f"{context}\n{marker(str(batch['id']), key, batch.get('createdAt'))}"
+        desc = order_text(fields["description"], fields["size"], batch.get("title"), batch.get("goal"),
+                          marker(str(batch["id"]), key, batch.get("createdAt")))
         acceptance = [str(a) for a in (sub.get("acceptance") or sub.get("acceptance_criteria") or []) if str(a).strip()]
         base = str(batch.get("base") or "").strip() or None  # else the publisher's (FOUNDRY_PR_BASE / repo default)
         if base is not None and not valid_ref(base):
