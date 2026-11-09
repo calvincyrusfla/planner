@@ -406,6 +406,28 @@ def test_sizes_and_acceptance_reach_the_order(tmp_path: Path) -> None:
     asyncio.run(go())
 
 
+def test_board_read_files_reach_the_order(tmp_path: Path) -> None:
+    """The board sends ``readFiles``; the order must carry them as read-only files."""
+    board = FakeBoard()
+    b = board.add(subtasks=[
+        {"key": "1", "title": "Add clamp helper", "description": "clamp", "files": ["shop/mathx.py"],
+         "readFiles": ["shop/strings.py"]},
+    ])
+
+    async def go() -> None:
+        svc = _service(tmp_path)
+        await svc.start()
+        try:
+            w = _watcher(svc, board)
+            await _pump(w, lambda: board.get(b["id"])["status"] == "done")
+            tid = w._record(b["id"])["tasks"]["1"]
+            assert "shop/strings.py" in svc.factory.manager.orders[tid].read_files
+        finally:
+            await svc.stop()
+
+    asyncio.run(go())
+
+
 # --------------------------------------------------------------------------- never claims
 
 
