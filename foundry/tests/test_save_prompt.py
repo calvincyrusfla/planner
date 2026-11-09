@@ -104,6 +104,7 @@ def test_builder_saves_the_prompt_it_sends(prompt_dir: Path) -> None:
         _already_done=list,
         _focus_files=lambda _ticket, _assignment: [],
         _tm=lambda *_args: None,
+        _help_answer=lambda _ticket: {},
     )
     ticket = {"ticket_id": "T-1", "task_id": "T"}
     assert asyncio.run(BuilderWorker._build_ticket(worker, ticket)) == "released"

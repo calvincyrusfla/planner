@@ -283,6 +283,24 @@ class FoundryConfig(BaseModel):
         ),
     )
 
+    help_after: int = Field(
+        default=2,
+        ge=0,
+        le=3,
+        description=(
+            "Missing-information failures in a row (BLOCKED replies and the like) before a "
+            "ticket stops and waits for the Floor Manager's answer instead of spending "
+            "another attempt; at most one pause per ticket. 0 disables pausing."
+        ),
+    )
+    help_timeout_s: float = Field(
+        default=86400,
+        gt=0,
+        description=(
+            "Seconds an awaiting_help ticket may wait for the Floor Manager; pass it to "
+            "FoundryQueue.expire_help, which then quarantines the ticket's task."
+        ),
+    )
     min_subtask_lines: int = Field(
         default=30,
         ge=0,
@@ -488,6 +506,8 @@ class FoundryConfig(BaseModel):
             "PR_DRAFT": "pr_draft",
             "TYPECHECK": "typecheck",
             "MIN_SUBTASK_LINES": "min_subtask_lines",
+            "HELP_AFTER": "help_after",
+            "HELP_TIMEOUT_S": "help_timeout_s",
         }
         for var, field in simple.items():
             value = get(var)

@@ -94,14 +94,14 @@ def test_read_only_touched_reports_protected_files_only() -> None:
 
 
 def test_read_files_drops_task_files_the_ticket_may_edit() -> None:
-    worker = _stub(read_files_for=lambda _task: ["foundry/tests/test_a.py", "foundry/a.py"])
+    worker = _stub(read_files_for=lambda _task: ["foundry/tests/test_a.py", "foundry/a.py"], _help_answer=lambda _ticket: {})
     ticket = _stub(task_id="F-1", read_files=["docs\\spec.md"])
     assert BuilderWorker._read_files(worker, ticket, ["foundry/a.py"]) == ["docs/spec.md", "foundry/tests/test_a.py"]
 
 
 def test_read_files_keeps_the_tickets_own_list_even_when_allowed() -> None:
     ticket = _stub(task_id="F-1", read_files=["foundry/a.py"])
-    assert BuilderWorker._read_files(_stub(read_files_for=None), ticket, ["foundry/a.py"]) == ["foundry/a.py"]
+    assert BuilderWorker._read_files(_stub(read_files_for=None, _help_answer=lambda _ticket: {}), ticket, ["foundry/a.py"]) == ["foundry/a.py"]
 
 
 def test_read_only_excerpts_query_carries_the_ticket_text() -> None:
@@ -263,3 +263,12 @@ def test_editing_a_module_adds_at_most_three_of_its_tests_as_read_only(tmp_path:
     found = _related(tmp_path, ["foundry/x.py"])
     assert found == ["foundry/tests/test_x.py", "tests/test_a.py", "tests/test_b.py"]
     assert set(_read_only_files(["foundry/x.py"], found, str(tmp_path))) == set(found)
+
+
+def test_read_files_include_the_floor_manager_answer_files() -> None:
+    worker = _stub(
+        read_files_for=lambda _task: [],
+        _help_answer=lambda _ticket: {"note": "n", "read_files": ["docs/guide.md", "foundry/a.py"]},
+    )
+    ticket = _stub(task_id="F-1", read_files=[])
+    assert BuilderWorker._read_files(worker, ticket, ["foundry/a.py"]) == ["docs/guide.md"]

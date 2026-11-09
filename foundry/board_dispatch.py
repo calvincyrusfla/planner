@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import urllib.error
@@ -64,6 +65,11 @@ KV_PREFIX = "foundry_batch:"
 #: Board limit for error texts (department/lib/foundry-batches.mjs LIMITS.error).
 LIMIT_ERROR = 2000
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
+#: Longest question, context or option sent to the board in a help request.
+LIMIT_HELP = 2000
+#: A file path mentioned in a Floor Manager answer.
+_PATH_TOKEN = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+")
+_MAX_HELP_FILES = 10
 
 #: Foundry task state -> batch subtask state.
 _STATE_FOR = {
@@ -387,6 +393,8 @@ class BatchWatcher:
                 if claimed is not None:
                     await self._advance(claimed)
                     handled.append(bid)
+        # after the batches, so an answer already on the board wins over the timeout
+        self._expire_help()
         return handled
 
     def _is_ours(self, batch: Mapping[str, Any]) -> bool:
@@ -490,6 +498,9 @@ class BatchWatcher:
         first = not rec["tasks"] and not rec["failed"]
         results: dict[str, dict[str, Any]] = {}
 
+        # answers first, so a ticket reopened here is reported with its new state below
+        self._apply_answers(batch, bid, rec, queue)
+
         # 1) every subtask already submitted or failed, whatever its position
         for key in keys:
             if key in rec["failed"]:
@@ -539,6 +550,8 @@ class BatchWatcher:
                 log.info("board dispatch: %s subtask %s -> %s", bid, key, tid)
                 results[key] = subtask_state(manager, queue, tid)
                 progress = True
+
+        self._report_help(results, rec, queue, batch)
 
         # The board closes a batch (and refuses further updates) once every subtask is
         # terminal, so "complete" is only reported once the subtask's PR is settled.
@@ -622,6 +635,114 @@ class BatchWatcher:
         batches = state.get("foundryBatches") if isinstance(state, dict) else None
         b = next((x for x in batches or [] if isinstance(x, dict) and x.get("id") == bid), None)
         return b is None or not self._is_ours(b) or b.get("status") not in _OPEN_BATCH
+
+    def _help_files(self, answer: str) -> list[str]:
+        """The repo-relative files named in ``answer`` that exist (deduplicated, at most 10)."""
+        root = Path(str(self.service.repo))
+        found: list[str] = []
+        for match in _PATH_TOKEN.findall(answer):
+            path = match.strip("`'\"").removeprefix("./")
+            if path.startswith("/") or ".." in path or path in found:
+                continue
+            if (root / path).is_file():
+                found.append(path)
+                if len(found) >= _MAX_HELP_FILES:
+                    break
+        return found
+
+    def _apply_answers(self, batch: Mapping[str, Any], bid: str, rec: dict[str, Any], queue: Any) -> None:
+        """Reopen the tickets whose question was answered on the board, once per answer."""
+        requests_fn = getattr(queue, "help_requests", None)
+        answer_fn = getattr(queue, "answer_help", None)
+        board_results = batch.get("results")
+        if not callable(requests_fn) or not callable(answer_fn) or not isinstance(board_results, dict):
+            return
+        handled = rec.setdefault("answered", {})
+        for key, tid in list(rec["tasks"].items()):
+            result = board_results.get(key)
+            if not isinstance(result, dict) or result.get("state") != "answered":
+                continue
+            help_info = result.get("help")
+            if not isinstance(help_info, dict):
+                continue
+            answer = help_info.get("answer")
+            if not isinstance(answer, str) or not answer.strip():
+                continue
+            stamp = str(help_info.get("answeredAt") or "")
+            if handled.get(key) == stamp:
+                continue
+            try:
+                read_files = self._help_files(answer)
+                for request in requests_fn():
+                    if str(request.get("task_id")) != str(tid):
+                        continue
+                    ticket_id = request["ticket_id"]
+                    applied = answer_fn(ticket_id, answer, read_files)
+                    log.info("board dispatch: %s subtask %s: answered ticket %s (applied: %s, files: %s)",
+                             bid, key, ticket_id, applied, read_files)
+            except Exception as exc:  # not marked as handled: tried again next round
+                log.warning("board dispatch: %s subtask %s: could not apply the answer: %s", bid, key, exc)
+                continue
+            handled[key] = stamp
+            self._save(bid, rec)
+
+    @staticmethod
+    def _help_payload(request: Mapping[str, Any]) -> dict[str, Any]:
+        """The board's ``help`` object for one help request."""
+        options = request.get("options")
+        return {
+            "question": str(request.get("question") or "")[:LIMIT_HELP],
+            "context": str(request.get("context") or "")[:LIMIT_HELP],
+            "options": [str(o)[:LIMIT_HELP] for o in options] if isinstance(options, list) else [],
+        }
+
+    def _report_help(self, results: dict[str, dict[str, Any]], rec: Mapping[str, Any], queue: Any,
+                     batch: Mapping[str, Any]) -> None:
+        """Report paused subtasks as ``needs_help`` and clear the question once they are not."""
+        requests_fn = getattr(queue, "help_requests", None)
+        if not callable(requests_fn):
+            return
+        waiting: dict[str, Mapping[str, Any]] = {}
+        try:
+            for request in requests_fn():
+                if isinstance(request, dict):
+                    waiting.setdefault(str(request.get("task_id")), request)
+        except Exception as exc:  # the normal states still go out
+            log.warning("board dispatch: could not read the help requests: %s", exc)
+            return
+        board_results = batch.get("results")
+        shown: Mapping[str, Any] = board_results if isinstance(board_results, dict) else {}
+        for key, result in list(results.items()):
+            request_for_task = waiting.get(str(result.get("foundryTask")))
+            if request_for_task is not None and result.get("state") not in TERMINAL:
+                results[key] = {**result, "state": "needs_help", "help": self._help_payload(request_for_task)}
+                continue
+            pushed = rec["pushed"].get(key)
+            on_board = shown.get(key)
+            # the board may show a question our record missed (a write whose reply was lost)
+            asked = isinstance(on_board, dict) and on_board.get("state") in ("needs_help", "answered")
+            # "help" stays None after the first clear, so the result does not look changed next round
+            if asked or (isinstance(pushed, dict) and (pushed.get("state") == "needs_help" or "help" in pushed)):
+                results[key] = {**result, "help": None}
+
+    def _expire_help(self) -> None:
+        """Quarantine tasks whose question waited too long. Never raises."""
+        try:
+            if not self._ready():
+                return
+            expire = getattr(self._queue(), "expire_help", None)
+            if not callable(expire):
+                return
+            configured = getattr(getattr(self.service, "config", None), "help_timeout_s", None)
+            if isinstance(configured, (int, float)) and not isinstance(configured, bool):
+                timeout = float(configured)
+            else:
+                timeout = float(os.environ.get("FOUNDRY_HELP_TIMEOUT_S", 86400))
+            expired = expire(timeout)
+            if expired:
+                log.info("board dispatch: help requests timed out: %s", expired)
+        except Exception as exc:  # the timeout must never break a round
+            log.warning("board dispatch: could not expire help requests: %s", exc)
 
     def _auto_pr(self) -> bool:
         m = self.service.factory.manager

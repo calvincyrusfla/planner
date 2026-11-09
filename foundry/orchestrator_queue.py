@@ -66,7 +66,7 @@ INFRA_ERROR_MAX: int = 500
 #: SQLite busy timeout in milliseconds.
 BUSY_TIMEOUT_MS: int = 5000
 
-TicketStatus = Literal["open", "claimed", "done", "blocked"]
+TicketStatus = Literal["open", "claimed", "done", "blocked", "awaiting_help"]
 
 #: States a task can never leave.
 TERMINAL_STATES: frozenset[TaskState] = frozenset(
@@ -696,7 +696,7 @@ class FoundryQueue:
             self._transition(conn, task_id, TaskState.FAILED, reason)
             conn.execute(
                 "UPDATE tickets SET status='blocked', in_review=0, updated_at=?"
-                " WHERE task_id=? AND status IN ('open','claimed')",
+                " WHERE task_id=? AND status IN ('open','claimed','awaiting_help')",
                 (now, task_id),
             )
 
@@ -1220,6 +1220,145 @@ class FoundryQueue:
                         {"ticket_id": ticket_id, "was_claimed_by": t["claimed_by"],
                          "attempt": int(t["attempt"]), "reason": reason})
             return True
+
+    # Pausing a ticket for the Floor Manager's help. None of these steps spends an attempt.
+    #
+    # pause_for_help(ticket_id, request): the builder parks a claimed or open ticket as
+    #   ``awaiting_help``. It cannot be claimed and does not count as stalled. The request
+    #   (question, context, options, attempts_used, attempts_left) is kept in kv under
+    #   ``help_request:<ticket_id>`` with an ``asked_at`` time, and a ``help_requested``
+    #   event is emitted. help_requests() lists every parked ticket with its request.
+    # answer_help(ticket_id, note, read_files): reopens the ticket with ``attempt``
+    #   unchanged, stores {note, read_files, at} in kv under ``help_answer:<ticket_id>``
+    #   for the next build, removes the request and emits ``help_answered``.
+    # expire_help(timeout_s): call it periodically with ``FoundryConfig.help_timeout_s``.
+    #   It quarantines the task of every ticket asked more than ``timeout_s`` ago, with the
+    #   reason ``no Floor Manager answer within <hours> h: <question>``, and returns the
+    #   ticket ids.
+    #
+    # pause_for_help and answer_help return False, changing nothing, for a ticket in the
+    # wrong status or a terminal task.
+    HELP_REQUEST_KV_PREFIX = "help_request:"
+    HELP_ANSWER_KV_PREFIX = "help_answer:"
+
+    def pause_for_help(self, ticket_id: str, request: dict[str, Any]) -> bool:
+        """Park a ticket until the Floor Manager answers; no attempt is spent.
+
+        Only a ``claimed`` or ``open`` ticket of a non-terminal task can be
+        paused. It becomes ``awaiting_help`` (not claimable, claim and review
+        flag cleared, ``attempt`` and ``fix_hint`` kept), ``request`` is stored
+        with an ``asked_at`` time and the task returns to ``building``. Returns
+        True when paused, else False (no change).
+        """
+        now = self.now()
+        stored = {**request, "asked_at": now}
+        with self.transaction() as conn:
+            t = conn.execute("SELECT * FROM tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if t is None or t["status"] not in ("claimed", "open"):
+                return False
+            cur = TaskState(self._require_task(conn, t["task_id"])["state"])
+            if cur in TERMINAL_STATES:
+                return False
+            conn.execute(
+                "UPDATE tickets SET status='awaiting_help', claimed_by=NULL, claimed_at=NULL,"
+                " in_review=0, updated_at=? WHERE ticket_id=?",
+                (now, ticket_id),
+            )
+            self._kv_put(conn, self.HELP_REQUEST_KV_PREFIX + ticket_id, stored, now)
+            self._event(conn, "help_requested", t["task_id"], {"ticket_id": ticket_id, **stored})
+            if cur != TaskState.BUILDING:
+                self._set_state_row(conn, t["task_id"], cur, TaskState.BUILDING, "awaiting help")
+            return True
+
+    def help_requests(self) -> list[dict[str, Any]]:
+        """Every ticket in ``awaiting_help``: ticket_id, task_id, subtask_id, attempt and its request."""
+        with self.lock:
+            return self._awaiting_help(self.conn)
+
+    def answer_help(self, ticket_id: str, note: str, read_files: list[str] | None = None) -> bool:
+        """Put an ``awaiting_help`` ticket back on the line with the Floor Manager's answer.
+
+        The ticket is ``open`` again with ``attempt`` unchanged (moved onto a
+        slot within the current allocation if needed), the answer is stored for
+        the next build and the request is removed. Returns True when answered,
+        False (no change) for any other ticket or a terminal task.
+        """
+        now = self.now()
+        with self.transaction() as conn:
+            t = conn.execute("SELECT * FROM tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+            if t is None or t["status"] != "awaiting_help":
+                return False
+            task = self._require_task(conn, t["task_id"])
+            cur = TaskState(task["state"])
+            if cur in TERMINAL_STATES:
+                return False
+            slot = int(t["slot"])
+            alloc = int(task["allocated_builders"]) or 1
+            if slot > alloc:
+                slot = self._least_loaded_slot(conn, t["task_id"], alloc)
+            conn.execute(
+                "UPDATE tickets SET status='open', slot=?, updated_at=? WHERE ticket_id=?",
+                (slot, now, ticket_id),
+            )
+            files = list(read_files or [])
+            self._kv_put(conn, self.HELP_ANSWER_KV_PREFIX + ticket_id,
+                         {"note": note, "read_files": files, "at": now}, now)
+            conn.execute("DELETE FROM kv WHERE key=?", (self.HELP_REQUEST_KV_PREFIX + ticket_id,))
+            self._event(conn, "help_answered", t["task_id"],
+                        {"ticket_id": ticket_id, "note": note, "read_files": files})
+            if cur != TaskState.BUILDING:
+                self._set_state_row(conn, t["task_id"], cur, TaskState.BUILDING, "help answered")
+            return True
+
+    def expire_help(self, timeout_s: float) -> list[str]:
+        """Quarantine the task of every ``awaiting_help`` ticket asked more than ``timeout_s`` ago.
+
+        Returns the expired ticket ids.
+        """
+        cutoff = datetime.fromisoformat(self.now()).timestamp() - float(timeout_s)
+        hours = f"{float(timeout_s) / 3600:g}"
+        expired: list[str] = []
+        with self.transaction() as conn:
+            for item in self._awaiting_help(conn):
+                try:
+                    asked = datetime.fromisoformat(str(item.get("asked_at")))
+                except ValueError:
+                    continue  # nothing usable to age it by
+                if asked.tzinfo is None:
+                    asked = asked.replace(tzinfo=timezone.utc)
+                if asked.timestamp() >= cutoff:
+                    continue
+                task = self._require_task(conn, item["task_id"])
+                if TaskState(task["state"]) not in TERMINAL_STATES:
+                    reason = f"no Floor Manager answer within {hours} h: {item.get('question', '')}"
+                    self._quarantine(conn, item["task_id"], reason.strip())
+                expired.append(item["ticket_id"])
+        return expired
+
+    def _awaiting_help(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        """Every ``awaiting_help`` ticket merged with its stored request, oldest first."""
+        rows = conn.execute(
+            "SELECT t.ticket_id, t.task_id, t.subtask_id, t.attempt, k.value FROM tickets t"
+            " LEFT JOIN kv k ON k.key = ? || t.ticket_id"
+            " WHERE t.status='awaiting_help' ORDER BY t.rowid",
+            (self.HELP_REQUEST_KV_PREFIX,),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            request = json.loads(r["value"] or "{}") or {}
+            items.append({"ticket_id": r["ticket_id"], "task_id": r["task_id"],
+                          "subtask_id": r["subtask_id"], "attempt": int(r["attempt"]), **request})
+        return items
+
+    @staticmethod
+    def _kv_put(conn: sqlite3.Connection, key: str, value: Any, now: str) -> None:
+        """``kv_set`` inside a transaction the caller already holds."""
+        conn.execute(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?,?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+            " updated_at=excluded.updated_at",
+            (key, _dump(value), now),
+        )
 
     def set_in_review(self, ticket_id: str, in_review: bool) -> None:
         """Flag a ticket as handed to (True) or finished with (False) the review inbox.
@@ -1901,7 +2040,7 @@ class FoundryQueue:
         conn.execute("UPDATE tasks SET quarantine_reason=?, updated_at=? WHERE task_id=?",
                      (reason, now, task_id))
         conn.execute("UPDATE tickets SET status='blocked', in_review=0, updated_at=?"
-                     " WHERE task_id=? AND status IN ('open','claimed')", (now, task_id))
+                     " WHERE task_id=? AND status IN ('open','claimed','awaiting_help')", (now, task_id))
         self._event(conn, "quarantined", task_id, {"reason": reason})
 
     def _release_later(self, conn: sqlite3.Connection, t: sqlite3.Row, now: str) -> list[str]:
