@@ -498,12 +498,15 @@ def build_builder_prompt(
     max_retries: int = MAX_RETRIES,
     already_done: Sequence[StackedWork] | None = None,
     focus_files: Sequence[str] | None = None,
+    floor_manager_note: str | None = None,
     order_description: str | None = None,
 ) -> str:
     """Return the exact prompt a builder sends to Claude for ``assignment``.
 
     ``already_done`` (stacked tickets): the task's earlier approved tickets,
     listed under "## Already done on this piece" (title, files, symbols).
+    ``floor_manager_note``: the Floor Manager's answer to this ticket's help request,
+    shown right after the order details.
     ``focus_files``: this subtask's own files; when they are a strict subset
     of the allowed files the prompt lists "## Your files" and, separately,
     "## You may also touch" (the rest of the task's files).
@@ -530,6 +533,8 @@ def build_builder_prompt(
     ]
     parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
     parts += _order_details_section(order_description, assignment.ticket_description)
+    if floor_manager_note and floor_manager_note.strip():
+        parts += ["", "## Floor Manager note (follow it)", floor_manager_note.strip()]
     allowed = list(assignment.allowed_files)
     read_files = list(getattr(assignment, "read_files", ()))
     protected = set(read_files)
@@ -1072,6 +1077,45 @@ def directives_to_hint(directives: Iterable[LineDirective], limit: int = MAX_FIX
     return hint if len(hint) <= limit else hint[: limit - 3] + "..."
 
 
+# When a builder pauses for help (see _WorkerBase._help_request): a send-back parks the
+# ticket through ``queue.pause_for_help`` instead of reopening it when ALL of these hold:
+#   - the queue has ``pause_for_help`` and ``help_after`` (FOUNDRY_HELP_AFTER) is above 0;
+#   - this failure is a missing-information one: its reason or hint contains ``BLOCKED`` or,
+#     in any case, one of _MISSING_INFO_PHRASES;
+#   - at least ``help_after`` such failures came in a row (any other failure resets the count);
+#   - the ticket still has an attempt left (attempt + 1 <= max_retries);
+#   - the ticket has never been paused before, so it pauses at most once.
+# If the queue refuses the pause, the normal send-back runs. The outcome of a pause is
+# ``awaiting_help``, which is handled like a retry, not like a quarantine.
+#
+# How the answer reaches the builder: once ``queue.answer_help`` has stored a note, the next
+# prompt for that ticket shows it in a ``## Floor Manager note (follow it)`` section right
+# after ``## Order details``, and the answer's read_files join the ticket's read-only files.
+
+#: Queue kv keys of the pause-for-help bookkeeping (each followed by the ticket id).
+MISSING_INFO_KV_PREFIX = "missing_info:"
+LAST_HINT_KV_PREFIX = "last_hint:"
+HELP_PAUSED_KV_PREFIX = "help_paused:"
+HELP_ANSWER_KV_PREFIX = "help_answer:"
+#: Missing-information failures in a row before a ticket waits for the Floor Manager.
+DEFAULT_HELP_AFTER = 2
+MAX_HELP_AFTER = 3
+MAX_HELP_TEXT_CHARS = 2000
+_MISSING_INFO_PHRASES = (
+    "can't see", "cannot see", "not shown", "isn't shown", "not supplied", "not provided",
+    "need the body", "need the exact", "is missing", "no context",
+)
+
+
+def _is_missing_information(reason: str, hint: str) -> bool:
+    """True when a failure says the builder lacked information rather than got the code wrong."""
+    text = f"{reason}\n{hint}"
+    if "BLOCKED" in text:
+        return True
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _MISSING_INFO_PHRASES)
+
+
 # ---------------------------------------------------------------------------
 # Data passed between builders and the reviewer
 # ---------------------------------------------------------------------------
@@ -1271,10 +1315,11 @@ class _WorkerBase:
         return True
 
     def _send_back(self, ticket: Any, hint: str, *, reason: str) -> str:
-        """Reopen ``ticket`` with ``hint`` (attempt + 1) or quarantine at the cap.
+        """Reopen ``ticket`` with ``hint`` (attempt + 1), pause it for help or quarantine at the cap.
 
-        Returns ``"retry"``, ``"quarantined"`` or ``"superseded"`` (the ticket
-        was already reopened or closed by someone else, so nothing is done).
+        Returns ``"retry"``, ``"awaiting_help"`` (parked until the Floor Manager
+        answers, no attempt spent), ``"quarantined"`` or ``"superseded"`` (the
+        ticket was already reopened or closed by someone else, so nothing is done).
         """
         task_id = _get(ticket, "task_id")
         ticket_id = _get(ticket, "ticket_id")
@@ -1283,6 +1328,14 @@ class _WorkerBase:
         if not self._still_owned(ticket):
             self._event("superseded", task_id, {"ticket_id": ticket_id, "agent_id": self.agent_id, "reason": reason})
             return "superseded"
+        request = self._help_request(ticket_id, attempt, hint, reason)
+        if request is not None and self._pause_for_help(ticket_id, request):
+            self._kv_write(f"{HELP_PAUSED_KV_PREFIX}{ticket_id}", True)
+            self._event("help_requested", task_id,
+                        {"ticket_id": ticket_id, "agent_id": self.agent_id, "reason": reason, **request})
+            self._release_later(ticket)
+            self._ticket_changed(task_id)
+            return "awaiting_help"
         # The queue enforces the cap: past queue.max_retries it quarantines and returns False.
         try:
             ok: Any = self.queue.reopen_ticket(ticket_id, hint)
@@ -1299,6 +1352,80 @@ class _WorkerBase:
         self._event("quarantined", task_id, {"ticket_id": ticket_id, "attempt": attempt, "reason": reason})
         self._ticket_changed(task_id)
         return "quarantined"
+
+    @property
+    def help_after(self) -> int:
+        """Missing-information failures in a row before pausing (FOUNDRY_HELP_AFTER; 0 disables)."""
+        configured = getattr(getattr(self, "config", None), "help_after", None)
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            value = configured
+        else:
+            try:
+                value = int(os.environ.get("FOUNDRY_HELP_AFTER", DEFAULT_HELP_AFTER))
+            except ValueError:
+                value = DEFAULT_HELP_AFTER
+        return max(0, min(value, MAX_HELP_AFTER))
+
+    def _kv_read(self, key: str) -> Any:
+        """The queue's value under ``key``; None when absent or the queue has no kv store."""
+        fn = getattr(self.queue, "kv_get", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(key)
+        except Exception:  # bookkeeping must never break a send-back
+            log.exception("kv_get(%s) failed", key)
+            return None
+
+    def _kv_write(self, key: str, value: Any) -> None:
+        """Store ``value`` under ``key`` in the queue (best effort)."""
+        fn = getattr(self.queue, "kv_set", None)
+        if not callable(fn):
+            return
+        try:
+            fn(key, value)
+        except Exception:  # bookkeeping must never break a send-back
+            log.exception("kv_set(%s) failed", key)
+
+    def _help_request(self, ticket_id: Any, attempt: int, hint: str, reason: str) -> dict[str, Any] | None:
+        """Record this failure; the help request when the ticket should pause, else None."""
+        if not callable(getattr(self.queue, "pause_for_help", None)) or self.help_after <= 0:
+            return None
+        hint_key = f"{LAST_HINT_KV_PREFIX}{ticket_id}"
+        count_key = f"{MISSING_INFO_KV_PREFIX}{ticket_id}"
+        previous_hint = self._kv_read(hint_key)
+        self._kv_write(hint_key, hint)
+        if not _is_missing_information(reason, hint):
+            self._kv_write(count_key, 0)
+            return None
+        previous_count = self._kv_read(count_key)
+        count = (previous_count if isinstance(previous_count, int) else 0) + 1
+        self._kv_write(count_key, count)
+        if count < self.help_after or attempt + 1 > self.max_retries:
+            return None
+        if self._kv_read(f"{HELP_PAUSED_KV_PREFIX}{ticket_id}"):
+            return None
+        hints = [previous_hint, hint] if isinstance(previous_hint, str) and previous_hint else [hint]
+        return {
+            "question": hint[:MAX_HELP_TEXT_CHARS],
+            "context": "\n".join(hints)[:MAX_HELP_TEXT_CHARS],
+            "options": [],
+            "attempts_used": attempt + 1,
+            "attempts_left": self.max_retries - attempt,
+        }
+
+    def _pause_for_help(self, ticket_id: Any, request: dict[str, Any]) -> bool:
+        """``queue.pause_for_help``; False when the queue refuses, so the normal send-back runs."""
+        try:
+            return bool(self.queue.pause_for_help(ticket_id, request))
+        except (ValueError, KeyError) as exc:
+            log.debug("pause_for_help(%s) refused: %s", ticket_id, exc)
+            return False
+
+    def _help_answer(self, ticket: Any) -> dict[str, Any]:
+        """The Floor Manager's stored answer for ``ticket`` (empty when there is none)."""
+        answer = self._kv_read(f"{HELP_ANSWER_KV_PREFIX}{_get(ticket, 'ticket_id')}")
+        return answer if isinstance(answer, dict) else {}
 
     def _release_later(self, ticket: Any) -> list[str]:
         """An earlier ticket was reopened: release later claimed tickets built on it.
@@ -1828,12 +1955,14 @@ class BuilderWorker(_WorkerBase):
     def _read_files(self, ticket: Any, allowed: Sequence[str]) -> list[str]:
         """Files this ticket may read but not change.
 
-        The ticket's own ``read_files`` always count. The task's list is general, so
-        a file this ticket is allowed to edit (exactly or through a glob) is left out of it.
+        The ticket's own ``read_files`` always count. The task's list and the files named
+        in a Floor Manager answer are general, so a file this ticket is allowed to edit
+        (exactly or through a glob) is left out of them.
         """
         own = [_read_only_path(f) for f in (_get(ticket, "read_files") or [])]
         task_files = self.read_files_for(str(_get(ticket, "task_id"))) if self.read_files_for is not None else ()
-        general = [p for p in map(_read_only_path, task_files) if not _path_covered(p, allowed)]
+        answer_files = self._help_answer(ticket).get("read_files") or []
+        general = [p for p in map(_read_only_path, [*answer_files, *task_files]) if not _path_covered(p, allowed)]
         return [f for f in dict.fromkeys(own + general) if f]
 
     def _read_only_excerpts(self, ticket: Any, info: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2232,6 +2361,7 @@ class BuilderWorker(_WorkerBase):
 
         Labels: ``"review"`` (sent to the reviewer), ``"cached"`` (cache hit
         completed without Claude), ``"retry"`` (reopened with a fix hint),
+        ``"awaiting_help"`` (parked until the Floor Manager answers),
         ``"quarantined"``, ``"skipped"`` (task already terminal).
         """
         task_id = _get(ticket, "task_id")
@@ -2254,7 +2384,8 @@ class BuilderWorker(_WorkerBase):
         # 2. Claude (inside limiter.slot + call_with_backoff)
         prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
                                       focus_files=self._focus_files(ticket, assignment),
-                                      order_description=meta.get("description"))
+                                      order_description=meta.get("description"),
+                                      floor_manager_note=self._help_answer(ticket).get("note"))
         self.scratch["last_prompt"] = prompt
         _save_prompt(prompt, str(_get(ticket, "ticket_id")), assignment.attempt)
         try:
@@ -2326,11 +2457,12 @@ class BuilderWorker(_WorkerBase):
         if send_back is not None:
             _restore_files(self.workspace, snapshot)
             outcome = self._send_back(ticket, f"[pre-review] {send_back}", reason="pre_review")
-            if outcome == "retry":
-                # Only a real reopen uses the once-per-ticket cap and counts as a review avoided.
+            sent_back = outcome in ("retry", "awaiting_help")
+            if sent_back:
+                # Only a real send-back uses the once-per-ticket cap and counts as a review avoided.
                 self._mark_pre_review_sent_back(ticket)
                 self._tm("record_pre_review", task_id, "sent_back")
-            self._pre_review_event(ticket, "sent_back" if outcome == "retry" else outcome, review)
+            self._pre_review_event(ticket, "sent_back" if sent_back else outcome, review)
             return outcome
 
         await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta, notes)
