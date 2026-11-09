@@ -40,7 +40,35 @@ export const LIMITS = Object.freeze({
   help: 4000,
   helpOptions: 20,
   keep: 200, // batches kept on the board; the oldest finished ones go first
+  builderOrder: 6000, // must equal MAX_ORDER_DETAILS_CHARS in foundry/builder_worker.py
 });
+const MARKER_ALLOWANCE = 100; // the '(Foundry batch S-n of <createdAt>, subtask k)' line, unknown before dispatch
+
+// Length of the order text Foundry builds for a subtask (foundry/board_dispatch.py _submit):
+// description, '\n\nRequested size: X', '\n\n' + 'Part of "<title>"' + ': <goal>', '\n' + marker.
+export function orderTextLength(batch, subtask) {
+  let t = String(subtask?.description ?? '');
+  const size = subtask?.size ?? subtask?.size_hint;
+  if (size) t = (t ? t + '\n\n' : '') + `Requested size: ${String(size).trim().toUpperCase()}`;
+  const goal = String(batch?.goal ?? '').trim();
+  const context = `Part of "${batch?.title ?? ''}"` + (goal ? `: ${goal}` : '');
+  return (t ? t.length + 2 : 0) + context.length + 1 + MARKER_ALLOWANCE;
+}
+
+export function oversizedOrders(batch) {
+  const subs = Array.isArray(batch?.subtasks) ? batch.subtasks : [];
+  return subs.map((st, i) => ({
+    key: st?.key === undefined || st?.key === null || st?.key === '' ? String(i + 1) : String(st.key).trim(),
+    title: String(st?.title ?? ''),
+    length: orderTextLength(batch, st),
+    limit: LIMITS.builderOrder,
+  })).filter((o) => o.length > o.limit);
+}
+
+export function oversizedOrderMessage(o) {
+  return `subtask ${o.key} ("${o.title}") order is ${o.length} characters; the builder sees only ${o.limit} (description + goal + title). Shorten it, move detail into readFiles, or split the subtask.`;
+}
+
 export const TAKEOVER_MS = 10 * 60 * 1000;
 
 const LOG_LIMIT = 500;
@@ -287,6 +315,8 @@ export function dispatchBatch(state, { title, goal, repo, base, subtasks, by } =
     subtasks: cleanSubtasks(subtasks),
     results: {},
   };
+  const over = oversizedOrders(batch);
+  if (over.length) throw bad(over.map(oversizedOrderMessage).join('\n'));
   state.nextBatchNumber++;
   state.foundryBatches.push(batch);
   prune(state);
