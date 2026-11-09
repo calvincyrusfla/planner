@@ -14,6 +14,8 @@ import * as core from './lib/core.mjs';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { hubConfig, hubGet, hubOp } from './lib/hub.mjs';
+import { OPEN_BATCH } from './lib/foundry-batches.mjs';
+import { claudeLaunchSpec, launchClaude } from './lib/claude-launch.mjs';
 import { refreshUsageFromAnthropic, isUsageDirectEnabled, defaultSource, CODE_STATUS, MESSAGES } from './lib/usage-direct.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -45,7 +47,16 @@ const sync = hub ? { mode: 'hub', ok: false, lastSync: null, error: null, url: h
 // who asks: usage refresh only works for callers on this computer (see
 // refreshAllowed), so a phone on the LAN is told it can't, and shows no button.
 const usageDirectOff = !isUsageDirectEnabled(process.env); // DEPT_USAGE_DIRECT=off
-const capabilities = (local) => ({ usageRefresh: !usageDirectOff && local });
+// Worked out once: the platform, environment and repo root don't change while the server runs.
+// A dry run (tests) spawns nothing, so it doesn't need a terminal emulator on this machine.
+const claudeDryRun = String(process.env.DEPT_CLAUDE_LAUNCH_DRYRUN || '') === '1';
+const claudeLaunch = claudeLaunchSpec({
+  platform: process.platform,
+  repoRoot: path.dirname(here),
+  env: process.env,
+  which: claudeDryRun ? () => true : undefined,
+});
+const capabilities = (local) => ({ usageRefresh: !usageDirectOff && local, claudeLaunch: local && Boolean(claudeLaunch.spec) });
 const payload = (local = false) => ({ ...state, sync: { ...sync }, capabilities: capabilities(local) });
 
 const clients = new Map(); // SSE response -> whether its request came from this computer
@@ -252,6 +263,41 @@ async function refreshUsage(req, res) {
   return send(res, 200, { ok: true, result: { usage: result?.usage ?? null, stored: result?.stored !== false } });
 }
 
+// ---------- Answer with Claude (POST /api/claude/answer-help) ----------
+// Opens a visible terminal on this computer running Claude Code with a fixed prompt
+// (lib/claude-launch.mjs). The request body is never read, so nothing a caller sends
+// can reach the command line. Only callers on this machine may trigger it, and at most
+// once per CLAUDE_LAUNCH_GAP_MS.
+const CLAUDE_LAUNCH_GAP_MS = 30 * 1000;
+let lastClaudeLaunchAt = 0;
+
+function hasHelpRequest() {
+  return (Array.isArray(state.foundryBatches) ? state.foundryBatches : []).some(
+    (b) => OPEN_BATCH.has(b.status) && Object.values(b.results || {}).some((r) => r?.state === 'needs_help'),
+  );
+}
+
+function answerWithClaude(req, res) {
+  if (!refreshAllowed(req)) return send(res, 403, { ok: false, error: 'Claude can only be opened from this computer', code: 'forbidden' });
+  if (!hasHelpRequest()) return send(res, 409, { ok: false, error: 'No Foundry subtask needs help' });
+  if (!claudeLaunch.spec) return send(res, 501, { ok: false, error: claudeLaunch.reason });
+  const wait = lastClaudeLaunchAt + CLAUDE_LAUNCH_GAP_MS - Date.now();
+  if (wait > 0) {
+    const retryAfter = Math.ceil(wait / 1000);
+    res.setHeader('retry-after', String(retryAfter));
+    return send(res, 429, { ok: false, error: `Wait ${retryAfter} s before opening Claude again`, code: 'throttled', retryAfter });
+  }
+  lastClaudeLaunchAt = Date.now();
+  if (claudeDryRun) return send(res, 200, { ok: true });
+  const started = launchClaude(claudeLaunch.spec);
+  if (!started.ok) {
+    lastClaudeLaunchAt = 0; // nothing opened, so an immediate retry is fine
+    console.warn(`Could not open Claude: ${started.error}`);
+    return send(res, 500, { ok: false, error: started.error });
+  }
+  return send(res, 200, { ok: true });
+}
+
 // ---------- Foundry proxy (/api/foundry/* -> http://127.0.0.1:4310/api/*) ----------
 // The Foundry service (python -m foundry.serve) listens on loopback only. Only callers on
 // this computer may reach it through the dashboard; a phone on the LAN gets 403. Known
@@ -412,6 +458,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/usage/refresh') {
       if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use POST', code: 'method' });
       return await refreshUsage(req, res);
+    }
+    if (url.pathname === '/api/claude/answer-help') {
+      if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use POST', code: 'method' });
+      return answerWithClaude(req, res);
     }
     const fm = url.pathname.match(/^\/api\/foundry\/([a-z]+|actions\/[^/]+\/undo|tasks\/[^/]+\/pr\/retry)$/);
     if (fm) return await foundryProxy(req, res, fm[1]);
