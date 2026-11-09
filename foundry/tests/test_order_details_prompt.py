@@ -103,3 +103,11 @@ def test_description_lookup_failure_means_none() -> None:
     queue = SimpleNamespace(get_task=boom)
     ticket = SimpleNamespace(task_id="T-1", subtask_id="T-1.2")
     assert BuilderWorker._ticket_description(_worker(queue), ticket) is None
+
+
+def test_board_sized_order_is_quoted_in_full() -> None:
+    marker = "ORDER-END-MARKER-XYZ"
+    order = "x" * (20_500 - len(marker)) + marker
+    prompt = build_builder_prompt(_assignment(None), order_description=order)
+    assert marker in prompt
+    assert "truncated" not in prompt
