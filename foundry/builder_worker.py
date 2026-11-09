@@ -1101,18 +1101,29 @@ HELP_ANSWER_KV_PREFIX = "help_answer:"
 DEFAULT_HELP_AFTER = 2
 MAX_HELP_AFTER = 3
 MAX_HELP_TEXT_CHARS = 2000
+#: Send-back reasons that judge the work; these never mean the builder lacked information
+#: (nor does any ``gate_*`` reason).
+_WORK_JUDGEMENT_REASONS = frozenset({"pre_review", "revise", "review_error", "worker_error"})
+#: Looked for in the hint only, and only for reasons that are not judgements of the work.
 _MISSING_INFO_PHRASES = (
     "can't see", "cannot see", "not shown", "isn't shown", "not supplied", "not provided",
-    "need the body", "need the exact", "is missing", "no context",
+    "need the body", "need the exact", "no context",
 )
 
 
 def _is_missing_information(reason: str, hint: str) -> bool:
-    """True when a failure says the builder lacked information rather than got the code wrong."""
-    text = f"{reason}\n{hint}"
-    if "BLOCKED" in text:
+    """True when a failure says the builder lacked information rather than got the code wrong.
+
+    Send-backs that judge the work (pre-review, reviewer, worker errors, any ``gate_*``)
+    never count, whatever their text says.  A ``blocked`` send-back counts when its hint
+    holds the builder's ``BLOCKED`` reply; anything else counts only when the hint (not
+    the reason) contains one of ``_MISSING_INFO_PHRASES``.
+    """
+    if reason in _WORK_JUDGEMENT_REASONS or reason.startswith("gate_"):
+        return False
+    if reason == "blocked" and "BLOCKED" in hint:
         return True
-    lowered = text.lower()
+    lowered = hint.lower()
     return any(phrase in lowered for phrase in _MISSING_INFO_PHRASES)
 
 
