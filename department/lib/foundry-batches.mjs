@@ -12,7 +12,8 @@
 //   subtasks: [{key, title, description, files: [], size: "S"|"M"|"L"|"XL"|null,
 //               acceptance: [], dependsOn: [keys], readFiles: []}],
 //   results: {[key]: {foundryTask: "F-012"|null, state, pr: {state,url,branch,error}|null,
-//                     error: string|null, updatedAt, usage?: {...}|null}},
+//                     error: string|null, updatedAt, usage?: {...}|null,
+//                     help?: {question, context, options: [], answer?, answeredBy?, answeredAt?}}},
 // }
 // Log entries go to state.log with kind "foundry" and batchId: dispatch, claims,
 // batch status changes and cancel only (not every result update).
@@ -21,7 +22,7 @@ import { DeptError, clockNow } from './core.mjs';
 import { cleanUsage } from './foundry-metrics.mjs';
 
 export const BATCH_STATUSES = ['queued', 'claimed', 'running', 'done', 'failed', 'cancelled'];
-export const RESULT_STATES = ['queued', 'sizing', 'building', 'reviewing', 'complete', 'quarantined', 'failed'];
+export const RESULT_STATES = ['queued', 'sizing', 'building', 'reviewing', 'needs_help', 'answered', 'complete', 'quarantined', 'failed'];
 export const TERMINAL_RESULT = new Set(['complete', 'quarantined', 'failed']);
 export const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 export const SIZES = ['S', 'M', 'L', 'XL'];
@@ -36,6 +37,8 @@ export const LIMITS = Object.freeze({
   acceptanceItem: 2000,
   error: 2000,
   note: 2000,
+  help: 4000,
+  helpOptions: 20,
   keep: 200, // batches kept on the board; the oldest finished ones go first
 });
 export const TAKEOVER_MS = 10 * 60 * 1000;
@@ -166,6 +169,20 @@ function cleanPr(pr) {
   };
 }
 
+// What a subtask asks the user when it is stuck. The answer fields are set only
+// by answerHelp, so anything else a worker sends is dropped here.
+function cleanHelp(help, name) {
+  if (help === null) return null;
+  if (!isObj(help)) throw bad(`${name} must be an object`);
+  return {
+    question: text(help.question, `${name} question`, LIMITS.help, { required: true }),
+    context: text(help.context, `${name} context`, LIMITS.help),
+    options: list(help.options, `${name} options`, LIMITS.helpOptions).map((o, i) =>
+      text(o, `${name} option ${i + 1}`, LIMITS.help, { required: true }),
+    ),
+  };
+}
+
 function cleanResult(batch, key, partial) {
   if (!batch.subtasks.some((s) => s.key === key)) throw bad(`batch ${batch.id} has no subtask ${key}`);
   if (!isObj(partial)) throw bad(`result for ${key} must be an object`);
@@ -183,6 +200,8 @@ function cleanResult(batch, key, partial) {
   if (pr !== undefined) out.pr = pr;
   if (partial.error !== undefined) out.error = partial.error === null ? null : text(partial.error, 'error', LIMITS.error) || null;
   if (partial.usage !== undefined) out.usage = cleanUsage(partial.usage, `result for ${key} usage`);
+  if (partial.help !== undefined) out.help = cleanHelp(partial.help, `result for ${key} help`);
+  if (out.state === 'needs_help' && !out.help) throw bad(`result for ${key}: needs_help requires a help object`);
   return out;
 }
 
@@ -321,6 +340,7 @@ export function updateBatch(state, { id, service, host, status, results, heartbe
   if (results !== undefined && results !== null && !isObj(results)) throw bad('results must be an object keyed by subtask');
   // Validate everything before changing anything.
   const cleaned = Object.entries(results || {}).map(([key, partial]) => [key, cleanResult(b, key, partial)]);
+  if (cleaned.some(([, patch]) => patch.state === 'answered')) throw bad('only answerHelp can set a result to answered');
   const noteText = note === undefined ? undefined : text(note, 'note', LIMITS.note);
   const iso = now();
   for (const [key, patch] of cleaned) {
@@ -343,6 +363,26 @@ export function updateBatch(state, { id, service, host, status, results, heartbe
     const p = batchProgress(b);
     log(state, b.id, `${b.id} ${b.status} (${p.complete}/${p.total} complete)${noteText ? `: ${noteText}` : ''}`);
   }
+  return { ok: true, batch: b };
+}
+
+// The user's reply to a subtask in needs_help. Foundry picks it up from the
+// result's help.answer once the state reads answered.
+export function answerHelp(state, { id, key, answer, by } = {}) {
+  const b = getBatch(state, id);
+  if (!OPEN_BATCH.has(b.status)) throw new DeptError(`${b.id} is ${b.status}`, 409);
+  const k = String(key ?? '').trim();
+  if (!b.subtasks.some((s) => s.key === k)) throw bad(`batch ${b.id} has no subtask ${k}`);
+  const result = b.results[k];
+  if (result?.state !== 'needs_help') throw new DeptError(`${b.id} subtask ${k} is ${result?.state || 'queued'}, not needs_help`, 409);
+  const reply = text(answer, 'answer', LIMITS.help, { required: true });
+  const who = text(by, 'by', 100) || 'user';
+  const iso = now();
+  result.state = 'answered';
+  result.help = { ...result.help, answer: reply, answeredBy: who, answeredAt: iso };
+  result.updatedAt = iso;
+  b.updatedAt = iso;
+  log(state, b.id, `${b.id} subtask ${k} answered by ${who}`);
   return { ok: true, batch: b };
 }
 
@@ -410,12 +450,21 @@ function validateImported(raw) {
     for (const [key, r] of Object.entries(raw.results)) {
       const clean = cleanResult(b, key, isObj(r) ? { ...r, usage: undefined } : r);
       const usage = importedUsage(r.usage, `result for ${key} usage`);
+      const help = clean.help && {
+        ...clean.help,
+        ...(r.help.answer ? {
+          answer: text(r.help.answer, 'help answer', LIMITS.help),
+          answeredBy: text(r.help.answeredBy, 'help answeredBy', 100) || 'user',
+          answeredAt: iso(r.help.answeredAt, 'help answeredAt'),
+        } : {}),
+      };
       b.results[key] = {
         foundryTask: clean.foundryTask ?? null,
         state: clean.state ?? 'queued',
         pr: clean.pr ?? null,
         error: clean.error ?? null,
         ...(usage !== undefined ? { usage } : {}),
+        ...(help ? { help } : {}),
         updatedAt: iso(r.updatedAt, 'result updatedAt'),
       };
     }
