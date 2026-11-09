@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Seismogram line">
+  <title>Seismogram line</title>
+  <rect width="512" height="512" rx="96" fill="#1f3a5f"/>
+  <polyline points="48,256 120,256 140,232 160,280 180,240 204,256 228,120 256,404 284,160 308,324 332,216 352,284 372,244 392,256 464,256" fill="none" stroke="#f7f4ee" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
