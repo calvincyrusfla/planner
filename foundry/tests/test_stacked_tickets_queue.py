@@ -91,14 +91,23 @@ def test_parallel_ok_only_when_independent_disjoint_without_tests_or_dependencie
     # a test file anywhere before (or in) the ticket keeps it sequential
     plan = plan_tickets([sub(1, ["a.py", "tests/test_a.py"]), sub(2, ["b.py"], independent=True)])
     assert plan[1].parallel_ok is False
-    # unknown files: sequential, and still unrestricted as before
+    # unknown files: sequential, and it gets the task's other files
     plan = plan_tickets([sub(1, ["a.py"]), sub(2, [])])
-    assert plan[1].parallel_ok is False and plan[1].allowed_files == []
+    assert plan[1].parallel_ok is False and plan[1].allowed_files == ["a.py"] and plan[1].focus_files == []
     # an explicit depends_on (when the directive carries one) is honoured
     class Dep:
         subtask_id, title, acceptance_criteria, allowed_files, depends_on = "T-1.2", "x", [], ["b.py"], ["T-1.1"]
         independent = True
     assert plan_tickets([sub(1, ["a.py"]), Dep()])[1].parallel_ok is False
+
+
+def test_plan_fileless_subtask_gets_all_task_files() -> None:
+    plan = plan_tickets([sub(1, ["a.py", "tests/test_a.py"]), sub(2, []), sub(3, ["b.py"])])
+    assert set(plan[1].allowed_files) == {"a.py", "tests/test_a.py", "b.py"}
+    assert plan[1].focus_files == [] and plan[1].parallel_ok is False
+    # no subtask has files: still unrestricted
+    plan = plan_tickets([sub(1, []), sub(2, [])])
+    assert [p.allowed_files for p in plan] == [[], []]
 
 
 # ---------------------------------------------------------------- claiming

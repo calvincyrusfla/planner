@@ -107,5 +107,5 @@ def test_builder_saves_the_prompt_it_sends(prompt_dir: Path) -> None:
     )
     ticket = {"ticket_id": "T-1", "task_id": "T"}
     assert asyncio.run(BuilderWorker._build_ticket(worker, ticket)) == "released"
-    saved = (prompt_dir / "T-1_attempt2.txt").read_text(encoding="utf-8")
+    saved = (prompt_dir / "T-1_attempt3.txt").read_text(encoding="utf-8")
     assert saved == worker.scratch["last_prompt"]

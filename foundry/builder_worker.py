@@ -2256,7 +2256,7 @@ class BuilderWorker(_WorkerBase):
                                       focus_files=self._focus_files(ticket, assignment),
                                       order_description=meta.get("description"))
         self.scratch["last_prompt"] = prompt
-        _save_prompt(prompt, str(_get(ticket, "ticket_id")), assignment.attempt)
+        _save_prompt(prompt, str(_get(ticket, "ticket_id")), assignment.attempt + 1)
         try:
             result = await self._call_claude(prompt, task_id=task_id)
         except asyncio.CancelledError:
