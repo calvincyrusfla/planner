@@ -22,9 +22,18 @@ def _stub(**fields: Any) -> Any:
     return SimpleNamespace(**fields)
 
 
+class _Partial(SimpleNamespace):
+    """A stub whose unset public attributes read as None, like a model's optional fields."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return None
+
+
 def _assignment(allowed: list[str], read_files: list[str], excerpts: list[dict[str, Any]] | None = None) -> Any:
-    context = _stub(objective="Do the thing.", acceptance_criteria=["works"], snippets=[])
-    return _stub(
+    context = _Partial(objective="Do the thing.", acceptance_criteria=["works"], snippets=[])
+    return _Partial(
         builder_id="bravo-1",
         team_id="bravo",
         task_id="F-1",
@@ -46,7 +55,7 @@ def _write(root: Path, rel: str, text: str = "x = 1\n") -> None:
 
 
 def _engine(root: Path) -> Any:
-    return _stub(repo_root=str(root))
+    return ContextEngine(root)
 
 
 def test_prompt_lists_read_only_files_apart_from_editable_ones() -> None:
