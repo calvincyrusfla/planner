@@ -434,14 +434,14 @@ test('CLI foundry dispatch refuses an over-long order before sending anything', 
   const fileEnv = { ...base, DEPT_HUB: 'off', DEPT_DATA: path.join(dir, 'file-run.json') };
   const cmd = (env, ...args) => spawnSync(process.execPath, [cli, ...args], { env, encoding: 'utf8' });
   const dispatch = (env, title, description) => cmd(env, 'foundry', 'dispatch', '--title', 'T', '--repo', 'me/p', '--subtask', `${title}::${description}`);
-  const longText = 'x'.repeat(7000);
+  const longText = 'x'.repeat(LIMITS.builderOrder + 1000);
   try {
     // (a) Dead hub, long order: refused without trying the hub.
     const refused = dispatch(hubEnv, 'Long', longText);
     const refusedOut = refused.stdout + refused.stderr;
     assert.notEqual(refused.status, 0);
     assert.match(refusedOut, /subtask 1 \("Long"\) order is \d+ characters/);
-    assert.ok(refusedOut.includes('6000'), refusedOut);
+    assert.ok(refusedOut.includes(String(LIMITS.builderOrder)), refusedOut);
     assert.doesNotMatch(refusedOut, /unreachable|ECONNREFUSED|fetch failed/i);
 
     // (b) Dead hub, short order: fails on the hub, so (a) stopped before it.
@@ -522,8 +522,8 @@ test('CLI foundry dispatch / list / poll / cancel on a scratch board', () => {
 
 // ---------- order length limit ----------
 
-test('LIMITS: builderOrder is 6000; description and goal stay 20000', () => {
-  assert.equal(LIMITS.builderOrder, 6000);
+test('LIMITS: builderOrder is 24000; description and goal stay 20000', () => {
+  assert.equal(LIMITS.builderOrder, 24000);
   assert.equal(LIMITS.description, 20000);
   assert.equal(LIMITS.goal, 20000);
 });
@@ -536,28 +536,34 @@ test('orderTextLength matches the order text Foundry composes', () => {
   assert.equal(orderTextLength({ title: 'T' }, { description: 'do it' }), bare.length);
 });
 
-test('dispatchBatch takes an order of exactly 6000 characters and refuses 6001', () => {
-  const empty = orderTextLength({ title: 'Two things' }, { description: '' });
+test('dispatchBatch takes an order of exactly 24000 characters and refuses 24001', () => {
+  // A description alone stops at LIMITS.description, so a goal makes up the rest.
+  const goal = 'g'.repeat(5000);
+  const empty = orderTextLength({ title: 'Two things', goal }, { description: '' });
   const subtasks = (n) => [{ key: 'big', title: 'Big', description: 'x'.repeat(n - empty - 2) }];
   const s = fresh();
-  const b = op(s, 'dispatchBatch', sample({ subtasks: subtasks(6000) }));
+  const b = op(s, 'dispatchBatch', sample({ goal, subtasks: subtasks(LIMITS.builderOrder) }));
   assert.equal(b.id, 'S-001');
-  assert.equal(orderTextLength(b, b.subtasks[0]), 6000);
+  assert.equal(orderTextLength(b, b.subtasks[0]), LIMITS.builderOrder);
   assert.throws(
-    () => op(s, 'dispatchBatch', sample({ subtasks: subtasks(6001) })),
-    (e) => e.status === 400 && /big/.test(e.message) && /6000/.test(e.message),
+    () => op(s, 'dispatchBatch', sample({ goal, subtasks: subtasks(LIMITS.builderOrder + 1) })),
+    (e) => e.status === 400 && /big/.test(e.message) && e.message.includes(String(LIMITS.builderOrder)),
   );
   assert.equal(s.foundryBatches.length, 1);
   assert.equal(s.nextBatchNumber, 2);
 });
 
-test('a 6000-character goal makes every subtask oversized', () => {
-  const goal = 'g'.repeat(6000);
+test('a 24000-character goal makes every subtask oversized', () => {
+  const goal = 'g'.repeat(LIMITS.builderOrder);
   const over = oversizedOrders(sample({ goal }));
   assert.deepEqual(over.map((o) => o.key), ['1', '2']);
-  assert.ok(over.every((o) => o.limit === 6000 && o.length > 6000));
+  assert.ok(over.every((o) => o.limit === LIMITS.builderOrder && o.length > LIMITS.builderOrder));
   const s = fresh();
-  assert.throws(() => op(s, 'dispatchBatch', sample({ goal })), /subtask 1 [\s\S]*subtask 2 /);
+  // dispatchBatch caps the goal first, so reach the order limit with the longest goal it takes.
+  assert.throws(() => op(s, 'dispatchBatch', sample({ goal })), /goal is too long/);
+  const longest = 'g'.repeat(LIMITS.goal);
+  const subtasks = [{ title: 'A', description: 'x'.repeat(4000) }, { title: 'B', description: 'y'.repeat(4000) }];
+  assert.throws(() => op(s, 'dispatchBatch', sample({ goal: longest, subtasks })), /subtask 1 [\s\S]*subtask 2 /);
   assert.equal(s.foundryBatches.length, 0);
 });
 
@@ -593,7 +599,7 @@ test('orderTextLength handles size only, goal only and a missing description', (
 
 test('oversizedOrderMessage names the subtask, its length and the limit', () => {
   assert.equal(
-    oversizedOrderMessage({ key: 'big', title: 'Big', length: 6001, limit: 6000 }),
-    'subtask big ("Big") order is 6001 characters; the builder sees only 6000 (description + goal + title). Shorten it, move detail into readFiles, or split the subtask.',
+    oversizedOrderMessage({ key: 'big', title: 'Big', length: 24001, limit: 24000 }),
+    'subtask big ("Big") order is 24001 characters; the builder sees only 24000 (description + goal + title). Shorten it, move detail into readFiles, or split the subtask.',
   );
 });
