@@ -287,13 +287,15 @@ def test_search_replace_works_on_non_python(tmp_path):
     assert (_apply_via_gates(root, diff, tmp_path) / "web/app.js").read_text() == "// app\nconst a = 2;\n"
 
 
-def test_symbol_ops_refuse_non_python(tmp_path):
-    _, _, errors = _run(
+def test_symbol_ops_refuse_unsupported_languages(tmp_path):
+    _, diff, errors = _run(
         tmp_path,
-        [{"op": "delete_symbol", "file": "web/app.js", "symbol": "a"}],
-        files={"web/app.js": "const a = 1;\n"},
+        [{"op": "delete_symbol", "file": "lib/app.rb", "symbol": "a"}],
+        files={"lib/app.rb": "a = 1\n"},
     )
-    assert "only works on .py files" in errors[0]
+    assert diff == ""
+    assert len(errors) == 1
+    assert errors[0].startswith("edit 1 (delete_symbol lib/app.rb:a):")
 
 
 def test_create_file(tmp_path):

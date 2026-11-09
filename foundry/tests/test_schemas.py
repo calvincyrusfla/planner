@@ -430,9 +430,9 @@ def test_slice_objective_two_sentences_ok() -> None:
     ContextSlice.model_validate(_slice(objective="Do one thing. Then another."))
 
 
-def test_slice_objective_three_sentences_rejected() -> None:
-    with pytest.raises(ValidationError):
-        ContextSlice.model_validate(_slice(objective="One. Two. Three."))
+def test_slice_objective_keeps_several_sentences() -> None:
+    objective = "One. Two. Three."
+    assert ContextSlice.model_validate(_slice(objective=objective)).objective == objective
 
 
 def test_slice_source_line_count_int() -> None:

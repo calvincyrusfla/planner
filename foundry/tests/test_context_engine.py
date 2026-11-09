@@ -22,7 +22,6 @@ from foundry.schemas import (
     MAX_SNIPPET_LINES,
     ContextSlice,
     SubtaskAllocation,
-    count_sentences,
 )
 
 # --------------------------------------------------------------------------- fixtures
@@ -307,12 +306,12 @@ def test_glob_allowed_files(repo: Path) -> None:
     assert engine.expand_files(["app/*.py"]) == ["app/billing.py", "app/broken.py", "app/other.py"]
 
 
-def test_objective_trimmed_to_two_sentences(repo: Path) -> None:
+def test_objective_kept_in_full(repo: Path) -> None:
     long = "First sentence here. Second one! Third? Fourth sentence."
-    assert trim_objective(long) == "First sentence here. Second one!"
+    assert trim_objective(long) == long
     assert trim_objective("  one   line  ") == "one line"
     sl = ContextEngine(repo).build_slice(objective=long, allowed_files=["app/other.py"])
-    assert count_sentences(sl.objective) == 2
+    assert sl.objective == long
     sub = SubtaskAllocation(subtask_id="s", title="Title only", acceptance_criteria=["c1"])
     sl2 = ContextEngine(repo).build_slice(sub)
     assert sl2.objective == "Title only" and sl2.acceptance_criteria == ["c1"]
