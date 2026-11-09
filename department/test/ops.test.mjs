@@ -70,8 +70,8 @@ test('dispatch and updateSettings', () => {
 
 test('every op type is covered and missing args are tolerated', () => {
   assert.deepEqual(OP_TYPES.sort(), [
-    'addTask', 'assignTeam', 'cancelBatch', 'claimBatch', 'deleteTask', 'dispatch', 'dispatchBatch', 'importState',
-    'reportProgress', 'reportUsage', 'reset', 'reviewTask', 'unassignTeam', 'updateBatch', 'updateSettings', 'updateTask',
+    'addTask', 'answerHelp', 'assignTeam', 'cancelBatch', 'claimBatch', 'deleteTask', 'dispatch', 'dispatchBatch', 'importState',
+    'reportFoundryMetrics', 'reportProgress', 'reportUsage', 'reset', 'reviewTask', 'unassignTeam', 'updateBatch', 'updateSettings', 'updateTask',
   ]);
   const s = fresh();
   assert.deepEqual(applyOp(s, { type: 'dispatch' }), []);
@@ -344,4 +344,26 @@ test('alpha-1: importState falls back to reviews for boards without teamIssues',
   const here = core.createInitialState();
   op(here, 'importState', { state: old });
   assert.equal(here.teams[0].issuesFound, 4);
+});
+
+// ---------- answerHelp ----------
+
+test('answerHelp records the reply on a subtask in needs_help', () => {
+  const s = fresh();
+  const batch = op(s, 'dispatchBatch', {
+    title: 'Needs a hand',
+    repo: 'owner/name',
+    subtasks: [{ title: 'One', description: 'Do the thing', files: ['a.py'], size: 'S' }],
+    by: 'fm',
+  });
+  const { id } = batch;
+  const key = batch.subtasks[0].key;
+  assert.equal(key, '1');
+  const worker = { id, host: 'pc', service: 'foundry' };
+  assert.equal(op(s, 'claimBatch', worker).ok, true);
+  op(s, 'updateBatch', { ...worker, results: { [key]: { state: 'needs_help', help: { question: 'Q?' } } } });
+  const r = op(s, 'answerHelp', { id, key, answer: 'Use X', by: 'fm' });
+  assert.equal(r.ok, true);
+  assert.equal(r.batch.results[key].state, 'answered');
+  assert.equal(r.batch.results[key].help.answer, 'Use X');
 });

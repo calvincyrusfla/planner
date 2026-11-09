@@ -48,6 +48,7 @@ const OPS = {
   updateBatch: (state, { id, service, host, status, results, heartbeat, note } = {}) =>
     batches.updateBatch(state, { id, service, host, status, results, heartbeat, note }),
   cancelBatch: (state, { id, by } = {}) => batches.cancelBatch(state, { id, by }),
+  answerHelp: (state, { id, key, answer, by } = {}) => batches.answerHelp(state, { id, key, answer, by }),
   // Foundry metrics: latest report per service (see lib/foundry-metrics.mjs).
   reportFoundryMetrics: (state, { service, host, reportedAt, metrics } = {}) =>
     foundryMetrics.reportFoundryMetrics(state, { service, host, reportedAt, metrics }),
