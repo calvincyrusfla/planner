@@ -24,6 +24,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -228,8 +229,13 @@ class FloorManager:
         self.pr_draft = bool(pr_draft)
         #: task id -> ``{state: pending|opened|failed|skipped, url, branch, error, stage, attempts}``
         self.pr_states: dict[str, dict[str, Any]] = {}
+        #: task id -> its draft PR of approved parts: ``{state: opened|failed, url, branch, error, stage, partial}``
+        #: (apart from ``pr_states``, so the normal PR logic and the snapshot pins never see it)
+        self.partial_prs: dict[str, dict[str, Any]] = {}
         #: task id -> its background publish task
         self._pr_tasks: dict[str, asyncio.Task[Any]] = {}
+        #: task id -> its background draft PR of approved parts (never holds up the normal PR)
+        self._partial_tasks: dict[str, asyncio.Task[Any]] = {}
         self.finish_timeout = float(finish_timeout)
         self.foreman = foreman
         self.teams = dict(teams)
@@ -324,6 +330,7 @@ class FloorManager:
             "patch_names": dict(self.patch_names),
             "sizing_meta": {t: dict(m) for t, m in self.sizing_meta.items()},
             "pr_states": {t: dict(v) for t, v in self.pr_states.items()},
+            "partial_prs": {t: dict(v) for t, v in self.partial_prs.items()},
             "task_bases": {t: dict(v) for t, v in self.task_bases.items()},
         }
         try:
@@ -333,6 +340,7 @@ class FloorManager:
 
     def _load(self) -> None:
         state = self._kv_get() or {}
+        self.partial_prs = {t: dict(v) for t, v in (state.get("partial_prs") or {}).items()}
         try:
             self.orders = {t: WorkOrder.model_validate(o) for t, o in (state.get("orders") or {}).items()}
             self.directives = {
@@ -1026,6 +1034,7 @@ class FloorManager:
         self.record_outcome(task_id)
         self.bridge.quarantined(task_id, reason)
         self._prune_later()
+        self._start_partial(task_id, reason)
 
     def record_outcome(self, task_id: str) -> dict[str, Any] | None:
         """Record the task's sizing outcome in the queue (predicted vs actual effort).
@@ -1644,14 +1653,19 @@ class FloorManager:
             return True
         return not any((self.patches_dir / f"{name}{ext}").is_file() for ext in (".patch", ".patch.rejected"))
 
-    def _ordered_diffs(self, task_id: str) -> list[str]:
-        """The task's approved diffs in ticket build order (``order_index``; subtask id as fallback)."""
+    def _approved_parts(self, task_id: str) -> dict[str, str]:
+        """Subtask id -> approved diff of the task (unordered)."""
         parts = dict(self.diffs.get(task_id, {}))
         if not parts:  # e.g. the manager's saved state was lost: use the diffs the queue kept
             stored = getattr(self.queue, "approved_diffs", None)
             got = stored(task_id) if callable(stored) else None
             if isinstance(got, (list, tuple)):
                 parts = {str(x[0]): str(x[1]) for x in got if isinstance(x, (list, tuple)) and len(x) == 2}
+        return parts
+
+    def _ordered_diffs(self, task_id: str) -> list[str]:
+        """The task's approved diffs in ticket build order (``order_index``; subtask id as fallback)."""
+        parts = self._approved_parts(task_id)
         rank: dict[str, int] = {}
         fn = getattr(self.queue, "tickets_in_order", None)
         if callable(fn):
@@ -1771,8 +1785,11 @@ class FloorManager:
         """Record the task's PR as ``pending`` (or ``skipped``); True when a publish should start.
 
         Never queues a task whose PR was already opened, failed, skipped or is in flight.
+        A draft PR of the approved parts of a quarantined task (``partial``) does not count:
+        the task's normal PR still opens when it completes.
         """
-        if not self.auto_pr or self.publisher is None or task_id in self.pr_states:
+        st = self.pr_states.get(task_id)
+        if not self.auto_pr or self.publisher is None or (st is not None and not st.get("partial")):
             return False
         if self._pr_patch(task_id) is None:
             why = "the combined patch does not apply" if task_id in self.rejected_patches else "no patch to publish"
@@ -1797,6 +1814,110 @@ class FloorManager:
             t.add_done_callback(lambda _t: self._prune_later())
         return t
 
+    def _start_partial(self, task_id: str, reason: str) -> asyncio.Task[Any] | None:
+        """Start the background draft PR of a quarantined task's approved parts, when one is due."""
+        try:
+            if not self.auto_pr or self.publisher is None or not _partial_pr_enabled():
+                return None
+            if task_id in self.partial_prs or task_id in self.pr_states or not self._ordered_diffs(task_id):
+                return None
+            running = self._partial_tasks.get(task_id)
+            if running is not None and not running.done():
+                return running
+            t = asyncio.get_running_loop().create_task(self._publish_partial(task_id, reason))
+        except Exception as exc:  # a quarantine must go through whatever happens here
+            log.warning("floor manager: could not start the partial PR of %s: %s", task_id, exc)
+            return None
+        self._partial_tasks[task_id] = t
+        self._pending.add(t)  # drain() (shutdown) waits for it
+        t.add_done_callback(self._pending.discard)
+        return t
+
+    async def _publish_partial(self, task_id: str, reason: str) -> dict[str, Any] | None:
+        """Open a draft PR with the approved parts of a quarantined task. Never raises."""
+        if task_id in self.partial_prs:
+            return None
+        try:
+            result = await self._send_partial(task_id, reason)
+        except Exception as exc:  # publishing must never take the line down
+            log.exception("floor manager: partial PR of %s failed", task_id)
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500], "stage": "error"}
+        try:
+            return self._record_partial(task_id, result)
+        except Exception:
+            log.exception("floor manager: could not record the partial PR of %s", task_id)
+            return None
+
+    async def _send_partial(self, task_id: str, reason: str) -> Any:
+        """Write the approved work to ``<task>.partial.patch`` and hand it to the publisher."""
+        pin = dict(self.task_bases.get(task_id) or {})
+        diff = await self._combined_diff(task_id)
+        text = _with_newline(diff) if diff else ""
+        if self.patches_dir is None or not text.strip():
+            return {"ok": False, "error": "no patch to publish", "stage": "no_patch"}
+        self.patches_dir.mkdir(parents=True, exist_ok=True)
+        patch = self.patches_dir / f"{task_id}.partial.patch"
+        patch.write_text(text, encoding="utf-8", newline="\n")
+        order = self.orders.get(task_id)
+        title = "[partial] " + (order.title if order else task_id)
+        req = {"title": title, "body": self._partial_body(task_id, reason), "draft": True}
+        publish = self.publisher.publish
+        params = _params(publish)
+        kwargs: dict[str, Any] = {}
+        if "draft" in params:
+            kwargs["draft"] = True
+        base = (getattr(order, "pr_base", None) if order else None) or pin.get("base") or None
+        if base and "base" in params:
+            kwargs["base"] = base
+        if pin.get("sha") and "base_sha" in params:
+            kwargs["base_sha"] = pin["sha"]
+        return await _maybe_await(publish(task_id, title, patch, req, **kwargs))
+
+    def _partial_body(self, task_id: str, reason: str) -> str:
+        """The draft PR's body: which parts were approved, which were not and why."""
+        approved = {k for k, v in self._approved_parts(task_id).items() if v}
+        titles: dict[str, str] = {}
+        fn = getattr(self.queue, "tickets_in_order", None)
+        if callable(fn):
+            try:
+                titles = {str(_get(t, "subtask_id")): str(_get(t, "title") or "") for t in fn(task_id)}
+            except Exception as exc:  # pragma: no cover - the ids of the diffs are still listed
+                log.debug("tickets_in_order(%s) failed: %s", task_id, exc)
+
+        def line(subtask_id: str) -> str:
+            name = titles.get(subtask_id)
+            return f"- {subtask_id}: {name}" if name else f"- {subtask_id}"
+
+        good = [s for s in titles if s in approved] + sorted(approved - set(titles), key=_subtask_order)
+        bad = [s for s in titles if s not in approved]
+        lines = ["This draft holds only the approved parts of a task that was quarantined.", "", "Approved parts:"]
+        lines += [line(s) for s in good]
+        if bad:
+            lines += ["", "Failed or unfinished parts (not included):"] + [line(s) for s in bad]
+        lines += ["", f"Quarantine reason: {reason}", "", "---",
+                  f"Opened by Foundry (task {task_id}, partial: the task was quarantined)"]
+        return "\n".join(lines)
+
+    def _record_partial(self, task_id: str, result: Any) -> dict[str, Any]:
+        """Save the draft PR's outcome in ``partial_prs`` and note it on the board."""
+        ok = bool(_get(result, "ok"))
+        url = _get(result, "pr_url")
+        branch = _get(result, "branch")
+        rec: dict[str, Any] = {"state": "opened" if ok else "failed", "url": url, "branch": branch,
+                               "error": None, "stage": None, "partial": True}
+        if not ok:
+            rec["error"] = str(_get(result, "error") or "publishing failed")[:500]
+            rec["stage"] = _get(result, "stage")
+            log.warning("floor manager: %s partial PR not opened (%s): %s", task_id, rec["stage"], rec["error"])
+        self.partial_prs[task_id] = rec
+        self.save()
+        if ok:
+            d = self.directives.get(task_id)
+            self.bridge.progress(task_id, f"[Foundry] partial PR (draft): {url or branch}",
+                                 team_id=d.team_id if d else None)
+            log.info("floor manager: %s partial PR opened: %s", task_id, url or branch)
+        return rec
+
     def pr_request(self, task_id: str) -> dict[str, Any]:
         """``{title, body, draft}`` for the task's PR, from the Foreman's draft."""
         summary = self.pr_summaries.get(task_id) or {}
@@ -1812,6 +1933,8 @@ class FloorManager:
 
     async def _publish(self, task_id: str) -> dict[str, Any]:
         st = dict(self.pr_states.get(task_id) or {})
+        if st.get("partial"):  # the draft of the approved parts is not this task's PR
+            st = {}
         attempts = int(st.get("attempts") or 0) + 1
         # branch + commit known (only the PR step failed), or a pending one whose
         # on_pushed was saved before a restart: it is on the remote -> open_pr only
@@ -2057,6 +2180,14 @@ def _finish_timeout(config: Any, explicit: float | None) -> float:
         return float(value) if value is not None and float(value) >= 0 else DEFAULT_FINISH_TIMEOUT_S
     except (TypeError, ValueError):
         return DEFAULT_FINISH_TIMEOUT_S
+
+
+_PARTIAL_PR_OFF = {"0", "false", "no", "off"}
+
+
+def _partial_pr_enabled() -> bool:
+    """False when FOUNDRY_PARTIAL_PR is 0/false/no/off (default: on)."""
+    return os.environ.get("FOUNDRY_PARTIAL_PR", "").strip().lower() not in _PARTIAL_PR_OFF
 
 
 def _params(fn: Any) -> set[str]:
