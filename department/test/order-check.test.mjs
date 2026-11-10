@@ -101,9 +101,9 @@ test('related-test skips tests already listed in files or readFiles', () => {
 });
 
 test('related-test reports at most 8 paths, sorted', () => {
-  const contents = { 'lib/mod.mjs': '' };
-  for (let i = 9; i >= 0; i--) contents[`test/t${i}.test.mjs`] = "import '../lib/mod.mjs';\n";
-  const [finding] = byRule(checkOrder(order({ files: ['lib/mod.mjs'] }), fakeRepo(contents)), 'related-test');
+  const contents = { 'lib/mod.mjs': '', 'lib/other.mjs': '' };
+  for (let i = 9; i >= 0; i--) contents[`test/t${i}.test.mjs`] = `import '../lib/${i < 5 ? 'mod' : 'other'}.mjs';\n`;
+  const [finding] = byRule(checkOrder(order({ files: ['lib/mod.mjs', 'lib/other.mjs'] }), fakeRepo(contents)), 'related-test');
   assert.deepEqual(finding.paths, [0, 1, 2, 3, 4, 5, 6, 7].map((i) => `test/t${i}.test.mjs`));
   assert.match(finding.message, /2 more/);
 });
@@ -166,4 +166,35 @@ test('findings are ordered by subtask key then rule', () => {
     '10:not-found',
     '10:too-many-files',
   ]);
+});
+
+const manyTests = (count, text) => Object.fromEntries(Array.from({ length: count }, (_, i) => [`test/t${i}.test.mjs`, text]));
+
+test('a module imported by 6 tests gives one widely-imported note and no listing', () => {
+  const repo = fakeRepo({ 'lib/mod.mjs': '', ...manyTests(6, "import '../lib/mod.mjs';\n") });
+  const findings = checkOrder(order({ key: 'a', files: ['lib/mod.mjs'] }), repo);
+  assert.deepEqual(byRule(findings, 'related-test'), []);
+  assert.deepEqual(byRule(findings, 'widely-imported'), [
+    { key: 'a', rule: 'widely-imported', level: 'note', message: '6 tests import lib/mod.mjs; run them', paths: ['lib/mod.mjs'] },
+  ]);
+});
+
+test('a module imported by 5 tests still lists them', () => {
+  const repo = fakeRepo({ 'lib/mod.mjs': '', ...manyTests(5, "import '../lib/mod.mjs';\n") });
+  const findings = checkOrder(order({ files: ['lib/mod.mjs'] }), repo);
+  assert.deepEqual(byRule(findings, 'widely-imported'), []);
+  assert.deepEqual(byRule(findings, 'related-test')[0].paths, [0, 1, 2, 3, 4].map((i) => `test/t${i}.test.mjs`));
+});
+
+test('a quoted name found in 6 tests is ignored', () => {
+  const repo = fakeRepo(manyTests(6, 'shared_name;\n'));
+  const findings = checkOrder(order({ files: ['lib/x.mjs'], description: 'Change `shared_name`.' }), repo);
+  assert.deepEqual(byRule(findings, 'related-test'), []);
+  assert.deepEqual(byRule(findings, 'not-found'), []);
+});
+
+test('a quoted name found in 5 tests still counts', () => {
+  const repo = fakeRepo(manyTests(5, 'shared_name;\n'));
+  const [finding] = byRule(checkOrder(order({ files: ['lib/x.mjs'], description: 'Change `shared_name`.' }), repo), 'related-test');
+  assert.equal(finding.paths.length, 5);
 });

@@ -3206,6 +3206,7 @@ class TeamPool:
         queue: Any,
         client: ClaudeLike,
         builder_client: ClaudeLike | None = None,
+        reviewer_client: ClaudeLike | None = None,
         limiter: LimiterLike | None,
         telemetry: Any,
         context_engine: Any = None,
@@ -3256,8 +3257,10 @@ class TeamPool:
         self.team_id = team_id
         self.queue = queue
         self.client = client
-        #: The client builder slots call; reviewers (team and promoted peers) keep ``client``.
+        #: The client builder slots call; reviewers use ``reviewer_client``.
         self.builder_client: ClaudeLike = builder_client if builder_client is not None else client
+        #: The client reviewers (team and promoted peers) call; defaults to ``client``.
+        self.reviewer_client: ClaudeLike = reviewer_client if reviewer_client is not None else client
         self.limiter = limiter
         self.telemetry = telemetry
         self.cache = cache
@@ -3319,7 +3322,7 @@ class TeamPool:
         return ReviewerWorker(
             self.team_id,
             self.queue,
-            self.client,
+            self.reviewer_client,
             self.limiter,
             self.telemetry,
             self.cache,
