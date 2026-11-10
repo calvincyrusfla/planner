@@ -47,6 +47,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from foundry.metrics_report import build_metrics
+# Board limits from schema/order.json: error texts, and each question, context or option of a help request.
+from foundry.order_schema import LIMIT_ERROR, LIMIT_HELP
 
 log = logging.getLogger("foundry.board_dispatch")
 
@@ -62,11 +64,7 @@ HEARTBEAT_S = 120.0
 #: A claim whose heartbeat is older than this may be taken over (the board enforces it too).
 STALE_HEARTBEAT_S = 600.0
 KV_PREFIX = "foundry_batch:"
-#: Board limit for error texts (department/lib/foundry-batches.mjs LIMITS.error).
-LIMIT_ERROR = 2000
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
-#: Longest question, context or option sent to the board in a help request.
-LIMIT_HELP = 2000
 #: A file path mentioned in a Floor Manager answer.
 _PATH_TOKEN = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+")
 _MAX_HELP_FILES = 10
