@@ -199,17 +199,19 @@ test('a quoted name found in 5 tests still counts', () => {
   assert.equal(finding.paths.length, 5);
 });
 
-const changeRun = { files: ['lib/x.mjs'], description: 'Change `pkg.run_gate`.' };
+const changeRun = { files: ['lib/x.mjs', 'pkg/mod.py'], description: 'Change `pkg.run_gate`.' };
+const JS_IMPORT = "import '../lib/x.mjs';\n";
+const PY_IMPORT = 'import pkg.mod\n';
 
 test('fake-defined finds each way a test can define the function', () => {
   const sources = {
-    'tests/test_def.py': 'def run_gate(a):\n    pass\n',
-    'tests/test_async.py': 'class Fake:\n    async def run_gate(self):\n        pass\n',
-    'test/function.test.mjs': 'function run_gate(a) {}\n',
-    'test/method.test.mjs': 'class Fake {\n  run_gate(a, b = f()) {\n    return a;\n  }\n}\n',
-    'test/inline.test.mjs': 'const fake = { run_gate() { return 1; } };\n',
-    'test/assign.test.mjs': 'fake.run_gate = (a) => a;\n',
-    'test/property.test.mjs': 'const fake = {\n  run_gate: (a) => a,\n};\n',
+    'tests/test_def.py': PY_IMPORT + 'def run_gate(a):\n    pass\n',
+    'tests/test_async.py': PY_IMPORT + 'class Fake:\n    async def run_gate(self):\n        pass\n',
+    'test/function.test.mjs': JS_IMPORT + 'function run_gate(a) {}\n',
+    'test/method.test.mjs': JS_IMPORT + 'class Fake {\n  run_gate(a, b = f()) {\n    return a;\n  }\n}\n',
+    'test/inline.test.mjs': JS_IMPORT + 'const fake = { run_gate() { return 1; } };\n',
+    'test/assign.test.mjs': JS_IMPORT + 'fake.run_gate = (a) => a;\n',
+    'test/property.test.mjs': JS_IMPORT + 'const fake = {\n  run_gate: (a) => a,\n};\n',
   };
   const findings = byRule(checkOrder(order({ ...changeRun, key: 'a' }), fakeRepo(sources)), 'fake-defined');
   assert.deepEqual(findings.map((f) => f.paths[0]).sort(), Object.keys(sources).sort());
@@ -224,32 +226,46 @@ test('fake-defined finds each way a test can define the function', () => {
 test('fake-defined ignores calls, other names, listed tests, non-tests and fixture text', () => {
   const repo = fakeRepo({
     'lib/real.py': 'def run_gate(a):\n    pass\n',
-    'test/listed.test.mjs': 'function run_gate(a) {}\n',
-    'test/call.test.mjs': 'run_gate(1);\nconst y = run_gate(2);\nif (run_gate(3)) {\n}\nif (f(a, run_gate(4))) {\n}\nrun_gate == (a);\n',
-    'test/longer.test.mjs': 'function run_gate_two(a) {}\nmy_run_gate = (a) => a;\n',
-    'tests/test_call.py': 'run_gate(1)\nrun_gate = (1, 2)\n',
-    'tests/test_fixture.py': 'SOURCE = """\ndef run_gate(a):\n    pass\n"""\n# def run_gate(a):\n',
-    'test/fixture.test.mjs': "const source = 'function run_gate(a) {}';\n// function run_gate(a) {}\n",
+    'test/listed.test.mjs': JS_IMPORT + 'function run_gate(a) {}\n',
+    'test/call.test.mjs': JS_IMPORT + 'run_gate(1);\nconst y = run_gate(2);\nif (run_gate(3)) {\n}\nif (f(a, run_gate(4))) {\n}\nrun_gate == (a);\n',
+    'test/longer.test.mjs': JS_IMPORT + 'function run_gate_two(a) {}\nmy_run_gate = (a) => a;\n',
+    'tests/test_call.py': PY_IMPORT + 'run_gate(1)\nrun_gate = (1, 2)\n',
+    'tests/test_fixture.py': PY_IMPORT + 'SOURCE = """\ndef run_gate(a):\n    pass\n"""\n# def run_gate(a):\n',
+    'test/fixture.test.mjs': JS_IMPORT + "const source = 'function run_gate(a) {}';\n// function run_gate(a) {}\n",
     'test/data.txt': 'def run_gate(a):\n',
   });
-  const subtask = { ...changeRun, files: ['lib/x.mjs', 'test/listed.test.mjs'] };
+  const subtask = { ...changeRun, files: ['lib/x.mjs', 'pkg/mod.py', 'test/listed.test.mjs'] };
   assert.deepEqual(byRule(checkOrder(order(subtask), repo), 'fake-defined'), []);
 });
 
 test('fake-defined still warns about a test that is only readable', () => {
-  const repo = fakeRepo({ 'test/a.test.mjs': 'function run_gate(a) {}\n' });
+  const repo = fakeRepo({ 'test/a.test.mjs': JS_IMPORT + 'function run_gate(a) {}\n' });
   const findings = byRule(checkOrder(order({ ...changeRun, readFiles: ['test/a.test.mjs'] }), repo), 'fake-defined');
   assert.equal(findings.length, 1);
 });
 
 test('fake-defined reports at most 8 paths, sorted', () => {
   const contents = {};
-  for (let i = 9; i >= 0; i--) contents[`test/t${i}.test.mjs`] = 'function run_gate(a) {}\n';
+  for (let i = 9; i >= 0; i--) contents[`test/t${i}.test.mjs`] = JS_IMPORT + 'function run_gate(a) {}\n';
   const findings = byRule(checkOrder(order(changeRun), fakeRepo(contents)), 'fake-defined');
   assert.deepEqual(findings.map((f) => f.paths[0]), [0, 1, 2, 3, 4, 5, 6, 7].map((i) => `test/t${i}.test.mjs`));
 });
 
-const addGate = { files: ['lib/x.mjs'], description: 'Add the hygiene gate after syntax.' };
+test('fake-defined needs the test to import a file of the piece', () => {
+  const run = { files: ['pkg/mod.py'], description: 'Change `run_once` and `apply_escalation`.' };
+  const findings = (contents) => byRule(checkOrder(order(run), fakeRepo(contents)), 'fake-defined');
+  assert.deepEqual(findings({ 'tests/test_a.py': 'import other\n\ndef apply_escalation(a):\n    pass\n' }), []);
+  const hit = findings({ 'tests/test_b.py': 'import pkg.mod\n\ndef apply_escalation(a):\n    pass\n' });
+  assert.deepEqual(hit.map((f) => f.names), [['apply_escalation']]);
+});
+
+test('fake-defined ignores short names after stripping leading underscores', () => {
+  const run = { files: ['pkg/mod.py'], description: 'Change `_run` and `run_once`.' };
+  const contents = { 'tests/test_a.py': 'import pkg.mod\n\ndef _run(a):\n    pass\n' };
+  assert.deepEqual(byRule(checkOrder(order(run), fakeRepo(contents)), 'fake-defined'), []);
+});
+
+const addGate = { files: ['lib/x.mjs'], description: 'Add the `hygiene` gate after `syntax`.' };
 const exactLists = (contents, subtask = addGate) => byRule(checkOrder(order(subtask), fakeRepo(contents)), 'exact-list');
 
 test('exact-list finds Python lists and tuples and names the file and line', () => {
@@ -280,7 +296,7 @@ test('exact-list reads a multi-line Python list', () => {
 });
 
 test('exact-list matches strings from the acceptance criteria', () => {
-  const subtask = { files: ['lib/x.mjs'], acceptance: ['The hygiene gate runs.'] };
+  const subtask = { files: ['lib/x.mjs'], acceptance: ['The `hygiene` gate runs.'] };
   const findings = exactLists({ 'test/a.test.mjs': "assert.deepEqual(g, ['hygiene']);\n" }, subtask);
   assert.deepEqual(findings[0].names, ['hygiene']);
 });
@@ -310,13 +326,22 @@ test('exact-list ignores strings on the lines after the assertion', () => {
   );
 });
 
-test('exact-list compares whole words of the order', () => {
-  const subtask = { files: ['lib/x.mjs'], description: 'Add an option to the function for gates, a pre-hygiene step.' };
+test('exact-list only fires for names quoted in backticks', () => {
+  const list = "assert.deepEqual(g, ['hygiene']);\n";
+  const plain = { files: ['lib/x.mjs'], description: 'Add the hygiene gate.' };
+  assert.equal(exactLists({ 'test/a.test.mjs': list }).length, 1);
+  assert.deepEqual(exactLists({ 'test/a.test.mjs': list }, plain), []);
+  const py = { 'tests/test_a.py': "assert names == ['syntax', 'secrets', 'hygiene']\n" };
+  assert.deepEqual(exactLists(py, plain), []);
+  assert.deepEqual(exactLists(py)[0].names, ['syntax', 'hygiene']);
+});
+
+test('exact-list ignores common words and short names', () => {
+  const subtask = { files: ['lib/x.mjs'], description: 'Change the foundry list, open `gat` in the function.' };
   assert.deepEqual(
     exactLists({
-      'test/a.test.mjs': "assert.deepEqual(g, ['on', 'funct', 'gate', 'hygiene-x', 'hygien']);\n",
-      'tests/test_a.py': 'assert g == ["on", "gate"]\n',
-      'test/b.test.mjs': "assert.deepEqual(g, ['a', 'an', 'to', 'for']);\n",
+      'test/a.test.mjs': "assert.deepEqual(g, ['foundry', 'list', 'open', 'gat', 'function']);\n",
+      'tests/test_a.py': 'assert g == ["foundry", "gat", "open"]\n',
     }, subtask),
     [],
   );
