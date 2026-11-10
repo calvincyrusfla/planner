@@ -85,6 +85,13 @@ const HELP = `Agent Department CLI
   node department/dept.mjs foundry help                Subtasks stuck in needs_help and their questions
   node department/dept.mjs foundry answer <S-id> <key> --guidance "..."
                                                        Answer a subtask in needs_help
+  node department/dept.mjs foundry update [--repo owner/name] [--set KEY=VALUE ...] [--now]
+                                                       Ask Foundry on the PC to pull its base branch,
+                                                       apply FOUNDRY_* settings and restart (U-###);
+                                                       repo defaults to this folder's origin
+  node department/dept.mjs foundry update status [U-id] [--repo owner/name] [--json]
+                                                       An update request (default: latest for this repo)
+  node department/dept.mjs foundry update cancel <U-id> Cancel an update request that hasn't finished
   node department/dept.mjs foundry metrics [--json]    Latest metrics report of each Foundry service:
                                                        totals and per-task rows
   node department/dept.mjs foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]
@@ -105,7 +112,7 @@ Shared board (one board for this PC and Claude sessions, stored on the Netlify s
 `;
 
 // Options that never take a value (so `poll --json S-001` keeps S-001 positional).
-const FLAGS = new Set(['open']);
+const FLAGS = new Set(['open', 'now']);
 function parse(argv) {
   const pos = [];
   const opt = {};
@@ -114,12 +121,13 @@ function parse(argv) {
     const eq = a.startsWith('--') ? a.indexOf('=') : -1;
     if (a === '-m') opt.message = argv[++i];
     else if (a === '--subtask') (opt.subtask ||= []).push(argv[++i]); // repeatable
+    else if (a === '--set') (opt.set ||= []).push(argv[++i]); // repeatable
     else if (eq > 2) {
       // --key=value
       const key = a.slice(2, eq);
       const value = a.slice(eq + 1);
       if (FLAGS.has(key)) throw new core.DeptError(`--${key} takes no value`);
-      if (key === 'subtask') (opt.subtask ||= []).push(value);
+      if (key === 'subtask' || key === 'set') (opt[key] ||= []).push(value);
       else opt[key] = value;
     } else if (a.startsWith('--')) {
       const key = a.slice(2);
@@ -581,7 +589,7 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry check --json file.json | foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..." | foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry check --json file.json | foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..." | foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]\n       foundry update [--repo owner/name] [--set KEY=VALUE ...] [--now] | foundry update status [U-id] [--repo owner/name] [--json] | foundry update cancel <U-id>';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
 // "Title::description::file1,file2::S::read1,read2" → subtask. Empty parts are skipped.
@@ -802,8 +810,80 @@ function printDispatchCheck(batch) {
   }
 }
 
+// ---------------------------------------------------------------- foundry update requests
+
+// ["KEY=VALUE", ...] from --set → {KEY: VALUE}.
+function settingArgs(specs) {
+  const settings = {};
+  for (const spec of specs || []) {
+    const eq = typeof spec === 'string' ? spec.indexOf('=') : -1;
+    if (eq <= 0) throw new core.DeptError(`--set needs KEY=VALUE\n${FOUNDRY_HELP}`);
+    settings[spec.slice(0, eq).trim()] = spec.slice(eq + 1);
+  }
+  return settings;
+}
+
+const settingsLine = (settings) => {
+  const list = Object.entries(settings || {}).map(([k, v]) => `${k}=${v}`);
+  return list.length ? list.join(', ') : 'no settings';
+};
+
+function printUpdate(u) {
+  console.log(`${u.id} [${u.status}] ${u.repo}`);
+  console.log(`  settings  ${settingsLine(u.settings)}`);
+  console.log(`  now       ${u.now ? 'yes' : 'no'}`);
+  console.log(`  requested ${u.createdAt || '?'} by ${u.createdBy || '?'}`);
+  console.log(`  claimed   ${u.claimedBy ? `Foundry on ${u.claimedBy.host || '?'} (${u.claimedBy.service || '?'}) at ${u.claimedBy.at || '?'}` : u.status === 'queued' ? 'waiting for Foundry' : '—'}`);
+  if (u.finishedAt) console.log(`  finished  ${u.finishedAt}`);
+  if (u.result) {
+    console.log(`  commits   ${u.result.commitBefore || '?'} → ${u.result.commitAfter || '?'}`);
+    if (u.result.message) console.log(`  message   ${u.result.message}`);
+  }
+}
+
+async function foundryUpdateCommand(args, opt) {
+  const [action, ...rest] = args;
+  const repoOpt = typeof opt.repo === 'string' ? opt.repo : null;
+  if (action === undefined) {
+    const repo = repoOpt || originSlug();
+    if (!repo) throw new core.DeptError(`No --repo given and this folder has no origin remote\n${FOUNDRY_HELP}`);
+    const settings = settingArgs(opt.set);
+    const u = await batchOp('requestFoundryUpdate', { repo, settings, now: Boolean(opt.now), by: typeof opt.by === 'string' ? opt.by : 'cli' });
+    console.log(`${u.id} requested for ${u.repo}: pull, then restart (${settingsLine(u.settings)})`);
+    return;
+  }
+  if (action === 'status') {
+    if (typeof opt.json === 'string') {
+      rest.unshift(opt.json);
+      opt.json = true;
+    }
+    const s = await currentState();
+    const list = Array.isArray(s.foundryUpdates) ? s.foundryUpdates : [];
+    let u;
+    if (rest[0]) {
+      const id = String(rest[0]).toUpperCase();
+      u = list.find((x) => x.id === id);
+      if (!u) throw new core.DeptError(`No Foundry update request ${rest[0]}`, 404);
+    } else {
+      const repo = repoOpt || originSlug();
+      u = [...list].reverse().find((x) => !repo || x.repo === repo);
+      if (!u) return console.log(repo ? `No Foundry update requests for ${repo}` : 'No Foundry update requests');
+    }
+    if (opt.json) return console.log(JSON.stringify(u, null, 2));
+    return printUpdate(u);
+  }
+  if (action === 'cancel') {
+    if (!rest[0]) throw new core.DeptError(FOUNDRY_HELP);
+    const r = await batchOp('cancelFoundryUpdate', { id: String(rest[0]).toUpperCase(), by: typeof opt.by === 'string' ? opt.by : 'cli' });
+    console.log(`${r.update.id} cancelled`);
+    return;
+  }
+  throw new core.DeptError(FOUNDRY_HELP);
+}
+
 async function foundryCommand(sub, args, opt) {
   if (sub === 'metrics') return foundryMetricsCommand(opt);
+  if (sub === 'update') return foundryUpdateCommand(args, opt);
   if (sub === 'watch') return foundryWatchCommand(args, opt);
   switch (sub) {
     case 'dispatch': {

@@ -54,4 +54,12 @@ if [ "${FOUNDRY_DRY_RUN:-0}" = "1" ]; then
   printf '[dry-run] %s -m foundry.serve --repo %s\n' "$PY" "$TARGET"
   exit 0
 fi
-exec "$PY" -m foundry.serve --repo "$TARGET"
+# Exit status 75 means "restart me" (a remote update pulled new code).
+while :; do
+  "$PY" -m foundry.serve --repo "$TARGET"
+  rc=$?
+  if [ "$rc" -ne 75 ]; then
+    exit "$rc"
+  fi
+  say "Restarting with the updated code..."
+done

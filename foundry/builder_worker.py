@@ -59,6 +59,7 @@ from pydantic import ValidationError
 
 from foundry import claude_client as _claude_client
 from foundry.order_schema import LIMIT_BUILDER_ORDER
+from foundry.piece_workspace import WorkspaceError, collect_changes, make_workspace, remove_workspace
 from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
 from foundry.schemas import (
     MAX_RETRIES,
@@ -78,6 +79,7 @@ from foundry.schemas import (
 __all__ = [
     "DIFF_CONTRACT",
     "BUILDER_CONTRACT",
+    "EDIT_CONTRACT",
     "REVIEWER_CONTRACT",
     "MAX_FIX_HINT_CHARS",
     "build_builder_prompt",
@@ -152,6 +154,15 @@ BUILDER_CONTRACT = (
 )
 DIFF_CONTRACT = BUILDER_CONTRACT  # backwards-compatible name
 """The builder output contract quoted verbatim in every builder prompt."""
+
+EDIT_CONTRACT = (
+    "Make the change by editing the files in your working directory with the Edit and Write tools; "
+    "Foundry collects your edits itself, so do not paste a diff or code block. Only change the files "
+    "listed under 'Files you may modify'. When you are done, reply with a short plain summary of what "
+    "you changed. If you cannot do the work, make no edits and reply with a single line starting with "
+    "`BLOCKED:` naming what you need in backticks."
+)
+"""The output contract of an edit-mode builder (``builder_mode`` ``edit``)."""
 
 REVIEWER_CONTRACT = (
     "Reply with a single JSON object and nothing else (no prose, no code fence): "
@@ -551,8 +562,11 @@ def build_builder_prompt(
     focus_files: Sequence[str] | None = None,
     floor_manager_note: str | None = None,
     order_description: str | None = None,
+    contract: str = BUILDER_CONTRACT,
 ) -> str:
     """Return the exact prompt a builder sends to Claude for ``assignment``.
+
+    ``contract``: the text of the '## Output contract' section (``EDIT_CONTRACT`` in edit mode).
 
     ``already_done`` (stacked tickets): the task's earlier approved tickets,
     listed under "## Already done on this piece" (title, files, symbols).
@@ -651,7 +665,7 @@ def build_builder_prompt(
                 text.rstrip("\n"),
                 fence,
             ]
-    parts += ["", "## Output contract", BUILDER_CONTRACT]
+    parts += ["", "## Output contract", contract]
     return "\n".join(parts) + "\n"
 
 
@@ -1568,14 +1582,16 @@ class _WorkerBase:
         return str(path) if path is not None else self.cwd
 
     # -- Claude ---------------------------------------------------------------
-    async def _call_claude(self, prompt: str, *, task_id: str) -> ClaudeResult:
+    async def _call_claude(self, prompt: str, *, task_id: str, cwd: str | None = None) -> ClaudeResult:
         """One Claude call inside ``limiter.slot`` wrapped by ``call_with_backoff``.
 
         Records tokens per call; raises whatever the client raises once backoff
-        gives up.
+        gives up. ``cwd`` (edit mode: the piece workspace) replaces the task's
+        snapshot / ``self.cwd`` as Claude's working directory.
         """
         estimate = _estimate_tokens(prompt)
-        cwd = await self._claude_cwd(task_id)
+        if cwd is None:
+            cwd = await self._claude_cwd(task_id)
 
         async def once() -> ClaudeResult:
             if self.limiter is None:
@@ -1905,6 +1921,10 @@ class BuilderWorker(_WorkerBase):
         self._backoff_s = 0.0
         #: True while this slot serves as a promoted peer reviewer (M1: claims no build tickets).
         self.promoted = False
+        #: ``FoundryConfig`` (``builder_mode``, ``db_path``); None = diff mode.
+        self.config: Any = None
+        #: Tickets already logged as built in diff mode although ``builder_mode`` is edit.
+        self._edit_skip_logged: set[str] = set()
 
     # -- lifecycle ------------------------------------------------------------
     def _set_busy(self, busy: bool) -> None:
@@ -2429,6 +2449,10 @@ class BuilderWorker(_WorkerBase):
         completed without Claude), ``"retry"`` (reopened with a fix hint),
         ``"awaiting_help"`` (parked until the Floor Manager answers),
         ``"quarantined"``, ``"skipped"`` (task already terminal).
+
+        In edit mode (``config.builder_mode`` ``edit``, a base snapshot and no
+        earlier approved work) Claude edits a private piece workspace and the
+        workspace's changes become the submission; the workspace is always removed.
         """
         task_id = _get(ticket, "task_id")
         if self._task_state(task_id) in _TERMINAL_STATES:
@@ -2448,35 +2472,58 @@ class BuilderWorker(_WorkerBase):
             # A stale cached diff no longer passes its gates: build normally, no retry burned.
 
         # 2. Claude (inside limiter.slot + call_with_backoff)
+        edit_mode = (getattr(getattr(self, "config", None), "builder_mode", "diff") == "edit"
+                     and self._edit_mode_applies(ticket))
         prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
                                       focus_files=self._focus_files(ticket, assignment),
                                       order_description=meta.get("description"),
-                                      floor_manager_note=self._help_answer(ticket).get("note"))
+                                      floor_manager_note=self._help_answer(ticket).get("note"),
+                                      contract=EDIT_CONTRACT if edit_mode else BUILDER_CONTRACT)
         self.scratch["last_prompt"] = prompt
         _save_prompt(prompt, str(_get(ticket, "ticket_id")), assignment.attempt + 1)
+        workspace: Path | None = None
+        if edit_mode:
+            opened = await self._open_piece_workspace(ticket, assignment)
+            if isinstance(opened, str):
+                return opened
+            workspace = opened
         try:
-            result = await self._call_claude(prompt, task_id=task_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # D1/E1: not the builder's fault -> no attempt spent; account-wide errors
-            # pause dispatch, the rest count toward the per-ticket infrastructure cap.
+            try:
+                if workspace is None:
+                    result = await self._call_claude(prompt, task_id=task_id)
+                else:
+                    result = await self._call_claude(prompt, task_id=task_id, cwd=str(workspace))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # D1/E1: not the builder's fault -> no attempt spent; account-wide errors
+                # pause dispatch, the rest count toward the per-ticket infrastructure cap.
+                self._tm("record_duration", task_id, "build", time.monotonic() - started)
+                return await self._infra_release(ticket, exc)
             self._tm("record_duration", task_id, "build", time.monotonic() - started)
-            return await self._infra_release(ticket, exc)
-        self._tm("record_duration", task_id, "build", time.monotonic() - started)
-        self.scratch["last_reply"] = result.text
-        if is_infrastructure_error(result):
-            # timeout / non-zero exit without JSON / no reply at all
-            return await self._infra_release(
-                ticket, _claude_client.ClaudeError(result.error or "claude produced no reply")
-            )
-        if result.is_error:
-            return self._send_back(
-                ticket, _one_line(f"Claude call failed: {result.error or 'error'}"), reason="claude_error"
-            )
+            self.scratch["last_reply"] = result.text
+            if is_infrastructure_error(result):
+                # timeout / non-zero exit without JSON / no reply at all
+                return await self._infra_release(
+                    ticket, _claude_client.ClaudeError(result.error or "claude produced no reply")
+                )
+            if result.is_error:
+                return self._send_back(
+                    ticket, _one_line(f"Claude call failed: {result.error or 'error'}"), reason="claude_error"
+                )
 
-        # 3. parse the reply (diff-only contract); a bad reply never reaches gates or reviewer
-        submission = parse_builder_reply(result.text, assignment, workspace=self._edits_root())
+            # 3. parse the reply (diff-only contract) or collect the edits (edit mode);
+            # a bad reply never reaches gates or reviewer
+            if workspace is None:
+                submission = parse_builder_reply(result.text, assignment, workspace=self._edits_root())
+            else:
+                edited = await self._edited_submission(ticket, assignment, result.text, workspace)
+                if isinstance(edited, str):
+                    return edited
+                submission = edited
+        finally:
+            if workspace is not None:
+                await remove_workspace(workspace)
         self._event(
             "submission",
             task_id,
@@ -2533,6 +2580,79 @@ class BuilderWorker(_WorkerBase):
 
         await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta, notes)
         return "review"
+
+    # -- edit mode -----------------------------------------------------------------
+    def _edit_mode_applies(self, ticket: Any) -> bool:
+        """``builder_mode`` is edit: True when the ticket can be built in a piece workspace.
+
+        Needs the task's base snapshot, a ``db_path`` for the pieces directory and no
+        earlier approved work; otherwise the ticket builds in diff mode (logged once).
+        """
+        why: str | None = None
+        if not isinstance(self._base, Path):
+            why = "no base snapshot"
+        elif getattr(self.config, "db_path", None) is None:
+            why = "no db_path for the pieces directory"
+        elif self._stack_items(ticket):
+            why = "stacked on earlier approved work"
+        if why is None:
+            return True
+        key = str(_get(ticket, "ticket_id"))
+        if key not in self._edit_skip_logged:
+            self._edit_skip_logged.add(key)
+            log.info("%s: ticket %s builds in diff mode although builder_mode is edit (%s)",
+                     self.agent_id, key, why)
+        return False
+
+    async def _open_piece_workspace(self, ticket: Any, assignment: TaskAssignment) -> Path | str:
+        """A fresh piece workspace for this attempt, or the outcome of releasing the ticket."""
+        assert self._base is not None
+        pieces = Path(self.config.db_path).parent / "pieces"
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", str(_get(ticket, "ticket_id")))
+        dest = pieces / f"{name}-a{assignment.attempt + 1}"
+        try:
+            await asyncio.to_thread(pieces.mkdir, parents=True, exist_ok=True)
+            return await make_workspace(self._base, dest)
+        except (WorkspaceError, OSError) as exc:
+            # not this builder's fault: no attempt spent, counted toward the infra cap
+            self._event("workspace_failed", _get(ticket, "task_id"),
+                        {"ticket_id": _get(ticket, "ticket_id"), "error": _one_line(str(exc), 300)})
+            return await self._infra_release(ticket, exc)
+        except BaseException:
+            await remove_workspace(dest)
+            raise
+
+    async def _edited_submission(
+        self, ticket: Any, assignment: TaskAssignment, text: str, workspace: Path
+    ) -> BuilderSubmission | str:
+        """Turn an edit-mode reply plus the workspace's changes into a submission (or an outcome)."""
+        fields: dict[str, Any] = {
+            "task_id": assignment.task_id,
+            "subtask_id": assignment.subtask_id,
+            "builder_id": assignment.builder_id,
+        }
+        blocked = _BLOCKED_RE.search(text or "")
+        if blocked:
+            return BuilderSubmission(**fields, status="blocked", blocker_notes=blocked.group(0).strip())
+        protected = set(getattr(assignment, "read_files", ()))
+        allowed = [f for f in assignment.allowed_files if _read_only_path(f) not in protected]
+        try:
+            changes = await collect_changes(workspace, allowed)
+        except WorkspaceError as exc:
+            return await self._infra_release(ticket, exc)
+        if changes.outside:
+            self._reset_infra(ticket)  # a real reply (E1)
+            self._tm("record_gate_failure", assignment.task_id)
+            return self._send_back(
+                ticket,
+                f"Edited files outside the allowed files: {', '.join(changes.outside)}. "
+                f"Change only: {', '.join(allowed)}.",
+                reason="outside_files",
+            )
+        if not changes.diff.strip():
+            return BuilderSubmission(**fields, status="blocked", blocker_notes="no changes were made")
+        return BuilderSubmission(**fields, status="ready_for_review", modified_files=list(changes.changed),
+                                 diff=changes.diff)
 
     # -- edits / requested symbols ----------------------------------------------
     def _edits_root(self) -> Path | None:
