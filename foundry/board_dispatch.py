@@ -71,6 +71,12 @@ DEFAULT_DASHBOARD_URL = "http://127.0.0.1:4300"
 #: A file path mentioned in a Floor Manager answer.
 _PATH_TOKEN = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+")
 _MAX_HELP_FILES = 10
+#: Queue kv entry of foundry/combined_check.py; its ``status`` maps a PR number to the last status line.
+_COMBINED_CHECK_KEY = "combined_check:last"
+_PR_NUMBER = re.compile(r"/pull/(\d+)$")
+_MAX_PR_CHECK = 300
+#: The board refuses usage text holding these, which would turn usage off for the whole run.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
 #: Foundry task state -> batch subtask state.
 _STATE_FOR = {
@@ -323,6 +329,8 @@ class BatchWatcher:
         self._ledger_warned = False
         #: Batches whose pieces only the Ledger knows, while it cannot be read: nothing may be submitted.
         self._ledger_blind: set[str] = set()
+        #: The combined checker's status lines as read this round; None until something needs them.
+        self._pr_lines: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -391,6 +399,7 @@ class BatchWatcher:
         state = await asyncio.to_thread(self.board.state)
         self._warned_down = False
         self.last_error = None
+        self._pr_lines = None
         batches = state.get("foundryBatches") if isinstance(state, dict) else None
         handled: list[str] = []
         for batch in batches if isinstance(batches, list) else []:
@@ -921,12 +930,36 @@ class BatchWatcher:
             log.info("board dispatch: attempts of %s not available: %s", tid, exc)
             return None
 
+    def _read_pr_lines(self) -> dict[str, Any]:
+        """The combined checker's ``status`` map; empty when it cannot be read."""
+        try:
+            raw = self._queue().kv_get(_COMBINED_CHECK_KEY)
+            state = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            status = state.get("status") if isinstance(state, dict) else None
+        except Exception as exc:  # optional: the usage still goes out
+            log.info("board dispatch: combined check status not available: %s", exc)
+            return {}
+        return status if isinstance(status, dict) else {}
+
+    def _pr_check(self, result: Mapping[str, Any]) -> str | None:
+        """The combined checker's status line for this result's PR; None without one."""
+        pr = result.get("pr")
+        url = pr.get("url") if isinstance(pr, dict) else None
+        match = _PR_NUMBER.search(url) if isinstance(url, str) else None
+        if match is None:
+            return None
+        if self._pr_lines is None:
+            self._pr_lines = self._read_pr_lines()
+        line = self._pr_lines.get(match.group(1))
+        return _cap(_CONTROL_CHARS.sub(" ", line), _MAX_PR_CHECK) if isinstance(line, str) else None
+
     def _usage_results(self, rec: Mapping[str, Any], view: Mapping[str, Mapping[str, Any]],
                        changed: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         """Results carrying ``usage``: every changed subtask with usage, and any whose usage moved.
 
-        Besides the tokens, ``usage`` holds the service's settings (``run``) and the task's
-        builder ``attempts`` when they can be read; a task without usage rows gets neither.
+        Besides the tokens, ``usage`` holds the service's settings (``run``), the task's
+        builder ``attempts`` and its PR's combined check line (``prCheck``) when they can be
+        read; a task without usage rows gets none of them.
 
         Called only when a write is due anyway, so usage alone never adds a board write, and on
         the service loop, because a SQLite connection belongs to its thread. Never raises:
@@ -951,6 +984,9 @@ class BatchWatcher:
             attempts = self._attempts(tid)
             if attempts is not None:
                 usage["attempts"] = attempts
+            pr_check = self._pr_check(view[key])
+            if pr_check is not None:
+                usage["prCheck"] = pr_check
             if key in changed or rec["usage"].get(key) != usage:
                 out[key] = {**view[key], "usage": usage}
         return out

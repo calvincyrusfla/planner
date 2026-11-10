@@ -37,7 +37,8 @@ _GIT_TIMEOUT_S = 300
 _GH_TIMEOUT_S = 120
 #: Hidden first line of every comment this check posts.
 COMMENT_MARKER = "<!-- foundry-combined-check -->"
-#: Queue kv entry: {"fingerprints": {base: fingerprint}, "status": {PR number: last status line posted}}.
+#: Queue kv entry: {"fingerprints": {base: fingerprint}, "status": {PR number: last status line posted},
+#: "conflicts": {PR number: head commit already told it conflicts with its base}}.
 _STATE_KEY = "combined_check:last"
 #: Failing test ids named in a status line.
 _MAX_IDS_SHOWN = 10
@@ -239,10 +240,16 @@ def combined_check_enabled() -> bool:
     return os.environ.get("FOUNDRY_COMBINED_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-async def open_foundry_prs(gh: str, repo_root: Path, runner: Any = default_runner) -> list[dict[str, Any]]:
-    """The open pull requests on ``foundry/`` branches; ``[]`` (and a warning) when gh fails."""
-    argv = [gh, "pr", "list", "--state", "open", "--limit", "50", "--json",
-            "number,title,headRefName,headRefOid,baseRefName"]
+async def open_foundry_prs(gh: str, repo_root: Path, runner: Any = default_runner, *,
+                           merge_state: bool = False) -> list[dict[str, Any]]:
+    """The open pull requests on ``foundry/`` branches; ``[]`` (and a warning) when gh fails.
+
+    ``merge_state`` also asks for ``mergeable`` and ``mergeStateStatus``.
+    """
+    fields = "number,title,headRefName,headRefOid,baseRefName"
+    if merge_state:
+        fields += ",mergeable,mergeStateStatus"
+    argv = [gh, "pr", "list", "--state", "open", "--limit", "50", "--json", fields]
     try:
         rc, out, err = await runner(argv, cwd=str(repo_root), timeout=_GH_TIMEOUT_S, env=GitPublisher._env())
         if rc != 0:
@@ -341,14 +348,15 @@ class CombinedChecker:
                 log.warning("combined check: round failed: %s", self.last_error)
 
     async def run_once(self) -> None:
-        """One round: check every base with at least two open Foundry PRs whose code changed."""
+        """One round: follow the bases, then check every base with at least two open Foundry PRs whose code changed."""
         if not self.service.running:
             return
         self.rounds += 1
-        prs = await open_foundry_prs(self.gh, Path(self.service.repo), self.runner)
+        prs = await open_foundry_prs(self.gh, Path(self.service.repo), self.runner, merge_state=True)
         if not prs:  # none open, or gh failed: what was posted is still remembered
             return
         state = self._load_state()
+        await self._follow_base(prs)
         groups: dict[str, list[dict[str, Any]]] = {}
         for pr in prs:
             base = pr.get("baseRefName")
@@ -371,6 +379,51 @@ class CombinedChecker:
         numbers = {str(pr.get("number")) for pr in prs}
         state["status"] = {number: line for number, line in state["status"].items() if number in numbers}
         self._save_state()
+
+    async def _follow_base(self, prs: list[dict[str, Any]]) -> None:
+        """Update the PRs that are behind their base and flag the ones that conflict with it.
+
+        An updated PR gets a new head, so the next round's combined test picks it up.
+        """
+        state = self._load_state()
+        numbers = {str(pr.get("number")) for pr in prs}
+        state["conflicts"] = {number: head for number, head in state["conflicts"].items() if number in numbers}
+        failures: list[str] = []
+        for pr in prs:
+            number = pr.get("number")
+            if not isinstance(number, int):
+                continue
+            if not self.service.running:
+                break
+            try:
+                failure = await self._follow_pr(number, pr)
+            except Exception as exc:  # noqa: BLE001 - one bad PR must not stop the round
+                failure = f"{type(exc).__name__}: {exc}"
+            if failure:
+                failures.append(f"#{number}: {failure}")
+        if failures:
+            log.warning("combined check: could not follow the base on %d PR(s): %s", len(failures), "; ".join(failures))
+        self._save_state()  # the combined test can take long: a restart must not repeat these comments
+
+    async def _follow_pr(self, number: int, pr: dict[str, Any]) -> str | None:
+        """Act on one PR's merge state; returns why updating it failed, None otherwise."""
+        mergeable = pr.get("mergeable")
+        if mergeable == "CONFLICTING":
+            conflicts = self._load_state()["conflicts"]
+            head = str(pr.get("headRefOid") or "")
+            if conflicts.get(str(number)) != head:
+                body = (f"{COMMENT_MARKER}\nConflicts with the latest {pr.get('baseRefName')}: "
+                        "this piece needs a rebuild on the new base.\n")
+                if await self._comment(number, body):
+                    conflicts[str(number)] = head
+            return None
+        if mergeable != "MERGEABLE" or pr.get("mergeStateStatus") != "BEHIND":
+            return None
+        rc, out, err = await self._run([self.gh, "pr", "update-branch", str(number)], _GH_TIMEOUT_S)
+        if rc != 0:
+            return (err or out or f"exit {rc}").strip()[-300:]
+        log.info("combined check: updated #%d with its base", number)
+        return None
 
     async def _check_base(self, base: str, group: list[dict[str, Any]]) -> None:
         sha = await self._base_sha(base)
@@ -443,7 +496,7 @@ class CombinedChecker:
         return fn if callable(fn) else None
 
     def _load_state(self) -> dict[str, dict[str, str]]:
-        """The remembered fingerprints and status lines (read from the queue once)."""
+        """The remembered fingerprints, status lines and conflicts (read from the queue once)."""
         if self._state is None:
             raw: Any = None
             get = self._kv("kv_get")
@@ -457,7 +510,7 @@ class CombinedChecker:
                     raw = None
             saved = raw if isinstance(raw, dict) else {}
             self._state = {key: dict(saved[key]) if isinstance(saved.get(key), dict) else {}
-                           for key in ("fingerprints", "status")}
+                           for key in ("fingerprints", "status", "conflicts")}
         return self._state
 
     def _save_state(self) -> None:
