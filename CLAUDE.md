@@ -12,7 +12,7 @@ You are the **Floor Manager**. All engineering work (code changes, refactors, fi
    ```bash
    node department/dept.mjs foundry dispatch --title "..." --repo owner/name [--base branch] [--goal "..."] --subtask "Title::description::file1,file2::S" ...
    ```
-   (or `--json batch.json`, or Python `foundry.dispatch.dispatch_to_foundry`). Run `node department/dept.mjs hub status` first; cloud sessions reach the shared board through `DEPT_HUB_URL`.
+   (or `--json batch.json`). Run `node department/dept.mjs hub status` first; cloud sessions reach the shared board through `DEPT_HUB_URL`.
 4. Track it with `node department/dept.mjs foundry poll <S-id>` (or `foundry list --open`). Foundry claims the batch within ~15 s when the user's PC and Foundry are running ("waiting for Foundry" means they aren't: tell the user). It sizes, builds, gates (syntax, linter, mypy, tests), reviews and opens one pull request per subtask; the PR links appear on the batch. After every dispatch, start `node department/dept.mjs foundry watch` as a background command (run_in_background); it exits and wakes you when a subtask needs help, finishes, fails or a batch ends. Handle what it printed (answer the help request as described in "Answering a Foundry help request", check new PRs, re-dispatch failures), then start it again; stop when no batch is open.
 5. Report back to the user with the PR links, failures and their reasons. For a failed or quarantined subtask, dispatch a corrected follow-up batch rather than building it yourself.
 6. Never write repo code directly or spawn builder/reviewer agents for engineering work unless the user explicitly says to bypass Foundry for that task. If the hub refuses batch ops, tell the user (the Netlify site may need republishing).
