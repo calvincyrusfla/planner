@@ -45,11 +45,19 @@ echo.
 
 if "%FOUNDRY_DRY_RUN%"=="1" goto :dry_run
 
+:run
 "%PY%" -m foundry.serve --repo "%TARGET%"
 set "RC=%ERRORLEVEL%"
+if "%RC%"=="75" goto :restart
 echo.
 echo [foundry] Foundry stopped (exit code %RC%).
 goto :hold
+
+:restart
+echo.
+echo [foundry] Restarting with the updated code...
+echo.
+goto :run
 
 :dry_run
 echo [dry-run] "%PY%" -m foundry.serve --repo "%TARGET%"

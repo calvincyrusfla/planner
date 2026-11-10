@@ -151,3 +151,78 @@ def test_sh_missing_repo_folder(tmp_path: Path) -> None:
     proc = _run(repo, "--repo", str(tmp_path / "nope"))
     assert proc.returncode == 1
     assert "Repository folder not found" in proc.stdout
+
+
+# --------------------------------------------------------------------------- restart on exit code 75
+
+
+needs_posix_shell = pytest.mark.skipif(os.name == "nt", reason="shell execution is not run on Windows")
+
+_COUNTING_PYTHON = (
+    "#!/bin/sh\n"
+    'count_file="$(dirname "$0")/runs"\n'
+    'n=$(cat "$count_file" 2>/dev/null || echo 0)\n'
+    "n=$((n + 1))\n"
+    'echo "$n" > "$count_file"\n'
+    'echo "fake-python-run-$n"\n'
+    'if [ "$n" -eq 1 ]; then exit "${FIRST_RC:-75}"; fi\n'
+    "exit 0\n"
+)
+
+
+def _counting_repo(tmp_path: Path) -> Path:
+    repo = _scratch_repo(tmp_path)
+    py = repo / ".venv" / "bin" / "python"
+    py.write_text(_COUNTING_PYTHON)
+    py.chmod(0o755)
+    return repo
+
+
+def test_bat_restarts_on_exit_code_75() -> None:
+    text = BAT.read_bytes().decode("ascii")
+    assert 'if "%RC%"=="75" goto :restart' in text
+    assert "[foundry] Restarting with the updated code..." in text
+    assert re.search(r"^:restart\r?\n", text, flags=re.M)
+    assert re.search(r"^:run\r?\n\"%PY%\" -m foundry\.serve", text, flags=re.M)
+    restart = text[text.index(":restart"):]
+    assert "goto :run" in restart.split(":dry_run")[0]
+    # The 75 check comes right after the launch, before the 'stopped' message.
+    rc_line = text.index('set "RC=%ERRORLEVEL%"')
+    assert rc_line < text.index('if "%RC%"=="75" goto :restart') < text.index("Foundry stopped (exit code %RC%).")
+
+
+@needs_bash
+@needs_posix_shell
+def test_sh_restarts_on_75_then_stops_on_0(tmp_path: Path) -> None:
+    repo = _counting_repo(tmp_path)
+    proc = _run(repo, dry=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "fake-python-run-1" in proc.stdout
+    assert "fake-python-run-2" in proc.stdout
+    assert "fake-python-run-3" not in proc.stdout
+    assert proc.stdout.count("[foundry] Restarting with the updated code...") == 1
+
+
+@needs_bash
+@needs_posix_shell
+def test_sh_stops_on_0_without_restart(tmp_path: Path) -> None:
+    repo = _scratch_repo(tmp_path)
+    proc = _run(repo, dry=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.count("fake-python-ran") == 1
+    assert "Restarting" not in proc.stdout
+
+
+@needs_bash
+@needs_posix_shell
+def test_sh_exits_with_foundry_status(tmp_path: Path) -> None:
+    repo = _counting_repo(tmp_path)
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(repo.parent), "FIRST_RC": "3"}
+    proc = subprocess.run(
+        ["bash", str(repo / "foundry" / "start_foundry.sh")],
+        env=env, cwd=repo.parent, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "fake-python-run-1" in proc.stdout
+    assert "fake-python-run-2" not in proc.stdout
+    assert "Restarting" not in proc.stdout
