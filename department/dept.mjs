@@ -3,15 +3,18 @@
 // is running (so the dashboard updates live) and edits the state file directly
 // when it is not.
 import * as core from './lib/core.mjs';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { metricLines } from './lib/foundry-metrics.mjs';
 import { watchEvents } from './lib/foundry-watch.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
 import { LIMITS as BATCH_LIMITS, oversizedOrders, oversizedOrderMessage } from './lib/foundry-batches.mjs';
+import { checkOrder } from './lib/order-check.mjs';
 
 // Node's built-in fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY is set
 // (Node 22.21+). Behind a proxy, as in Claude cloud sessions, re-run this
@@ -73,6 +76,9 @@ const HELP = `Agent Department CLI
                        The optional last field lists extra files the builder may read but not change.
                                                        Hand a batch of work to Foundry (S-###);
                                                        Foundry on the PC claims batches for its repo
+  node department/dept.mjs foundry check --json file.json
+                                                       Print order-check findings for a batch; only
+                                                       advises ("-" reads the batch from stdin)
   node department/dept.mjs foundry poll <S-id> [--json] Batch status: each subtask's F-id, state, PR
   node department/dept.mjs foundry list [--open]       Foundry batches, newest first
   node department/dept.mjs foundry cancel <S-id>       Cancel a batch that hasn't finished
@@ -575,7 +581,7 @@ function printTimes(s, taskId) {
 
 // ---------------------------------------------------------------- foundry batches
 
-const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..." | foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]';
+const FOUNDRY_HELP = 'Usage: foundry dispatch --title "..." --repo owner/name [--base main] [--goal "..."] --subtask "Title::description::files::S::readFiles" ... | --json file.json\n         ("::" separates --subtask fields; readFiles is optional; use --json for text containing "::")\n       foundry check --json file.json | foundry poll <S-id> [--json] | foundry list [--open] | foundry cancel <S-id> | foundry metrics [--json] | foundry help | foundry answer <S-id> <key> --guidance "..." | foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]';
 const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
 
 // "Title::description::file1,file2::S::read1,read2" → subtask. Empty parts are skipped.
@@ -736,30 +742,87 @@ async function foundryWatchCommand(args, opt) {
   finish([], `TIMEOUT no events in ${Math.round(timeoutS / 60)} min; still open: ${open.join(', ') || '—'}`);
 }
 
+// The value of --json (a path, or - for stdin) → the batch object.
+function readBatchJson(source) {
+  if (typeof source !== 'string') throw new core.DeptError(FOUNDRY_HELP);
+  let batch;
+  try {
+    batch = JSON.parse(fs.readFileSync(source === '-' ? 0 : source, 'utf8'));
+  } catch (err) {
+    throw new core.DeptError(`Could not read batch JSON from ${source}: ${err.message}`);
+  }
+  if (!batch || typeof batch !== 'object') throw new core.DeptError('Batch JSON must be an object');
+  return batch;
+}
+
+// The folder that holds department/: the repository the order check reads.
+const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+function gitOutput(args) {
+  return execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+}
+
+// owner/name of this folder's origin remote (https or git@, .git optional), or null.
+function originSlug() {
+  try {
+    const parts = gitOutput(['remote', 'get-url', 'origin']).trim().replace(/\/+$/, '').replace(/\.git$/i, '').split(/[/:]/).filter(Boolean);
+    return parts.length >= 2 ? parts.slice(-2).join('/') : null;
+  } catch {
+    return null;
+  }
+}
+
+// → { skipped: reason } when the batch is for another repository, else { lines }.
+function runOrderCheck(batch) {
+  const slug = originSlug();
+  const repo = String(batch.repo ?? '').trim();
+  if (!slug || slug.toLowerCase() !== repo.toLowerCase()) {
+    return { skipped: `this folder is ${slug || 'not a git repo'}, not ${repo || '(no repo in the batch)'}` };
+  }
+  const files = gitOutput(['ls-files', '-z']).split('\0').filter(Boolean);
+  const read = (file) => {
+    try {
+      return fs.readFileSync(path.join(REPO_ROOT, file), 'utf8');
+    } catch {
+      return '';
+    }
+  };
+  const findings = checkOrder(batch, { files, read });
+  return { lines: findings.length ? findings.map((f) => `#${f.key} ${f.level} ${f.rule}: ${f.message}`) : ['No findings'] };
+}
+
+// Advice only: whatever goes wrong here, the dispatch goes on.
+function printDispatchCheck(batch) {
+  try {
+    const result = runOrderCheck(batch);
+    if (result.skipped) console.log(`check: skipped (${result.skipped})`);
+    else for (const line of result.lines) console.log(`check: ${line}`);
+  } catch (err) {
+    console.log(`check: skipped (${err.message})`);
+  }
+}
+
 async function foundryCommand(sub, args, opt) {
   if (sub === 'metrics') return foundryMetricsCommand(opt);
   if (sub === 'watch') return foundryWatchCommand(args, opt);
   switch (sub) {
     case 'dispatch': {
-      let batch;
-      if (opt.json !== undefined) {
-        if (typeof opt.json !== 'string') throw new core.DeptError(FOUNDRY_HELP);
-        try {
-          batch = JSON.parse(fs.readFileSync(opt.json === '-' ? 0 : opt.json, 'utf8'));
-        } catch (err) {
-          throw new core.DeptError(`Could not read batch JSON from ${opt.json}: ${err.message}`);
-        }
-        if (!batch || typeof batch !== 'object') throw new core.DeptError('Batch JSON must be an object');
-      } else batch = {};
+      const batch = opt.json !== undefined ? readBatchJson(opt.json) : {};
       for (const k of ['title', 'repo', 'base', 'goal']) if (typeof opt[k] === 'string') batch[k] = opt[k];
       if (opt.subtask) batch.subtasks = [...(Array.isArray(batch.subtasks) ? batch.subtasks : []), ...opt.subtask.map(subtaskArg)];
       if (!batch.title || !batch.repo || !Array.isArray(batch.subtasks) || !batch.subtasks.length) throw new core.DeptError(FOUNDRY_HELP);
       // Refuse here, before anything is sent: the builder only sees the first LIMITS.builderOrder characters.
       const over = oversizedOrders(batch);
       if (over.length) throw new core.DeptError(over.map(oversizedOrderMessage).join('\n'));
+      printDispatchCheck(batch);
       const b = await batchOp('dispatchBatch', { ...batch, by: typeof opt.by === 'string' ? opt.by : batch.by || 'cli' });
       console.log(`${b.id} dispatched to Foundry (${b.repo}, ${plural(b.subtasks.length, 'subtask')}): ${b.title}`);
       console.log(`  Poll with: node department/dept.mjs foundry poll ${b.id}`);
+      return;
+    }
+    case 'check': {
+      const result = runOrderCheck(readBatchJson(opt.json));
+      console.log(result.skipped ? `check skipped: ${result.skipped}` : result.lines.join('\n'));
       return;
     }
     case 'poll': {
