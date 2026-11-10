@@ -5,14 +5,14 @@ scratch ``DEPT_DATA``, free loopback port) is the board. A real Foundry service
 (simulated Claude and Gemma) points its board bridge and its batch watcher at
 that server.
 
-* **CLI + Python dispatch, run to done.** A 2-subtask batch is dispatched with
-  ``node department/dept.mjs foundry dispatch`` and another with
-  ``foundry.dispatch.dispatch_to_foundry``; a third batch names another
+* **CLI dispatch, run to done.** Two 2-subtask batches are sent with the
+  ``node department/dept.mjs`` CLI, one with ``--subtask`` arguments and one
+  with ``--json <file>``; a third batch names another
   repository. Foundry claims the two batches for its repository, sends every
   subtask in as an F-task (respecting ``dependsOn``), the subtasks complete with
   an opened PR (fake ``gh``, local bare ``origin``), and both batches end
-  ``done``. ``foundry poll`` (CLI) and ``poll_foundry_sprint`` (Python) show the
-  F-ids, states and PR links. The other repository's batch is never claimed.
+  ``done``. ``foundry poll`` shows the F-ids, states and PR links, as text and
+  with ``--json``. The other repository's batch is never claimed.
 * **Restart mid-batch.** Subtask 2 depends on subtask 1; dispatch is held so
   subtask 1 stays open; the service stops after subtask 1 got its F-id. A new
   service on the same database picks the batch up again, does not resubmit
@@ -328,16 +328,15 @@ def _on_loop(service: Any, fn: Any, timeout: float = 15.0) -> Any:
     return asyncio.run_coroutine_threadsafe(call(), service.loop).result(timeout)
 
 
-# --------------------------------------------------------------------------- 1 CLI + Python -> done
+# --------------------------------------------------------------------------- 1 two CLI batches -> done
 
 
 @posix_only
 @needs_git
-def test_batches_from_cli_and_python_run_to_done_and_other_repo_is_left_alone(
+def test_two_cli_batches_run_to_done_and_other_repo_is_left_alone(
     tmp_path: Path, clean_foundry_env: pytest.MonkeyPatch
 ) -> None:
     from foundry import git_publisher
-    from foundry.dispatch import DispatchFoundryBatch, SubtaskPayload, dispatch_to_foundry, poll_foundry_sprint
 
     mp = clean_foundry_env
     _git_env(tmp_path, mp)
@@ -361,28 +360,30 @@ def test_batches_from_cli_and_python_run_to_done_and_other_repo_is_left_alone(
         other_id, cli_id = ids
         assert other_id in other and cli_id in cli_out, (other, cli_out)
 
-        # The Python batch, through the local dashboard: subtask 2 depends on 1.
-        mp.setenv("FOUNDRY_DASHBOARD_URL", board)
-        sprint = dispatch_to_foundry(DispatchFoundryBatch(
-            title="Slug helper", repo=REPO_SLUG, base="main",
-            subtasks=[
-                SubtaskPayload(title="Add slug helper", description="Add a helper to slug.", files=["shop/slug.py"],
-                               size="S", acceptance_criteria=["the helper exists"]),
-                SubtaskPayload(title="Add mathx helper again", files=["shop/mathx.py"], depends_on=["1"]),
+        # The second CLI batch, from a JSON file: subtask 2 depends on 1.
+        spec_file = tmp_path / "second-batch.json"
+        spec_file.write_text(json.dumps({
+            "title": "Slug helper", "repo": REPO_SLUG, "base": "main",
+            "subtasks": [
+                {"key": "1", "title": "Add slug helper", "description": "Add a helper to slug.",
+                 "files": ["shop/slug.py"], "size": "S", "acceptance": ["the helper exists"]},
+                {"key": "2", "title": "Add mathx helper again", "files": ["shop/mathx.py"], "dependsOn": ["1"]},
             ],
-        ))
-        py_id = sprint.sprint_id
-        assert py_id not in (other_id, cli_id) and sprint.status == "queued", sprint
+        }), encoding="utf-8")
+        second_out = _dept(env, "foundry", "dispatch", "--json", str(spec_file))
+        (second_id,) = set(_batches(board)) - {other_id, cli_id}
+        second = _batches(board)[second_id]
+        assert second_id in second_out and second["status"] == "queued", (second_out, second)
 
         with _service(tmp_path, repo, board, auto_pr=True) as (service, _base):
             _wait_batch(board, cli_id, ("done", "failed", "cancelled"))
-            _wait_batch(board, py_id, ("done", "failed", "cancelled"))
+            _wait_batch(board, second_id, ("done", "failed", "cancelled"))
             # The PR is opened after a subtask completes; the watcher keeps pushing it onto the batch.
             done_cli = _wait_prs(board, cli_id)
-            done_py = _wait_prs(board, py_id)
+            done_second = _wait_prs(board, second_id)
             tasks = _foundry_tasks(service)
 
-        for batch in (done_cli, done_py):
+        for batch in (done_cli, done_second):
             assert batch["status"] == "done", batch
             assert batch.get("claimedBy", {}).get("host"), batch
             assert set(batch["results"]) == {s["key"] for s in batch["subtasks"]} == {"1", "2"}, batch
@@ -399,20 +400,20 @@ def test_batches_from_cli_and_python_run_to_done_and_other_repo_is_left_alone(
         assert all(a[a.index("--base") + 1] == "main" for a in creates), creates
 
         # Four subtasks, four distinct F-tasks, each sent in once.
-        fids = [r["foundryTask"] for b in (done_cli, done_py) for r in b["results"].values()]
+        fids = [r["foundryTask"] for b in (done_cli, done_second) for r in b["results"].values()]
         assert len(set(fids)) == 4, fids
         assert len(tasks) == 4, [t.get("task_id") or t.get("id") for t in tasks]
 
         # dependsOn: the dependent subtask's F-task was created after its dependency's.
-        dep_first, dep_second = (int(done_py["results"][k]["foundryTask"][2:]) for k in ("1", "2"))
-        assert dep_first < dep_second, done_py["results"]
+        dep_first, dep_second = (int(done_second["results"][k]["foundryTask"][2:]) for k in ("1", "2"))
+        assert dep_first < dep_second, done_second["results"]
 
         # The other repository's batch was never touched.
         untouched = _batches(board)[other_id]
         assert untouched["status"] == "queued" and not untouched.get("claimedBy"), untouched
         assert not untouched.get("results"), untouched
 
-        # Polling: CLI and Python agree with the board.
+        # Polling: the CLI agrees with the board for both batches.
         polled = _dept(env, "foundry", "poll", cli_id)
         for res in done_cli["results"].values():
             assert res["foundryTask"] in polled and PR_URL in polled, polled
@@ -421,12 +422,14 @@ def test_batches_from_cli_and_python_run_to_done_and_other_repo_is_left_alone(
         polled_batch = polled_json.get("batch", polled_json)
         assert polled_batch["id"] == cli_id and polled_batch["status"] == "done", polled_json
 
-        status = poll_foundry_sprint(py_id)
-        assert status.sprint_id == py_id and status.status == "done", status
-        dumped = json.dumps(status.model_dump(mode="json"))
-        for res in done_py["results"].values():
-            assert res["foundryTask"] in dumped, dumped
-        assert PR_URL in dumped, dumped
+        second_json = json.loads(_dept(env, "foundry", "poll", second_id, "--json"))
+        second_batch = second_json.get("batch", second_json)
+        assert second_batch["id"] == second_id and second_batch["status"] == "done", second_json
+        for key, res in done_second["results"].items():
+            polled_res = second_batch["results"][key]
+            assert polled_res["foundryTask"] == res["foundryTask"], (key, polled_res)
+            assert (polled_res.get("pr") or {}).get("state") == "opened", (key, polled_res)
+            assert polled_res["pr"]["url"] == PR_URL, (key, polled_res)
 
         # Each F-task is also an ordinary task on the board (registered by the board bridge).
         titles = [t.get("title", "") for t in _state(board).get("tasks", [])]
