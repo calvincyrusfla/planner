@@ -41,7 +41,7 @@ export const LIMITS = Object.freeze({
   answer: 6000,
   helpOptions: 20,
   keep: 200, // batches kept on the board; the oldest finished ones go first
-  builderOrder: 6000, // must equal MAX_ORDER_DETAILS_CHARS in foundry/builder_worker.py
+  builderOrder: 24000, // must equal MAX_ORDER_DETAILS_CHARS in foundry/builder_worker.py
 });
 const MARKER_ALLOWANCE = 100; // the '(Foundry batch S-n of <createdAt>, subtask k)' line, unknown before dispatch
 
