@@ -485,6 +485,7 @@ The dashboard uses these endpoints; you don't need them yourself. They answer on
 | `POST /api/tasks/<id>/pr/retry` | opens the pull request again for a task whose PR failed (see [Automatic pull requests](#automatic-pull-requests)) |
 | `GET /api/actions` | `{ok, actions}`: the Foreman's actions, newest first (see [The Foreman fixes things itself](#the-foreman-fixes-things-itself)) |
 | `POST /api/actions/<id>/undo` | undoes one action; `{ok: false, reason}` when it can't be undone |
+| `GET /api/events` | `{ok, events, last_id}`: the queue's events in id order (`?since=` id, default 0; `?limit=` 1-1000, default 200; optional `?kind=` and `?task=`). `last_id` is the last returned id, or `since` when there are none. A non-numeric `since` or `limit` gets HTTP 400 |
 
 ## Automatic pull requests
 

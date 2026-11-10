@@ -16,6 +16,9 @@ Routes
 if the answer fails mid-stream).
 ``GET  /api/actions`` -> ``{ok, actions: [...]}`` the Foreman's applied actions,
 newest first (``?limit=N``, 1-200, default 50).
+``GET  /api/events``  -> ``{ok, events: [...], last_id}`` the queue's events in id
+order (``?since=ID`` default 0, ``?limit=N`` 1-1000 default 200, ``?kind=``,
+``?task=``); ``last_id`` is the last returned id, or ``since`` when there are none.
 ``POST /api/tasks/<id>/pr/retry`` -> ``{ok: true, task_id, pr}`` (publishing again
 in the background); 409 ``{ok: false, reason, code: "refused"}`` when the PR is
 open, already publishing or has no patch; 404 for an unknown task.
@@ -37,7 +40,9 @@ duck-typed methods, so tests can pass a simulated one:
   with ``task_id``); raises ``ValueError`` for an invalid order,
 * ``ask(question)`` -> (async) iterator of text chunks,
 * ``actions(limit=)`` -> list of action dicts (optional; ``[]`` without it),
-* ``undo_action(action_id, by=)`` -> ``{ok, ...}`` / ``{ok: False, reason}``.
+* ``undo_action(action_id, by=)`` -> ``{ok, ...}`` / ``{ok: False, reason}``,
+* ``factory.queue.events(task_id=, kind=, since_id=, limit=)`` -> list of event
+  dicts (optional; no events without a factory).
 
 Any of them may be a coroutine / async generator.  When the service exposes a
 running asyncio loop as ``service.loop`` the coroutine runs on that loop
@@ -94,6 +99,10 @@ SIZES = {"S": "S", "M": "M", "L": "L", "XL": "XL", "SMALL": "S", "MEDIUM": "M", 
 
 
 ACTION_LIMIT_MAX = 200
+EVENT_LIMIT_DEFAULT = 200
+EVENT_LIMIT_MAX = 1000
+#: Exclusive bound of a SQLite INTEGER; a larger ``since`` cannot be queried.
+SQLITE_INT_BOUND = 2**63
 #: Ids in a route path (action ids, task ids): short plain tokens only.
 ROUTE_ID = r"([A-Za-z0-9][A-Za-z0-9_.:-]{0,79})"
 #: Routes with an id segment: (pattern, method, handler name).  The handler gets the id.
@@ -380,6 +389,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/orders": ("POST", self._orders),
             "/api/ask": ("POST", self._ask),
             "/api/actions": ("GET", self._actions),
+            "/api/events": ("GET", self._events),
         }
         hit = routes.get(path)
         if hit is not None:
@@ -553,6 +563,32 @@ class _Handler(BaseHTTPRequestHandler):
         fn = getattr(svc, "actions", None)
         rows = list(_call(svc, fn, limit=limit) or []) if callable(fn) else []
         self._send_json(200, {"ok": True, "actions": rows[:limit]})
+
+    def _events(self) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        raw_since = (query.get("since") or ["0"])[0]
+        raw_limit = (query.get("limit") or [str(EVENT_LIMIT_DEFAULT)])[0]
+        try:
+            since = int(raw_since)
+        except ValueError:
+            raise OrderError("since must be a number.") from None
+        if abs(since) >= SQLITE_INT_BOUND:
+            raise OrderError("since is out of range.")
+        try:
+            limit = max(1, min(EVENT_LIMIT_MAX, int(raw_limit)))
+        except ValueError:
+            raise OrderError("limit must be a number.") from None
+        kinds = query.get("kind")
+        tasks = query.get("task")
+        kind = kinds[0] if kinds else None
+        task = tasks[0] if tasks else None
+        svc = self.service
+        queue = getattr(getattr(svc, "factory", None), "queue", None)
+        if queue is None:
+            return self._send_json(200, {"ok": True, "events": [], "last_id": since})
+        rows = list(_call(svc, queue.events, task_id=task, kind=kind, since_id=since, limit=limit) or [])
+        last_id = rows[-1]["id"] if rows else since
+        self._send_json(200, {"ok": True, "events": rows, "last_id": last_id})
 
     def _undo(self, action_id: str) -> None:
         self._read_json()  # body is optional and ignored, but must be valid JSON when present
