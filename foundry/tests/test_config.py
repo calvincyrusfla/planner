@@ -36,6 +36,8 @@ def test_defaults() -> None:
     assert cfg.thresholds.gate_fail_quarantine is None
     assert cfg.effective_gate_fail_quarantine() == cfg.max_retries + 1 == 4
     assert cfg.thresholds.tpm_spike_ratio == 0.9
+    assert cfg.builder_tools == "off"
+    assert cfg.builder_max_turns == 30
 
 
 def test_from_env_empty_matches_defaults() -> None:
@@ -106,6 +108,9 @@ def test_overrides_win_over_env() -> None:
         ("FOUNDRY_TPM_SPIKE_RATIO", "1.5"),
         ("FOUNDRY_GATE_FAIL_QUARANTINE", "0"),
         ("FOUNDRY_TEAMS", " , "),
+        ("FOUNDRY_BUILDER_TOOLS", "bogus"),
+        ("FOUNDRY_BUILDER_MAX_TURNS", "2"),
+        ("FOUNDRY_BUILDER_MAX_TURNS", "101"),
     ],
 )
 def test_from_env_rejects_bad_values(var: str, value: str) -> None:
