@@ -40,7 +40,12 @@ from typing import Any, Sequence
 
 from foundry.board_bridge import BoardBridge
 from foundry.claude_client import SimulatedClaudeClient
-from foundry.config import DEFAULT_BUILDER_READ_PROMPT, DEFAULT_REVIEWER_READ_PROMPT, FoundryConfig
+from foundry.config import (
+    DEFAULT_BUILDER_EDIT_PROMPT,
+    DEFAULT_BUILDER_READ_PROMPT,
+    DEFAULT_REVIEWER_READ_PROMPT,
+    FoundryConfig,
+)
 from foundry.floor_manager import Factory, WorkOrder, build_factory
 from foundry.gemma_client import GemmaReply, GemmaRequest, SimulatedGemmaClient
 from foundry.schemas import ClaudeResult
@@ -408,12 +413,27 @@ def _set_flag(args: list[str], flag: str, value: str) -> None:
 def builder_claude_args(config: FoundryConfig) -> list[str]:
     """Extra ``claude -p`` flags for builder calls.
 
-    The same as :func:`claude_args` unless ``config.builder_tools`` is ``read``.
-    Then builders get ``config.builder_max_turns`` turns, the Read, Grep and Glob
-    tools and :data:`DEFAULT_BUILDER_READ_PROMPT`; every other flag stays. Always
-    a new list: ``config.claude_extra_args`` is never changed.
+    With ``config.builder_mode`` ``edit`` (this wins over ``builder_tools``) builders
+    may use the Edit and Write tools as well as Read, Grep and Glob, get
+    ``config.builder_edit_max_turns`` turns, ``--permission-mode acceptEdits`` and
+    :data:`DEFAULT_BUILDER_EDIT_PROMPT`; every other disallowed tool stays disallowed.
+
+    Otherwise the same as :func:`claude_args` unless ``config.builder_tools`` is
+    ``read``. Then builders get ``config.builder_max_turns`` turns, the Read, Grep
+    and Glob tools and :data:`DEFAULT_BUILDER_READ_PROMPT`; every other flag stays.
+    Always a new list: ``config.claude_extra_args`` is never changed.
     """
     args = claude_args(config)
+    if getattr(config, "builder_mode", "diff") == "edit":
+        # FOUNDRY_CLAUDE_ARGS appends to the defaults, so the flag can occur twice.
+        for i, arg in enumerate(args[:-1]):
+            if arg == "--disallowedTools":
+                args[i + 1] = " ".join(t for t in args[i + 1].split() if t not in ("Edit", "Write"))
+        _set_flag(args, "--max-turns", str(config.builder_edit_max_turns))
+        _set_flag(args, "--permission-mode", "acceptEdits")
+        args.extend(["--allowedTools", "Read Grep Glob Edit Write"])
+        _set_flag(args, "--append-system-prompt", DEFAULT_BUILDER_EDIT_PROMPT)
+        return args
     if getattr(config, "builder_tools", "off") != "read":
         return args
     _set_flag(args, "--max-turns", str(config.builder_max_turns))
