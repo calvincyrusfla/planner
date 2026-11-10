@@ -3430,6 +3430,11 @@ class TeamPool:
             )
             for slot in range(1, builders + 1)
         ]
+        #: ``FoundryConfig`` handed to every worker of this pool (None: workers keep their default).
+        self.config: Any = config
+        if config is not None:
+            for worker in self.builders:
+                worker.config = config
         self.reviewer = self._make_reviewer(reviewer_id or f"{team_id}-6")
         self.peer_reviewers: dict[str, ReviewerWorker] = {}
         #: agent id -> the stop event of its peer reviewer (see :meth:`demote_peer_reviewer`).
@@ -3439,7 +3444,7 @@ class TeamPool:
         self._tasks: list[asyncio.Task[None]] = []
 
     def _make_reviewer(self, reviewer_id: str, exclude_builder: str | None = None) -> ReviewerWorker:
-        return ReviewerWorker(
+        reviewer = ReviewerWorker(
             self.team_id,
             self.queue,
             self.reviewer_client,
@@ -3462,6 +3467,10 @@ class TeamPool:
             base_for=self.base_for,
             on_ticket_change=self.on_ticket_change,
         )
+        config = getattr(self, "config", None)
+        if config is not None:
+            reviewer.config = config  # type: ignore[attr-defined]
+        return reviewer
 
     def set_on_ticket_change(self, on_ticket_change: Callable[..., Any] | None) -> None:
         """Point every worker of this pool (peer reviewers too) at the ``on_ticket_change`` hook."""
