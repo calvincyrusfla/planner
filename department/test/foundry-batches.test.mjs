@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import * as core from '../lib/core.mjs';
 import { applyOp, OP_TYPES } from '../lib/ops.mjs';
 import { TAKEOVER_MS, LIMITS, importBatches, normalizeBatches, orderTextLength, oversizedOrderMessage, oversizedOrders } from '../lib/foundry-batches.mjs';
+import { LIMITS as SCHEMA_LIMITS } from '../lib/order-schema.mjs';
 import { makeHandler } from '../../netlify/functions/department.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -602,4 +603,22 @@ test('oversizedOrderMessage names the subtask, its length and the limit', () => 
     oversizedOrderMessage({ key: 'big', title: 'Big', length: 24001, limit: 24000 }),
     'subtask big ("Big") order is 24001 characters; the builder sees only 24000 (description + goal + title). Shorten it, move detail into readFiles, or split the subtask.',
   );
+});
+
+// ---------- generated schema ----------
+
+test('LIMITS is the same object as the generated schema LIMITS', () => {
+  assert.equal(LIMITS, SCHEMA_LIMITS);
+});
+
+test('a help question of 2000 characters is accepted and 2001 is refused', () => {
+  const s = fresh();
+  op(s, 'dispatchBatch', sample());
+  op(s, 'claimBatch', { id: 'S-001', host, service });
+  const ask = (n) => op(s, 'updateBatch', { id: 'S-001', service, results: { 1: { state: 'needs_help', help: { question: 'x'.repeat(n) } } } });
+  assert.throws(() => ask(2001), (e) => e.status === 400 && /max 2000/.test(e.message));
+  assert.equal(s.foundryBatches[0].results['1'], undefined);
+  const b = ask(2000).batch;
+  assert.equal(b.results['1'].state, 'needs_help');
+  assert.equal(b.results['1'].help.question.length, 2000);
 });

@@ -20,29 +20,11 @@
 
 import { DeptError, clockNow } from './core.mjs';
 import { cleanUsage } from './foundry-metrics.mjs';
+// These values come from schema/order.json, through the generated order-schema.mjs.
+import { BATCH_STATUSES, RESULT_STATES, TERMINAL_RESULT, OPEN_BATCH, SIZES, LIMITS } from './order-schema.mjs';
 
-export const BATCH_STATUSES = ['queued', 'claimed', 'running', 'done', 'failed', 'cancelled'];
-export const RESULT_STATES = ['queued', 'sizing', 'building', 'reviewing', 'needs_help', 'answered', 'complete', 'quarantined', 'failed'];
-export const TERMINAL_RESULT = new Set(['complete', 'quarantined', 'failed']);
-export const OPEN_BATCH = new Set(['queued', 'claimed', 'running']);
-export const SIZES = ['S', 'M', 'L', 'XL'];
-export const LIMITS = Object.freeze({
-  subtasks: 20,
-  title: 200,
-  goal: 20000,
-  description: 20000,
-  files: 50,
-  path: 500,
-  acceptance: 50,
-  acceptanceItem: 2000,
-  error: 2000,
-  note: 2000,
-  help: 4000,
-  answer: 6000,
-  helpOptions: 20,
-  keep: 200, // batches kept on the board; the oldest finished ones go first
-  builderOrder: 24000, // must equal MAX_ORDER_DETAILS_CHARS in foundry/builder_worker.py
-});
+export { BATCH_STATUSES, RESULT_STATES, TERMINAL_RESULT, OPEN_BATCH, SIZES, LIMITS };
+
 const MARKER_ALLOWANCE = 100; // the '(Foundry batch S-n of <createdAt>, subtask k)' line, unknown before dispatch
 
 // Length of the order text Foundry builds for a subtask (foundry/board_dispatch.py _submit):

@@ -227,12 +227,12 @@ test('import keeps a stored answer longer than the help limit', () => {
   assert.equal(resultOf(state, 'S-007').help.answer, answer);
 });
 
-test('the help question limit stays 4000', () => {
+test('the help question limit is 2000', () => {
   const { state, id } = claimed();
-  assert.equal(LIMITS.help, 4000);
-  refuses(() => report(state, id, { a: { state: 'needs_help', help: { question: 'x'.repeat(4001) } } }), /max 4000/);
+  assert.equal(LIMITS.help, 2000);
+  refuses(() => report(state, id, { a: { state: 'needs_help', help: { question: 'x'.repeat(2001) } } }), /max 2000/);
   assert.equal(resultOf(state, id), undefined);
-  report(state, id, { a: { state: 'needs_help', help: { question: 'x'.repeat(4000) } } });
+  report(state, id, { a: { state: 'needs_help', help: { question: 'x'.repeat(2000) } } });
   assert.equal(resultOf(state, id).state, 'needs_help');
 });
 
