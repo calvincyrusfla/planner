@@ -17,23 +17,36 @@ slug, host and service id) and every ``interval`` seconds:
    ``done``, asks the service to restart (``service.request_restart()``).
 
 Board errors are logged and retried on the next poll; one request is handled at a time.
+
+With the ``auto_update`` setting on, a poll that finds nothing to carry out also
+compares this checkout with ``origin`` (at most every :data:`AUTO_UPDATE_CHECK_S`
+seconds) and, when the remote branch has a commit that HEAD does not contain,
+sends ``requestFoundryUpdate`` (``by: "auto"``) once for that remote commit. The
+steps above then carry it out.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, Mapping
 
 log = logging.getLogger("foundry.update_watcher")
 
-__all__ = ["DEFAULT_UPDATE_POLL_S", "MAX_MESSAGE", "UpdateWatcher"]
+__all__ = ["AUTO_UPDATE_CHECK_S", "DEFAULT_UPDATE_POLL_S", "MAX_MESSAGE", "UpdateWatcher"]
 
 DEFAULT_UPDATE_POLL_S = 15.0
 #: The result message sent to the board is cut to this many characters.
 MAX_MESSAGE = 2000
 #: Task states that never come back to life (``builder_worker._TERMINAL_STATES``).
 _TERMINAL_STATES = frozenset({"complete", "quarantined", "failed"})
+#: Auto-update looks at the remote branch at most this often (seconds).
+AUTO_UPDATE_CHECK_S = 60.0
+#: Time limit of each git call of the auto-update check (seconds).
+_AUTO_GIT_TIMEOUT = 30.0
+#: Request states that block a new request (the board's ``OPEN_UPDATE``).
+_OPEN_STATES = frozenset({"queued", "claimed"})
 
 
 def _field(result: Any, *names: str) -> Any:
@@ -66,6 +79,7 @@ class UpdateWatcher:
         service_id: this Foundry's service id on the board.
         apply: ``async (repo, settings) -> UpdateResult``; default :func:`foundry.self_update.apply_update`.
         interval: seconds between polls.
+        clock: monotonic time source of the auto-update timer; default :func:`time.monotonic`.
     """
 
     def __init__(
@@ -79,6 +93,7 @@ class UpdateWatcher:
         apply: Callable[[Any, Any], Any] | None = None,
         interval: float = DEFAULT_UPDATE_POLL_S,
         sleep: Callable[[float], Any] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.service = service
         self.board = board
@@ -95,6 +110,10 @@ class UpdateWatcher:
         self.handled: list[str] = []
         #: Set once an update is done and a restart was requested: nothing more is claimed.
         self.restarting = False
+        self._clock: Callable[[], float] = clock or time.monotonic
+        self._last_auto_check: float | None = None
+        #: Remote commits an automatic request was already sent for.
+        self._auto_requested: set[str] = set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -142,11 +161,19 @@ class UpdateWatcher:
                 log.warning("foundry updates: poll failed (retrying next poll): %s", self.last_error)
                 return None
 
+    def _same_repo(self, request: Mapping[str, Any]) -> bool:
+        repo = request.get("repo")
+        return isinstance(repo, str) and repo.strip().lower() == str(self.repo_slug).strip().lower()
+
     def _matches(self, request: Any) -> bool:
         if not isinstance(request, Mapping) or not request.get("id") or request.get("status") != "queued":
             return False
-        repo = request.get("repo")
-        return isinstance(repo, str) and repo.strip().lower() == str(self.repo_slug).strip().lower()
+        return self._same_repo(request)
+
+    def _has_open_request(self, state: Any) -> bool:
+        requests = state.get("foundryUpdates") if isinstance(state, Mapping) else None
+        return any(isinstance(r, Mapping) and r.get("status") in _OPEN_STATES and self._same_repo(r)
+                   for r in (requests if isinstance(requests, list) else []))
 
     def _next_request(self, state: Any) -> Mapping[str, Any] | None:
         requests = state.get("foundryUpdates") if isinstance(state, Mapping) else None
@@ -196,6 +223,7 @@ class UpdateWatcher:
         self.last_error = None
         request = self._next_request(state)
         if request is None:
+            await self._auto_update(state)
             return None
         rid = str(request["id"])
         if not request.get("now") and self.busy():
@@ -229,6 +257,70 @@ class UpdateWatcher:
             if callable(restart):
                 restart()
         return rid
+
+    # ------------------------------------------------------------------ auto-update
+
+    async def _auto_update(self, state: Any) -> None:
+        """Request an update when ``auto_update`` is on and the remote branch moved.
+
+        A git or board error is logged and tried again at the next check.
+        """
+        if not getattr(getattr(self.service, "config", None), "auto_update", False):
+            return
+        if self._has_open_request(state):
+            return
+        now = self._clock()
+        if self._last_auto_check is not None and now - self._last_auto_check < AUTO_UPDATE_CHECK_S:
+            return
+        self._last_auto_check = now
+        try:
+            remote = await self._new_remote_sha()
+            if remote is None:
+                return
+            out = await asyncio.to_thread(self.board.op, "requestFoundryUpdate",
+                                          {"repo": self.repo_slug, "by": "auto"})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.info("foundry updates: auto-update check failed (retrying later): %s: %s", type(exc).__name__, exc)
+            return
+        if isinstance(out, Mapping) and out.get("ok") is False:
+            log.info("foundry updates: auto-update request refused (retrying later): %s", out.get("reason"))
+            return
+        self._auto_requested.add(remote)
+        log.info("foundry updates: %s moved to %s, update requested", self.repo_slug, remote[:7])
+
+    async def _new_remote_sha(self) -> str | None:
+        """The remote branch's commit when it should be pulled, else None.
+
+        None when the remote matches HEAD, was already requested, or is contained in HEAD:
+        pulling a commit HEAD already has changes nothing, yet would still restart Foundry.
+        """
+        head = await self._git_out("rev-parse", "HEAD")
+        branch = await self._git_out("symbolic-ref", "--short", "HEAD")
+        ref = f"refs/heads/{branch}"
+        listing = await self._git_out("ls-remote", "origin", ref)
+        rows = [line.split() for line in listing.splitlines()]
+        remote = next((row[0] for row in rows if len(row) == 2 and row[1] == ref), None)
+        if remote is None:
+            log.info("foundry updates: %s is not on origin, no auto-update", branch)
+            return None
+        if remote == head or remote in self._auto_requested:
+            return None
+        # exit 1: not an ancestor; 128: the commit is not fetched yet, so HEAD cannot contain it
+        rc, _, _ = await self._git("merge-base", "--is-ancestor", remote, "HEAD")
+        return None if rc == 0 else remote
+
+    async def _git(self, *args: str) -> tuple[int, str, str]:
+        from foundry.self_update import _git  # non-interactive, without the git location variables
+
+        return await _git(self.service.repo, *args, timeout=_AUTO_GIT_TIMEOUT)
+
+    async def _git_out(self, *args: str) -> str:
+        rc, out, err = await self._git(*args)
+        if rc != 0:
+            raise RuntimeError(f"git {args[0]} exited {rc}: {(err or out).strip()}")
+        return out.strip()
 
     async def _claim(self, rid: str) -> bool:
         try:
