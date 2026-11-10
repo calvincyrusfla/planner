@@ -189,6 +189,7 @@ class Service:
         probe: ``() -> bool`` telling whether Gemma answers; default probes
             ``config.gemma_base_url`` with :func:`foundry.foreman_probe.probe`.
         claude_ok: whether Claude Code was found and validated (shown in health).
+        builder_claude: client for builder calls; None = use ``claude``.
         factory_kwargs: extra :func:`~foundry.floor_manager.build_factory` arguments.
     """
 
@@ -198,6 +199,7 @@ class Service:
         *,
         repo: str | Path,
         claude: Any = None,
+        builder_claude: Any = None,
         gemma: Any = None,
         factory: Any = None,
         monitor_s: float | None = None,
@@ -211,6 +213,7 @@ class Service:
         self.config = config
         self.repo = Path(repo).resolve()
         self.claude = claude
+        self.builder_claude = builder_claude
         self.gemma = gemma
         self.factory = factory
         self.monitor_s = float(monitor_s) if monitor_s else monitor_interval()
@@ -272,7 +275,7 @@ class Service:
                 # next to the publisher's worktrees (foundry/data/base by default; git-ignored)
                 kwargs["snapshots"] = BaseSnapshots(self.repo, remote=pub.remote,
                                                     root=Path(pub.worktree_root).parent / "base")
-        return build_factory(self.config, claude=self.claude, gemma=self.gemma, **kwargs)
+        return build_factory(self.config, claude=self.claude, builder_claude=self.builder_claude, gemma=self.gemma, **kwargs)
 
     async def start(self) -> Service:
         """Build the factory (if needed), start the pools, resume work, start the monitor."""
@@ -1001,7 +1004,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     from foundry.config import FoundryConfig
-    from foundry.main import claude_args
+    from foundry.main import builder_claude_args, claude_args
 
     config = FoundryConfig.from_env(**({"board_bridge_mode": args.board} if args.board else {}))
     repo = Path(args.repo).resolve()
@@ -1013,6 +1016,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         claude = ClaudeCodeClient(resolve_claude_bin(config.claude_bin), extra_args=claude_args(config))
+        builder_claude = (
+            ClaudeCodeClient(resolve_claude_bin(config.claude_bin), extra_args=builder_claude_args(config))
+            if getattr(config, "builder_tools", "off") == "read"
+            else None
+        )
         validate = getattr(claude, "validate_launch", None)
         if callable(validate):
             validate()
@@ -1020,7 +1028,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Claude Code is not ready: {exc}", file=sys.stderr)
         return 2
     gemma = OllamaGemmaClient(config.gemma_base_url, config.gemma_model, timeout=config.gemma_timeout_s)
-    service = Service(config, repo=repo, claude=claude, gemma=gemma, monitor_s=args.monitor, claude_ok=True)
+    service = Service(
+        config, repo=repo, claude=claude, builder_claude=builder_claude, gemma=gemma,
+        monitor_s=args.monitor, claude_ok=True,
+    )
     try:
         return asyncio.run(run_service(service, host=DEFAULT_HOST, port=args.port))
     except PortInUse as exc:  # another Foundry is probably running
