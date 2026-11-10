@@ -40,6 +40,8 @@ def test_defaults() -> None:
     assert cfg.builder_max_turns == 30
     assert cfg.reviewer_tools == "off"
     assert cfg.reviewer_max_turns == 20
+    assert cfg.builder_mode == "diff"
+    assert cfg.builder_edit_max_turns == 60
 
 
 def test_from_env_empty_matches_defaults() -> None:
@@ -116,6 +118,9 @@ def test_overrides_win_over_env() -> None:
         ("FOUNDRY_REVIEWER_TOOLS", "bogus"),
         ("FOUNDRY_REVIEWER_MAX_TURNS", "2"),
         ("FOUNDRY_REVIEWER_MAX_TURNS", "101"),
+        ("FOUNDRY_BUILDER_MODE", "bogus"),
+        ("FOUNDRY_BUILDER_EDIT_MAX_TURNS", "2"),
+        ("FOUNDRY_BUILDER_EDIT_MAX_TURNS", "201"),
     ],
 )
 def test_from_env_rejects_bad_values(var: str, value: str) -> None:
