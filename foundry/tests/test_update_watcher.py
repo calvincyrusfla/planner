@@ -14,6 +14,7 @@ from foundry.board_bridge import BoardBridge
 from foundry.board_dispatch import BoardRefused
 from foundry.config import FoundryConfig
 from foundry.main import builder_claude_args, demo_claude, demo_gemma, write_demo_repo
+from foundry.schemas import TaskState
 from foundry.serve import Service, run_service
 from foundry.update_watcher import MAX_MESSAGE, UpdateWatcher
 
@@ -24,14 +25,22 @@ REPO = "Owner/Repo"
 class FakeTicket:
     status: str = "open"
     in_review: bool = False
+    task_id: str = "F-1"
 
 
 class FakeQueue:
     def __init__(self, tickets: list[FakeTicket] | None = None) -> None:
         self.items: list[FakeTicket] = list(tickets or [])
+        self.tasks: dict[str, dict[str, Any]] = {"F-1": {"state": TaskState.BUILDING}}
+        self.get_task_error: Exception | None = None
 
     def tickets(self) -> list[FakeTicket]:
         return list(self.items)
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        if self.get_task_error is not None:
+            raise self.get_task_error
+        return self.tasks.get(task_id)
 
 
 class FakeFactory:
@@ -155,6 +164,61 @@ def test_now_does_not_wait_for_busy() -> None:
     apply = FakeApply(FakeResult("done"))
     assert asyncio.run(_watcher(svc, board, apply).poll_once()) == "U-001"
     assert len(apply.calls) == 1 and svc.restarts == 1
+
+
+@pytest.mark.parametrize("state", [TaskState.QUARANTINED, TaskState.COMPLETE, "quarantined"])
+def test_claimed_ticket_of_a_finished_task_is_not_busy(state: Any) -> None:
+    svc = FakeService([FakeTicket(status="claimed")])
+    svc.queue.tasks["F-1"] = {"state": state}
+    board = FakeBoard([_request()])
+    apply = FakeApply(FakeResult("done"))
+    w = _watcher(svc, board, apply)
+    assert w.busy() is False
+    assert asyncio.run(w.poll_once()) == "U-001"
+    assert len(apply.calls) == 1 and svc.restarts == 1
+
+
+@pytest.mark.parametrize("state", [TaskState.BUILDING, "queued"])
+def test_claimed_ticket_of_a_live_task_is_busy(state: Any) -> None:
+    svc = FakeService([FakeTicket(status="claimed")])
+    svc.queue.tasks["F-1"] = {"state": state}
+    board = FakeBoard([_request()])
+    apply = FakeApply(FakeResult("done"))
+    w = _watcher(svc, board, apply)
+    assert w.busy() is True
+    assert asyncio.run(w.poll_once()) is None
+    assert board.ops == [] and apply.calls == []
+
+
+def test_ticket_in_review_of_a_failed_task_is_ignored() -> None:
+    svc = FakeService([FakeTicket(status="open", in_review=True)])
+    svc.queue.tasks["F-1"] = {"state": TaskState.FAILED}
+    w = _watcher(svc, FakeBoard([_request()]), FakeApply(FakeResult("done")))
+    assert w.busy() is False
+    assert asyncio.run(w.poll_once()) == "U-001"
+
+
+def test_ticket_of_a_missing_task_is_not_busy() -> None:
+    svc = FakeService([FakeTicket(status="claimed", task_id="F-404")])
+    w = _watcher(svc, FakeBoard([_request()]), FakeApply(FakeResult("done")))
+    assert w.busy() is False
+
+
+def test_get_task_raising_counts_as_not_busy() -> None:
+    svc = FakeService([FakeTicket(status="claimed")])
+    svc.queue.get_task_error = RuntimeError("db locked")
+    board = FakeBoard([_request()])
+    apply = FakeApply(FakeResult("done"))
+    w = _watcher(svc, board, apply)
+    assert w.busy() is False
+    assert asyncio.run(w.poll_once()) == "U-001"
+    assert len(apply.calls) == 1
+
+
+def test_awaiting_help_ticket_is_not_busy() -> None:
+    svc = FakeService([FakeTicket(status="awaiting_help")])
+    w = _watcher(svc, FakeBoard([_request()]), FakeApply(FakeResult("done")))
+    assert w.busy() is False
 
 
 def test_refused_claim_is_skipped() -> None:

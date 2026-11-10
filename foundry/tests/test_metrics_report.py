@@ -509,7 +509,7 @@ class BrokenConfig:
 
 PILOT_CONFIG = SimpleNamespace(builders_per_team=1, help_after=1, max_retries=2, pre_review="advise")
 PILOT_RUN = {"builderTools": "off", "reviewerTools": "off", "buildersPerTeam": 1, "helpAfter": 1, "maxRetries": 2,
-             "preReview": "advise"}
+             "preReview": "advise", "builderMode": "diff"}
 
 
 def usage_results(telemetry: Any, queue: Any, *, pushed: Any = None, changed: bool = True,
@@ -537,7 +537,8 @@ def test_usage_reports_the_configured_builder_tools(conn: sqlite3.Connection) ->
     out = usage_results(conn, TicketQueue(), config=config)
 
     assert out["a"]["usage"]["run"] == {"builderTools": "read", "buildersPerTeam": None, "helpAfter": None,
-                                         "maxRetries": None, "preReview": None, "reviewerTools": "off"}
+                                         "maxRetries": None, "preReview": None, "reviewerTools": "off",
+                                         "builderMode": "diff"}
 
 
 def test_attempts_is_the_highest_ticket_attempt_plus_one(conn: sqlite3.Connection) -> None:

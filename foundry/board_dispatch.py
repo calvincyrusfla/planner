@@ -848,6 +848,7 @@ class BatchWatcher:
             return {
                 "builderTools": getattr(cfg, "builder_tools", "off"),
                 "reviewerTools": getattr(cfg, "reviewer_tools", "off"),
+                "builderMode": getattr(cfg, "builder_mode", "diff"),
                 "buildersPerTeam": getattr(cfg, "builders_per_team", None),
                 "helpAfter": getattr(cfg, "help_after", None),
                 "maxRetries": getattr(cfg, "max_retries", None),
