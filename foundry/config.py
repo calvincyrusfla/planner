@@ -86,6 +86,9 @@ Environment variable               Field (default)
 ``FOUNDRY_REVIEWER_MAX_TURNS``     ``reviewer_max_turns`` (``20``, 3..100):
                                    ``--max-turns`` for reviewer calls when
                                    ``reviewer_tools`` is ``read``
+``FOUNDRY_LEDGER_READ``            ``ledger_read`` (``false``): the batch
+                                   watcher reads submitted pieces and submit
+                                   failures from the Ledger
 =================================  ==========================================
 
 Empty environment values are treated as unset.  The rate-limit defaults are
@@ -430,6 +433,14 @@ class FoundryConfig(BaseModel):
         description="--max-turns for reviewer calls when reviewer_tools is read.",
     )
 
+    ledger_read: bool = Field(
+        default=False,
+        description=(
+            "Whether the batch watcher takes submitted pieces and submit failures from the "
+            "Ledger. The kv record keeps being written, so turning this off returns to it."
+        ),
+    )
+
     @field_validator("gemma_base_url")
     @classmethod
     def _check_base_url(cls, value: str) -> str:
@@ -580,6 +591,7 @@ class FoundryConfig(BaseModel):
             "TYPECHECK": "typecheck",
             "MIN_SUBTASK_LINES": "min_subtask_lines",
             "HELP_AFTER": "help_after",
+            "LEDGER_READ": "ledger_read",
             "HELP_TIMEOUT_S": "help_timeout_s",
             "BUILDER_TOOLS": "builder_tools",
             "BUILDER_MAX_TURNS": "builder_max_turns",

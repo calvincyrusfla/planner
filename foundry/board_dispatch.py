@@ -505,7 +505,10 @@ class BatchWatcher:
             self._ledger_piece(batch, key, **fields)
 
     def _record(self, bid: str, created_at: str | None = None) -> dict[str, Any]:
-        """The saved record of a batch; a record of another batch with the same id starts over."""
+        """The saved record of a batch; a record of another batch with the same id starts over.
+
+        With ``ledger_read`` on, the Ledger's submitted pieces and submit failures are laid over it.
+        """
         fn = getattr(self._queue(), "kv_get", None)
         rec = fn(KV_PREFIX + bid) if callable(fn) else None
         if not isinstance(rec, dict) or (created_at and rec.get("createdAt") not in (None, created_at)):
@@ -516,7 +519,30 @@ class BatchWatcher:
         rec.setdefault("failed", {})
         rec.setdefault("pushed", {})
         rec.setdefault("usage", {})
+        if getattr(getattr(self.service, "config", None), "ledger_read", False):
+            self._overlay_ledger(bid, created_at, rec)
         return rec
+
+    def _overlay_ledger(self, bid: str, created_at: str | None, rec: dict[str, Any]) -> None:
+        """Lay the Ledger's tasks and submit failures over ``rec``; any read error leaves ``rec`` as it was."""
+        tasks: dict[str, str] = {}
+        failed: dict[str, str] = {}
+        try:
+            ledger = self._ledger()
+            if ledger is None:
+                return
+            for piece in ledger.pieces(bid, created_at):
+                key = str(piece["key"])
+                if piece.get("foundry_task"):
+                    tasks[key] = str(piece["foundry_task"])
+                elif piece.get("state") == "failed" and key not in rec["tasks"]:
+                    # a key with a kv task was submitted: its row just predates foundry_task
+                    failed[key] = str(piece.get("error") or "failed")
+        except Exception as exc:  # the kv record still holds everything needed
+            log.info("board dispatch: Ledger read failed, using the kv record: %s", exc)
+            return
+        rec["tasks"].update(tasks)
+        rec["failed"].update(failed)
 
     def _save(self, bid: str, rec: Mapping[str, Any]) -> None:
         fn = getattr(self._queue(), "kv_set", None)
