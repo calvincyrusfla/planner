@@ -310,6 +310,18 @@ def test_infra_failure_cap() -> None:
         FoundryConfig(infra_failure_cap=0)
 
 
+def test_gate_error_chars() -> None:
+    assert FoundryConfig.from_env({}).gate_error_chars == 0
+    assert FoundryConfig.from_env({"FOUNDRY_GATE_ERROR_CHARS": "4000"}).gate_error_chars == 4000
+    assert FoundryConfig.from_env({"FOUNDRY_GATE_ERROR_CHARS": "20000"}).gate_error_chars == 20000
+
+
+@pytest.mark.parametrize("value", ["-1", "20001", "abc"])
+def test_gate_error_chars_out_of_range(value: str) -> None:
+    with pytest.raises(ValidationError):
+        FoundryConfig.from_env({"FOUNDRY_GATE_ERROR_CHARS": value})
+
+
 def test_patches_dir_follows_db(tmp_path: Path) -> None:
     cfg = FoundryConfig(db_path=tmp_path / "run1" / "foundry.db")
     assert cfg.patches_dir is None

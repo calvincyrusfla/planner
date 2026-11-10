@@ -55,7 +55,7 @@ from foundry.schemas import ClaudeResult
 __all__ = [
     "VirtualClock", "DEMO_FILES", "DEMO_ORDERS", "demo_claude", "demo_gemma", "run_demo", "run_real",
     "explain_task", "completion_report", "task_outputs", "main", "builder_claude_args",
-    "reviewer_claude_args",
+    "builder_retry_claude_args", "reviewer_claude_args",
 ]
 
 #: Claude Code carries a large system prompt into every headless session; the
@@ -426,9 +426,13 @@ def builder_claude_args(config: FoundryConfig) -> list[str]:
     Otherwise the same as :func:`claude_args` unless ``config.builder_tools`` is
     ``read``. Then builders get ``config.builder_max_turns`` turns, the Read, Grep
     and Glob tools and :data:`DEFAULT_BUILDER_READ_PROMPT`; every other flag stays.
+    In every mode ``config.builder_model``, when set, becomes the one ``--model``.
     Always a new list: ``config.claude_extra_args`` is never changed.
     """
     args = claude_args(config)
+    model = getattr(config, "builder_model", None)
+    if model:
+        _set_flag(args, "--model", str(model))
     if getattr(config, "builder_mode", "diff") == "edit":
         run_tests = bool(getattr(config, "builder_tests", False))
         # A bare Bash in --disallowedTools beats every Bash(...) allow rule.
@@ -453,6 +457,19 @@ def builder_claude_args(config: FoundryConfig) -> list[str]:
     _set_flag(args, "--max-turns", str(config.builder_max_turns))
     args.extend(["--allowedTools", "Read Grep Glob"])
     _set_flag(args, "--append-system-prompt", DEFAULT_BUILDER_READ_PROMPT)
+    return args
+
+
+def builder_retry_claude_args(config: FoundryConfig) -> list[str]:
+    """Extra ``claude -p`` flags for builder retries.
+
+    :func:`builder_claude_args` with ``--model`` set to ``config.builder_retry_model``
+    when that is set, else exactly :func:`builder_claude_args`.
+    """
+    args = builder_claude_args(config)
+    model = getattr(config, "builder_retry_model", None)
+    if model:
+        _set_flag(args, "--model", str(model))
     return args
 
 

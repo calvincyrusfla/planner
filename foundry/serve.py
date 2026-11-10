@@ -483,7 +483,10 @@ class Service:
             if alert is None:
                 self.last_monitor_error = None
                 return None
-            action = await f.manager.apply_escalation(alert)
+            if getattr(self.config, "foreman_actions", "act") == "log":
+                action = await f.manager.apply_escalation(alert, act=False)
+            else:
+                action = await f.manager.apply_escalation(alert)
             if hasattr(alert, "model_dump"):
                 self.last_alert = alert.model_dump(mode="json")
             else:

@@ -19,6 +19,9 @@ newest first (``?limit=N``, 1-200, default 50).
 ``GET  /api/events``  -> ``{ok, events: [...], last_id}`` the queue's events in id
 order (``?since=ID`` default 0, ``?limit=N`` 1-1000 default 200, ``?kind=``,
 ``?task=``); ``last_id`` is the last returned id, or ``since`` when there are none.
+``GET  /api/ledger``  -> ``{ok, batches: [...]}`` every open Ledger batch with its
+``pieces``; ``?batch=S-001`` (optional ``&created=<createdAt>``) answers that batch
+alone, or no batches when it is unknown.  Any other batch id is a 400.
 ``POST /api/tasks/<id>/pr/retry`` -> ``{ok: true, task_id, pr}`` (publishing again
 in the background); 409 ``{ok: false, reason, code: "refused"}`` when the PR is
 open, already publishing or has no patch; 404 for an unknown task.
@@ -42,7 +45,9 @@ duck-typed methods, so tests can pass a simulated one:
 * ``actions(limit=)`` -> list of action dicts (optional; ``[]`` without it),
 * ``undo_action(action_id, by=)`` -> ``{ok, ...}`` / ``{ok: False, reason}``,
 * ``factory.queue.events(task_id=, kind=, since_id=, limit=)`` -> list of event
-  dicts (optional; no events without a factory).
+  dicts (optional; no events without a factory),
+* ``factory.queue``: a ``FoundryQueue`` the Ledger is read from (optional; no
+  batches without a factory).
 
 Any of them may be a coroutine / async generator.  When the service exposes a
 running asyncio loop as ``service.loop`` the coroutine runs on that loop
@@ -66,6 +71,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from foundry import __version__
+from foundry.ledger import Ledger
 
 __all__ = [
     "DEFAULT_HOST",
@@ -110,6 +116,8 @@ PATTERN_ROUTES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (re.compile(rf"^/api/actions/{ROUTE_ID}/undo$"), "POST", "_undo"),
     (re.compile(rf"^/api/tasks/{ROUTE_ID}/pr/retry$"), "POST", "_pr_retry"),  # handler: alpha-2
 )
+#: A board batch id, as ``GET /api/ledger?batch=`` accepts it.
+BATCH_ID = re.compile(r"S-[0-9]+")
 
 
 class OrderError(ValueError):
@@ -277,6 +285,17 @@ def _not_running(service: Any) -> bool:
     return getattr(service, "running", True) is False
 
 
+def _ledger_batches(queue: Any, batch_id: str | None, created_at: str | None) -> list[dict[str, Any]]:
+    """The open batches, or the one asked for, each with a ``pieces`` list."""
+    ledger = Ledger(queue)
+    if batch_id is None:
+        rows = ledger.open_batches()
+    else:
+        found = ledger.batch(batch_id, created_at)
+        rows = [found] if found is not None else []
+    return [{**row, "pieces": ledger.pieces(row["batch_id"], row["created_at"])} for row in rows]
+
+
 class _ChunkPump:
     """Iterate a sync or async iterator of chunks from a request thread."""
 
@@ -390,6 +409,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/ask": ("POST", self._ask),
             "/api/actions": ("GET", self._actions),
             "/api/events": ("GET", self._events),
+            "/api/ledger": ("GET", self._ledger),
         }
         hit = routes.get(path)
         if hit is not None:
@@ -589,6 +609,20 @@ class _Handler(BaseHTTPRequestHandler):
         rows = list(_call(svc, queue.events, task_id=task, kind=kind, since_id=since, limit=limit) or [])
         last_id = rows[-1]["id"] if rows else since
         self._send_json(200, {"ok": True, "events": rows, "last_id": last_id})
+
+    def _ledger(self) -> None:
+        # Blank values kept: ``?batch=`` is a bad id, ``?created=`` a batch stored without a date.
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        batch_id = query["batch"][0] if "batch" in query else None
+        created_at = query["created"][0] if "created" in query else None
+        if batch_id is not None and not BATCH_ID.fullmatch(batch_id):
+            raise OrderError("batch must be S- followed by digits.")
+        svc = self.service
+        queue = getattr(getattr(svc, "factory", None), "queue", None)
+        if queue is None:
+            return self._send_json(200, {"ok": True, "batches": []})
+        batches = _call(svc, _ledger_batches, queue, batch_id, created_at)
+        self._send_json(200, {"ok": True, "batches": batches})
 
     def _undo(self, action_id: str) -> None:
         self._read_json()  # body is optional and ignored, but must be valid JSON when present
