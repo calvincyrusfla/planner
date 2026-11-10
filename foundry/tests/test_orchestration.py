@@ -803,7 +803,7 @@ def test_run_real_usage_limit_pause_is_explained(tmp_path: Path) -> None:
     code = _run(run_real(_real_args(repo, 0.5), _real_config(tmp_path), claude, SimulatedGemmaClient(), out=lines.append))
     assert code == EXIT_IN_PROGRESS
     text = "\n".join(lines)
-    assert re.search(r"paused until \d\d:\d\d \(usage limit\) - rerun the same command to resume", text), text
+    assert re.search(r"paused until (?:\w{3} \d{1,2} \w{3} )?\d\d:\d\d \(usage limit\) - rerun the same command to resume", text), text
 
 
 def test_main_real_preflight_rejects_a_bad_claude_launch(
