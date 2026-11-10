@@ -353,6 +353,8 @@ node department/dept.mjs foundry cancel S-001
 
 Each `--subtask` is `title::description::files::size`: files are comma separated paths inside the repository, size is `S`, `M`, `L` or `XL`, and any part after the title can be left empty. See [Dispatching work through the board](../foundry/README.md#dispatching-work-through-the-board).
 
+`foundry check --json batch.json` prints order-check findings (related tests not listed, oversized pieces, shared files, unknown names); dispatch prints them too.
+
 ## How the agents use it
 
 `CLAUDE.md` at the repo root sets the protocol for Claude sessions in this repo. Each task is registered here with a crew size, staffed with that many of the assigned team's builders (`.claude/agents/builder.md`), and progress is reported back as the work happens. When the builders finish, the head sends the task to review and spawns each team's reviewer (`.claude/agents/reviewer.md`); findings go back to the builders until every reviewer approves.

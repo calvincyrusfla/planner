@@ -5,6 +5,7 @@
 // finding = { key, rule, level: 'warn'|'note', message, paths?: [], names?: [] }
 
 const MAX_RELATED_TESTS = 8;
+const MAX_TESTS_PER_MATCH = 5; // a module or name used by more tests than this says nothing about one piece
 const MAX_NON_TEST_FILES = 3;
 const MIN_NAME_LENGTH = 4;
 
@@ -88,23 +89,39 @@ function toPiece(subtask, index) {
 
 function relatedTest(piece, repo, read) {
   const listed = new Set([...piece.files, ...piece.readFiles]);
-  const found = repo.files
-    .filter((path) => isTestFile(path) && !listed.has(path))
-    .filter((path) => {
-      const text = read(path);
-      return piece.sources.some((file) => importsFile(text, file)) || piece.names.some((name) => text.includes(name));
-    })
-    .sort();
-  if (!found.length) return null;
-  const paths = found.slice(0, MAX_RELATED_TESTS);
-  const more = found.length - paths.length;
-  return {
-    key: piece.key,
-    rule: 'related-test',
-    level: 'warn',
-    message: `Tests outside this piece look related: ${paths.join(', ')}${more ? ` and ${more} more` : ''}. Add the ones it affects to files or readFiles.`,
-    paths,
-  };
+  const tests = repo.files.filter((path) => isTestFile(path));
+  const found = new Set();
+  const widelyImported = [];
+  for (const file of piece.sources) {
+    const importers = tests.filter((path) => importsFile(read(path), file));
+    if (importers.length > MAX_TESTS_PER_MATCH) {
+      widelyImported.push({
+        key: piece.key,
+        rule: 'widely-imported',
+        level: 'note',
+        message: `${importers.length} tests import ${file}; run them`,
+        paths: [file],
+      });
+    } else importers.forEach((path) => found.add(path));
+  }
+  for (const name of piece.names) {
+    const users = tests.filter((path) => read(path).includes(name));
+    if (users.length <= MAX_TESTS_PER_MATCH) users.forEach((path) => found.add(path));
+  }
+  const related = [...found].filter((path) => !listed.has(path)).sort();
+  if (!related.length) return widelyImported;
+  const paths = related.slice(0, MAX_RELATED_TESTS);
+  const more = related.length - paths.length;
+  return [
+    {
+      key: piece.key,
+      rule: 'related-test',
+      level: 'warn',
+      message: `Tests outside this piece look related: ${paths.join(', ')}${more ? ` and ${more} more` : ''}. Add the ones it affects to files or readFiles.`,
+      paths,
+    },
+    ...widelyImported,
+  ];
 }
 
 function tooManyFiles(piece) {
@@ -155,7 +172,7 @@ export function checkOrder(batch, repo) {
     return contents.get(path);
   };
   const pieces = asList(batch?.subtasks).map(toPiece);
-  const perPiece = pieces.flatMap((piece) => [relatedTest(piece, repo, read), tooManyFiles(piece), notFound(piece, repo, read)]);
+  const perPiece = pieces.flatMap((piece) => [...relatedTest(piece, repo, read), tooManyFiles(piece), notFound(piece, repo, read)]);
   return [...perPiece.filter(Boolean), ...sharedFiles(pieces)].sort(
     (a, b) => a.key.localeCompare(b.key, 'en', { numeric: true }) || a.rule.localeCompare(b.rule, 'en'),
   );
