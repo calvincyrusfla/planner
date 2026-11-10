@@ -351,7 +351,7 @@ node department/dept.mjs foundry list [--open]
 node department/dept.mjs foundry cancel S-001
 ```
 
-Each `--subtask` is `title::description::files::size`: files are comma separated paths inside the repository, size is `S`, `M`, `L` or `XL`, and any part after the title can be left empty. From Python, `foundry.dispatch` has `dispatch_to_foundry(batch)` and `poll_foundry_sprint("S-001")`; see [Dispatching work through the board](../foundry/README.md#dispatching-work-through-the-board).
+Each `--subtask` is `title::description::files::size`: files are comma separated paths inside the repository, size is `S`, `M`, `L` or `XL`, and any part after the title can be left empty. See [Dispatching work through the board](../foundry/README.md#dispatching-work-through-the-board).
 
 ## How the agents use it
 

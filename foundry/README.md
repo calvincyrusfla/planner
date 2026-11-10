@@ -658,40 +658,17 @@ The Floor Manager (a Claude session) sends engineering work to Foundry through t
 
 1. The Floor Manager sends a **Foundry batch** (also called a sprint) to the board. A batch has a title, the repository it's for (`owner/name`), an optional base branch and 1 to 20 subtasks.
 2. Foundry, running on your PC, watches the board. It claims queued batches for **its own** repository and sends each subtask in as a normal Foundry order (`F-0xx`). From there the subtask is sized, built, reviewed and gets a pull request as usual.
-3. Foundry writes progress back onto the batch: for each subtask the F-id, its state, the PR link and any error. A subtask whose build and review are finished shows `reviewing` until its PR is settled (opened, failed or skipped), and then `complete`. The Floor Manager reads that with `poll_foundry_sprint`.
+3. Foundry writes progress back onto the batch: for each subtask the F-id, its state, the PR link and any error. A subtask whose build and review are finished shows `reviewing` until its PR is settled (opened, failed or skipped), and then `complete`. The Floor Manager reads that with `node department/dept.mjs foundry poll <S-id>`.
 
 Batches are not board tasks and never take agent teams. Each subtask's F-task still appears on the board as a normal task once Foundry accepts it. The dashboard's **Foundry batches** panel shows every batch with its status, who claimed it and per-subtask progress.
 
 ### Send a batch
 
-From Python (the Floor Manager's tools, `foundry/dispatch.py`):
+With the CLI, subtasks get the keys `1`, `2`, … in order unless the JSON gives a `key`, and `dependsOn` lists keys that must be complete first.
 
-```python
-from foundry.dispatch import DispatchFoundryBatch, SubtaskPayload, dispatch_to_foundry, poll_foundry_sprint
-
-sprint = dispatch_to_foundry(DispatchFoundryBatch(
-    title="Math helpers",
-    repo="owner/shop",
-    base="main",
-    subtasks=[
-        SubtaskPayload(title="Add clamp", description="Add clamp(x, lo, hi).", files=["shop/mathx.py"], size="S"),
-        SubtaskPayload(title="Use clamp", files=["shop/strings.py"], depends_on=["1"]),
-    ],
-))
-print(sprint.id)                     # S-001
-status = poll_foundry_sprint(sprint.id)
-```
-
-Subtasks get the keys `1`, `2`, … in order unless you give a `key`. `depends_on` lists keys that must be complete before Foundry sends this subtask in. `wait_for_sprint(...)` polls until the batch is finished.
-
-The board client tries, in order: the local dashboard (`http://127.0.0.1:4300`), the shared board (`DEPT_HUB_URL`, passcode from `DEPT_HUB_KEY`; in cloud sessions the network proxy supplies it), then `node department/dept.mjs`.
-
-From the command line:
+Send it with the CLI:
 
 ```bash
-python -m foundry.dispatch send --json batch.json
-python -m foundry.dispatch poll S-001
-
 node department/dept.mjs foundry dispatch --title "Math helpers" --repo owner/shop --base main \
   --subtask "Add clamp::Add clamp(x, lo, hi).::shop/mathx.py::S" \
   --subtask "Use clamp::Use it in strings.::shop/strings.py::S"
@@ -700,6 +677,8 @@ node department/dept.mjs foundry poll S-001          # add --json for the raw ba
 node department/dept.mjs foundry list --open
 node department/dept.mjs foundry cancel S-001
 ```
+
+The order fields and limits are defined once in `schema/order.json`.
 
 `--subtask` is `Title::description::file1,file2::size` (the parts after the title are optional). Limits: at most 20 subtasks, titles up to 200 characters, descriptions up to 20 000, up to 50 files per subtask, and file paths must be relative without `..`.
 
