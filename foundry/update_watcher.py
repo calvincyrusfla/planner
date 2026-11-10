@@ -8,7 +8,8 @@ slug, host and service id) and every ``interval`` seconds:
 1. reads the board state and takes the oldest ``queued`` request whose ``repo``
    is this Foundry's repo (case-insensitive);
 2. unless the request says ``now``, waits (until a later poll) while Foundry is
-   busy: any ticket ``claimed`` or ``in_review``;
+   busy: any ticket ``claimed`` or ``in_review`` whose task is still live
+   (not missing, complete, quarantined or failed);
 3. claims it (``claimFoundryUpdate``; a refusal means someone else took it);
 4. runs ``apply(service.repo, settings)`` (default
    :func:`foundry.self_update.apply_update`);
@@ -31,6 +32,8 @@ __all__ = ["DEFAULT_UPDATE_POLL_S", "MAX_MESSAGE", "UpdateWatcher"]
 DEFAULT_UPDATE_POLL_S = 15.0
 #: The result message sent to the board is cut to this many characters.
 MAX_MESSAGE = 2000
+#: Task states that never come back to life (``builder_worker._TERMINAL_STATES``).
+_TERMINAL_STATES = frozenset({"complete", "quarantined", "failed"})
 
 
 def _field(result: Any, *names: str) -> Any:
@@ -155,7 +158,11 @@ class UpdateWatcher:
         return mine[0]
 
     def busy(self) -> bool:
-        """True while any ticket is claimed or in review (no factory = not busy)."""
+        """True while any ticket of a live task is claimed or in review (no factory = not busy).
+
+        Tickets whose task is missing or finished (complete, quarantined, failed) do not count;
+        an error while reading a ticket's task counts that ticket as not busy.
+        """
         factory = getattr(self.service, "factory", None)
         queue = getattr(factory, "queue", None) if factory is not None else None
         tickets = getattr(queue, "tickets", None)
@@ -165,8 +172,24 @@ class UpdateWatcher:
             status = _field(t, "status")
             status = getattr(status, "value", status)
             if status == "claimed" or bool(_field(t, "in_review")):
-                return True
+                if self._task_live(queue, t):
+                    return True
         return False
+
+    @staticmethod
+    def _task_live(queue: Any, ticket: Any) -> bool:
+        """True when the ticket's task exists and is not in a terminal state."""
+        task_id = _field(ticket, "task_id")
+        try:
+            task = queue.get_task(task_id)
+            if task is None:
+                return False
+            state = task.get("state") if isinstance(task, Mapping) else getattr(task, "state", None)
+            state = getattr(state, "value", state)
+            return state not in _TERMINAL_STATES
+        except Exception as exc:
+            log.info("foundry updates: could not read task %s of a busy ticket (not counted): %s", task_id, exc)
+            return False
 
     async def _round(self) -> str | None:
         state = await asyncio.to_thread(self.board.state)

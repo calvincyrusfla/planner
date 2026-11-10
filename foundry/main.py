@@ -41,8 +41,10 @@ from typing import Any, Sequence
 from foundry.board_bridge import BoardBridge
 from foundry.claude_client import SimulatedClaudeClient
 from foundry.config import (
+    BUILDER_TEST_COMMANDS,
     DEFAULT_BUILDER_EDIT_PROMPT,
     DEFAULT_BUILDER_READ_PROMPT,
+    DEFAULT_BUILDER_TESTS_PROMPT_ADDITION,
     DEFAULT_REVIEWER_READ_PROMPT,
     FoundryConfig,
 )
@@ -417,6 +419,9 @@ def builder_claude_args(config: FoundryConfig) -> list[str]:
     may use the Edit and Write tools as well as Read, Grep and Glob, get
     ``config.builder_edit_max_turns`` turns, ``--permission-mode acceptEdits`` and
     :data:`DEFAULT_BUILDER_EDIT_PROMPT`; every other disallowed tool stays disallowed.
+    With ``config.builder_tests`` on as well, Bash is no longer disallowed, only the
+    :data:`BUILDER_TEST_COMMANDS` are allowed through it, and the prompt gets
+    :data:`DEFAULT_BUILDER_TESTS_PROMPT_ADDITION`.
 
     Otherwise the same as :func:`claude_args` unless ``config.builder_tools`` is
     ``read``. Then builders get ``config.builder_max_turns`` turns, the Read, Grep
@@ -425,14 +430,23 @@ def builder_claude_args(config: FoundryConfig) -> list[str]:
     """
     args = claude_args(config)
     if getattr(config, "builder_mode", "diff") == "edit":
+        run_tests = bool(getattr(config, "builder_tests", False))
+        # A bare Bash in --disallowedTools beats every Bash(...) allow rule.
+        unblocked = ("Edit", "Write", "Bash") if run_tests else ("Edit", "Write")
+        allowed = "Read Grep Glob Edit Write"
+        prompt = DEFAULT_BUILDER_EDIT_PROMPT
+        if run_tests:
+            allowed += "".join(f" Bash({command} *)" for command in BUILDER_TEST_COMMANDS)
+            # One line on purpose: a newline cannot pass through claude.cmd on Windows.
+            prompt += " " + DEFAULT_BUILDER_TESTS_PROMPT_ADDITION
         # FOUNDRY_CLAUDE_ARGS appends to the defaults, so the flag can occur twice.
         for i, arg in enumerate(args[:-1]):
             if arg == "--disallowedTools":
-                args[i + 1] = " ".join(t for t in args[i + 1].split() if t not in ("Edit", "Write"))
+                args[i + 1] = " ".join(t for t in args[i + 1].split() if t not in unblocked)
         _set_flag(args, "--max-turns", str(config.builder_edit_max_turns))
         _set_flag(args, "--permission-mode", "acceptEdits")
-        args.extend(["--allowedTools", "Read Grep Glob Edit Write"])
-        _set_flag(args, "--append-system-prompt", DEFAULT_BUILDER_EDIT_PROMPT)
+        args.extend(["--allowedTools", allowed])
+        _set_flag(args, "--append-system-prompt", prompt)
         return args
     if getattr(config, "builder_tools", "off") != "read":
         return args

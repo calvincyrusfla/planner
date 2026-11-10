@@ -1,4 +1,4 @@
-"""FOUNDRY_LEDGER_READ: the batch watcher takes submitted pieces and failures from the Ledger."""
+"""The Ledger owns the batch watcher's submitted pieces and submit failures; kv is only the fallback."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def db(tmp_path: Path) -> Iterator[ScriptedQueue]:
 
 
 def _scripted(queue: Any, repo: Path, *, config: FoundryConfig | None = None, fail: str | None = None) -> Any:
-    """A service on ``queue`` whose manager hands out F-1, F-2, ... (ledger_read on unless ``config`` says otherwise)."""
+    """A service on ``queue`` whose manager hands out F-1, F-2, ..."""
     accepted: list[Any] = []
 
     def accept(order: Any) -> str:
@@ -52,13 +52,17 @@ def _scripted(queue: Any, repo: Path, *, config: FoundryConfig | None = None, fa
     manager = SimpleNamespace(orders={}, auto_pr=False, publisher=None, accept=accept, accepted=accepted)
     factory = SimpleNamespace(manager=manager, queue=queue, telemetry=None)
     return SimpleNamespace(running=True, factory=factory, repo=repo,
-                           config=config if config is not None else FoundryConfig(ledger_read=True))
+                           config=config if config is not None else FoundryConfig())
 
 
 def _save_kv(queue: Any, **fields: Any) -> dict[str, Any]:
     rec = {"createdAt": CREATED, "tasks": {}, "failed": {}, "pushed": {}, "usage": {}, **fields}
     queue.kv_set(KV_PREFIX + BATCH, rec)
     return rec
+
+
+def _boom(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("ledger down")
 
 
 # --------------------------------------------------------------------------- the setting
@@ -76,15 +80,23 @@ def test_ledger_read_setting() -> None:
 # --------------------------------------------------------------------------- what _record returns
 
 
-def test_by_default_the_record_is_exactly_the_kv_record(tmp_path: Path, db: ScriptedQueue) -> None:
-    kv = _save_kv(db, tasks={"1": "F-kv"}, pushed={"1": {"state": "building"}}, answered={"1": "then"})
+@pytest.mark.parametrize("ledger_read", [False, True])
+def test_tasks_and_failures_come_from_the_ledger_whatever_the_setting(
+    tmp_path: Path, db: ScriptedQueue, ledger_read: bool
+) -> None:
+    pushed = {"1": {"state": "building"}}
+    _save_kv(db, pushed=pushed, answered={"1": "then"})
     Ledger(db).upsert_piece(BATCH, CREATED, "1", foundry_task="F-ledger", state="building")
     Ledger(db).upsert_piece(BATCH, CREATED, "2", state="failed", error="nope")
-    watcher = help_watcher(_scripted(db, tmp_path, config=FoundryConfig()), ArgsBoard())
-    assert watcher._record(BATCH, CREATED) == kv
+    config = FoundryConfig(ledger_read=ledger_read)
+    rec = help_watcher(_scripted(db, tmp_path, config=config), ArgsBoard())._record(BATCH, CREATED)
+    assert rec["tasks"] == {"1": "F-ledger"}
+    assert rec["failed"] == {"2": "nope"}
+    assert rec["pushed"] == pushed
+    assert rec["answered"] == {"1": "then"}
 
 
-def test_the_ledger_wins_and_kv_only_keys_stay(tmp_path: Path, db: ScriptedQueue) -> None:
+def test_the_ledger_wins_and_kv_only_keys_are_backfilled(tmp_path: Path, db: ScriptedQueue) -> None:
     pushed = {"1": {"state": "building"}}
     _save_kv(db, tasks={"1": "F-kv", "2": "F-only-kv"}, failed={"3": "kv reason"}, pushed=pushed, closed=True)
     Ledger(db).upsert_piece(BATCH, CREATED, "1", foundry_task="F-ledger", state="building")
@@ -93,6 +105,61 @@ def test_the_ledger_wins_and_kv_only_keys_stay(tmp_path: Path, db: ScriptedQueue
     assert rec["failed"] == {"3": "kv reason"}
     assert rec["pushed"] == pushed
     assert rec["closed"] is True
+    pieces = {piece["key"]: piece for piece in Ledger(db).pieces(BATCH, CREATED)}
+    assert pieces["1"]["foundry_task"] == "F-ledger"
+    assert pieces["2"]["foundry_task"] == "F-only-kv"
+    assert (pieces["3"]["state"], pieces["3"]["error"]) == ("failed", "kv reason")
+
+
+def test_a_kv_only_batch_is_backfilled_once(
+    tmp_path: Path, db: ScriptedQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _save_kv(db, tasks={"1": "F-kv"}, failed={"2": "kv reason"})
+    writes: list[str] = []
+    real = Ledger.upsert_piece
+
+    def counted(self: Ledger, batch_id: str, created_at: str | None, key: str, **fields: Any) -> bool:
+        writes.append(key)
+        return real(self, batch_id, created_at, key, **fields)
+
+    monkeypatch.setattr(Ledger, "upsert_piece", counted)
+    watcher = help_watcher(_scripted(db, tmp_path), ArgsBoard())
+    first = watcher._record(BATCH, CREATED)
+    assert sorted(writes) == ["1", "2"]
+    assert watcher._record(BATCH, CREATED) == first
+    assert sorted(writes) == ["1", "2"]
+
+
+def test_a_save_takes_tasks_and_failures_out_of_the_kv_record(tmp_path: Path, db: ScriptedQueue) -> None:
+    kept = {"pushed": {"1": {"state": "building"}}, "usage": {"1": {"tokens": 5}}, "answered": {"1": "then"},
+            "closed": True}
+    _save_kv(db, tasks={"1": "F-kv"}, failed={"2": "kv reason"}, **kept)
+    watcher = help_watcher(_scripted(db, tmp_path), ArgsBoard())
+    watcher._save(BATCH, watcher._record(BATCH, CREATED))
+    assert db.kv_get(KV_PREFIX + BATCH) == {"createdAt": CREATED, **kept}
+    rec = watcher._record(BATCH, CREATED)
+    assert rec["tasks"] == {"1": "F-kv"}
+    assert rec["failed"] == {"2": "kv reason"}
+
+
+def test_a_record_read_without_created_at_finds_the_ledger_rows(tmp_path: Path, db: ScriptedQueue) -> None:
+    watcher = help_watcher(_scripted(db, tmp_path), ArgsBoard())
+    help_pump(watcher)
+    assert watcher._record(BATCH)["tasks"] == {"1": "F-1"}
+
+
+def test_a_piece_that_is_submitted_lives_only_in_the_ledger(tmp_path: Path, db: ScriptedQueue) -> None:
+    board = ArgsBoard()
+    help_pump(help_watcher(_scripted(db, tmp_path), board))
+    saved = db.kv_get(KV_PREFIX + BATCH)
+    assert "tasks" not in saved and "failed" not in saved
+    assert Ledger(db).pieces(BATCH, CREATED)[0]["foundry_task"] == "F-1"
+
+    again = _scripted(db, tmp_path)  # a restart: the kv record no longer names the piece
+    watcher = help_watcher(again, board)
+    help_pump(watcher)
+    assert again.factory.manager.accepted == []
+    assert watcher._record(BATCH, CREATED)["tasks"] == {"1": "F-1"}
 
 
 def test_a_piece_that_failed_to_submit_appears_with_its_error(tmp_path: Path, db: ScriptedQueue) -> None:
@@ -113,6 +180,7 @@ def test_a_piece_submitted_in_kv_is_not_turned_into_a_submit_failure(tmp_path: P
     rec = help_watcher(_scripted(db, tmp_path), ArgsBoard())._record(BATCH, CREATED)
     assert rec["tasks"] == {"1": "F-kv"}
     assert rec["failed"] == {}
+    assert Ledger(db).pieces(BATCH, CREATED)[0]["foundry_task"] == "F-kv"
 
 
 def test_pieces_of_another_batch_with_the_same_id_are_ignored(tmp_path: Path, db: ScriptedQueue) -> None:
@@ -124,21 +192,82 @@ def test_pieces_of_another_batch_with_the_same_id_are_ignored(tmp_path: Path, db
 def test_a_failing_ledger_read_falls_back_to_the_kv_record(
     tmp_path: Path, db: ScriptedQueue, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def boom(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
-        raise RuntimeError("ledger down")
-
-    kv = _save_kv(db, tasks={"1": "F-kv"})
-    monkeypatch.setattr(Ledger, "pieces", boom)
+    kv = _save_kv(db, tasks={"1": "F-kv"}, failed={"2": "kv reason"})
+    monkeypatch.setattr(Ledger, "pieces", _boom)
     watcher = help_watcher(_scripted(db, tmp_path), ArgsBoard())
     with caplog.at_level(logging.INFO, logger="foundry.board_dispatch"):
-        assert watcher._record(BATCH, CREATED) == kv
+        rec = watcher._record(BATCH, CREATED)
+        assert rec == kv
+        watcher._save(BATCH, rec)
     assert "Ledger read failed" in caplog.text
+    assert "Ledger write failed" in caplog.text
+    assert db.kv_get(KV_PREFIX + BATCH) == kv  # still there: the Ledger may never have taken them
 
 
 def test_a_queue_without_a_ledger_uses_the_kv_record(tmp_path: Path) -> None:
     queue = LegacyQueue()
     kv = _save_kv(queue, tasks={"1": "F-kv"})
-    assert help_watcher(_scripted(queue, tmp_path), ArgsBoard())._record(BATCH, CREATED) == kv
+    watcher = help_watcher(_scripted(queue, tmp_path), ArgsBoard())
+    rec = watcher._record(BATCH, CREATED)
+    assert rec == kv
+    watcher._save(BATCH, rec)
+    assert queue.kv_get(KV_PREFIX + BATCH) == kv
+
+
+def test_a_failing_ledger_write_keeps_the_pieces_in_kv_until_it_recovers(
+    tmp_path: Path, db: ScriptedQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = ArgsBoard()
+    monkeypatch.setattr(Ledger, "upsert_piece", _boom)
+    help_pump(help_watcher(_scripted(db, tmp_path), board))
+    assert db.kv_get(KV_PREFIX + BATCH)["tasks"] == {"1": "F-1"}
+
+    again = _scripted(db, tmp_path)
+    help_pump(help_watcher(again, board))
+    assert again.factory.manager.accepted == []
+    assert db.kv_get(KV_PREFIX + BATCH)["tasks"] == {"1": "F-1"}
+
+    monkeypatch.undo()
+    help_pump(help_watcher(again, board))
+    assert again.factory.manager.accepted == []
+    assert "tasks" not in db.kv_get(KV_PREFIX + BATCH)
+    assert Ledger(db).pieces(BATCH, CREATED)[0]["foundry_task"] == "F-1"
+
+
+def test_a_failing_ledger_write_keeps_a_submit_failure_in_kv(
+    tmp_path: Path, db: ScriptedQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = ArgsBoard()
+    monkeypatch.setattr(Ledger, "upsert_piece", _boom)
+    help_pump(help_watcher(_scripted(db, tmp_path, fail="no disk"), board))
+    reason = "could not be submitted: no disk"
+    assert db.kv_get(KV_PREFIX + BATCH)["failed"] == {"1": reason}
+
+    again = _scripted(db, tmp_path)
+    help_pump(help_watcher(again, board))
+    assert again.factory.manager.accepted == []
+
+
+def test_nothing_is_submitted_while_the_ledger_holding_the_pieces_cannot_be_read(
+    tmp_path: Path, db: ScriptedQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = ArgsBoard()
+    help_pump(help_watcher(_scripted(db, tmp_path), board))
+    assert "tasks" not in db.kv_get(KV_PREFIX + BATCH)
+
+    monkeypatch.setattr(Ledger, "pieces", _boom)
+    again = _scripted(db, tmp_path)
+    help_pump(help_watcher(again, board))
+    assert again.factory.manager.accepted == []
+    assert board.updates[-1]["heartbeat"] is True
+    assert "results" not in board.updates[-1]
+    assert "tasks" not in db.kv_get(KV_PREFIX + BATCH)  # still marked as handed to the Ledger
+
+    monkeypatch.undo()
+    watcher = help_watcher(again, board)
+    help_pump(watcher)
+    assert again.factory.manager.accepted == []
+    assert watcher._record(BATCH, CREATED)["tasks"] == {"1": "F-1"}
 
 
 # --------------------------------------------------------------------------- restarts
@@ -156,7 +285,6 @@ def test_a_restart_does_not_resubmit_a_piece_the_kv_record_lost(
 
     async def run_once() -> None:
         svc = _service(tmp_path, repo=repo)
-        svc.config.ledger_read = True
         await svc.start()
         try:
             w = _watcher(svc, board)
@@ -168,7 +296,6 @@ def test_a_restart_does_not_resubmit_a_piece_the_kv_record_lost(
 
     async def run_again() -> None:
         svc = _service(tmp_path, repo=repo)
-        svc.config.ledger_read = True
         await svc.start()
         try:
             before = set(svc.factory.manager.orders)
