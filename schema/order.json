@@ -1,0 +1,64 @@
+{
+  "batchStatuses": [
+    "queued",
+    "claimed",
+    "running",
+    "done",
+    "failed",
+    "cancelled"
+  ],
+  "resultStates": [
+    "queued",
+    "sizing",
+    "building",
+    "reviewing",
+    "needs_help",
+    "answered",
+    "complete",
+    "quarantined",
+    "failed"
+  ],
+  "terminalResults": [
+    "complete",
+    "quarantined",
+    "failed"
+  ],
+  "openBatches": [
+    "queued",
+    "claimed",
+    "running"
+  ],
+  "sizes": [
+    "S",
+    "M",
+    "L",
+    "XL"
+  ],
+  "subtaskFields": [
+    "key",
+    "title",
+    "description",
+    "files",
+    "size",
+    "acceptance",
+    "dependsOn",
+    "readFiles"
+  ],
+  "limits": {
+    "subtasks": 20,
+    "title": 200,
+    "goal": 20000,
+    "description": 20000,
+    "files": 50,
+    "path": 500,
+    "acceptance": 50,
+    "acceptanceItem": 2000,
+    "error": 2000,
+    "note": 2000,
+    "help": 2000,
+    "answer": 6000,
+    "helpOptions": 20,
+    "keep": 200,
+    "builderOrder": 24000
+  }
+}
