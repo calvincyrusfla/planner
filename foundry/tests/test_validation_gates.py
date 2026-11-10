@@ -444,7 +444,7 @@ def test_run_gates_all_pass(tmp_path: Path) -> None:
     )
     assert outcome.passed and outcome.first_failure is None
     assert [r.check_type for r in outcome.results] == [
-        "syntax", "secrets", "linter", "typecheck", "tests", "schema"
+        "syntax", "secrets", "hygiene", "linter", "typecheck", "tests", "schema"
     ]
     assert outcome.summary().startswith("all gates passed")
 
@@ -475,7 +475,7 @@ def test_run_gates_without_short_circuit_runs_everything(tmp_path: Path) -> None
         linter="builtin",
         short_circuit=False,
     )
-    assert [r.passed for r in results] == [True, True, False, True, True, False]
+    assert [r.passed for r in results] == [True, True, True, False, True, True, False]
     outcome = GateOutcome.from_results(results)
     assert outcome.failed_check == "linter"
 
@@ -567,8 +567,8 @@ def test_typecheck_runs_after_linter_and_short_circuits(tmp_path: Path) -> None:
         test_cmd=[sys.executable, "-c", "raise SystemExit('tests must not run')"],
         linter="builtin",
     )
-    assert [r.check_type for r in results] == ["syntax", "secrets", "linter", "typecheck"]
-    assert [r.passed for r in results] == [True, True, True, False]
+    assert [r.check_type for r in results] == ["syntax", "secrets", "hygiene", "linter", "typecheck"]
+    assert [r.passed for r in results] == [True, True, True, True, False]
 
 
 def test_typecheck_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

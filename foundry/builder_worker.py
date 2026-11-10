@@ -2080,7 +2080,13 @@ class BuilderWorker(_WorkerBase):
         Falls back to the attempt-based level when the queue has no
         ``task_context_level`` or the call fails; context must never cost a build.
         """
-        by_attempt = min(attempt + 1, MAX_CONTEXT_LEVEL)
+        try:
+            cap = int(getattr(getattr(self, "config", None), "max_context_level", MAX_CONTEXT_LEVEL)
+                      or MAX_CONTEXT_LEVEL)
+        except (TypeError, ValueError):
+            cap = MAX_CONTEXT_LEVEL
+        cap = max(1, min(cap, MAX_CONTEXT_LEVEL))
+        by_attempt = min(attempt + 1, cap)
         getter = getattr(self.queue, "task_context_level", None)
         if getter is None:
             return by_attempt
@@ -2090,7 +2096,7 @@ class BuilderWorker(_WorkerBase):
         except Exception as exc:
             log.warning("task_context_level failed for %s: %s; using attempt-based level", task_id, exc)
             return by_attempt
-        return min(max(task_level, by_attempt), MAX_CONTEXT_LEVEL)
+        return min(max(task_level, by_attempt), cap)
 
     def _record_context_level(self, ticket: Any, level: int) -> None:
         """Best effort: store the level ``ticket``'s slice was built at (queue kv)."""

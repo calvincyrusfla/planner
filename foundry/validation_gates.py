@@ -6,6 +6,8 @@ Every builder submission passes through these gates *before* any reviewer
 * ``syntax`` - ``ast.parse`` for ``.py``, ``json.loads`` for ``.json`` and
   ``node --check`` for ``.js``/``.mjs``/``.cjs`` (skipped with a note when
   ``node`` is not installed).
+* ``hygiene`` - the lines the diff adds must hold no debugger leftovers and no
+  unfinished-work markers.
 * ``linter`` - ``ruff`` when it is on ``PATH``, otherwise a small built-in AST
   checker (syntax-level errors via ``compile``, unused imports, bare
   ``except:``).
@@ -78,7 +80,15 @@ __all__ = [
     "run_gates_outcome",
 ]
 
-ALL_CHECKS: tuple[GateCheck, ...] = ("syntax", "secrets", "linter", "typecheck", "tests", "schema")
+ALL_CHECKS: tuple[GateCheck, ...] = (
+    "syntax",
+    "secrets",
+    "hygiene",
+    "linter",
+    "typecheck",
+    "tests",
+    "schema",
+)
 """Default gate order. Cheapest first so failures short-circuit early."""
 
 LinterMode = Literal["auto", "ruff", "builtin"]
@@ -1340,6 +1350,88 @@ def _gate_secrets(diff: str) -> tuple[bool, str, str]:
     return False, "", "\n".join([header, *report])
 
 
+# The debugger rules read code only, so strings and comments are blanked first.
+# The marker pattern is spelled indirectly so this file's own diff passes the gate.
+_PY_NOISE = re.compile(r"""#.*|"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)""")
+_JS_NOISE = re.compile(
+    r"""//.*|/\*.*?(?:\*/|$)|"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)"""
+    r"""|`(?:\\.|[^`\\])*(?:`|$)"""
+)
+_PY_DEBUG_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("breakpoint()", re.compile(r"(?<![\w.])breakpoint\(\s*\)")),
+    ("pdb.set_trace(", re.compile(r"\bpdb\.set_trace\(")),
+    ("ipdb.set_trace(", re.compile(r"\bipdb\.set_trace\(")),
+    ("import pdb", re.compile(r"(?:^|[;:])\s*import\s+pdb\b")),
+    ("import ipdb", re.compile(r"(?:^|[;:])\s*import\s+ipdb\b")),
+)
+_JS_DEBUGGER = re.compile(r"(?<![\w$.])debugger\s*;")
+_HYGIENE_MARKER = re.compile(r"\b(?:TO[D]O|FIXM[E]|X{3})\b")
+_HYGIENE_JS_SUFFIXES = _JS_SUFFIXES | {".html", ".htm"}
+_MAX_HYGIENE_FINDINGS = 10
+
+
+def _is_test_path(path: str) -> bool:
+    """True for files under a ``tests``/``test`` directory and for test files."""
+    *folders, name = path.replace("\\", "/").split("/")
+    return (
+        "tests" in folders
+        or "test" in folders
+        or (name.startswith("test_") and name.endswith(".py"))
+        or name.endswith(".test.mjs")
+    )
+
+
+def _js_code(text: str, in_comment: bool) -> tuple[str, bool]:
+    """Blank strings and comments in a JS line; also say if a block comment stays open."""
+    if in_comment:
+        end = text.find("*/")
+        if end < 0:
+            return "", True
+        text = text[end + 2 :]
+    elif text.lstrip().startswith("*"):  # the body of a block comment opened earlier
+        return "", False
+    noise = [match.group() for match in _JS_NOISE.finditer(text)]
+    still_open = bool(noise) and noise[-1].startswith("/*") and not noise[-1][2:].endswith("*/")
+    return _JS_NOISE.sub(" ", text), still_open
+
+
+def _gate_hygiene(diff: str) -> tuple[bool, str, str]:
+    """Fail when a line added by ``diff`` holds a debugger leftover or a work marker.
+
+    Python rules apply to ``.py`` files and the JavaScript rule to script and HTML
+    files; markers apply everywhere except test files. ``print(`` and
+    ``console.log(`` are allowed on purpose.
+    """
+    findings: list[str] = []
+    open_comment: tuple[str, int] | None = None
+    for path, line_no, text in _added_diff_lines(diff):
+        if text.startswith("++ "):
+            header = text[3:].split("\t", 1)[0].strip().strip('"').removeprefix("b/")
+            if header == path:
+                continue
+        suffix = posixpath.splitext(path)[1].lower()
+        if suffix == ".py":
+            code = _PY_NOISE.sub(" ", text)
+            for label, pattern in _PY_DEBUG_RULES:
+                if pattern.search(code):
+                    findings.append(f"{path}:{line_no}: debug leftover: {label}")
+        elif suffix in _HYGIENE_JS_SUFFIXES:
+            code, still_open = _js_code(text, open_comment == (path, line_no))
+            open_comment = (path, line_no + 1) if still_open else None
+            if _JS_DEBUGGER.search(code):
+                findings.append(f"{path}:{line_no}: debug leftover: debugger statement")
+        if not _is_test_path(path):
+            for match in _HYGIENE_MARKER.finditer(text):
+                findings.append(f"{path}:{line_no}: unfinished-work marker: {match.group()}")
+    if not findings:
+        return True, "hygiene: no debug leftovers or markers in the added lines", ""
+    report = findings[:_MAX_HYGIENE_FINDINGS]
+    if len(findings) > len(report):
+        report.append(f"... and {len(findings) - len(report)} more")
+    header_line = "debug leftovers or unfinished-work markers in the diff; remove them:"
+    return False, "", "\n".join([header_line, *report])
+
+
 # --------------------------------------------------------------------------
 # Public runner
 # --------------------------------------------------------------------------
@@ -1398,6 +1490,8 @@ def run_gates(
             passed, out, err = _gate_syntax(files or [])
         elif check == "secrets":
             passed, out, err = _gate_secrets(submission.diff)
+        elif check == "hygiene":
+            passed, out, err = _gate_hygiene(submission.diff)
         elif check == "linter":
             passed, out, err = _gate_linter(files or [], root, linter)
         elif check == "typecheck":
