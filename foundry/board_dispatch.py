@@ -46,6 +46,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from foundry.ledger import Ledger
 from foundry.metrics_report import build_metrics
 # Board limits from schema/order.json: error texts, and each question, context or option of a help request.
 from foundry.order_schema import LIMIT_ERROR, LIMIT_HELP
@@ -316,6 +317,8 @@ class BatchWatcher:
         self._usage_refused = False
         #: batch id -> when the last updateBatch was accepted (this run).
         self._last_sent: dict[str, float] = {}
+        self._ledger_cache: Ledger | None = None
+        self._ledger_warned = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -463,6 +466,44 @@ class BatchWatcher:
     def _queue(self) -> Any:
         return self.service.factory.queue
 
+    def _ledger(self) -> Ledger | None:
+        """The one Ledger on this service's queue, made on first use; None when the queue can't be read."""
+        if self._ledger_cache is None:
+            try:
+                self._ledger_cache = Ledger(self._queue())
+            except Exception as exc:  # the Ledger is a record only: the board work goes on without it
+                if not self._ledger_warned:
+                    log.info("board dispatch: the Ledger is not available: %s", exc)
+                    self._ledger_warned = True
+        return self._ledger_cache
+
+    def _ledger_write(self, write: Callable[[Ledger], Any]) -> None:
+        """Run one Ledger write. Never raises: the Ledger must not change what goes to the board."""
+        try:
+            ledger = self._ledger()
+            if ledger is not None:
+                write(ledger)
+        except Exception as exc:
+            log.info("board dispatch: Ledger write failed: %s", exc)
+
+    def _ledger_piece(self, batch: Mapping[str, Any], key: str, **fields: Any) -> None:
+        self._ledger_write(lambda ledger: ledger.upsert_piece(str(batch["id"]), batch.get("createdAt"), key, **fields))
+
+    def _ledger_round(self, batch: Mapping[str, Any], results: Mapping[str, Mapping[str, Any]],
+                      args: Mapping[str, Any], with_usage: Mapping[str, Mapping[str, Any]]) -> None:
+        """Record this round's batch status and every piece's state (the Ledger skips unchanged rows)."""
+        status = args["status"] if "status" in args else batch.get("status")
+        self._ledger_write(lambda ledger: ledger.upsert_batch({**batch, "status": status}))
+        for key, result in results.items():
+            pr = result.get("pr") or {}
+            fields: dict[str, Any] = {
+                "state": result.get("state"), "pr_url": pr.get("url"), "pr_state": pr.get("state"),
+                "error": result.get("error"), "help_question": (result.get("help") or {}).get("question"),
+            }
+            if key in with_usage:
+                fields["usage"] = with_usage[key]["usage"]
+            self._ledger_piece(batch, key, **fields)
+
     def _record(self, bid: str, created_at: str | None = None) -> dict[str, Any]:
         """The saved record of a batch; a record of another batch with the same id starts over."""
         fn = getattr(self._queue(), "kv_get", None)
@@ -577,6 +618,7 @@ class BatchWatcher:
         with_usage = self._usage_results(rec, board_view, changed) if write_due else {}
         if with_usage:
             args["results"] = {**changed, **with_usage}
+        self._ledger_round(batch, results, args, with_usage)
         if not write_due:
             # nothing new and the claim is fresh: no write to the (shared) board this round
             if self._settled(keys, results, cancelled):
@@ -686,6 +728,8 @@ class BatchWatcher:
                         continue
                     ticket_id = request["ticket_id"]
                     applied = answer_fn(ticket_id, answer, read_files)
+                    if applied:
+                        self._ledger_piece(batch, key, help_answer=answer)
                     log.info("board dispatch: %s subtask %s: answered ticket %s (applied: %s, files: %s)",
                              bid, key, ticket_id, applied, read_files)
             except Exception as exc:  # not marked as handled: tried again next round
@@ -777,6 +821,7 @@ class BatchWatcher:
                 return None
             return {
                 "builderTools": getattr(cfg, "builder_tools", "off"),
+                "reviewerTools": getattr(cfg, "reviewer_tools", "off"),
                 "buildersPerTeam": getattr(cfg, "builders_per_team", None),
                 "helpAfter": getattr(cfg, "help_after", None),
                 "maxRetries": getattr(cfg, "max_retries", None),
@@ -921,5 +966,9 @@ class BatchWatcher:
         accept = getattr(manager, "accept", None)
         if not callable(accept):
             raise RuntimeError("this Foundry cannot accept orders in the background")
-        return str(accept(order))
+        tid = str(accept(order))
+        self._ledger_piece(batch, key, title=fields["title"], order_text=desc, files=fields["files"],
+                           read_files=read_files, acceptance=acceptance, size=fields["size"],
+                           foundry_task=tid, state="queued")
+        return tid
 
