@@ -6,10 +6,12 @@ import asyncio
 import http.client
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from foundry import __version__
+from foundry.orchestrator_queue import FoundryQueue
 from foundry.serve_api import FoundryAPI, OrderError, is_local_request, validate_order
 
 
@@ -377,3 +379,101 @@ def test_ask_chunk_timeout_sends_error_and_cancels(monkeypatch, svc):
         loop.call_soon_threadsafe(loop.stop)
         thread.join(5)
         loop.close()
+
+
+@pytest.fixture()
+def events_queue(svc):
+    """A real queue holding events 1 and 2 (task_added) and 3 (repo_root, F-001)."""
+    queue = FoundryQueue(":memory:")
+    queue.add_task("F-001", "one", "", "alpha")
+    queue.add_task("F-002", "two", "", "alpha")
+    queue.set_repo_root("F-001", None)
+    svc.factory = SimpleNamespace(queue=queue)
+    yield queue
+    queue.close()
+
+
+def event_ids(api, query):
+    resp, text = request(api, "GET", "/api/events" + query)
+    assert resp.status == 200, text
+    body = json.loads(text)
+    assert body["ok"] is True
+    return [e["id"] for e in body["events"]], body["last_id"]
+
+
+def test_events_all_in_id_order(api, events_queue):
+    resp, text = request(api, "GET", "/api/events")
+    assert resp.status == 200
+    body = json.loads(text)
+    assert [e["id"] for e in body["events"]] == [1, 2, 3]
+    assert body["last_id"] == 3
+    first = body["events"][0]
+    assert set(first) == {"id", "ts", "kind", "task_id", "payload"}
+    assert first["kind"] == "task_added" and first["task_id"] == "F-001"
+    assert isinstance(first["payload"], dict)
+
+
+def test_events_after_since_only(api, events_queue):
+    assert event_ids(api, "?since=1") == ([2, 3], 3)
+
+
+def test_events_last_id_is_since_when_none_returned(api, events_queue):
+    assert event_ids(api, "?since=3") == ([], 3)
+
+
+def test_events_limit_respected(api, events_queue):
+    assert event_ids(api, "?limit=2") == ([1, 2], 2)
+    assert event_ids(api, "?since=1&limit=1") == ([2], 2)
+
+
+def test_events_kind_and_task_filters(api, events_queue):
+    assert event_ids(api, "?kind=repo_root") == ([3], 3)
+    assert event_ids(api, "?task=F-002") == ([2], 2)
+    assert event_ids(api, "?kind=task_added&task=F-001") == ([1], 1)
+
+
+@pytest.mark.parametrize("query, expected", [
+    ("", 200),
+    ("?limit=0", 1),
+    ("?limit=-5", 1),
+    ("?limit=1000", 1000),
+    ("?limit=5000", 1000),
+])
+def test_events_limit_clamped(api, svc, query, expected):
+    seen = []
+
+    def events(**kwargs):
+        seen.append(kwargs)
+        return []
+
+    svc.factory = SimpleNamespace(queue=SimpleNamespace(events=events))
+    assert request(api, "GET", "/api/events" + query)[0].status == 200
+    assert seen == [{"task_id": None, "kind": None, "since_id": 0, "limit": expected}]
+
+
+@pytest.mark.parametrize("query", [
+    "?since=abc",
+    "?since=1.5",
+    "?since=99999999999999999999",
+    "?limit=abc",
+    "?limit=1.5",
+])
+def test_events_bad_numbers_400(api, events_queue, query):
+    resp, text = request(api, "GET", "/api/events" + query)
+    assert resp.status == 400
+    out = json.loads(text)
+    assert out["ok"] is False and out["code"] == "invalid" and out["error"]
+
+
+def test_events_no_factory_attribute(api):
+    assert event_ids(api, "") == ([], 0)
+    assert event_ids(api, "?since=7") == ([], 7)
+
+
+def test_events_factory_not_built_yet(api, svc):
+    svc.factory = None
+    assert event_ids(api, "?since=7&limit=3") == ([], 7)
+
+
+def test_events_no_factory_still_rejects_bad_since(api):
+    assert request(api, "GET", "/api/events?since=nope")[0].status == 400
