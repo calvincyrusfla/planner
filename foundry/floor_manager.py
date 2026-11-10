@@ -878,12 +878,18 @@ class FloorManager:
 
     # ------------------------------------------------------------ escalations
 
-    async def apply_escalation(self, alert: ForemanEscalation | Mapping[str, Any]) -> ActionOutcome:
+    async def apply_escalation(
+        self, alert: ForemanEscalation | Mapping[str, Any], *, act: bool = True
+    ) -> ActionOutcome:
         """Execute the escalation's prescribed action (validated first) and report it.
 
         Idempotent per ``alert_id``: an alert that was already applied (in this
         run or before a restart) returns the earlier outcome without acting,
         storing or posting it again.
+
+        With ``act=False`` (``FOUNDRY_FOREMAN_ACTIONS=log``) the action is not
+        carried out: the outcome says so (``applied`` False) and is stored,
+        logged and posted like any other, so the alert stays visible.
         """
         if not isinstance(alert, ForemanEscalation):
             alert = ForemanEscalation.model_validate(dict(alert))
@@ -907,13 +913,15 @@ class FloorManager:
                 handler[member] = fn
         before: dict[str, Any] = {}
         try:
-            result = await handler[action](alert)
+            result = await handler[action if act else PrescribedAction.NONE](alert)
             applied, detail, params = result[:3]
             if len(result) > 3:
                 before = dict(result[3] or {})
         except Exception as exc:  # an action must never take the line down
             log.warning("floor manager: %s failed: %s", action.value, exc)
             applied, detail, params = False, f"failed: {exc}", {}
+        if not act:
+            applied, detail = False, f"logged only (FOUNDRY_FOREMAN_ACTIONS=log): {action.value}"
         outcome = ActionOutcome(alert.alert_id, action.value, applied, detail, params)
         self.outcomes.append(outcome)
         self.applied_alerts[alert.alert_id] = outcome
