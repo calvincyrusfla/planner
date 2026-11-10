@@ -1087,10 +1087,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     from foundry.claude_client import ClaudeCodeClient, ClaudeError, resolve_claude_bin
     from foundry.gemma_client import OllamaGemmaClient
 
+    # Builders that run tests need `python` to be Foundry's own interpreter (it has pytest).
+    builder_client_options: dict[str, Any] = {}
+    if getattr(config, "builder_mode", "diff") == "edit" and getattr(config, "builder_tests", False):
+        builder_client_options["env"] = {
+            "PATH": os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
+        }
     try:
         claude = ClaudeCodeClient(resolve_claude_bin(config.claude_bin), extra_args=claude_args(config))
         builder_claude = (
-            ClaudeCodeClient(resolve_claude_bin(config.claude_bin), extra_args=builder_claude_args(config))
+            ClaudeCodeClient(
+                resolve_claude_bin(config.claude_bin),
+                extra_args=builder_claude_args(config),
+                **builder_client_options,
+            )
             if getattr(config, "builder_tools", "off") == "read"
             or getattr(config, "builder_mode", "diff") == "edit"
             else None
