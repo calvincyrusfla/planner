@@ -6,6 +6,7 @@
 import * as core from './core.mjs';
 import * as batches from './foundry-batches.mjs';
 import * as foundryMetrics from './foundry-metrics.mjs';
+import * as foundryUpdates from './foundry-updates.mjs';
 
 const LOG_LIMIT = 500;
 const OPEN = new Set(['queued', 'active', 'review', 'paused']);
@@ -52,6 +53,13 @@ const OPS = {
   // Foundry metrics: latest report per service (see lib/foundry-metrics.mjs).
   reportFoundryMetrics: (state, { service, host, reportedAt, metrics } = {}) =>
     foundryMetrics.reportFoundryMetrics(state, { service, host, reportedAt, metrics }),
+  // Foundry update requests (see lib/foundry-updates.mjs for the shape).
+  requestFoundryUpdate: (state, { repo, settings, now, by } = {}) =>
+    foundryUpdates.requestFoundryUpdate(state, { repo, settings, now, by }),
+  claimFoundryUpdate: (state, { id, host, service } = {}) => foundryUpdates.claimFoundryUpdate(state, { id, host, service }),
+  finishFoundryUpdate: (state, { id, service, status, result } = {}) =>
+    foundryUpdates.finishFoundryUpdate(state, { id, service, status, result }),
+  cancelFoundryUpdate: (state, { id, by } = {}) => foundryUpdates.cancelFoundryUpdate(state, { id, by }),
 };
 
 export const OP_TYPES = Object.keys(OPS);
