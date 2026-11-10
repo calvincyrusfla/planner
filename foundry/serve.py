@@ -253,6 +253,28 @@ class Service:
         self._metrics_finished: set[str] = set()
         #: Checks that the open Foundry PRs work together (:mod:`foundry.combined_check`).
         self.combined_checker: Any = None
+        #: Board update requests (:mod:`foundry.update_watcher`), started next to the batch watcher.
+        self.update_watcher: Any = None
+        #: Set by :meth:`request_restart`; ``run_service`` then returns 75.
+        self.restart_requested = False
+        #: The event ``run_service`` waits on (stored when it starts).
+        self._stop_event: asyncio.Event | None = None
+
+    def request_restart(self) -> None:
+        """Stop the service so the start script restarts it (``run_service`` returns 75)."""
+        self.restart_requested = True
+        event = self._stop_event
+        if event is None:
+            return
+        loop = self.loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is not None and running is not loop and loop.is_running():
+            loop.call_soon_threadsafe(event.set)
+        else:
+            event.set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -322,7 +344,26 @@ class Service:
             except Exception as exc:  # batches are optional: the service runs without them
                 log.warning("foundry serve: board batches are off: %s", exc)
                 return
-        self.batch_watcher.start()
+        if self.batch_watcher.start() is None:
+            return
+        self._start_updates()
+
+    def _start_updates(self) -> None:
+        """Carry out board update requests (same board client, repo, host and service id as the batches)."""
+        if self.update_watcher is None:
+            w = self.batch_watcher
+            try:
+                from foundry.update_watcher import UpdateWatcher
+
+                self.update_watcher = UpdateWatcher(
+                    self, getattr(w, "board", None) if w is not None else self._batch_board,
+                    repo_slug=getattr(w, "repo_slug", None), host=str(getattr(w, "host", "") or "pc"),
+                    service_id=str(getattr(w, "service_id", "") or f"foundry:{self.repo.name}"),
+                )
+            except Exception as exc:  # updates are optional: the service runs without them
+                log.warning("foundry serve: board update requests are off: %s", exc)
+                return
+        self.update_watcher.start()
 
     def _start_combined_check(self) -> None:
         """Keep checking that the open Foundry PRs work together (needs automatic PRs)."""
@@ -392,6 +433,8 @@ class Service:
         if self.factory is None:
             return
         self.running = False
+        if self.update_watcher is not None:
+            await self.update_watcher.stop()
         if self.batch_watcher is not None:
             await self.batch_watcher.stop()
         if self.combined_checker is not None:
@@ -978,6 +1021,7 @@ async def run_service(service: Service, *, host: str = DEFAULT_HOST, port: int |
     from foundry import serve_api
 
     stop_event = stop_event or asyncio.Event()
+    service._stop_event = stop_event  # service.request_restart() sets it
     loop = asyncio.get_running_loop()
     for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
         if sig is None:
@@ -1003,7 +1047,8 @@ async def run_service(service: Service, *, host: str = DEFAULT_HOST, port: int |
             await asyncio.to_thread(api.stop)
         await service.stop()
         out("Foundry stopped.")
-    return 0
+    # 75: the start script starts Foundry again (after an update was applied)
+    return 75 if getattr(service, "restart_requested", False) else 0
 
 
 def enable_ctrl_c(platform: str | None = None, kernel32: Any = None) -> bool:
@@ -1047,6 +1092,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         builder_claude = (
             ClaudeCodeClient(resolve_claude_bin(config.claude_bin), extra_args=builder_claude_args(config))
             if getattr(config, "builder_tools", "off") == "read"
+            or getattr(config, "builder_mode", "diff") == "edit"
             else None
         )
         reviewer_claude = (
