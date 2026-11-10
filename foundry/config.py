@@ -90,7 +90,17 @@ Environment variable               Field (default)
 ``FOUNDRY_BUILDER_TESTS``          ``builder_tests`` (``false``): with
                                    ``builder_mode`` ``edit``, builders may run
                                    the ``BUILDER_TEST_COMMANDS`` test commands
-``FOUNDRY_REVIEWER_TOOLS``       ``reviewer_tools`` (``off``; ``off|read``):
+``FOUNDRY_GATE_ERROR_CHARS``       ``gate_error_chars`` (``0``, 0..20000): how
+                                   many characters of a failed gate's own
+                                   output a retry gets besides the one-line
+                                   hint; ``0`` = only the hint
+``FOUNDRY_BUILDER_MODEL``          ``builder_model`` (unset): Claude Code model
+                                   name or alias for builder calls, such as
+                                   ``sonnet``; empty = the subscription default
+``FOUNDRY_BUILDER_RETRY_MODEL``    ``builder_retry_model`` (unset): the same for
+                                   builder retries, such as ``opus``; empty =
+                                   the same model as the first attempt
+``FOUNDRY_REVIEWER_TOOLS``     ``reviewer_tools`` (``off``; ``off|read``):
                                    ``read`` lets reviewers use the Read, Grep
                                    and Glob tools
 ``FOUNDRY_REVIEWER_MAX_TURNS``     ``reviewer_max_turns`` (``20``, 3..100):
@@ -531,6 +541,29 @@ class FoundryConfig(BaseModel):
             "only applies when builder_mode is edit."
         ),
     )
+    gate_error_chars: int = Field(
+        default=0,
+        ge=0,
+        le=20000,
+        description=(
+            "How many characters of a failed gate's own output a retry gets besides the "
+            "one-line hint; 0 = only the hint."
+        ),
+    )
+    builder_model: str | None = Field(
+        default=None,
+        description=(
+            "Claude Code model name or alias for builder calls, such as sonnet or opus; "
+            "None/empty: the subscription default."
+        ),
+    )
+    builder_retry_model: str | None = Field(
+        default=None,
+        description=(
+            "Claude Code model name or alias for builder retries; None/empty: the same "
+            "model as the first attempt."
+        ),
+    )
 
     reviewer_tools: ReviewerToolsMode = Field(
         default="off",
@@ -596,6 +629,17 @@ class FoundryConfig(BaseModel):
         """Treat a blank append prompt as no prompt."""
         if value is None or not value.strip():
             return None
+        return value
+
+    @field_validator("builder_model", "builder_retry_model")
+    @classmethod
+    def _check_model_name(cls, value: str | None) -> str | None:
+        """Treat a blank model as unset; refuse whitespace and quotes inside a name."""
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        if any(ch.isspace() or ch in "\"'" for ch in value):
+            raise ValueError("a model name must not contain whitespace or quotes")
         return value
 
     def claude_cli_args(self) -> list[str]:
@@ -728,6 +772,9 @@ class FoundryConfig(BaseModel):
             "BUILDER_MODE": "builder_mode",
             "BUILDER_EDIT_MAX_TURNS": "builder_edit_max_turns",
             "BUILDER_TESTS": "builder_tests",
+            "GATE_ERROR_CHARS": "gate_error_chars",
+            "BUILDER_MODEL": "builder_model",
+            "BUILDER_RETRY_MODEL": "builder_retry_model",
             "REVIEWER_TOOLS": "reviewer_tools",
             "REVIEWER_MAX_TURNS": "reviewer_max_turns",
         }
