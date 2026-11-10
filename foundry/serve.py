@@ -248,6 +248,8 @@ class Service:
         self.last_metrics_error: str | None = None
         self._metrics_elapsed = 0.0
         self._metrics_finished: set[str] = set()
+        #: Checks that the open Foundry PRs work together (:mod:`foundry.combined_check`).
+        self.combined_checker: Any = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -297,6 +299,7 @@ class Service:
         self._metrics_finished = self._finished_tasks()  # tasks finished before this run send nothing
         self._monitor_task = self.loop.create_task(self._monitor_loop())
         self._start_batches()
+        self._start_combined_check()
         log.info("foundry serve: running for %s (%d pool(s))", self.repo, len(self.factory.pools))
         return self
 
@@ -314,6 +317,22 @@ class Service:
                 log.warning("foundry serve: board batches are off: %s", exc)
                 return
         self.batch_watcher.start()
+
+    def _start_combined_check(self) -> None:
+        """Keep checking that the open Foundry PRs work together (needs automatic PRs)."""
+        if self.combined_checker is None:
+            if not getattr(self.config, "auto_pr", False):
+                return
+            from foundry.combined_check import CombinedChecker, combined_check_enabled
+
+            if not combined_check_enabled():
+                return
+            try:
+                self.combined_checker = CombinedChecker(self)
+            except Exception as exc:  # the check is optional: the service runs without it
+                log.warning("foundry serve: the combined PR check is off: %s", exc)
+                return
+        self.combined_checker.start()
 
     def _resume(self) -> None:
         """Open tickets of this repo are claimed by the pools; finish approved tasks without a patch."""
@@ -369,6 +388,8 @@ class Service:
         self.running = False
         if self.batch_watcher is not None:
             await self.batch_watcher.stop()
+        if self.combined_checker is not None:
+            await self.combined_checker.stop()
         if self._monitor_task is not None:
             self._monitor_task.cancel()
             try:
@@ -599,6 +620,7 @@ class Service:
         }
         if watcher is not None:
             out["batches"] = watcher.summary()
+        out["combined_check"] = self.combined_checker.summary() if self.combined_checker is not None else None
         return out
 
     def _gemma_stats(self) -> dict[str, Any]:
