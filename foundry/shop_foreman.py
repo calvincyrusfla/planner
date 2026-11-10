@@ -1509,7 +1509,8 @@ class ShopForeman:
         shifts = calibration_shifts(outcomes)
         examples = similar_outcomes(outcomes, title, files, task_id=task_id)
 
-        if self.gemma is not None:
+        heuristic_only = getattr(getattr(self, "config", None), "sizing", "gemma") == "heuristic"
+        if self.gemma is not None and not heuristic_only:
             directive = await self._gemma_sizing(
                 task_id, team_id, title, description, files, criteria, examples=examples, shifts=shifts
             )

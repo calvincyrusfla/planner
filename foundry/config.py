@@ -112,6 +112,10 @@ Environment variable               Field (default)
 ``FOUNDRY_FOREMAN_ACTIONS``        ``foreman_actions`` (``act``; ``act|log``):
                                    ``log`` reports the Foreman's prescribed
                                    actions without carrying them out
+``FOUNDRY_SIZING``                 ``sizing`` (``gemma``; ``gemma|heuristic``):
+                                   ``heuristic`` sizes tasks without Gemma
+``FOUNDRY_MAX_CONTEXT_LEVEL``      ``max_context_level`` (``3``, 1..3): highest
+                                   context level of a builder's prompt
 =================================  ==========================================
 
 Settings file: when ``from_env()`` reads the real environment (``environ`` is
@@ -151,6 +155,7 @@ __all__ = [
     "ForemanActionsMode",
     "ReviewerToolsMode",
     "PreReviewMode",
+    "SizingMode",
     "TypecheckMode",
     "BUILDER_TEST_COMMANDS",
     "DEFAULT_BUILDER_EDIT_PROMPT",
@@ -272,6 +277,7 @@ BuilderToolsMode = Literal["off", "read"]
 BuilderMode = Literal["diff", "edit"]
 ReviewerToolsMode = Literal["off", "read"]
 ForemanActionsMode = Literal["act", "log"]
+SizingMode = Literal["gemma", "heuristic"]
 
 _BOOL = TypeAdapter(bool)
 
@@ -477,6 +483,19 @@ class FoundryConfig(BaseModel):
         ge=0,
         le=1,
         description="Minimum Gemma confidence for a pre-review send-back in gate mode.",
+    )
+    sizing: SizingMode = Field(
+        default="gemma",
+        description=(
+            "How tasks are sized: gemma = the Shop Foreman asks Gemma (heuristic on "
+            "failure); heuristic = never call Gemma, use the deterministic rules."
+        ),
+    )
+    max_context_level: int = Field(
+        default=3,
+        ge=1,
+        le=3,
+        description="Highest context level a builder's prompt may use (1..3).",
     )
     foreman_actions: ForemanActionsMode = Field(
         default="act",
@@ -790,13 +809,15 @@ class FoundryConfig(BaseModel):
             "REVIEWER_TOOLS": "reviewer_tools",
             "REVIEWER_MAX_TURNS": "reviewer_max_turns",
             "FOREMAN_ACTIONS": "foreman_actions",
+            "SIZING": "sizing",
+            "MAX_CONTEXT_LEVEL": "max_context_level",
         }
         for var, field in simple.items():
             value = get(var)
             if value is not None:
                 lowered = field in (
                     "board_bridge_mode", "pre_review", "typecheck", "builder_tools", "reviewer_tools",
-                    "builder_mode", "foreman_actions",
+                    "builder_mode", "foreman_actions", "sizing",
                 )
                 data[field] = value.lower() if lowered else value
 
