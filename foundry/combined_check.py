@@ -38,8 +38,16 @@ _GH_TIMEOUT_S = 120
 #: Hidden first line of every comment this check posts.
 COMMENT_MARKER = "<!-- foundry-combined-check -->"
 #: Queue kv entry: {"fingerprints": {base: fingerprint}, "status": {PR number: last status line posted},
-#: "conflicts": {PR number: head commit already told it conflicts with its base}}.
+#: "conflicts": {PR number: head commit already told it conflicts with its base},
+#: "green": {PR number: fingerprint of the combined run it passed}, "merged": {PR number: head merged automatically}}.
 _STATE_KEY = "combined_check:last"
+#: Status line of a PR that passed the combined check.
+_OK_LINE = "✅ Works together with the other open Foundry PRs"
+#: The merge states auto-merge accepts: UNSTABLE means a check is failing.
+_AUTO_MERGE_STATES = ("CLEAN", "HAS_HOOKS")
+_AUTO_MERGE_COMMENT = "Merged automatically: tests/docs only, green and mergeable."
+#: File name endings that are always a test or a doc.
+_TEST_DOC_SUFFIXES = ("_test.py", ".test.mjs", ".test.js", ".test.ts", ".md")
 #: Failing test ids named in a status line.
 _MAX_IDS_SHOWN = 10
 #: Applied to every git call: files as stored, readable paths, and none of the user's
@@ -287,7 +295,22 @@ def status_line(result: CombinedResult, pr_number: int) -> str:
         hidden = len(result.new_failures) - _MAX_IDS_SHOWN
         more = f" and {hidden} more" if hidden > 0 else ""
         return f"❌ New test failures when merged with the other open Foundry PRs: {ids}{more}"
-    return "✅ Works together with the other open Foundry PRs"
+    return _OK_LINE
+
+
+def _is_test_or_doc(path: str) -> bool:
+    """Whether a repo-relative path is a test or a doc as far as auto-merge is concerned."""
+    *folders, name = path.split("/")
+    return ("tests" in folders or "test" in folders or folders[:1] == ["docs"] or name.endswith(_TEST_DOC_SUFFIXES)
+            or (name.startswith("test_") and name.endswith(".py")))
+
+
+def _only_tests_or_docs(files: Any) -> bool:
+    """Whether a ``files`` list from gh names at least one file and only tests or docs."""
+    if not isinstance(files, list) or not files:
+        return False
+    paths = [row.get("path") if isinstance(row, dict) else None for row in files]
+    return all(isinstance(path, str) and _is_test_or_doc(path) for path in paths)
 
 
 def comment_body(result: CombinedResult, pr_number: int) -> str:
@@ -348,7 +371,7 @@ class CombinedChecker:
                 log.warning("combined check: round failed: %s", self.last_error)
 
     async def run_once(self) -> None:
-        """One round: follow the bases, then check every base with at least two open Foundry PRs whose code changed."""
+        """One round: follow the bases, check each base with two or more open Foundry PRs that moved, then auto-merge."""
         if not self.service.running:
             return
         self.rounds += 1
@@ -363,13 +386,14 @@ class CombinedChecker:
             if isinstance(pr.get("number"), int) and isinstance(base, str) and valid_ref(base):
                 groups.setdefault(base, []).append(pr)
         failed = False
+        checked: dict[str, str] = {}  # base -> fingerprint of its current base and heads, when it could be read
         for base, group in sorted(groups.items()):
             if len(group) < 2:  # a single PR already passed the whole-suite gate before it opened
                 continue
             if not self.service.running:
                 return
             try:
-                await self._check_base(base, group)
+                checked[base] = await self._check_base(base, group)
             except Exception as exc:  # noqa: BLE001 - one bad base must not starve the others
                 failed = True
                 self.last_error = f"{base}: {type(exc).__name__}: {exc}"
@@ -378,7 +402,53 @@ class CombinedChecker:
             self.last_error = None
         numbers = {str(pr.get("number")) for pr in prs}
         state["status"] = {number: line for number, line in state["status"].items() if number in numbers}
+        state["green"] = {number: mark for number, mark in state["green"].items() if number in numbers}
         self._save_state()
+        if getattr(getattr(self.service, "config", None), "auto_merge", "off") == "tests_docs":
+            await self._auto_merge(groups, checked)
+            self._save_state()
+
+    async def _auto_merge(self, groups: dict[str, list[dict[str, Any]]], checked: dict[str, str]) -> None:
+        """Merge the green, mergeable PRs that only touch tests or docs: one attempt per PR and round."""
+        merged = self._load_state()["merged"]
+        for base, group in sorted(groups.items()):
+            for pr in sorted(group, key=lambda row: row["number"]):
+                number = pr["number"]
+                if not self.service.running:
+                    return
+                if str(number) in merged or not self._merge_ready(pr, len(group) == 1, checked.get(base, "")):
+                    continue
+                try:
+                    await self._merge_if_tests_docs(number, str(pr["headRefOid"]))
+                except Exception as exc:  # noqa: BLE001 - one bad PR must not stop the round
+                    log.warning("combined check: could not auto-merge #%d: %s: %s", number, type(exc).__name__, exc)
+
+    def _merge_ready(self, pr: dict[str, Any], alone: bool, current: str) -> bool:
+        """Mergeable, and alone on its base or green in a combined run of exactly ``current``."""
+        if (pr.get("mergeable") != "MERGEABLE" or pr.get("mergeStateStatus") not in _AUTO_MERGE_STATES
+                or not pr.get("headRefOid")):
+            return False
+        return alone or (bool(current) and self._load_state()["green"].get(str(pr["number"])) == current)
+
+    async def _merge_if_tests_docs(self, number: int, head: str) -> None:
+        """Squash-merge the PR when every file is a test or a doc; ``head`` pins the commit that was judged."""
+        rc, out, err = await self._run([self.gh, "pr", "view", str(number), "--json", "files"], _GH_TIMEOUT_S)
+        if rc != 0:
+            log.warning("combined check: could not read the files of #%d: %s", number,
+                        (err or out or f"exit {rc}").strip()[-300:])
+            return
+        if not _only_tests_or_docs(json.loads(out or "{}").get("files")):
+            return
+        rc, out, err = await self._run([self.gh, "pr", "merge", str(number), "--squash", "--match-head-commit", head],
+                                       _GH_TIMEOUT_S)
+        if rc != 0:
+            log.warning("combined check: could not auto-merge #%d: %s", number,
+                        (err or out or f"exit {rc}").strip()[-300:])
+            return
+        self._load_state()["merged"][str(number)] = head
+        self._save_state()  # a restart must never merge or comment on it again
+        await self._comment(number, f"{COMMENT_MARKER}\n{_AUTO_MERGE_COMMENT}\n")
+        log.info("combined check: merged #%d automatically", number)
 
     async def _follow_base(self, prs: list[dict[str, Any]]) -> None:
         """Update the PRs that are behind their base and flag the ones that conflict with it.
@@ -425,25 +495,39 @@ class CombinedChecker:
         log.info("combined check: updated #%d with its base", number)
         return None
 
-    async def _check_base(self, base: str, group: list[dict[str, Any]]) -> None:
+    async def _check_base(self, base: str, group: list[dict[str, Any]]) -> str:
+        """Check one base unless nothing moved; returns the current fingerprint, empty when the base is unreadable."""
         sha = await self._base_sha(base)
         if not sha:
-            return
+            return ""
         state = self._load_state()
         current = fingerprint(sha, group)
         if state["fingerprints"].get(base) == current:
             latest = self._latest.get(base)
             if latest is not None and latest[0] == current:
                 await self._post(latest[1], group)  # only comments that could not be posted earlier
-            return
+            return current
         result = await asyncio.to_thread(run_combined, Path(self.service.repo), base, group, timeout_s=self.timeout_s,
                                          workdir=self._workdir(), git=self.git)
         state["fingerprints"][base] = current
         self._latest[base] = (current, result)
         self.last_result = result
+        self._remember_green(result, sha, current, group)
         posted = await self._post(result, group)
         self._save_state()
         log.info("combined check: %s: %s (%d PR(s), %d comment(s) posted)", base, result.summary, len(group), posted)
+        return current
+
+    def _remember_green(self, result: CombinedResult, sha: str, current: str, group: list[dict[str, Any]]) -> None:
+        """Record which PRs passed this run, whether or not their comments can be posted."""
+        green = self._load_state()["green"]
+        for pr in group:
+            number = pr["number"]
+            passed = number in result.prs and status_line(result, number) == _OK_LINE
+            if passed and result.ran and result.base_sha == sha:
+                green[str(number)] = current
+            else:
+                green.pop(str(number), None)
 
     async def _post(self, result: CombinedResult, group: list[dict[str, Any]]) -> int:
         """Comment on each PR whose status line differs from the last one posted; returns how many."""
@@ -496,7 +580,7 @@ class CombinedChecker:
         return fn if callable(fn) else None
 
     def _load_state(self) -> dict[str, dict[str, str]]:
-        """The remembered fingerprints, status lines and conflicts (read from the queue once)."""
+        """The remembered fingerprints, status lines, conflicts, green runs and merges (read from the queue once)."""
         if self._state is None:
             raw: Any = None
             get = self._kv("kv_get")
@@ -510,7 +594,7 @@ class CombinedChecker:
                     raw = None
             saved = raw if isinstance(raw, dict) else {}
             self._state = {key: dict(saved[key]) if isinstance(saved.get(key), dict) else {}
-                           for key in ("fingerprints", "status", "conflicts")}
+                           for key in ("fingerprints", "status", "conflicts", "green", "merged")}
         return self._state
 
     def _save_state(self) -> None:
