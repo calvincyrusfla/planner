@@ -1,6 +1,7 @@
 // Order check: advice on a Foundry batch before it is dispatched (tests a piece
-// may break, files two pieces share, pieces that are too wide). Pure: the caller
-// passes the batch and the repository, nothing here touches the disk.
+// may break, test fakes and exact lists it may invalidate, files two pieces share,
+// pieces that are too wide). Pure: the caller passes the batch and the repository,
+// nothing here touches the disk.
 //
 // finding = { key, rule, level: 'warn'|'note', message, paths?: [], names?: [] }
 
@@ -20,6 +21,10 @@ const IDENTIFIER = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/;
 const JS_FILE = /\.(?:[cm]?[jt]s|[jt]sx)$/;
 const PY_IMPORT = /^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+)?import[ \t]+(\([^)]*\)|[^\n#]*)/gm;
 const JS_IMPORT = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)(['"`])([^'"`\n]+)\1/g;
+const PY_TOKENS = /#[^\n]*|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g;
+const JS_TOKENS = /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\[\s\S])*`/g;
+const ADDS_WORD = /\b(?:add|adds|adding|added|new)\b/i;
+const PARAMETER_WORD = /\b(?:parameters?|arguments?|keywords?|kwargs?|options?)\b/i;
 
 export function isTestFile(path) {
   const dirs = String(path).split('/');
@@ -78,12 +83,151 @@ const asList = (value) => (Array.isArray(value) ? value : []);
 
 function toPiece(subtask, index) {
   const files = [...new Set(asList(subtask?.files))];
+  const text = [subtask?.description, ...asList(subtask?.acceptance ?? subtask?.acceptance_criteria)].join('\n');
   return {
     key: String(subtask?.key ?? '').trim() || String(index + 1),
     files,
     readFiles: [...new Set(asList(subtask?.readFiles ?? subtask?.read_files))],
     sources: files.filter((path) => !isTestFile(path)),
-    names: quotedNames([subtask?.description, ...asList(subtask?.acceptance ?? subtask?.acceptance_criteria)].join('\n')),
+    description: String(subtask?.description ?? ''),
+    text,
+    names: quotedNames(text),
+  };
+}
+
+// Splits a source file into its code, with strings and comments blanked to spaces
+// (offsets stay valid), and its string values by offset. Null for other languages.
+function scanSource(text, path) {
+  const python = path.endsWith('.py');
+  if (!python && !JS_FILE.test(path)) return null;
+  const strings = new Map();
+  const code = text.replace(python ? PY_TOKENS : JS_TOKENS, (token, offset) => {
+    if (!/^(?:#|\/[/*])/.test(token)) {
+      const quote = /^(?:"""|''')/.test(token) ? 3 : 1;
+      strings.set(offset, token.slice(quote, -quote));
+    }
+    return token.replace(/[^\n]/g, ' ');
+  });
+  return { python, code, strings };
+}
+
+// Reads the bracketed group opening at `open`. Strings inside an object or dict
+// are left out: only the elements of the list or tuple count.
+function readGroup(source, open) {
+  const stack = [];
+  const strings = [];
+  const commas = [];
+  for (let i = open; i < source.code.length; i++) {
+    if (source.strings.has(i) && !stack.includes('{')) strings.push(source.strings.get(i));
+    const ch = source.code[i];
+    if ('([{'.includes(ch)) stack.push(ch);
+    else if (')]}'.includes(ch)) {
+      stack.pop();
+      if (!stack.length) return { strings, commas };
+    } else if (ch === ',' && stack.length === 1) commas.push(i);
+  }
+  return null;
+}
+
+function pythonLists(source) {
+  const lists = [];
+  for (const line of source.code.matchAll(/^[ \t]*assert\b[^\n]*/gm)) {
+    for (const equals of line[0].matchAll(/==[ \t]*([[(])/g)) {
+      const index = line.index + equals.index;
+      const group = readGroup(source, index + equals[0].length - 1);
+      // A parenthesis without a comma only groups an expression: it is no tuple.
+      if (group && (equals[1] === '[' || group.commas.length)) lists.push({ index, strings: group.strings });
+    }
+  }
+  return lists;
+}
+
+function jsLists(source) {
+  const lists = [];
+  for (const call of source.code.matchAll(/\bdeep(?:Strict)?Equal[ \t]*\(/g)) {
+    const open = call.index + call[0].length - 1;
+    const args = readGroup(source, open);
+    if (!args) continue;
+    for (const before of [open, args.commas[0]]) { // actual and expected; a third argument is the message
+      if (before === undefined) continue;
+      const lead = source.code.slice(before + 1).match(/^\s*\[/);
+      const group = lead && readGroup(source, before + lead[0].length);
+      if (group) lists.push({ index: call.index, strings: group.strings });
+    }
+  }
+  return lists;
+}
+
+// A whole word of the order, and long enough not to be an everyday short word.
+function mentions(text, value) {
+  if (value.length < MIN_NAME_LENGTH) return false;
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`).test(text);
+}
+
+// `name` comes from quotedNames, so it holds no regular expression characters.
+function definesName(source, name) {
+  const pattern = source.python
+    ? `^[ \\t]*(?:async[ \\t]+)?def[ \\t]+${name}[ \\t]*\\(`
+    : [
+        `\\bfunction\\b[ \\t]*\\*?[ \\t]*${name}[ \\t]*\\(`,
+        `(?:^|[{,;])[ \\t]*(?:(?:async|static|get|set)[ \\t]+)*\\*?${name}[ \\t]*\\((?:[^()\\n]|\\([^()\\n]*\\))*\\)[ \\t]*\\{`,
+        `(?<![\\w$])${name}[ \\t]*[=:][ \\t]*(?:async\\b[ \\t]*)?(?:function\\b[ \\t]*\\*?[ \\t]*)?\\(`,
+      ].join('|');
+  return new RegExp(pattern, 'm').test(source.code);
+}
+
+function outsideTests(piece, repo, source) {
+  return repo.files.filter((path) => isTestFile(path) && !piece.files.includes(path) && source(path)).sort();
+}
+
+function fakeDefined(piece, repo, source) {
+  const names = [...new Set(piece.names.map((name) => name.split('.').pop()))];
+  if (!names.length) return [];
+  return outsideTests(piece, repo, source)
+    .map((path) => ({ path, defined: names.filter((name) => definesName(source(path), name)) }))
+    .filter(({ defined }) => defined.length)
+    .slice(0, MAX_RELATED_TESTS)
+    .map(({ path, defined }) => ({
+      key: piece.key,
+      rule: 'fake-defined',
+      level: 'warn',
+      message: `${path} defines its own ${defined.join(', ')}; keep the call shape compatible or add the test to files`,
+      paths: [path],
+      names: defined,
+    }));
+}
+
+function exactList(piece, repo, source) {
+  const findings = outsideTests(piece, repo, source).flatMap((path) => {
+    const scanned = source(path);
+    const hit = (scanned.python ? pythonLists : jsLists)(scanned)
+      .map((list) => ({ index: list.index, names: [...new Set(list.strings.filter((value) => mentions(piece.text, value)))] }))
+      .find((list) => list.names.length);
+    if (!hit) return [];
+    const line = scanned.code.slice(0, hit.index).split('\n').length;
+    return [
+      {
+        key: piece.key,
+        rule: 'exact-list',
+        level: 'warn',
+        message: `${path}:${line} asserts an exact list with ${hit.names.join(', ')}; update it or add the test to files`,
+        paths: [path],
+        names: hit.names,
+      },
+    ];
+  });
+  return findings.slice(0, MAX_RELATED_TESTS);
+}
+
+function optionalParameter(piece) {
+  const sentences = piece.description.split(/[.!?]\s|\n/);
+  if (!sentences.some((sentence) => ADDS_WORD.test(sentence) && PARAMETER_WORD.test(sentence))) return null;
+  return {
+    key: piece.key,
+    rule: 'optional-parameter',
+    level: 'note',
+    message: 'Adding a parameter: keep it optional so existing calls and test fakes keep working.',
   };
 }
 
@@ -171,8 +315,20 @@ export function checkOrder(batch, repo) {
     if (!contents.has(path)) contents.set(path, repo.read(path));
     return contents.get(path);
   };
+  const scanned = new Map();
+  const source = (path) => {
+    if (!scanned.has(path)) scanned.set(path, scanSource(read(path), path));
+    return scanned.get(path);
+  };
   const pieces = asList(batch?.subtasks).map(toPiece);
-  const perPiece = pieces.flatMap((piece) => [...relatedTest(piece, repo, read), tooManyFiles(piece), notFound(piece, repo, read)]);
+  const perPiece = pieces.flatMap((piece) => [
+    ...relatedTest(piece, repo, read),
+    tooManyFiles(piece),
+    notFound(piece, repo, read),
+    ...fakeDefined(piece, repo, source),
+    ...exactList(piece, repo, source),
+    optionalParameter(piece),
+  ]);
   return [...perPiece.filter(Boolean), ...sharedFiles(pieces)].sort(
     (a, b) => a.key.localeCompare(b.key, 'en', { numeric: true }) || a.rule.localeCompare(b.rule, 'en'),
   );
