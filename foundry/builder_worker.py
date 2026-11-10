@@ -1394,8 +1394,10 @@ class _WorkerBase:
                 return False
         return True
 
-    def _send_back(self, ticket: Any, hint: str, *, reason: str) -> str:
+    def _send_back(self, ticket: Any, hint: str, *, reason: str, limit: int | None = None) -> str:
         """Reopen ``ticket`` with ``hint`` (attempt + 1), pause it for help or quarantine at the cap.
+
+        ``limit``: longest hint stored (None = :data:`MAX_FIX_HINT_CHARS`).
 
         Returns ``"retry"``, ``"awaiting_help"`` (parked until the Floor Manager
         answers, no attempt spent), ``"quarantined"`` or ``"superseded"`` (the
@@ -1404,7 +1406,8 @@ class _WorkerBase:
         task_id = _get(ticket, "task_id")
         ticket_id = _get(ticket, "ticket_id")
         attempt = int(_get(ticket, "attempt", 0) or 0)
-        hint = hint if len(hint) <= MAX_FIX_HINT_CHARS else hint[: MAX_FIX_HINT_CHARS - 3] + "..."
+        cap = MAX_FIX_HINT_CHARS if limit is None else limit
+        hint = hint if len(hint) <= cap else hint[: cap - 3] + "..."
         if not self._still_owned(ticket):
             self._event("superseded", task_id, {"ticket_id": ticket_id, "agent_id": self.agent_id, "reason": reason})
             return "superseded"
@@ -1582,26 +1585,30 @@ class _WorkerBase:
         return str(path) if path is not None else self.cwd
 
     # -- Claude ---------------------------------------------------------------
-    async def _call_claude(self, prompt: str, *, task_id: str, cwd: str | None = None) -> ClaudeResult:
+    async def _call_claude(
+        self, prompt: str, *, task_id: str, cwd: str | None = None, client: ClaudeLike | None = None
+    ) -> ClaudeResult:
         """One Claude call inside ``limiter.slot`` wrapped by ``call_with_backoff``.
 
         Records tokens per call; raises whatever the client raises once backoff
         gives up. ``cwd`` (edit mode: the piece workspace) replaces the task's
-        snapshot / ``self.cwd`` as Claude's working directory.
+        snapshot / ``self.cwd`` as Claude's working directory. ``client`` (builder
+        retries) is called instead of ``self.client`` when given.
         """
         estimate = _estimate_tokens(prompt)
         if cwd is None:
             cwd = await self._claude_cwd(task_id)
+        caller = client if client is not None else self.client
 
         async def once() -> ClaudeResult:
             if self.limiter is None:
                 self.claude_calls += 1
-                return await self.client.run(
+                return await caller.run(
                     prompt, agent_id=self.agent_id, role=self.role, cwd=cwd, timeout=self.claude_timeout
                 )
             async with self.limiter.slot(estimate) as handle:
                 self.claude_calls += 1
-                result = await self.client.run(
+                result = await caller.run(
                     prompt, agent_id=self.agent_id, role=self.role, cwd=cwd, timeout=self.claude_timeout
                 )
                 # D11: charge uncached input + output only; cache reads are free for TPM.
@@ -1923,6 +1930,8 @@ class BuilderWorker(_WorkerBase):
         self.promoted = False
         #: ``FoundryConfig`` (``builder_mode``, ``db_path``); None = diff mode.
         self.config: Any = None
+        #: The client attempts after the first call (set by ``TeamPool``); None = ``self.client``.
+        self.retry_client: ClaudeLike | None = None
         #: Tickets already logged as built in diff mode although ``builder_mode`` is edit.
         self._edit_skip_logged: set[str] = set()
 
@@ -2487,12 +2496,15 @@ class BuilderWorker(_WorkerBase):
             if isinstance(opened, str):
                 return opened
             workspace = opened
+        call_options: dict[str, Any] = {}
+        if workspace is not None:
+            call_options["cwd"] = str(workspace)
+        retry_client = getattr(self, "retry_client", None)
+        if assignment.attempt >= 1 and retry_client is not None:
+            call_options["client"] = retry_client
         try:
             try:
-                if workspace is None:
-                    result = await self._call_claude(prompt, task_id=task_id)
-                else:
-                    result = await self._call_claude(prompt, task_id=task_id, cwd=str(workspace))
+                result = await self._call_claude(prompt, task_id=task_id, **call_options)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2560,7 +2572,14 @@ class BuilderWorker(_WorkerBase):
             trace = (getattr(failure, "stderr", "") or "") + "\n" + (getattr(failure, "stdout", "") or "")
             hint = await self._condense(trace, gates.summary or getattr(failure, "note", None), task_id=task_id)
             check = getattr(failure, "check_type", "gate")
-            return self._send_back(ticket, f"[{check}] {hint}", reason=f"gate_{check}")
+            message = f"[{check}] {hint}"
+            chars = int(getattr(getattr(self, "config", None), "gate_error_chars", 0) or 0)
+            output = trace.strip()
+            if chars > 0 and output:
+                # the gate's own output keeps its newlines, so it stays out of _one_line
+                message += f"\n\nGate output (last {chars} characters):\n{output[-chars:]}"
+                return self._send_back(ticket, message, reason=f"gate_{check}", limit=MAX_FIX_HINT_CHARS + chars + 100)
+            return self._send_back(ticket, message, reason=f"gate_{check}")
         # what reviewer, cache, queue and patch see: the exact diff of the change
         submission = self._normalized(ticket, submission, before)
 
@@ -3326,6 +3345,7 @@ class TeamPool:
         queue: Any,
         client: ClaudeLike,
         builder_client: ClaudeLike | None = None,
+        builder_retry_client: ClaudeLike | None = None,
         reviewer_client: ClaudeLike | None = None,
         limiter: LimiterLike | None,
         telemetry: Any,
@@ -3379,6 +3399,10 @@ class TeamPool:
         self.client = client
         #: The client builder slots call; reviewers use ``reviewer_client``.
         self.builder_client: ClaudeLike = builder_client if builder_client is not None else client
+        #: The client builder slots call on attempts after the first; defaults to ``builder_client``.
+        self.builder_retry_client: ClaudeLike = (
+            builder_retry_client if builder_retry_client is not None else self.builder_client
+        )
         #: The client reviewers (team and promoted peers) call; defaults to ``client``.
         self.reviewer_client: ClaudeLike = reviewer_client if reviewer_client is not None else client
         self.limiter = limiter
@@ -3430,6 +3454,8 @@ class TeamPool:
             )
             for slot in range(1, builders + 1)
         ]
+        for worker in self.builders:
+            worker.retry_client = self.builder_retry_client
         #: ``FoundryConfig`` handed to every worker of this pool (None: workers keep their default).
         self.config: Any = config
         if config is not None:
