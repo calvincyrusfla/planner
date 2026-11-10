@@ -58,6 +58,7 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from foundry import claude_client as _claude_client
+from foundry.order_schema import LIMIT_BUILDER_ORDER
 from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
 from foundry.schemas import (
     MAX_RETRIES,
@@ -461,7 +462,8 @@ def _read_only_touched(files: Iterable[str], assignment: TaskAssignment) -> list
     return [f for f in files if _read_only_path(f) in protected]
 
 
-MAX_ORDER_DETAILS_CHARS = 24000  # cap on the work-order text quoted in builder and reviewer prompts; equals LIMITS.builderOrder in department/lib/foundry-batches.mjs
+#: Cap on the work-order text quoted in builder and reviewer prompts (limits.builderOrder in schema/order.json).
+MAX_ORDER_DETAILS_CHARS = LIMIT_BUILDER_ORDER
 
 
 def _capped_order_text(text: str, label: str) -> str:
