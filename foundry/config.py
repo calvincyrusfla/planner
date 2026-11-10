@@ -98,6 +98,16 @@ Environment variable               Field (default)
                                    failures from the Ledger
 =================================  ==========================================
 
+Settings file: when ``from_env()`` reads the real environment (``environ`` is
+None), it also reads ``foundry/data/settings.json`` (``DEFAULT_SETTINGS_FILE``,
+or the ``settings_file`` argument) if it exists: a JSON object of
+``"FOUNDRY_NAME": "value"`` strings that a remote update can write.  File
+values win over the environment and are validated the same way; keys not
+starting with ``FOUNDRY_`` and non-string values are ignored with a warning,
+and an unreadable or invalid file is ignored with a warning.  When
+``environ`` is given (tests), the file is read only if ``settings_file`` is
+passed explicitly.
+
 Empty environment values are treated as unset.  The rate-limit defaults are
 deliberately conservative for a Claude subscription (not an API key): a few
 headless sessions at once, well below the plan's usage ceiling.
@@ -105,6 +115,8 @@ headless sessions at once, well below the plan's usage ceiling.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import shlex
 from collections.abc import Mapping
@@ -131,6 +143,7 @@ __all__ = [
     "DEFAULT_DATA_DIR",
     "DEFAULT_DB_PATH",
     "DEFAULT_PATCHES_DIR",
+    "DEFAULT_SETTINGS_FILE",
     "ENV_PREFIX",
     "FoundryConfig",
     "split_claude_args",
@@ -148,6 +161,12 @@ DEFAULT_DB_PATH: Path = DEFAULT_DATA_DIR / "foundry.db"
 #: defaults to None, which resolves to ``<db_path dir>/patches``; this
 #: constant is that value when ``db_path`` is the default.
 DEFAULT_PATCHES_DIR: Path = DEFAULT_DATA_DIR / "patches"
+
+#: Settings file ``from_env()`` reads on top of the real environment: a JSON
+#: object of ``"FOUNDRY_NAME": "value"`` strings (see the module docstring).
+DEFAULT_SETTINGS_FILE: Path = DEFAULT_DATA_DIR / "settings.json"
+
+_log = logging.getLogger(__name__)
 
 #: Safe default flags for diff-only headless Claude Code roles (builder,
 #: reviewer): few turns, no tools that could touch the working tree, run
@@ -242,6 +261,40 @@ def split_claude_args(text: str) -> list[str]:
     lexer.escape = ""
     lexer.commenters = ""
     return list(lexer)
+
+
+def _read_settings_file(path: Path) -> dict[str, str]:
+    """Return the ``FOUNDRY_*`` string values of a settings file.
+
+    A missing file gives ``{}``.  An unreadable file, invalid JSON or a
+    top-level value that is not an object is ignored with a log warning.
+    Keys not starting with ``FOUNDRY_`` and non-string values are dropped
+    with one log warning naming them.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        _log.warning("Foundry settings file %s ignored: %s", path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        _log.warning("Foundry settings file %s ignored: not a JSON object", path)
+        return {}
+    values: dict[str, str] = {}
+    ignored: list[str] = []
+    for key, value in raw.items():
+        if isinstance(key, str) and key.startswith(ENV_PREFIX) and isinstance(value, str):
+            values[key] = value
+        else:
+            ignored.append(str(key))
+    if ignored:
+        _log.warning(
+            "Foundry settings file %s: ignored entries (not FOUNDRY_* string values): %s",
+            path, ", ".join(ignored),
+        )
+    return values
 
 
 _SECRET_SCAN_OFF = ("0", "false", "no", "off")
@@ -580,12 +633,20 @@ class FoundryConfig(BaseModel):
 
     @classmethod
     def from_env(
-        cls, environ: Mapping[str, str] | None = None, **overrides: Any
+        cls,
+        environ: Mapping[str, str] | None = None,
+        *,
+        settings_file: Path | None = None,
+        **overrides: Any,
     ) -> FoundryConfig:
         """Build a config from ``FOUNDRY_*`` environment variables.
 
         Args:
             environ: Mapping to read instead of ``os.environ`` (for tests).
+            settings_file: JSON settings file whose ``FOUNDRY_*`` values win
+                over the environment.  With ``environ`` None it defaults to
+                ``DEFAULT_SETTINGS_FILE``; with ``environ`` given the file is
+                read only when this is passed.
             **overrides: Field values that win over the environment.
 
         Raises:
@@ -594,7 +655,16 @@ class FoundryConfig(BaseModel):
             ValueError: if ``FOUNDRY_CLAUDE_ARGS`` has an unbalanced quote or
                 ``FOUNDRY_CLAUDE_ARGS_REPLACE`` is not a boolean.
         """
-        env = os.environ if environ is None else environ
+        env: Mapping[str, str]
+        if environ is None:
+            file_values = _read_settings_file(settings_file or DEFAULT_SETTINGS_FILE)
+            env = {**os.environ, **file_values} if file_values else os.environ
+        else:
+            env = environ
+            if settings_file is not None:
+                file_values = _read_settings_file(settings_file)
+                if file_values:
+                    env = {**environ, **file_values}
 
         def get(name: str) -> str | None:
             raw = env.get(ENV_PREFIX + name)
