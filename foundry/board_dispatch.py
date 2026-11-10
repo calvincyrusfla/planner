@@ -20,9 +20,11 @@ Foundry service on the user's PC runs one :class:`BatchWatcher`, which every
    ``updateBatch`` when something changed, else as a heartbeat at most every 2 minutes, until every subtask is
    finished and its PR settled.
 
-The mapping batch/subtask -> Foundry task id is kept in the queue's key-value
-table (``foundry_batch:<id>``) and every order carries a marker line in its
+The mapping batch/subtask -> Foundry task id and the submit failures are kept
+in the Ledger, the rest of a batch's record in the queue's key-value table
+(``foundry_batch:<id>``), and every order carries a marker line in its
 description, so a restarted service resumes a batch without resubmitting.
+While the Ledger cannot be used, the key-value record holds them too.
 
 ``FOUNDRY_BATCHES=off`` turns the watcher off; it never claims while the
 service is not running. The watcher never raises into the service: board and
@@ -319,6 +321,8 @@ class BatchWatcher:
         self._last_sent: dict[str, float] = {}
         self._ledger_cache: Ledger | None = None
         self._ledger_warned = False
+        #: Batches whose pieces only the Ledger knows, while it cannot be read: nothing may be submitted.
+        self._ledger_blind: set[str] = set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -507,47 +511,81 @@ class BatchWatcher:
     def _record(self, bid: str, created_at: str | None = None) -> dict[str, Any]:
         """The saved record of a batch; a record of another batch with the same id starts over.
 
-        With ``ledger_read`` on, the Ledger's submitted pieces and submit failures are laid over it.
+        ``tasks`` and ``failed`` are the Ledger's, once it has taken whatever only the kv record
+        still holds; while the Ledger cannot be used they are the kv record's.
         """
         fn = getattr(self._queue(), "kv_get", None)
         rec = fn(KV_PREFIX + bid) if callable(fn) else None
         if not isinstance(rec, dict) or (created_at and rec.get("createdAt") not in (None, created_at)):
             rec = {}
+        handed_over = bool(rec) and "tasks" not in rec  # a save gave them to the Ledger
         if created_at:
             rec["createdAt"] = created_at
         rec.setdefault("tasks", {})
         rec.setdefault("failed", {})
         rec.setdefault("pushed", {})
         rec.setdefault("usage", {})
-        if getattr(getattr(self.service, "config", None), "ledger_read", False):
-            self._overlay_ledger(bid, created_at, rec)
+        if self._overlay_ledger(bid, rec) or not handed_over:
+            self._ledger_blind.discard(bid)
+        else:
+            self._ledger_blind.add(bid)
         return rec
 
-    def _overlay_ledger(self, bid: str, created_at: str | None, rec: dict[str, Any]) -> None:
-        """Lay the Ledger's tasks and submit failures over ``rec``; any read error leaves ``rec`` as it was."""
-        tasks: dict[str, str] = {}
-        failed: dict[str, str] = {}
+    def _overlay_ledger(self, bid: str, rec: dict[str, Any]) -> bool:
+        """Replace ``rec``'s tasks and submit failures with the Ledger's; False leaves ``rec`` as it was."""
         try:
             ledger = self._ledger()
             if ledger is None:
-                return
-            for piece in ledger.pieces(bid, created_at):
-                key = str(piece["key"])
-                if piece.get("foundry_task"):
-                    tasks[key] = str(piece["foundry_task"])
-                elif piece.get("state") == "failed" and key not in rec["tasks"]:
-                    # a key with a kv task was submitted: its row just predates foundry_task
-                    failed[key] = str(piece.get("error") or "failed")
-        except Exception as exc:  # the kv record still holds everything needed
-            log.info("board dispatch: Ledger read failed, using the kv record: %s", exc)
-            return
-        rec["tasks"].update(tasks)
-        rec["failed"].update(failed)
+                return False
+            pieces = self._backfill(ledger, bid, rec)
+        except Exception as exc:  # the kv record still holds what the Ledger never took
+            log.info("board dispatch: Ledger read failed (or its backfill), using the kv record: %s", exc)
+            return False
+        tasks: dict[str, str] = {}
+        failed: dict[str, str] = {}
+        for piece in pieces:
+            key = str(piece["key"])
+            if piece.get("foundry_task"):
+                tasks[key] = str(piece["foundry_task"])
+            elif piece.get("state") == "failed":
+                failed[key] = str(piece.get("error") or "failed")
+        rec["tasks"] = tasks
+        rec["failed"] = failed
+        return True
+
+    @staticmethod
+    def _backfill(ledger: Ledger, bid: str, rec: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Write the tasks and failures of ``rec`` the Ledger lacks; returns its pieces. Raises when it can't."""
+        created = rec.get("createdAt")
+        pieces = ledger.pieces(bid, created)
+        rows = {str(piece["key"]): piece for piece in pieces}
+        wrote = False
+        for key, tid in rec["tasks"].items():
+            if not rows.get(key, {}).get("foundry_task"):  # no row, or one from before foundry_task
+                ledger.upsert_piece(bid, created, key, foundry_task=tid)
+                wrote = True
+        for key, reason in rec["failed"].items():
+            row = rows.get(key, {})
+            if key not in rec["tasks"] and not row.get("foundry_task") and row.get("state") != "failed":
+                ledger.upsert_piece(bid, created, key, state="failed", error=reason)
+                wrote = True
+        return ledger.pieces(bid, created) if wrote else pieces
 
     def _save(self, bid: str, rec: Mapping[str, Any]) -> None:
+        """Save the record; ``tasks`` and ``failed`` stay out of kv once the Ledger holds them all."""
         fn = getattr(self._queue(), "kv_set", None)
-        if callable(fn):
-            fn(KV_PREFIX + bid, dict(rec))
+        if not callable(fn):
+            return
+        saved = dict(rec)
+        try:
+            ledger = self._ledger()
+            if ledger is not None:
+                self._backfill(ledger, bid, rec)
+                saved.pop("tasks", None)
+                saved.pop("failed", None)
+        except Exception as exc:  # kept in kv, so a broken Ledger loses nothing
+            log.info("board dispatch: Ledger write failed, keeping %s's pieces in the kv record: %s", bid, exc)
+        fn(KV_PREFIX + bid, saved)
 
     def _find_order(self, bid: str, key: str, created_at: str | None) -> str | None:
         """An order already submitted for this subtask (submitted, then cut off before the kv write)."""
@@ -563,6 +601,9 @@ class BatchWatcher:
         bid = str(batch["id"])
         created = batch.get("createdAt")
         rec = self._record(bid, created)
+        if bid in self._ledger_blind:
+            await self._heartbeat_only(bid)
+            return
         f = self.service.factory
         manager, queue = f.manager, f.queue
         subtasks = [s for s in (batch.get("subtasks") or []) if isinstance(s, dict)]
@@ -688,6 +729,19 @@ class BatchWatcher:
             rec["closed"] = True
             log.info("board dispatch: %s finished", bid)
         self._save(bid, rec)
+
+    async def _heartbeat_only(self, bid: str) -> None:
+        """Keep the claim alive in a round that cannot see the batch's pieces: nothing else goes out."""
+        last = self._last_sent.get(bid)
+        if last is not None and self._now() - last < self.heartbeat_s:
+            return
+        args = {"id": bid, "service": self.service_id, "heartbeat": True}
+        try:
+            await asyncio.to_thread(self.board.op, "updateBatch", args)
+        except BoardRefused as exc:
+            log.info("board dispatch: %s heartbeat refused (%s); retrying next round", bid, exc)
+            return
+        self._last_sent[bid] = self._now()
 
     @staticmethod
     def _dep_closure(key: str, by_key: Mapping[str, Mapping[str, Any]]) -> set[str]:
