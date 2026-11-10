@@ -40,7 +40,7 @@ from typing import Any, Sequence
 
 from foundry.board_bridge import BoardBridge
 from foundry.claude_client import SimulatedClaudeClient
-from foundry.config import DEFAULT_BUILDER_READ_PROMPT, FoundryConfig
+from foundry.config import DEFAULT_BUILDER_READ_PROMPT, DEFAULT_REVIEWER_READ_PROMPT, FoundryConfig
 from foundry.floor_manager import Factory, WorkOrder, build_factory
 from foundry.gemma_client import GemmaReply, GemmaRequest, SimulatedGemmaClient
 from foundry.schemas import ClaudeResult
@@ -48,6 +48,7 @@ from foundry.schemas import ClaudeResult
 __all__ = [
     "VirtualClock", "DEMO_FILES", "DEMO_ORDERS", "demo_claude", "demo_gemma", "run_demo", "run_real",
     "explain_task", "completion_report", "task_outputs", "main", "builder_claude_args",
+    "reviewer_claude_args",
 ]
 
 #: Claude Code carries a large system prompt into every headless session; the
@@ -391,6 +392,19 @@ def claude_args(config: FoundryConfig) -> list[str]:
     return args
 
 
+def _set_flag(args: list[str], flag: str, value: str) -> None:
+    """Give ``flag`` the value ``value`` in ``args``, in place, keeping one copy of it."""
+    # FOUNDRY_CLAUDE_ARGS appends to the defaults, so a flag can occur twice;
+    # keep only the first, or a later copy would override this value.
+    positions = [i for i, arg in enumerate(args) if arg == flag]
+    if not positions:
+        args.extend([flag, value])
+        return
+    for i in reversed(positions[1:]):
+        del args[i:i + 2]
+    args[positions[0] + 1:positions[0] + 2] = [value]
+
+
 def builder_claude_args(config: FoundryConfig) -> list[str]:
     """Extra ``claude -p`` flags for builder calls.
 
@@ -402,21 +416,26 @@ def builder_claude_args(config: FoundryConfig) -> list[str]:
     args = claude_args(config)
     if getattr(config, "builder_tools", "off") != "read":
         return args
-
-    def set_flag(flag: str, value: str) -> None:
-        # FOUNDRY_CLAUDE_ARGS appends to the defaults, so a flag can occur twice;
-        # keep only the first, or a later copy would override this value.
-        positions = [i for i, arg in enumerate(args) if arg == flag]
-        if not positions:
-            args.extend([flag, value])
-            return
-        for i in reversed(positions[1:]):
-            del args[i:i + 2]
-        args[positions[0] + 1:positions[0] + 2] = [value]
-
-    set_flag("--max-turns", str(config.builder_max_turns))
+    _set_flag(args, "--max-turns", str(config.builder_max_turns))
     args.extend(["--allowedTools", "Read Grep Glob"])
-    set_flag("--append-system-prompt", DEFAULT_BUILDER_READ_PROMPT)
+    _set_flag(args, "--append-system-prompt", DEFAULT_BUILDER_READ_PROMPT)
+    return args
+
+
+def reviewer_claude_args(config: FoundryConfig) -> list[str]:
+    """Extra ``claude -p`` flags for reviewer calls.
+
+    The same as :func:`claude_args` unless ``config.reviewer_tools`` is ``read``.
+    Then reviewers get ``config.reviewer_max_turns`` turns, the Read, Grep and Glob
+    tools and :data:`DEFAULT_REVIEWER_READ_PROMPT`; every other flag stays. Always
+    a new list: ``config.claude_extra_args`` is never changed.
+    """
+    args = claude_args(config)
+    if getattr(config, "reviewer_tools", "off") != "read":
+        return args
+    _set_flag(args, "--max-turns", str(config.reviewer_max_turns))
+    args.extend(["--allowedTools", "Read Grep Glob"])
+    _set_flag(args, "--append-system-prompt", DEFAULT_REVIEWER_READ_PROMPT)
     return args
 
 
