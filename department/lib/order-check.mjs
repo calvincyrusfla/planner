@@ -181,10 +181,13 @@ function outsideTests(piece, repo, source) {
   return repo.files.filter((path) => isTestFile(path) && !piece.files.includes(path) && source(path)).sort();
 }
 
-function fakeDefined(piece, repo, source) {
-  const names = [...new Set(piece.names.map((name) => name.split('.').pop()))];
-  if (!names.length) return [];
+function fakeDefined(piece, repo, source, read) {
+  const names = [...new Set(piece.names.map((name) => name.split('.').pop()))].filter(
+    (name) => name.replace(/^_+/, '').length >= MIN_NAME_LENGTH,
+  );
+  if (!names.length || !piece.sources.length) return [];
   return outsideTests(piece, repo, source)
+    .filter((path) => piece.sources.some((file) => importsFile(read(path), file)))
     .map((path) => ({ path, defined: names.filter((name) => definesName(source(path), name)) }))
     .filter(({ defined }) => defined.length)
     .slice(0, MAX_RELATED_TESTS)
@@ -198,11 +201,22 @@ function fakeDefined(piece, repo, source) {
     }));
 }
 
+function backtickNames(text) {
+  const names = new Set();
+  for (const match of String(text ?? '').matchAll(/(?<!`)`([^`\n]+)`(?!`)/g)) {
+    const name = match[1].replace(/\(\)$/, '');
+    if (name.length >= MIN_NAME_LENGTH && /^[\w.-]+$/.test(name)) names.add(name);
+  }
+  return names;
+}
+
 function exactList(piece, repo, source) {
+  const quoted = backtickNames(piece.text);
+  if (!quoted.size) return [];
   const findings = outsideTests(piece, repo, source).flatMap((path) => {
     const scanned = source(path);
     const hit = (scanned.python ? pythonLists : jsLists)(scanned)
-      .map((list) => ({ index: list.index, names: [...new Set(list.strings.filter((value) => mentions(piece.text, value)))] }))
+      .map((list) => ({ index: list.index, names: [...new Set(list.strings.filter((value) => quoted.has(value)))] }))
       .find((list) => list.names.length);
     if (!hit) return [];
     const line = scanned.code.slice(0, hit.index).split('\n').length;
@@ -325,7 +339,7 @@ export function checkOrder(batch, repo) {
     ...relatedTest(piece, repo, read),
     tooManyFiles(piece),
     notFound(piece, repo, read),
-    ...fakeDefined(piece, repo, source),
+    ...fakeDefined(piece, repo, source, read),
     ...exactList(piece, repo, source),
     optionalParameter(piece),
   ]);
