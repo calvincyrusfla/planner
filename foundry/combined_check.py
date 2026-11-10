@@ -301,6 +301,8 @@ def status_line(result: CombinedResult, pr_number: int) -> str:
 def _is_test_or_doc(path: str) -> bool:
     """Whether a repo-relative path is a test or a doc as far as auto-merge is concerned."""
     *folders, name = path.split("/")
+    if name.lower() == "claude.md" or ".claude" in folders:
+        return False
     return ("tests" in folders or "test" in folders or folders[:1] == ["docs"] or name.endswith(_TEST_DOC_SUFFIXES)
             or (name.startswith("test_") and name.endswith(".py")))
 

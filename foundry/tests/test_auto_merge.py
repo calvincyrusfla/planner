@@ -225,6 +225,25 @@ def test_tests_and_docs_are_recognised(tmp_path: Path, monkeypatch: pytest.Monke
     assert runner.merged() == [1]
 
 
+@pytest.mark.parametrize("path", ["CLAUDE.md", "docs/CLAUDE.md", "claude.md", ".claude/agents/reviewer.md",
+                                  "department/.claude/x.md"])
+def test_agent_instructions_are_not_test_or_doc(path: str) -> None:
+    assert combined_check._is_test_or_doc(path) is False
+
+
+@pytest.mark.parametrize("path", ["docs/guide.md", "foundry/tests/test_x.py"])
+def test_regular_docs_and_tests_still_count(path: str) -> None:
+    assert combined_check._is_test_or_doc(path) is True
+
+
+def test_a_pr_touching_claude_md_is_never_merged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], {1: ["README.md", "CLAUDE.md"]})
+
+    _round(checker)
+
+    assert runner.merges == []
+
+
 def test_no_files_is_not_tests_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], {1: []})
 
