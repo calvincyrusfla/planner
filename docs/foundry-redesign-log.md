@@ -46,3 +46,18 @@ Lessons from running the prototype (Nov 2026). Each entry: what happened, what i
 ## Agency Warehouse (v2) ideas
 - **Answer help requests from the phone.** The PC dashboard's "Answer with Claude" button opens Claude Code on the PC. v2: the online board gets the same button, opening a claude.ai Claude Code session with the prompt filled in (or a notification plus a copy-the-prompt button if pre-filled links are not supported).
 - **The Floor Manager must be woken by events, not by the user.** In the prototype a Claude session only acts when the user writes; a piece that asked for help sat waiting until the user typed "check status". Stopgap: `foundry watch` (S-037) polls the board every 30 s in a background job after every dispatch and wakes the session on help requests, finished or failed pieces and finished batches. Its limits: a background job lasts at most 2 hours and must be re-armed, and it dies with the session. v2: the board pushes events (help needed, PR ready, failure) to a standing Floor Manager service and to the user's phone, so nothing depends on a chat session staying open.
+
+## Cost analysis (9 Nov 2026, batches S-030 to S-050)
+- **Measured:** 35 pieces with per-piece usage. 30 succeeded (86%); failures took 19% of fresh tokens (was over half). Fresh tokens per opened PR fell from ~535k to ~212k; median successful piece ~125k.
+- **Clean pieces are very cheap:** 13 pieces passed with one build and one review at ~40k each. Pieces with retries averaged ~272k, about 7x more. Order clarity mattered more than size (one M piece cost 734k, others 33k).
+- **Every failure was the builder missing something:** files (F-066), two steps editing the same line (F-076), a truncated order (F-082), conflicting limits (F-086).
+- **Study guide (S-042):** ~600k so far, ~700k when finished. Estimated agent team 350-500k, one solo session 150-250k. Clean runs would have cost 150-250k: the gap is failures and retries, not the design.
+- **Not measured:** the Floor Manager's own overhead (writing exact orders, testing every PR, answering help) and Gemma's time. The Floor Manager's share is likely large: precise orders mean it does the design work.
+
+## Can Foundry be cheaper than agent teams?
+- **Today: break-even at best**, probably worse with the Floor Manager counted.
+- **Structural costs:** builders have no tools, so "I need to see X" means a full retry (a full prompt again) where an agent does one cheap read; splitting a feature repeats the shared context per piece and step; fixing Foundry itself only pays back if it builds a lot.
+- **Levers, by impact:** (1) read-only tools (Read/Grep/Glob) for builders, edits still through Foundry: removes most retry cost; (2) cheaper models for small pieces, reviews and test fixes (same tokens, much less usage-limit spend); (3) prompts laid out for caching (stable prefix first, a batch's pieces close together); (4) shorter "what, not how" orders once builders can look things up; (5) skip the Claude review for small pieces that pass the full suite and Gemma pre-review.
+- **Target:** about 75% of pieces passing first time (about 40% today) would make a clean 3-piece feature cost 150-250k including the Floor Manager, roughly 30-60% cheaper than agent teams (340-800k).
+- **Where Foundry won't win:** small self-contained apps (one solo session is cheapest) and big unclear features that need design back-and-forth (agent teams iterate more cheaply in one context). Its niche: many small, well-defined changes to a large existing codebase.
+- **Next:** measure Floor Manager overhead per batch; trial levers 1 and 2 on one batch; if first-time passes stay below 60-70%, v2 builds with agent teams and keeps Foundry's board batches, gates, combined check and Gemma's free work.
