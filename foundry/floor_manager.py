@@ -2565,6 +2565,7 @@ def build_factory(
     *,
     claude: Any,
     builder_claude: Any = None,
+    builder_retry_claude: Any = None,
     reviewer_claude: Any = None,
     gemma: Any,
     repo_root: str | Path,
@@ -2588,6 +2589,7 @@ def build_factory(
         config: a :class:`~foundry.config.FoundryConfig`.
         claude / gemma: the clients (simulated in phase 1).
         builder_claude: client for builder calls; None = use ``claude``.
+        builder_retry_claude: client for builder attempts after the first; None = the builder client.
         reviewer_claude: client for reviewer calls (team and peer); None = use ``claude``.
         repo_root: what the context engine reads.
         workspace: directory gates copy and patch (defaults to ``repo_root``).
@@ -2696,6 +2698,7 @@ def build_factory(
             queue=queue,
             client=claude,
             builder_client=builder_claude,
+            builder_retry_client=builder_retry_claude,
             reviewer_client=reviewer_claude,
             limiter=limiter,
             telemetry=telemetry,
