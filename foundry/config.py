@@ -116,6 +116,16 @@ Environment variable               Field (default)
                                    ``heuristic`` sizes tasks without Gemma
 ``FOUNDRY_MAX_CONTEXT_LEVEL``      ``max_context_level`` (``3``, 1..3): highest
                                    context level of a builder's prompt
+``FOUNDRY_REVIEWER_MODEL``         ``reviewer_model`` (unset): ``--model`` for
+                                   reviewer calls
+``FOUNDRY_AUTO_UPDATE``            ``auto_update`` (``false``): update Foundry
+                                   when the base branch moves
+``FOUNDRY_AUTO_MERGE``             ``auto_merge`` (``off``; ``off|tests_docs``):
+                                   ``tests_docs`` merges small test/docs PRs
+``FOUNDRY_GEMMA_NOTES``            ``gemma_notes`` (``false``): Gemma writes
+                                   advisory pitfall notes and PR briefs
+``FOUNDRY_GEMMA_NOTES_TIMEOUT_S``  ``gemma_notes_timeout_s`` (``90``, > 0):
+                                   timeout of a Gemma notes call
 =================================  ==========================================
 
 Settings file: when ``from_env()`` reads the real environment (``environ`` is
@@ -149,6 +159,7 @@ from foundry.schemas import MAX_RETRIES, MAX_RETRIES_LIMIT
 
 __all__ = [
     "AnomalyThresholds",
+    "AutoMergeMode",
     "BoardBridgeMode",
     "BuilderMode",
     "BuilderToolsMode",
@@ -242,12 +253,14 @@ DEFAULT_BUILDER_EDIT_PROMPT: str = (
 )
 
 #: The only commands builders may run when ``builder_tests`` is on in edit mode.
-BUILDER_TEST_COMMANDS: tuple[str, ...] = ("python -m pytest", "node --test", "npm test", "npm run test")
+BUILDER_TEST_COMMANDS: tuple[str, ...] = (
+    "python -m pytest", "node --test", "npm test", "npm run test", "python -m mypy",
+)
 
 #: Added to :data:`DEFAULT_BUILDER_EDIT_PROMPT` when ``builder_tests`` is on.
 DEFAULT_BUILDER_TESTS_PROMPT_ADDITION: str = (
     "You can run the tests of the files you change, and only tests, with these commands: "
-    "python -m pytest <test files>, node --test <test files>, npm test, npm run test:<name>. "
+    "python -m pytest <test files>, node --test <test files>, npm test, npm run test:<name>, python -m mypy <files>. "
     "Run the tests related to your change before you finish and fix what fails; do not run "
     "other commands."
 )
@@ -276,6 +289,7 @@ PreReviewMode = Literal["off", "advise", "gate"]
 BuilderToolsMode = Literal["off", "read"]
 BuilderMode = Literal["diff", "edit"]
 ReviewerToolsMode = Literal["off", "read"]
+AutoMergeMode = Literal["off", "tests_docs"]
 ForemanActionsMode = Literal["act", "log"]
 SizingMode = Literal["gemma", "heuristic"]
 
@@ -617,6 +631,30 @@ class FoundryConfig(BaseModel):
             "Ledger. The kv record keeps being written, so turning this off returns to it."
         ),
     )
+    reviewer_model: str | None = Field(
+        default=None,
+        description=(
+            "Claude Code model name or alias for reviewer calls; None/empty: the "
+            "subscription default."
+        ),
+    )
+    auto_update: bool = Field(
+        default=False,
+        description="Whether Foundry updates itself when the base branch moves.",
+    )
+    auto_merge: AutoMergeMode = Field(
+        default="off",
+        description="off = never merge PRs; tests_docs = merge small test/docs-only PRs.",
+    )
+    gemma_notes: bool = Field(
+        default=False,
+        description="Whether Gemma writes advisory pitfall notes and PR briefs.",
+    )
+    gemma_notes_timeout_s: float = Field(
+        default=90,
+        gt=0,
+        description="Seconds a Gemma notes call may take.",
+    )
 
     @field_validator("gemma_base_url")
     @classmethod
@@ -662,7 +700,7 @@ class FoundryConfig(BaseModel):
             return None
         return value
 
-    @field_validator("builder_model", "builder_retry_model")
+    @field_validator("builder_model", "builder_retry_model", "reviewer_model")
     @classmethod
     def _check_model_name(cls, value: str | None) -> str | None:
         """Treat a blank model as unset; refuse whitespace and quotes inside a name."""
@@ -811,13 +849,18 @@ class FoundryConfig(BaseModel):
             "FOREMAN_ACTIONS": "foreman_actions",
             "SIZING": "sizing",
             "MAX_CONTEXT_LEVEL": "max_context_level",
+            "REVIEWER_MODEL": "reviewer_model",
+            "AUTO_UPDATE": "auto_update",
+            "AUTO_MERGE": "auto_merge",
+            "GEMMA_NOTES": "gemma_notes",
+            "GEMMA_NOTES_TIMEOUT_S": "gemma_notes_timeout_s",
         }
         for var, field in simple.items():
             value = get(var)
             if value is not None:
                 lowered = field in (
                     "board_bridge_mode", "pre_review", "typecheck", "builder_tools", "reviewer_tools",
-                    "builder_mode", "foreman_actions", "sizing",
+                    "builder_mode", "foreman_actions", "sizing", "auto_merge",
                 )
                 data[field] = value.lower() if lowered else value
 
