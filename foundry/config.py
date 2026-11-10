@@ -99,6 +99,9 @@ Environment variable               Field (default)
 ``FOUNDRY_LEDGER_READ``            ``ledger_read`` (``false``): the batch
                                    watcher reads submitted pieces and submit
                                    failures from the Ledger
+``FOUNDRY_FOREMAN_ACTIONS``        ``foreman_actions`` (``act``; ``act|log``):
+                                   ``log`` reports the Foreman's prescribed
+                                   actions without carrying them out
 =================================  ==========================================
 
 Settings file: when ``from_env()`` reads the real environment (``environ`` is
@@ -135,6 +138,7 @@ __all__ = [
     "BoardBridgeMode",
     "BuilderMode",
     "BuilderToolsMode",
+    "ForemanActionsMode",
     "ReviewerToolsMode",
     "PreReviewMode",
     "TypecheckMode",
@@ -257,6 +261,7 @@ PreReviewMode = Literal["off", "advise", "gate"]
 BuilderToolsMode = Literal["off", "read"]
 BuilderMode = Literal["diff", "edit"]
 ReviewerToolsMode = Literal["off", "read"]
+ForemanActionsMode = Literal["act", "log"]
 
 _BOOL = TypeAdapter(bool)
 
@@ -462,6 +467,13 @@ class FoundryConfig(BaseModel):
         ge=0,
         le=1,
         description="Minimum Gemma confidence for a pre-review send-back in gate mode.",
+    )
+    foreman_actions: ForemanActionsMode = Field(
+        default="act",
+        description=(
+            "What the service's monitor does with the Foreman's prescribed actions: "
+            "act = carry them out; log = only report them (board and action log)."
+        ),
     )
     auto_pr: bool = Field(
         default=True,
@@ -730,13 +742,14 @@ class FoundryConfig(BaseModel):
             "BUILDER_TESTS": "builder_tests",
             "REVIEWER_TOOLS": "reviewer_tools",
             "REVIEWER_MAX_TURNS": "reviewer_max_turns",
+            "FOREMAN_ACTIONS": "foreman_actions",
         }
         for var, field in simple.items():
             value = get(var)
             if value is not None:
                 lowered = field in (
                     "board_bridge_mode", "pre_review", "typecheck", "builder_tools", "reviewer_tools",
-                    "builder_mode",
+                    "builder_mode", "foreman_actions",
                 )
                 data[field] = value.lower() if lowered else value
 
