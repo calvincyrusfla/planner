@@ -482,6 +482,9 @@ def reviewer_claude_args(config: FoundryConfig) -> list[str]:
     a new list: ``config.claude_extra_args`` is never changed.
     """
     args = claude_args(config)
+    model = getattr(config, "reviewer_model", None)
+    if model:
+        _set_flag(args, "--model", str(model))
     if getattr(config, "reviewer_tools", "off") != "read":
         return args
     _set_flag(args, "--max-turns", str(config.reviewer_max_turns))

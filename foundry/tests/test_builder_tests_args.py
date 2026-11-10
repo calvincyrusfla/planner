@@ -27,8 +27,11 @@ def _value_after(args: list[str], flag: str) -> str:
     return args[args.index(flag) + 1]
 
 
-def test_commands_are_the_four_test_commands() -> None:
-    assert BUILDER_TEST_COMMANDS == ("python -m pytest", "node --test", "npm test", "npm run test")
+def test_commands_are_the_test_commands_and_mypy() -> None:
+    assert BUILDER_TEST_COMMANDS == (
+        "python -m pytest", "node --test", "npm test", "npm run test", "python -m mypy",
+    )
+    assert "python -m mypy" in DEFAULT_BUILDER_TESTS_PROMPT_ADDITION
 
 
 def test_setting_defaults_off_and_parses_like_a_bool() -> None:
@@ -56,7 +59,7 @@ def test_on_in_edit_mode_unblocks_bash_for_the_test_commands_only() -> None:
     assert args.count("--allowedTools") == 1
     assert _value_after(args, "--allowedTools") == (
         "Read Grep Glob Edit Write Bash(python -m pytest *) Bash(node --test *) "
-        "Bash(npm test *) Bash(npm run test *)"
+        "Bash(npm test *) Bash(npm run test *) Bash(python -m mypy *)"
     )
     assert cfg.claude_extra_args == before
 
