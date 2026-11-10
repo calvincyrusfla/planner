@@ -481,3 +481,110 @@ def test_an_unreadable_queue_keeps_the_last_finished_set(tmp_path: Path) -> None
     service._metrics_finished = {"F-1"}
 
     assert service._finished_tasks() == {"F-1"}
+
+
+# --------------------------------------------------------------------------- run settings and attempts
+
+
+class TicketQueue:
+    """Answers ``tickets_for_task`` with tickets of the given attempts, or raises ``error``."""
+
+    def __init__(self, attempts: list[int] | None = None, error: Exception | None = None) -> None:
+        self.attempts = attempts or []
+        self.error = error
+        self.asked: list[Any] = []
+
+    def tickets_for_task(self, task_id: Any) -> list[SimpleNamespace]:
+        self.asked.append(task_id)
+        if self.error is not None:
+            raise self.error
+        return [SimpleNamespace(attempt=a) for a in self.attempts]
+
+
+class BrokenConfig:
+    @property
+    def builders_per_team(self) -> int:
+        raise RuntimeError("config is broken")
+
+
+PILOT_CONFIG = SimpleNamespace(builders_per_team=1, help_after=1, max_retries=2, pre_review="advise")
+PILOT_RUN = {"builderTools": "off", "buildersPerTeam": 1, "helpAfter": 1, "maxRetries": 2, "preReview": "advise"}
+
+
+def usage_results(telemetry: Any, queue: Any, *, pushed: Any = None, changed: bool = True,
+                  **service_fields: Any) -> dict[str, dict[str, Any]]:
+    """``_usage_results`` for subtask ``a`` (Foundry task F-1); ``pushed`` is its usage already sent."""
+    service = SimpleNamespace(factory=SimpleNamespace(telemetry=telemetry, queue=queue), **service_fields)
+    watcher = BatchWatcher(service, object(), repo_slug="o/r", host="pc", enabled=True, interval=1)
+    view = {"a": {"foundryTask": "F-1", "state": "building", "error": None}}
+    rec = {"tasks": {"a": "F-1"}, "usage": {} if pushed is None else {"a": pushed}}
+    return watcher._usage_results(rec, view, view if changed else {})
+
+
+def test_usage_carries_the_run_settings_with_a_default_for_a_missing_field(conn: sqlite3.Connection) -> None:
+    add_usage(conn, USAGE_ROWS)
+
+    out = usage_results(conn, TicketQueue(), config=PILOT_CONFIG)
+
+    assert out["a"]["usage"] == {**USAGE, "run": PILOT_RUN}
+
+
+def test_usage_reports_the_configured_builder_tools(conn: sqlite3.Connection) -> None:
+    add_usage(conn, USAGE_ROWS)
+    config = SimpleNamespace(builder_tools="read")
+
+    out = usage_results(conn, TicketQueue(), config=config)
+
+    assert out["a"]["usage"]["run"] == {"builderTools": "read", "buildersPerTeam": None, "helpAfter": None,
+                                         "maxRetries": None, "preReview": None}
+
+
+def test_attempts_is_the_highest_ticket_attempt_plus_one(conn: sqlite3.Connection) -> None:
+    add_usage(conn, USAGE_ROWS)
+    queue = TicketQueue([0, 2])
+
+    out = usage_results(conn, queue)
+
+    assert out["a"]["usage"] == {**USAGE, "attempts": 3}
+    assert queue.asked == ["F-1"]
+
+
+def test_a_queue_that_raises_gives_usage_without_attempts(conn: sqlite3.Connection) -> None:
+    add_usage(conn, USAGE_ROWS)
+
+    out = usage_results(conn, TicketQueue(error=RuntimeError("database is locked")), config=PILOT_CONFIG)
+
+    assert out["a"]["usage"] == {**USAGE, "run": PILOT_RUN}
+
+
+@pytest.mark.parametrize("queue", [TicketQueue(), object(), None])
+def test_no_tickets_or_no_ticket_reader_gives_usage_without_attempts(conn: sqlite3.Connection, queue: Any) -> None:
+    add_usage(conn, USAGE_ROWS)
+
+    assert "attempts" not in usage_results(conn, queue)["a"]["usage"]
+
+
+@pytest.mark.parametrize("fields", [{}, {"config": None}, {"config": BrokenConfig()}])
+def test_no_readable_config_gives_usage_without_run(conn: sqlite3.Connection, fields: dict[str, Any]) -> None:
+    add_usage(conn, USAGE_ROWS)
+
+    out = usage_results(conn, TicketQueue([1]), **fields)
+
+    assert out["a"]["usage"] == {**USAGE, "attempts": 2}
+
+
+def test_a_change_in_attempts_counts_as_usage_that_moved(conn: sqlite3.Connection) -> None:
+    add_usage(conn, USAGE_ROWS)
+    pushed = usage_results(conn, TicketQueue([0]), config=PILOT_CONFIG)["a"]["usage"]
+
+    same = usage_results(conn, TicketQueue([0]), pushed=pushed, changed=False, config=PILOT_CONFIG)
+    moved = usage_results(conn, TicketQueue([0, 1]), pushed=pushed, changed=False, config=PILOT_CONFIG)
+
+    assert same == {}
+    assert moved["a"]["usage"] == {**USAGE, "run": PILOT_RUN, "attempts": 2}
+
+
+def test_a_task_without_usage_rows_gets_no_run_or_attempts(conn: sqlite3.Connection) -> None:
+    add_usage(conn, [("F-2", 1, 1)])
+
+    assert usage_results(conn, TicketQueue([3]), config=PILOT_CONFIG) == {}

@@ -771,9 +771,38 @@ class BatchWatcher:
             out.setdefault("error", None)
         return out
 
+    def _run_settings(self) -> dict[str, Any] | None:
+        """The settings the service runs with; None without a readable config."""
+        try:
+            cfg = getattr(self.service, "config", None)
+            if cfg is None:
+                return None
+            return {
+                "builderTools": getattr(cfg, "builder_tools", "off"),
+                "buildersPerTeam": getattr(cfg, "builders_per_team", None),
+                "helpAfter": getattr(cfg, "help_after", None),
+                "maxRetries": getattr(cfg, "max_retries", None),
+                "preReview": getattr(cfg, "pre_review", None),
+            }
+        except Exception as exc:  # optional: the usage still goes out
+            log.info("board dispatch: run settings not available: %s", exc)
+            return None
+
+    def _attempts(self, tid: Any) -> int | None:
+        """Builder attempts the task used (``Ticket.attempt`` is 0-based); None when unknown."""
+        try:
+            tickets = self.service.factory.queue.tickets_for_task(str(tid))
+            return max(t.attempt for t in tickets) + 1 if tickets else None
+        except Exception as exc:  # optional: the usage still goes out
+            log.info("board dispatch: attempts of %s not available: %s", tid, exc)
+            return None
+
     def _usage_results(self, rec: Mapping[str, Any], view: Mapping[str, Mapping[str, Any]],
                        changed: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         """Results carrying ``usage``: every changed subtask with usage, and any whose usage moved.
+
+        Besides the tokens, ``usage`` holds the service's settings (``run``) and the task's
+        builder ``attempts`` when they can be read; a task without usage rows gets neither.
 
         Called only when a write is due anyway, so usage alone never adds a board write, and on
         the service loop, because a SQLite connection belongs to its thread. Never raises:
@@ -786,10 +815,19 @@ class BatchWatcher:
         except Exception as exc:  # usage is optional: states and heartbeats must still go out
             log.info("board dispatch: usage not available: %s", exc)
             return {}
+        run = self._run_settings()
         out: dict[str, dict[str, Any]] = {}
         for key, tid in rec["tasks"].items():
-            usage = by_task.get(str(tid))
-            if usage is not None and key in view and (key in changed or rec["usage"].get(key) != usage):
+            metrics = by_task.get(str(tid))
+            if metrics is None or key not in view:
+                continue
+            usage = dict(metrics)
+            if run is not None:
+                usage["run"] = dict(run)
+            attempts = self._attempts(tid)
+            if attempts is not None:
+                usage["attempts"] = attempts
+            if key in changed or rec["usage"].get(key) != usage:
                 out[key] = {**view[key], "usage": usage}
         return out
 
