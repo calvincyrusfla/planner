@@ -49,13 +49,16 @@ import urllib.request
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 from foundry.ledger import Ledger
 from foundry.metrics_report import build_metrics
 from foundry.order_consistency import consistency_note
 # Board limits from schema/order.json: error texts, and each question, context or option of a help request.
 from foundry.order_schema import LIMIT_ERROR, LIMIT_HELP
+from foundry.stacking import (
+    PR_OPEN, PR_UNKNOWN, STACK_PREFIX, github_origin, pr_info, pr_phase, stack_note, stack_record,
+)
 from foundry.wakeup import Wakeup
 
 log = logging.getLogger("foundry.board_dispatch")
@@ -305,6 +308,8 @@ class BatchWatcher:
         sleep: async sleep used by the loop (tests).
         now: wall clock in epoch seconds (tests).
         wakeup: starts the next round early when notified; without one the loop only sleeps.
+        stack_lookup: answers ``pr_info`` for a parent PR's url (tests). Without one, PRs are
+            only looked up when the repo's ``origin`` is a hosted repo gh can ask about.
     """
 
     def __init__(
@@ -319,6 +324,7 @@ class BatchWatcher:
         sleep: Callable[[float], Any] | None = None,
         now: Callable[[], float] | None = None,
         wakeup: Wakeup | None = None,
+        stack_lookup: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
     ) -> None:
         import time
 
@@ -359,6 +365,11 @@ class BatchWatcher:
         self._ledger_blind: set[str] = set()
         #: The combined checker's status lines as read this round; None until something needs them.
         self._pr_lines: dict[str, Any] | None = None
+        self.stack_lookup = stack_lookup
+        #: Whether ``origin`` is hosted; None until git has answered.
+        self._origin_hosted: bool | None = None
+        #: (batch id, key) -> the last stacking decision logged: a waiting piece is judged every round.
+        self._stack_logged: dict[tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -698,6 +709,7 @@ class BatchWatcher:
             rec["failed"][key] = reason
             results[key] = {"state": "failed", "error": reason}
 
+        pr_infos: dict[str, dict[str, Any] | None] = {}  # parent PR url -> its lookup, for this round
         progress = can_submit
         while progress:
             progress = False
@@ -718,8 +730,12 @@ class BatchWatcher:
                 if any(st != "complete" for st in dep_states.values()):
                     results[key] = {"state": "queued"}  # waits for its dependencies
                     continue
+                may_submit, parent = await self._stack_parent(bid, key, deps, results, pr_infos)
+                if not may_submit:
+                    results[key] = {"state": "queued"}  # waits for its parents' PRs
+                    continue
                 try:
-                    tid = self._submit(batch, key, by_key[key])
+                    tid = self._submit(batch, key, by_key[key], parent)
                 except Exception as exc:
                     reason = f"could not be submitted: {exc}"[:LIMIT_ERROR]
                     log.warning("board dispatch: %s subtask %s %s", bid, key, reason)
@@ -811,6 +827,60 @@ class BatchWatcher:
             rec["closed"] = True
             log.info("board dispatch: %s finished", bid)
         self._save(bid, rec)
+
+    def _log_stack(self, bid: str, key: str, decision: str) -> None:
+        """Log a stacking decision at info, once until it changes."""
+        if self._stack_logged.get((bid, key)) != decision:
+            self._stack_logged[(bid, key)] = decision
+            log.info("board dispatch: %s subtask %s %s", bid, key, decision)
+
+    async def _origin_is_hosted(self) -> bool | None:
+        """True when gh can be asked about this repo's PRs; None (asked again later) when git could not tell."""
+        if self._origin_hosted is None:
+            self._origin_hosted = await github_origin(self.service.repo)
+        return self._origin_hosted
+
+    async def _stack_parent(self, bid: str, key: str, deps: list[str], results: Mapping[str, Mapping[str, Any]],
+                            infos: dict[str, dict[str, Any] | None]) -> tuple[bool, dict[str, Any] | None]:
+        """Whether a piece whose dependencies completed may be submitted, and the open PR it stacks on."""
+        parents = [results.get(d) or {} for d in deps]
+        urls = sorted({str(url) for r in parents if (url := (r.get("pr") or {}).get("url"))})
+        pending = self._auto_pr() and any(self._pr_pending(r) for r in parents)
+        if not urls and not pending:
+            return True, None
+        if self.stack_lookup is None:
+            hosted = await self._origin_is_hosted()
+            if hosted is False:
+                return True, None  # no origin gh can ask about: nothing to stack on
+            if hosted is None:
+                self._log_stack(bid, key, "waits: git could not read the origin remote")
+                return False, None
+        if pending:
+            # the branch to build on does not exist yet
+            self._log_stack(bid, key, "waits: a parent's pull request is still being opened")
+            return False, None
+        lookup = self.stack_lookup or pr_info
+        for url in urls:
+            if url not in infos:
+                infos[url] = await lookup(url)
+        phases = {url: pr_phase(infos[url]) for url in urls}
+        unknown = [url for url in urls if phases[url] == PR_UNKNOWN]
+        if unknown:
+            self._log_stack(bid, key, f"waits: the state of {', '.join(unknown)} is unknown")
+            return False, None
+        still_open = [url for url in urls if phases[url] == PR_OPEN]
+        if len(still_open) > 1:
+            self._log_stack(bid, key, f"waits: {len(still_open)} parent pull requests are still open")
+            return False, None
+        if not still_open:
+            self._log_stack(bid, key, "builds on the batch base: its parents' pull requests are closed")
+            return True, None
+        url = still_open[0]
+        info = infos[url] or {}
+        branch = str(info["headRefName"])
+        self._log_stack(bid, key, f"stacks on {url} (branch {branch})")
+        head = info.get("headRefOid")
+        return True, {"url": url, "branch": branch, "head": str(head) if head else None}
 
     async def _heartbeat_only(self, bid: str) -> None:
         """Keep the claim alive in a round that cannot see the batch's pieces: nothing else goes out."""
@@ -1131,7 +1201,9 @@ class BatchWatcher:
         found.sort(key=lambda rel: (rel.rpartition("/")[2] not in stems, rel))
         return found[: self._MAX_RELATED_TESTS]
 
-    def _submit(self, batch: Mapping[str, Any], key: str, sub: Mapping[str, Any]) -> str:
+    def _submit(self, batch: Mapping[str, Any], key: str, sub: Mapping[str, Any],
+                parent: Mapping[str, Any] | None = None) -> str:
+        """Send one subtask in as an order; ``parent`` (url, branch, head) is the open PR it stacks on."""
         from foundry.floor_manager import WorkOrder
         from foundry.git_publisher import valid_ref
         from foundry.serve import Service
@@ -1140,7 +1212,11 @@ class BatchWatcher:
             "title": sub.get("title"), "description": sub.get("description") or "",
             "files": list(sub.get("files") or []), "size": sub.get("size"),
         })
-        desc = order_text(fields["description"], fields["size"], batch.get("title"), batch.get("goal"),
+        description = fields["description"]
+        if parent is not None:
+            note = stack_note(parent["url"], parent["branch"])
+            description = f"{description}\n\n{note}" if description else note
+        desc = order_text(description, fields["size"], batch.get("title"), batch.get("goal"),
                           marker(str(batch["id"]), key, batch.get("createdAt")))
         acceptance = [str(a) for a in (sub.get("acceptance") or sub.get("acceptance_criteria") or []) if str(a).strip()]
         base = str(batch.get("base") or "").strip() or None  # else the publisher's (FOUNDRY_PR_BASE / repo default)
@@ -1151,12 +1227,20 @@ class BatchWatcher:
         read_files = list(dict.fromkeys(explicit + self._related_tests(fields["files"])))
         order = WorkOrder(title=fields["title"], description=desc, files=fields["files"],
                           read_files=read_files, acceptance_criteria=acceptance,
-                          repo_root=str(self.service.repo), pr_base=base)
+                          repo_root=str(self.service.repo),
+                          pr_base=parent["branch"] if parent is not None else base)
         manager = self.service.factory.manager
         accept = getattr(manager, "accept", None)
         if not callable(accept):
             raise RuntimeError("this Foundry cannot accept orders in the background")
         tid = str(accept(order))
+        if parent is not None:
+            try:
+                self.service.factory.queue.kv_set(f"{STACK_PREFIX}{tid}", stack_record(
+                    task_id=tid, batch=str(batch["id"]), key=key, parent_url=parent["url"],
+                    parent_branch=parent["branch"], parent_head=parent["head"], base=base))
+            except Exception as exc:  # the order is in: a failed record must not report it as not submitted
+                log.warning("board dispatch: could not record the stack of %s: %s", tid, exc)
         self._ledger_piece(batch, key, title=fields["title"], order_text=desc, files=fields["files"],
                            read_files=read_files, acceptance=acceptance, size=fields["size"],
                            foundry_task=tid, state="queued")
