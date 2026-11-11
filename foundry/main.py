@@ -559,6 +559,33 @@ def reviewer_claude_args(config: FoundryConfig) -> list[str]:
     return args
 
 
+def reviewer_light_args(config: FoundryConfig) -> list[str]:
+    """Reviewer flags without repo tools: no Read/Grep/Glob, no read prompt, 3 turns."""
+    args = reviewer_claude_args(config)
+    kept: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        value = args[i + 1] if i + 1 < len(args) else None
+        if arg == "--allowedTools":
+            i += 2
+            continue
+        if arg == "--append-system-prompt" and value == DEFAULT_REVIEWER_READ_PROMPT:
+            i += 2
+            continue
+        kept.append(arg)
+        i += 1
+    _set_flag(kept, "--max-turns", "3")
+    return kept
+
+
+def reviewer_strict_args(config: FoundryConfig) -> list[str]:
+    """The usual reviewer flags with the Opus model."""
+    args = reviewer_claude_args(config)
+    _set_flag(args, "--model", "opus")
+    return args
+
+
 #: Exit codes of ``--real``: done / failed or quarantined / still in progress (rerun to resume).
 EXIT_DONE, EXIT_FAILED, EXIT_IN_PROGRESS = 0, 1, 3
 
