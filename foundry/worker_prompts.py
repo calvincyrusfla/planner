@@ -286,6 +286,7 @@ def build_builder_prompt(
     order_description: str | None = None,
     contract: str = BUILDER_CONTRACT,
     pitfall_notes: Sequence[str] | None = None,
+    file_map: Sequence[str] | None = None,
 ) -> str:
     """Return the exact prompt a builder sends to Claude for ``assignment``.
 
@@ -330,6 +331,14 @@ def build_builder_prompt(
             "Found by a search of the repo's tests. Check each against the code; ignore any that do not apply.",
         ]
         parts += [f"- {note}" for note in pitfall_notes]
+    if file_map:
+        parts += [
+            "",
+            "## Where to look (advisory)",
+            "Functions and classes this piece likely needs, with line ranges in the base. "
+            "Read these first; your tools reach the rest.",
+        ]
+        parts += [f"- {entry}" for entry in file_map]
     if floor_manager_note and floor_manager_note.strip():
         parts += ["", "## Floor Manager note (follow it)", floor_manager_note.strip()]
     allowed = list(assignment.allowed_files)
