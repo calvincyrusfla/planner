@@ -415,7 +415,9 @@ def _set_flag(args: list[str], flag: str, value: str) -> None:
 LIBRARY_PROMPT = (
     "Look code up with the library tools (mcp__library__find, show, callers, tests_for, "
     "outline) by name or call number before opening whole files; show returns just that "
-    "function or class with line numbers."
+    "function or class with line numbers. For moves and deletions use the library tools "
+    "move_symbol, delete_symbol, move_file and delete_file instead of retyping code; then "
+    "fix the imports and callers they report."
 )
 _LIBRARY_CONFIG_PATH = Path(__file__).resolve().parent / "data" / "library_mcp.json"
 _library_config_written: Path | None = None
