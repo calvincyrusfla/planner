@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import re
@@ -45,6 +46,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from foundry.schemas import MAX_RETRIES, MAX_RETRIES_LIMIT, TaskSizingDirective, TaskState
 from foundry.sizing_outcomes import SIZES, actual_complexity
+
+log = logging.getLogger("foundry.orchestrator_queue")
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -503,6 +506,10 @@ class FoundryQueue:
         #: Re-entrant lock guarding :attr:`conn`; other modules sharing the
         #: connection (telemetry) must hold it while they use ``conn``.
         self.lock: threading.RLock = threading.RLock()
+        #: Called as ``on_event(kind, task_id)`` for each event, after its transaction commits.
+        self.on_event: Callable[[str, str | None], None] | None = None
+        #: Events of the open :meth:`transaction`; None outside one.
+        self._tx_events: list[tuple[str, str | None]] | None = None
         #: The shared connection (autocommit mode; use :meth:`transaction`).
         self.conn: sqlite3.Connection = sqlite3.connect(
             self.path,
@@ -558,20 +565,37 @@ class FoundryQueue:
         """Run a block atomically: ``BEGIN IMMEDIATE`` ... ``COMMIT``.
 
         Holds :attr:`lock`. Nested use is safe: an inner ``transaction`` simply
-        joins the outer one.
+        joins the outer one. After the outermost ``COMMIT``, :attr:`on_event` is
+        called once per event recorded inside; a rollback calls it for none.
         """
         with self.lock:
             if self.conn.in_transaction:
                 yield self.conn
                 return
             self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            committed: list[tuple[str, str | None]] = []
+            self._tx_events = committed
             try:
                 yield self.conn
             except BaseException:
+                self._tx_events = None
                 self.conn.execute("ROLLBACK")
                 raise
             else:
+                self._tx_events = None
                 self.conn.execute("COMMIT")
+        self._emit_events(committed)
+
+    def _emit_events(self, events: list[tuple[str, str | None]]) -> None:
+        """Tell :attr:`on_event` about committed events; its failures stay here."""
+        callback = self.on_event
+        if callback is None:
+            return
+        for kind, task_id in events:
+            try:
+                callback(kind, task_id)
+            except Exception:
+                log.debug("queue: on_event failed for %s", kind, exc_info=True)
 
     def close(self) -> None:
         """Close the connection (idempotent)."""
@@ -1997,6 +2021,8 @@ class FoundryQueue:
             "INSERT INTO events (ts, kind, task_id, payload) VALUES (?,?,?,?)",
             (self.now(), kind, task_id, _dump(payload)),
         )
+        if self._tx_events is not None:
+            self._tx_events.append((kind, task_id))
         return int(cur.lastrowid or 0)
 
     def _require_task(self, conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
