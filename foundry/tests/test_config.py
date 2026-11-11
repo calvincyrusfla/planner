@@ -42,6 +42,10 @@ def test_defaults() -> None:
     assert cfg.reviewer_max_turns == 20
     assert cfg.builder_mode == "diff"
     assert cfg.builder_edit_max_turns == 60
+    assert cfg.builder_session_turns == 25
+    assert cfg.builder_sessions == 3
+    assert cfg.builder_library is False
+    assert cfg.strict_mcp is True
 
 
 def test_from_env_empty_matches_defaults() -> None:

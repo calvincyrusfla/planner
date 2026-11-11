@@ -412,7 +412,69 @@ def _set_flag(args: list[str], flag: str, value: str) -> None:
     args[positions[0] + 1:positions[0] + 2] = [value]
 
 
+LIBRARY_PROMPT = (
+    "Look code up with the library tools (mcp__library__find, show, callers, tests_for, "
+    "outline) by name or call number before opening whole files; show returns just that "
+    "function or class with line numbers."
+)
+_LIBRARY_CONFIG_PATH = Path(__file__).resolve().parent / "data" / "library_mcp.json"
+_library_config_written: Path | None = None
+
+
+def _library_config_file() -> Path:
+    """Write the library server config once per process and return its path."""
+    global _library_config_written
+    path = _LIBRARY_CONFIG_PATH
+    if _library_config_written != path or not path.exists():
+        config = {
+            "mcpServers": {
+                "library": {
+                    "command": sys.executable,
+                    "args": ["-m", "foundry.library_mcp"],
+                    "env": {"PYTHONPATH": str(Path(__file__).resolve().parent.parent)},
+                }
+            }
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        _library_config_written = path
+    return path
+
+
+def _apply_strict_mcp(args: list[str], strict: bool) -> None:
+    """Keep exactly one ``--strict-mcp-config`` when ``strict``, none otherwise (in place)."""
+    if not strict:
+        args[:] = [a for a in args if a != "--strict-mcp-config"]
+    elif "--strict-mcp-config" not in args:
+        args.append("--strict-mcp-config")
+
+
 def builder_claude_args(config: FoundryConfig) -> list[str]:
+    """Extra ``claude -p`` flags for builder calls (see :func:`_builder_mode_args`).
+
+    On top of those: with ``config.builder_library`` on and tools for the builder
+    (edit mode, or ``builder_tools`` ``read``) the library server is passed with
+    ``--mcp-config``, ``mcp__library`` is allowed and the prompt names its tools;
+    ``config.strict_mcp`` decides whether ``--strict-mcp-config`` is present.
+    """
+    args = _builder_mode_args(config)
+    edit = getattr(config, "builder_mode", "diff") == "edit"
+    has_tools = edit or getattr(config, "builder_tools", "off") == "read"
+    if getattr(config, "builder_library", False) and has_tools:
+        args.extend(["--mcp-config", str(_library_config_file())])
+        for i in range(len(args) - 2, -1, -1):
+            if args[i] == "--allowedTools":
+                args[i + 1] += " mcp__library"
+                break
+        for i in range(len(args) - 2, -1, -1):
+            if args[i] == "--append-system-prompt":
+                args[i + 1] += " " + LIBRARY_PROMPT
+                break
+    _apply_strict_mcp(args, getattr(config, "strict_mcp", True))
+    return args
+
+
+def _builder_mode_args(config: FoundryConfig) -> list[str]:
     """Extra ``claude -p`` flags for builder calls.
 
     With ``config.builder_mode`` ``edit`` (this wins over ``builder_tools``) builders
@@ -447,7 +509,9 @@ def builder_claude_args(config: FoundryConfig) -> list[str]:
         for i, arg in enumerate(args[:-1]):
             if arg == "--disallowedTools":
                 args[i + 1] = " ".join(t for t in args[i + 1].split() if t not in unblocked)
-        _set_flag(args, "--max-turns", str(config.builder_edit_max_turns))
+        sessions = int(getattr(config, "builder_sessions", 1))
+        turns = config.builder_session_turns if sessions > 1 else config.builder_edit_max_turns
+        _set_flag(args, "--max-turns", str(turns))
         _set_flag(args, "--permission-mode", "acceptEdits")
         args.extend(["--allowedTools", allowed])
         _set_flag(args, "--append-system-prompt", prompt)
@@ -485,11 +549,11 @@ def reviewer_claude_args(config: FoundryConfig) -> list[str]:
     model = getattr(config, "reviewer_model", None)
     if model:
         _set_flag(args, "--model", str(model))
-    if getattr(config, "reviewer_tools", "off") != "read":
-        return args
-    _set_flag(args, "--max-turns", str(config.reviewer_max_turns))
-    args.extend(["--allowedTools", "Read Grep Glob"])
-    _set_flag(args, "--append-system-prompt", DEFAULT_REVIEWER_READ_PROMPT)
+    if getattr(config, "reviewer_tools", "off") == "read":
+        _set_flag(args, "--max-turns", str(config.reviewer_max_turns))
+        args.extend(["--allowedTools", "Read Grep Glob"])
+        _set_flag(args, "--append-system-prompt", DEFAULT_REVIEWER_READ_PROMPT)
+    _apply_strict_mcp(args, getattr(config, "strict_mcp", True))
     return args
 
 

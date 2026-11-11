@@ -18,7 +18,9 @@ import contextlib
 import io
 import json
 import logging
+import os
 import sys
+import tempfile
 from typing import Any, Protocol, TextIO
 
 log = logging.getLogger(__name__)
@@ -328,21 +330,38 @@ def _use_utf8(stream: TextIO) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Open the library at ``--db`` and serve it over stdio."""
     parser = argparse.ArgumentParser(description="Serve the code library over MCP on stdio.")
-    parser.add_argument("--db", required=True, help="path of the code library database")
+    parser.add_argument("--db", default=None, help="path of the code library database")
+    parser.add_argument(
+        "--repo", default=None, help="repo to catalogue when --db is not given (default: cwd)"
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     _use_utf8(sys.stdin)
     _use_utf8(sys.stdout)
+    tmp_dir: tempfile.TemporaryDirectory[str] | None = None
     try:
-        from foundry.code_library import open_library
+        from foundry.code_library import build_library, open_library
 
-        backend = open_library(args.db)
+        db_path = args.db
+        if db_path is None:
+            repo = os.path.abspath(args.repo or os.getcwd())
+            tmp_dir = tempfile.TemporaryDirectory(prefix="foundry-library-")
+            db_path = os.path.join(tmp_dir.name, "library.db")
+            info = build_library(repo, db_path)
+            log.info("catalogued %s: %s entries", repo, info["entries"])
+        backend = open_library(db_path)
     except Exception:
-        log.exception("could not open the code library at %s", args.db)
+        log.exception("could not open the code library")
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
         return 1
-    serve(backend, sys.stdin, sys.stdout)
+    try:
+        serve(backend, sys.stdin, sys.stdout)
+    finally:
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
     return 0
 
 
