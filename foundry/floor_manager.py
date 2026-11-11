@@ -205,13 +205,8 @@ class FloorManager(ForemanActionsMixin):
         self.pr_draft = bool(pr_draft)
         #: task id -> ``{state: pending|opened|failed|skipped, url, branch, error, stage, attempts}``
         self.pr_states: dict[str, dict[str, Any]] = {}
-        #: task id -> its draft PR of approved parts: ``{state: opened|failed, url, branch, error, stage, partial}``
-        #: (apart from ``pr_states``, so the normal PR logic and the snapshot pins never see it)
-        self.partial_prs: dict[str, dict[str, Any]] = {}
         #: task id -> its background publish task
         self._pr_tasks: dict[str, asyncio.Task[Any]] = {}
-        #: task id -> its background draft PR of approved parts (never holds up the normal PR)
-        self._partial_tasks: dict[str, asyncio.Task[Any]] = {}
         self.finish_timeout = float(finish_timeout)
         self.foreman = foreman
         self.teams = dict(teams)
@@ -306,7 +301,6 @@ class FloorManager(ForemanActionsMixin):
             "patch_names": dict(self.patch_names),
             "sizing_meta": {t: dict(m) for t, m in self.sizing_meta.items()},
             "pr_states": {t: dict(v) for t, v in self.pr_states.items()},
-            "partial_prs": {t: dict(v) for t, v in self.partial_prs.items()},
             "task_bases": {t: dict(v) for t, v in self.task_bases.items()},
         }
         try:
@@ -316,7 +310,6 @@ class FloorManager(ForemanActionsMixin):
 
     def _load(self) -> None:
         state = self._kv_get() or {}
-        self.partial_prs = {t: dict(v) for t, v in (state.get("partial_prs") or {}).items()}
         try:
             self.orders = {t: WorkOrder.model_validate(o) for t, o in (state.get("orders") or {}).items()}
             self.directives = {
@@ -1018,27 +1011,12 @@ class FloorManager(ForemanActionsMixin):
         return [parts[k] for k in keys if parts[k]]
 
     def _approved_diff(self, task_id: str) -> str:
-        """Concatenated approved diffs in build order (the stacked patch is made in :meth:`_combined_diff`)."""
+        """The task's approved diff, as rebuilt from the diffs kept for it."""
         return "".join(_with_newline(d) for d in self._ordered_diffs(task_id)) or self._task_diff(task_id)
-
-    async def _combined_diff(self, task_id: str) -> str:
-        """The task's combined patch on its base: the stacked approved diffs folded into one diff.
-
-        Each later diff is relative to the earlier ones, so they are applied in
-        build order in a scratch copy and the final ``git diff`` is taken
-        (:func:`stack_diffs`). When that is not possible (no git, a diff that
-        does not apply) the diffs are concatenated as before; ``_write_patch``
-        then still checks the result on the base.
-        """
-        diffs = self._ordered_diffs(task_id)
-        if len(diffs) < 2:
-            return self._approved_diff(task_id)
-        stacked = await self._leased_root(task_id, stack_diffs, diffs)
-        return stacked if stacked is not None else self._approved_diff(task_id)
 
     async def _finish(self, task_id: str, diff: str | None) -> dict[str, str]:
         if diff is None:
-            diff = await self._combined_diff(task_id)
+            diff = self._approved_diff(task_id)
         known = self.pr_summaries.get(task_id)
         if known is not None:
             # repair: the summary (and the board's review/done) are already recorded
@@ -1126,11 +1104,8 @@ class FloorManager(ForemanActionsMixin):
         """Record the task's PR as ``pending`` (or ``skipped``); True when a publish should start.
 
         Never queues a task whose PR was already opened, failed, skipped or is in flight.
-        A draft PR of the approved parts of a quarantined task (``partial``) does not count:
-        the task's normal PR still opens when it completes.
         """
-        st = self.pr_states.get(task_id)
-        if not self.auto_pr or self.publisher is None or (st is not None and not st.get("partial")):
+        if not self.auto_pr or self.publisher is None or task_id in self.pr_states:
             return False
         if self._pr_patch(task_id) is None:
             why = "the combined patch does not apply" if task_id in self.rejected_patches else "no patch to publish"
@@ -1154,110 +1129,6 @@ class FloorManager(ForemanActionsMixin):
             # once the PR is settled the task's snapshot (and pin) are no longer needed
             t.add_done_callback(lambda _t: self._prune_later())
         return t
-
-    def _start_partial(self, task_id: str, reason: str) -> asyncio.Task[Any] | None:
-        """Start the background draft PR of a quarantined task's approved parts, when one is due."""
-        try:
-            if not self.auto_pr or self.publisher is None or not _partial_pr_enabled():
-                return None
-            if task_id in self.partial_prs or task_id in self.pr_states or not self._ordered_diffs(task_id):
-                return None
-            running = self._partial_tasks.get(task_id)
-            if running is not None and not running.done():
-                return running
-            t = asyncio.get_running_loop().create_task(self._publish_partial(task_id, reason))
-        except Exception as exc:  # a quarantine must go through whatever happens here
-            log.warning("floor manager: could not start the partial PR of %s: %s", task_id, exc)
-            return None
-        self._partial_tasks[task_id] = t
-        self._pending.add(t)  # drain() (shutdown) waits for it
-        t.add_done_callback(self._pending.discard)
-        return t
-
-    async def _publish_partial(self, task_id: str, reason: str) -> dict[str, Any] | None:
-        """Open a draft PR with the approved parts of a quarantined task. Never raises."""
-        if task_id in self.partial_prs:
-            return None
-        try:
-            result = await self._send_partial(task_id, reason)
-        except Exception as exc:  # publishing must never take the line down
-            log.exception("floor manager: partial PR of %s failed", task_id)
-            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500], "stage": "error"}
-        try:
-            return self._record_partial(task_id, result)
-        except Exception:
-            log.exception("floor manager: could not record the partial PR of %s", task_id)
-            return None
-
-    async def _send_partial(self, task_id: str, reason: str) -> Any:
-        """Write the approved work to ``<task>.partial.patch`` and hand it to the publisher."""
-        pin = dict(self.task_bases.get(task_id) or {})
-        diff = await self._combined_diff(task_id)
-        text = _with_newline(diff) if diff else ""
-        if self.patches_dir is None or not text.strip():
-            return {"ok": False, "error": "no patch to publish", "stage": "no_patch"}
-        self.patches_dir.mkdir(parents=True, exist_ok=True)
-        patch = self.patches_dir / f"{task_id}.partial.patch"
-        patch.write_text(text, encoding="utf-8", newline="\n")
-        order = self.orders.get(task_id)
-        title = "[partial] " + (order.title if order else task_id)
-        req = {"title": title, "body": self._partial_body(task_id, reason), "draft": True}
-        publish = self.publisher.publish
-        params = _params(publish)
-        kwargs: dict[str, Any] = {}
-        if "draft" in params:
-            kwargs["draft"] = True
-        base = (getattr(order, "pr_base", None) if order else None) or pin.get("base") or None
-        if base and "base" in params:
-            kwargs["base"] = base
-        if pin.get("sha") and "base_sha" in params:
-            kwargs["base_sha"] = pin["sha"]
-        return await _maybe_await(publish(task_id, title, patch, req, **kwargs))
-
-    def _partial_body(self, task_id: str, reason: str) -> str:
-        """The draft PR's body: which parts were approved, which were not and why."""
-        approved = {k for k, v in self._approved_parts(task_id).items() if v}
-        titles: dict[str, str] = {}
-        fn = getattr(self.queue, "tickets_in_order", None)
-        if callable(fn):
-            try:
-                titles = {str(_get(t, "subtask_id")): str(_get(t, "title") or "") for t in fn(task_id)}
-            except Exception as exc:  # pragma: no cover - the ids of the diffs are still listed
-                log.debug("tickets_in_order(%s) failed: %s", task_id, exc)
-
-        def line(subtask_id: str) -> str:
-            name = titles.get(subtask_id)
-            return f"- {subtask_id}: {name}" if name else f"- {subtask_id}"
-
-        good = [s for s in titles if s in approved] + sorted(approved - set(titles), key=_subtask_order)
-        bad = [s for s in titles if s not in approved]
-        lines = ["This draft holds only the approved parts of a task that was quarantined.", "", "Approved parts:"]
-        lines += [line(s) for s in good]
-        if bad:
-            lines += ["", "Failed or unfinished parts (not included):"] + [line(s) for s in bad]
-        lines += ["", f"Quarantine reason: {reason}", "", "---",
-                  f"Opened by Foundry (task {task_id}, partial: the task was quarantined)"]
-        return "\n".join(lines)
-
-    def _record_partial(self, task_id: str, result: Any) -> dict[str, Any]:
-        """Save the draft PR's outcome in ``partial_prs`` and note it on the board."""
-        ok = bool(_get(result, "ok"))
-        url = _get(result, "pr_url")
-        branch = _get(result, "branch")
-        rec: dict[str, Any] = {"state": "opened" if ok else "failed", "url": url, "branch": branch,
-                               "error": None, "stage": None, "partial": True}
-        if not ok:
-            rec["error"] = str(_get(result, "error") or "publishing failed")[:500]
-            rec["stage"] = _get(result, "stage")
-            log.warning("floor manager: %s partial PR not opened (%s): %s", task_id, rec["stage"], rec["error"])
-        self.partial_prs[task_id] = rec
-        self.save()
-        if ok:
-            d = self.directives.get(task_id)
-            self.bridge.progress(task_id, f"[Foundry] partial PR (draft): {url or branch}",
-                                 team_id=d.team_id if d else None)
-            log.info("floor manager: %s partial PR opened: %s", task_id, url or branch)
-        return rec
 
     def pr_request(self, task_id: str) -> dict[str, Any]:
         """``{title, body, draft}`` for the task's PR, from the Foreman's draft."""
@@ -1327,9 +1198,7 @@ class FloorManager(ForemanActionsMixin):
 
     async def _publish(self, task_id: str) -> dict[str, Any]:
         st = dict(self.pr_states.get(task_id) or {})
-        if st.get("partial"):  # the draft of the approved parts is not this task's PR
-            st = {}
-        attempts = int(st.get("attempts") or 0) + 1
+        attempts =int(st.get("attempts") or 0) + 1
         # branch + commit known (only the PR step failed), or a pending one whose
         # on_pushed was saved before a restart: it is on the remote -> open_pr only
         pushed = bool(st.get("branch") and (st.get("commit") or st.get("state") == "pending")) and callable(
@@ -1605,14 +1474,6 @@ def _finish_timeout(config: Any, explicit: float | None) -> float:
         return DEFAULT_FINISH_TIMEOUT_S
 
 
-_PARTIAL_PR_OFF = {"0", "false", "no", "off"}
-
-
-def _partial_pr_enabled() -> bool:
-    """False when FOUNDRY_PARTIAL_PR is 0/false/no/off (default: on)."""
-    return os.environ.get("FOUNDRY_PARTIAL_PR", "").strip().lower() not in _PARTIAL_PR_OFF
-
-
 def _params(fn: Any) -> set[str]:
     try:
         return set(inspect.signature(fn).parameters)
@@ -1701,92 +1562,6 @@ def _git_check(patch: str, repo_root: Path | None) -> str | None:
         return None
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("floor manager: patch check skipped: %s", exc)
-        return None
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-_DIFF_PATH_RE = re.compile(r"^(?:diff --git a/(\S+) b/(\S+)|--- a/(\S+)|\+\+\+ b/(\S+)|rename from (\S+)|rename to (\S+)|copy from (\S+)|copy to (\S+))\s*$")
-
-
-def diff_paths(diff: str) -> list[str]:
-    """Repo-relative paths a unified/git diff touches (old and new names), in first-seen order."""
-    out: list[str] = []
-    for line in diff.splitlines():
-        m = _DIFF_PATH_RE.match(line.rstrip("\r"))
-        if not m:
-            continue
-        for p in m.groups():
-            if p and p != "/dev/null" and p not in out:
-                out.append(p.strip('"'))
-    return out
-
-
-def stack_diffs(diffs: list[str], repo_root: Path | None) -> str | None:
-    """Fold stacked diffs (each relative to the ones before it) into one diff against the base.
-
-    Only the touched files are copied from ``repo_root`` into a scratch git
-    repository; each diff is ``git apply``-ed in order and the final tree is
-    diffed against the base tree. When the diffs touch pairwise disjoint
-    files and all apply, their concatenation is returned unchanged (it is
-    equivalent). None when git is missing or a diff does not apply in order.
-    """
-    texts = [_with_newline(d) for d in diffs if d and d.strip()]
-    if not texts:
-        return ""
-    git = shutil.which("git")
-    if git is None:
-        return None
-    paths_per = [diff_paths(d) for d in texts]
-    every: list[str] = []
-    for ps in paths_per:
-        every += [p for p in ps if p not in every]
-    tmp = Path(tempfile.mkdtemp(prefix="foundry-stack-"))
-    cfg = ["-c", "core.autocrlf=false", "-c", "core.eol=lf", "-c", "core.safecrlf=false", "-c", "core.quotepath=false",
-           "-c", "user.name=foundry", "-c", "user.email=foundry@localhost", "-c", "commit.gpgsign=false"]
-
-    def run(*args: str) -> subprocess.CompletedProcess[str]:
-        # bytes, decoded without newline translation: CRLF files keep their \r on Windows
-        proc = subprocess.run([git, *cfg, *args], cwd=str(ws), capture_output=True, timeout=120)
-        return subprocess.CompletedProcess(proc.args, proc.returncode,
-                                           proc.stdout.decode("utf-8", "replace"),
-                                           proc.stderr.decode("utf-8", "replace"))
-
-    try:
-        ws = tmp / "ws"
-        ws.mkdir()
-        base = (repo_root.resolve() if repo_root is not None and repo_root.is_dir() else None)
-        for rel in every:
-            src = (base / rel) if base is not None else None
-            if src is None or not src.is_file():
-                continue
-            try:
-                src.resolve().relative_to(base)  # type: ignore[arg-type]
-            except ValueError:
-                return None  # a path leaving the repo: never copy it
-            dst = ws / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
-        if run("init", "-q").returncode != 0:
-            return None
-        run("add", "-A", "-f")
-        base_tree = run("write-tree").stdout.strip()
-        for i, text in enumerate(texts):
-            patch = tmp / f"{i}.patch"
-            patch.write_text(text, encoding="utf-8", newline="\n")
-            if run("apply", "--whitespace=nowarn", str(patch)).returncode != 0:
-                return None
-        disjoint = sum(len(p) for p in paths_per) == len(every)
-        if disjoint:
-            return "".join(texts)
-        run("add", "-A", "-f")
-        final_tree = run("write-tree").stdout.strip()
-        if not base_tree or not final_tree:
-            return None
-        proc = run("diff", "--binary", "--no-color", "--no-ext-diff", base_tree, final_tree)
-        return proc.stdout if proc.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("floor manager: could not stack the approved diffs: %s", exc)
         return None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
