@@ -43,6 +43,16 @@ export function inboxItems(state, now = Date.now()) {
       });
     }
   }
+  const updateSince = now - 86400000;
+  for (const u of arr(state && state.foundryUpdates)) {
+    if (!u || typeof u.id !== 'string' || (u.status !== 'refused' && u.status !== 'failed')) continue;
+    const at = u.finishedAt || u.createdAt || '';
+    if (ms(at) < updateSince) continue;
+    items.push({
+      kind: 'update', id: u.id, updateId: u.id, repo: String(u.repo || ''), status: u.status,
+      message: String((u.result && u.result.message) || ''), finishedAt: u.finishedAt || '', at,
+    });
+  }
   return items.sort((a, b) => ms(b.at) - ms(a.at) || String(b.id).localeCompare(String(a.id)));
 }
 

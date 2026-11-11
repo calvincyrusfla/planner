@@ -35,6 +35,22 @@ test('inboxItems picks help, recent failures and open batches, newest first', ()
   assert.equal(inboxCount(state(), NOW), 3);
 });
 
+test('inboxItems lists refused and failed updates of the last 24 hours', () => {
+  const upd = (id, status, finishedAt, message = 'no') => ({ id, repo: 'o/r', status, finishedAt, result: { message } });
+  const items = inboxItems({
+    foundryUpdates: [
+      upd('U-001', 'refused', '2026-11-10T11:00:00Z', 'dirty tree'),
+      upd('U-002', 'failed', '2026-11-10T10:00:00Z'),
+      upd('U-003', 'refused', '2026-11-09T11:00:00Z'),
+      upd('U-004', 'done', '2026-11-10T11:30:00Z'),
+      upd('U-005', 'cancelled', '2026-11-10T11:30:00Z'),
+    ],
+  }, NOW);
+  assert.deepEqual(items.map((i) => `${i.kind}:${i.id}:${i.status}`), ['update:U-001:refused', 'update:U-002:failed']);
+  assert.equal(items[0].message, 'dirty tree');
+  assert.equal(items[0].finishedAt, '2026-11-10T11:00:00Z');
+});
+
 test('inboxItems tolerates a missing or junk state', () => {
   assert.deepEqual(inboxItems({}, NOW), []);
   assert.deepEqual(inboxItems(null, NOW), []);

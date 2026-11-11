@@ -1193,6 +1193,13 @@ function inboxItems(st, now = Date.now()) {
     }
     if (open) items.push({ kind: 'batch', id: b.id, batchId: b.id, title: String(b.title || b.id), at: b.updatedAt || b.createdAt || '', status: b.status, prs, prCount: prs.length });
   }
+  for (const u of arr(st && st.foundryUpdates)) {
+    if (!u || typeof u.id !== 'string' || (u.status !== 'refused' && u.status !== 'failed')) continue;
+    const at = u.finishedAt || u.createdAt || '';
+    if (ms(at) < now - 86400000) continue;
+    items.push({ kind: 'update', id: u.id, updateId: u.id, repo: String(u.repo || ''), status: u.status,
+      message: String((u.result && u.result.message) || ''), finishedAt: u.finishedAt || '', at });
+  }
   return items.sort((a, b) => ms(b.at) - ms(a.at) || String(b.id).localeCompare(String(a.id)));
 }
 function answerOperation(item, answer, by = 'user') {
@@ -1210,6 +1217,12 @@ function ibEl(tag, cls, text) {
 function inboxCard(it) {
   const card = ibEl('div', `card ib-item ${it.kind}`);
   const when = fmtAgoShort(it.at);
+  if (it.kind === 'update') {
+    card.append(ibEl('div', 'ib-kind', `Update ${it.status} · ${it.id}${when ? ` · ${when}` : ''}`));
+    card.append(ibEl('div', 'ib-title', it.repo));
+    card.append(ibEl('div', 'ib-text ib-err', it.message || '(no message)'));
+    return card;
+  }
   card.append(ibEl('div', 'ib-kind', `${it.kind === 'help' ? 'Needs help' : it.kind === 'failed' ? it.state : 'Open batch'} · ${it.batchId}${when ? ` · ${when}` : ''}`));
   card.append(ibEl('div', 'ib-title', it.title));
   if (it.kind === 'help') {
