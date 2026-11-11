@@ -126,6 +126,133 @@ def test_js_entries(lib: Library) -> None:
     assert (out["tools.mjs::make"]["start"], out["tools.mjs::make"]["end"]) == (7, 9)
     assert out["tools.mjs::Box"]["kind"] == "class"
     assert out["tools.mjs::Box"]["end"] == 15
+    assert out["tools.mjs::ENV"]["kind"] == "constant"
+    assert out["tools.mjs::make"]["kind"] == "function"
+
+
+CONSTANTS_PY = f'''from typing import Final
+
+LIMIT_ERROR = "too many"
+DEFAULT_BATCH_POLL_S: Final[float] = 2.5
+_PRIVATE_LIMIT = 3
+BIG_TABLE = {{
+    "a": 1,
+}}
+V2 = 2
+LONG_LINE = "{"x" * 200}"
+lowercase_var = 1
+Mixed_Case = 2
+FIRST, SECOND = 1, 2
+LEFT = RIGHT = 0
+_ = 5
+obj.ATTR = 1
+
+
+def use():
+    INNER_LIMIT = 1
+    return LIMIT_ERROR
+'''
+
+CONSTANTS_JS = """export const ENV_NAME = 'x';
+const MAX_ITEMS = 10;
+export const TYPED_LIMIT: number = 5;
+const TABLE = {
+  a: '(',
+};
+const LONG_TEXT =
+  'value';
+let after = make();
+export const FAST = () => 1;
+const SLOW = async (a, b) => {
+  const INNER_LIMIT = 1;
+  return a;
+};
+export const TYPED_FN: Handler = (a) => a;
+export const WRAPPED = (
+  a,
+) => a;
+export const NESTED = (a = pick(1)) => a;
+export const OLD_STYLE = function () {};
+export const lower_value = 1;
+const other = 2;
+"""
+
+CONSTANTS_TEST = """from consts import LIMIT_ERROR
+
+
+def test_limit():
+    assert LIMIT_ERROR
+"""
+
+
+@pytest.fixture()
+def constants(tmp_path: Path) -> Library:
+    root = tmp_path / "constants"
+    (root / "tests").mkdir(parents=True)
+    (root / "consts.py").write_text(CONSTANTS_PY, encoding="utf-8")
+    (root / "consts.ts").write_text(CONSTANTS_JS, encoding="utf-8")
+    (root / "tests" / "test_consts.py").write_text(CONSTANTS_TEST, encoding="utf-8")
+    db = tmp_path / "constants.sqlite"
+    build_library(root, db)
+    return open_library(db)
+
+
+def test_python_constants(constants: Library) -> None:
+    out = {e["call"]: e for e in constants.outline("consts.py") if e["kind"] == "constant"}
+    assert list(out) == [
+        "consts.py::LIMIT_ERROR",
+        "consts.py::DEFAULT_BATCH_POLL_S",
+        "consts.py::_PRIVATE_LIMIT",
+        "consts.py::BIG_TABLE",
+        "consts.py::V2",
+        "consts.py::LONG_LINE",
+    ]
+    assert out["consts.py::LIMIT_ERROR"]["signature"] == 'LIMIT_ERROR = "too many"'
+    assert out["consts.py::DEFAULT_BATCH_POLL_S"]["signature"] == "DEFAULT_BATCH_POLL_S: Final[float] = 2.5"
+    table = out["consts.py::BIG_TABLE"]
+    assert (table["start"], table["end"]) == (6, 8)
+    assert table["signature"] == "BIG_TABLE = {"
+    assert len(out["consts.py::LONG_LINE"]["signature"]) == 160
+
+
+def test_python_non_constants_ignored(constants: Library) -> None:
+    names = {e["call"].split("::")[1] for e in constants.outline("consts.py")}
+    assert names == {"LIMIT_ERROR", "DEFAULT_BATCH_POLL_S", "_PRIVATE_LIMIT", "BIG_TABLE", "V2", "LONG_LINE", "use"}
+
+
+def test_js_constants(constants: Library) -> None:
+    out = {e["call"].split("::")[1]: e for e in constants.outline("consts.ts")}
+    assert {n for n, e in out.items() if e["kind"] == "constant"} == {
+        "ENV_NAME",
+        "MAX_ITEMS",
+        "TYPED_LIMIT",
+        "TABLE",
+        "LONG_TEXT",
+    }
+    assert out["ENV_NAME"]["signature"] == "export const ENV_NAME = 'x';"
+    assert (out["MAX_ITEMS"]["start"], out["MAX_ITEMS"]["end"]) == (2, 2)
+    assert (out["TABLE"]["start"], out["TABLE"]["end"]) == (4, 6)
+    assert (out["LONG_TEXT"]["start"], out["LONG_TEXT"]["end"]) == (7, 8)
+
+
+def test_js_callable_values_stay_functions(constants: Library) -> None:
+    out = {e["call"].split("::")[1]: e for e in constants.outline("consts.ts")}
+    for name in ("FAST", "SLOW", "TYPED_FN", "WRAPPED", "NESTED", "OLD_STYLE", "lower_value"):
+        assert out[name]["kind"] == "function", name
+    assert "INNER_LIMIT" not in out
+    assert "other" not in out
+
+
+def test_find_show_and_tests_for_constant(constants: Library) -> None:
+    found = constants.find("LIMIT_ERROR")
+    assert [e["call"] for e in found] == ["consts.py::LIMIT_ERROR"]
+    assert found[0]["kind"] == "constant"
+    assert constants.show("consts.py::LIMIT_ERROR") == '3| LIMIT_ERROR = "too many"'
+    assert constants.show("consts.py::BIG_TABLE") == '6| BIG_TABLE = {\n7|     "a": 1,\n8| }'
+    assert constants.show("consts.ts::TABLE") == "4| const TABLE = {\n5|   a: '(',\n6| };"
+    hits = constants.tests_for("consts.py::LIMIT_ERROR")
+    assert [(h["path"], h["line"]) for h in hits] == [("tests/test_consts.py", 1), ("tests/test_consts.py", 5)]
+    assert constants.callers("consts.py::LIMIT_ERROR") == []
 
 
 def test_find_ordering(lib: Library) -> None:
