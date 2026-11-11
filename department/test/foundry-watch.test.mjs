@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { watchEvents } from '../lib/foundry-watch.mjs';
+import { watchEvents, updateEvents } from '../lib/foundry-watch.mjs';
 
 const NOW = Date.parse('2026-11-08T12:00:00.000Z');
 const PR_URL = 'https://github.com/owner/name/pull/7';
@@ -19,6 +19,20 @@ const result = (state, extra = {}) => ({ foundryTask: 'F-012', state, pr: null, 
 function batch(status, results = {}, extra = {}) {
   return { id: 'S-001', status, heartbeatAt: minutesAgo(1), subtasks: [{ key: 'a', title: 'Build it' }], results, ...extra };
 }
+
+test('updateEvents reports a new refusal or failure once, never done/cancelled', () => {
+  const u = (id, status, message = '') => ({ id, repo: 'o/r', status, result: message ? { message } : null });
+  const long = 'x'.repeat(300);
+  const events = updateEvents(
+    [u('U-001', 'queued'), u('U-002', 'refused', 'old'), u('U-003', 'claimed')],
+    [u('U-001', 'refused', 'dirty tree'), u('U-002', 'refused', 'old'), u('U-003', 'failed', long), u('U-004', 'done'), u('U-005', 'cancelled')],
+  );
+  assert.deepEqual(kinds(events), ['UPDATE', 'UPDATE']);
+  assert.equal(events[0].line, 'UPDATE U-001 refused: dirty tree');
+  assert.equal(events[0].update, 'U-001');
+  assert.equal(events[1].line, `UPDATE U-003 failed: ${'x'.repeat(200)}`);
+  assert.deepEqual(updateEvents(undefined, undefined), []);
+});
 
 // Events for one subtask going from one result to another in a running batch.
 const change = (from, to) => watchEvents([batch('running', { a: from })], [batch('running', { a: to })], NOW);

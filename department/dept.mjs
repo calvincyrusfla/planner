@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { load, save, DATA_FILE } from './lib/store.mjs';
 import { applyOp } from './lib/ops.mjs';
 import { metricLines } from './lib/foundry-metrics.mjs';
-import { watchEvents } from './lib/foundry-watch.mjs';
+import { watchEvents, updateEvents } from './lib/foundry-watch.mjs';
 import { hubConfig, saveHubConfig, clearHubConfig, hubGet, hubOp, HUB_FILE } from './lib/hub.mjs';
 import { LIMITS as BATCH_LIMITS, oversizedOrders, oversizedOrderMessage } from './lib/foundry-batches.mjs';
 import { checkOrder } from './lib/order-check.mjs';
@@ -96,7 +96,7 @@ const HELP = `Agent Department CLI
                                                        totals and per-task rows
   node department/dept.mjs foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]
                                                        Wait until a batch needs attention: prints
-                                                       HELP/DONE/FAIL/NOTE/BATCH/STALE lines and exits.
+                                                       HELP/DONE/FAIL/NOTE/BATCH/STALE/UPDATE lines and exits.
                                                        Without ids: every open batch and new ones
                                                        (--interval default 30, min 5; --timeout 6900)
   node department/dept.mjs json                        Dump the full state
@@ -716,13 +716,17 @@ async function foundryWatchCommand(args, opt) {
 
   const deadline = Date.now() + timeoutS * 1000;
   let before = null;
+  let beforeUpdates = [];
   let isWatched = null;
   let watched = [];
   let warned = false;
   for (;;) {
     let all = null;
+    let updates = [];
     try {
-      all = (await currentState()).foundryBatches || [];
+      const board = await currentState();
+      all = board.foundryBatches || [];
+      updates = Array.isArray(board.foundryUpdates) ? board.foundryUpdates : [];
     } catch (err) {
       if (!warned) (opt.json ? console.error : console.log)(`WARN could not read the board: ${err.message}; still watching`);
       warned = true;
@@ -730,16 +734,18 @@ async function foundryWatchCommand(args, opt) {
     if (all) {
       if (!before) {
         before = all;
+        beforeUpdates = updates;
         const missing = [...wanted].find((id) => !all.some((b) => b.id === id));
         if (missing) throw new core.DeptError(`No Foundry batch ${missing}`, 404);
         const known = new Set(all.map((b) => b.id));
         const openAtStart = new Set(all.filter(isOpen).map((b) => b.id));
         isWatched = (b) => (wanted.size ? wanted.has(b.id) : openAtStart.has(b.id) || !known.has(b.id));
         // A closed batch can't change any more, so waiting on one would only time out.
-        if (!all.filter(isWatched).some(isOpen)) return finish([], 'No open Foundry batches');
+        const updateOpen = updates.some((u) => u.status === 'queued' || u.status === 'claimed');
+        if (!all.filter(isWatched).some(isOpen) && !updateOpen) return finish([], 'No open Foundry batches');
       }
       watched = all.filter(isWatched);
-      const events = watchEvents(before, watched, core.clockNow());
+      const events = [...watchEvents(before, watched, core.clockNow()), ...updateEvents(beforeUpdates, updates)];
       if (events.length) return finish(events);
     }
     const left = deadline - Date.now();

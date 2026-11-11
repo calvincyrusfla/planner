@@ -37,6 +37,22 @@ function subtaskEvents(b, st, r, p) {
   return events;
 }
 
+const BAD_UPDATE = new Set(['refused', 'failed']);
+
+// An UPDATE event for every update request refused or failed in `after` that was
+// not already refused or failed in `before`.
+export function updateEvents(beforeUpdates, afterUpdates) {
+  const was = new Map((Array.isArray(beforeUpdates) ? beforeUpdates : []).map((u) => [u.id, u]));
+  const events = [];
+  for (const u of Array.isArray(afterUpdates) ? afterUpdates : []) {
+    if (!u || !BAD_UPDATE.has(u.status)) continue;
+    if (BAD_UPDATE.has(was.get(u.id)?.status)) continue;
+    const message = oneLine(u.result?.message || '').slice(0, 200);
+    events.push({ kind: 'UPDATE', update: u.id, status: u.status, line: `UPDATE ${u.id} ${u.status}: ${message}` });
+  }
+  return events;
+}
+
 function heartbeatAge(b, nowMs) {
   const at = Date.parse(b.heartbeatAt || b.claimedBy?.at || '');
   return Number.isFinite(at) ? nowMs - at : NaN;
@@ -46,7 +62,7 @@ function heartbeatAge(b, nowMs) {
 // batch that existed then, closed ones too: a batch missing from it counts as
 // dispatched during the watch. `after` is the latest poll, already narrowed to
 // the watched batches. Returns [{kind: HELP|DONE|FAIL|NOTE|BATCH|STALE, batch, line,
-// ...details}]; `line` is the text to print. Queue progress (queued, sizing,
+// ...details}] (UPDATE events come from updateEvents, not from this function); `line` is the text to print. Queue progress (queued, sizing,
 // building, reviewing, answered) produces nothing.
 export function watchEvents(before, after, nowMs) {
   const known = new Map((before || []).map((b) => [b.id, b]));
