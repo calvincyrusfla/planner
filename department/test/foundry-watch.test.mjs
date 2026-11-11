@@ -153,6 +153,26 @@ test('a batch dispatched and closed during the watch counts as BATCH', () => {
   assert.equal(events[0].line, 'BATCH S-002 cancelled');
 });
 
+test('NOTE when a batch gets a new or changed note', () => {
+  const events = watchEvents([batch('running')], [batch('running', {}, { note: 'order mismatch' })], NOW);
+  assert.deepEqual(kinds(events), ['NOTE']);
+  assert.equal(events[0].line, 'NOTE  S-001 order mismatch');
+  assert.equal(events[0].note, 'order mismatch');
+  const changed = watchEvents([batch('running', {}, { note: 'old' })], [batch('running', {}, { note: 'new' })], NOW);
+  assert.deepEqual(kinds(changed), ['NOTE']);
+});
+
+test('no NOTE when the note is unchanged or empty', () => {
+  const same = batch('running', {}, { note: 'same' });
+  assert.deepEqual(watchEvents([same], [same], NOW), []);
+  assert.deepEqual(watchEvents([batch('running')], [batch('running', {}, { note: '' })], NOW), []);
+});
+
+test('NOTE comes before BATCH in the same poll', () => {
+  const events = watchEvents([batch('running')], [batch('done', {}, { note: 'heads up' })], NOW);
+  assert.deepEqual(kinds(events), ['NOTE', 'BATCH']);
+});
+
 // The child must only ever see the scratch board: no dashboard, hub or proxy.
 function scratchEnv(dataPath) {
   const env = { ...process.env, DEPT_DATA: dataPath, DEPT_HUB: 'off', DEPT_URL: 'http://127.0.0.1:9' };
