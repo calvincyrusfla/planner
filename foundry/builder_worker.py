@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from foundry import claude_client as _claude_client
+from foundry.gemma_excerpts import error_excerpt
 from foundry.gemma_notes import find_related, pitfall_notes
 from foundry.piece_workspace import WorkspaceError, collect_changes, make_workspace, remove_workspace
 from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
@@ -1650,7 +1651,20 @@ class BuilderWorker(_WorkerBase):
             output = trace.strip()
             if chars > 0 and output:
                 # the gate's own output keeps its newlines, so it stays out of _one_line
-                message += f"\n\nGate output (last {chars} characters):\n{output[-chars:]}"
+                excerpt: str | None = None
+                config = getattr(self, "config", None)
+                gemma = getattr(getattr(self, "context_engine", None), "gemma", None)
+                if getattr(config, "gemma_notes", False) and gemma is not None and len(output) > 1500:
+                    try:
+                        excerpt = await error_excerpt(
+                            gemma, output, timeout=float(getattr(config, "gemma_notes_timeout_s", 90)), max_chars=chars)
+                    except Exception as exc:  # noqa: BLE001 - advisory; fall back to the tail
+                        log.debug("error excerpt unavailable: %s", exc)
+                        excerpt = None
+                if excerpt:
+                    message += f"\n\nGate output (the lines that matter, copied exactly):\n{excerpt}"
+                else:
+                    message += f"\n\nGate output (last {chars} characters):\n{output[-chars:]}"
                 return self._send_back(ticket, message, reason=f"gate_{check}", limit=MAX_FIX_HINT_CHARS + chars + 100)
             return self._send_back(ticket, message, reason=f"gate_{check}")
         # what reviewer, cache, queue and patch see: the exact diff of the change
