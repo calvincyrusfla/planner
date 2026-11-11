@@ -107,7 +107,8 @@ def test_prompt_section_position_and_absence() -> None:
     prompt = build_builder_prompt(a, order_description="the order", pitfall_notes=["x.py:1: n"],
                                   file_map=["a.py:1-2 foo"])
     assert f"\n{HEADING}\n{INTRO}\n- a.py:1-2 foo\n" in prompt
-    assert prompt.index("## Watch out (advisory)") < prompt.index(HEADING) < prompt.index("## Files you may modify")
+    assert prompt.index("## Files you may modify") < prompt.index("## Watch out (advisory)") < prompt.index(HEADING)
+    assert prompt.index(HEADING) < prompt.index("## This attempt")
     base = build_builder_prompt(a, order_description="the order")
     assert build_builder_prompt(a, order_description="the order", file_map=None) == base
     assert build_builder_prompt(a, order_description="the order", file_map=[]) == base

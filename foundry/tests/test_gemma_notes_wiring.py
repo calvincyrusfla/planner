@@ -79,7 +79,7 @@ def test_prompt_section_position() -> None:
     a = _assignment()
     prompt = build_builder_prompt(a, order_description="the order", pitfall_notes=["a.py:1: one", "b.py:2: two"])
     assert f"\n{HEADING}\n{INTRO}\n- a.py:1: one\n- b.py:2: two\n" in prompt
-    assert prompt.index("## Order details") < prompt.index(HEADING) < prompt.index("## Files you may modify")
+    assert prompt.index("## Files you may modify") < prompt.index("## Order details") < prompt.index(HEADING)
 
 
 def test_prompt_unchanged_without_notes() -> None:
