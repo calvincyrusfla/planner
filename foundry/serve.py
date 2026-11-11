@@ -244,7 +244,7 @@ class Service:
         self.pr_preflight: dict[str, Any] | None = None
         self._preflight_task: asyncio.Task | None = None
         #: Board batches (``foundry.board_dispatch``): watched when a board client is given,
-        #: or when the service builds its own factory with the board bridge in ``auto`` mode.
+        #: or when the service builds its own factory with the board bridge in ``auto`` or ``off`` mode.
         self._batch_board = batch_board
         self._own_factory = factory is None
         self.batch_watcher: Any = batch_watcher
@@ -338,8 +338,11 @@ class Service:
     def _start_batches(self) -> None:
         """Watch the board for Foundry batches of this repo (see :mod:`foundry.board_dispatch`)."""
         if self.batch_watcher is None:
-            auto = getattr(self.config, "board_bridge_mode", "auto") == "auto"
-            if self._batch_board is None and not (self._own_factory and auto):
+            # ``off`` only stops the department-task mirror: batches and the remote updates started
+            # below keep running, or the mode could not be switched back without the PC. A dry run
+            # must not touch the real board.
+            live = getattr(self.config, "board_bridge_mode", "auto") in ("auto", "off")
+            if self._batch_board is None and not (self._own_factory and live):
                 return
             from foundry.board_dispatch import BatchWatcher
 
@@ -560,17 +563,17 @@ class Service:
             await self.report_metrics()
 
     def _metrics_sender(self) -> Callable[[str, Mapping[str, Any]], Any] | None:
-        """How a board op is sent: the factory's bridge, else (``auto`` mode only) the batch board.
+        """How a board op is sent: the factory's bridge, else (``auto`` and ``off`` modes) the batch board.
 
-        The bridge is found by method name (:data:`_BRIDGE_OP_METHODS`). Outside ``auto``
-        mode nothing falls through to the batch board: a dry run must not write to the real one.
+        The bridge is found by method name (:data:`_BRIDGE_OP_METHODS`). In ``dry`` mode
+        nothing falls through to the batch board: a dry run must not write to the real one.
         """
         bridge = getattr(self.factory, "bridge", None)
         for name in _BRIDGE_OP_METHODS:
             fn = getattr(bridge, name, None)
             if callable(fn):
                 return fn
-        if getattr(self.config, "board_bridge_mode", "auto") != "auto":
+        if getattr(self.config, "board_bridge_mode", "auto") not in ("auto", "off"):
             return None
         op = getattr(getattr(self.batch_watcher, "board", None), "op", None)
         if not callable(op):

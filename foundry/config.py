@@ -35,7 +35,10 @@ Environment variable               Field (default)
 ``FOUNDRY_TPM_SPIKE_RATIO``        ``thresholds.tpm_spike_ratio`` (``0.9``)
 ``FOUNDRY_TEAMS``                  ``teams`` (``alpha,bravo,charlie``; comma separated)
 ``FOUNDRY_BUILDERS_PER_TEAM``      ``builders_per_team`` (``5``)
-``FOUNDRY_BOARD_BRIDGE_MODE``      ``board_bridge_mode`` (``auto``; ``auto|off|dry``)
+``FOUNDRY_BOARD_BRIDGE_MODE``      ``board_bridge_mode`` (``auto``; ``auto|off|dry``;
+                                   ``off`` stops the department-task mirror, board
+                                   batches and metrics keep working; ``dry`` records
+                                   ops without any I/O)
 ``FOUNDRY_TRUST_CACHE``            ``trust_cache`` (``false``; ``1/true/yes/on``
                                    or ``0/false/no/off``)
 ``FOUNDRY_LIMIT_COOLDOWN_S``       ``limit_cooldown_s`` (``1200``)
