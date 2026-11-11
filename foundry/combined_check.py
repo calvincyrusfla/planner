@@ -414,6 +414,9 @@ class CombinedChecker:
         """Merge the green, mergeable PRs that only touch tests or docs: one attempt per PR and round."""
         merged = self._load_state()["merged"]
         for base, group in sorted(groups.items()):
+            if base.startswith("foundry/"):  # stacked on another Foundry branch: wait for the retarget
+                log.debug("combined check: not auto-merging %d PR(s) stacked on %s", len(group), base)
+                continue
             for pr in sorted(group, key=lambda row: row["number"]):
                 number = pr["number"]
                 if not self.service.running:
