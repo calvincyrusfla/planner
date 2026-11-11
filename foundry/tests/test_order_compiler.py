@@ -83,7 +83,60 @@ def test_resolved_ambiguous_unresolved(repo: Path, tmp_path: Path) -> None:
     assert sorted(status["alpha"]["calls"]) == ["pkg/a.py::alpha", "pkg/b.py::alpha"]
     assert status["missing_fn"]["status"] == "unresolved"
     findings = "\n".join(rep["subtasks"][0]["findings"])
-    assert "`missing_fn` not found; fine if this piece creates it" in findings
+    assert "not found (fine if this piece creates them): missing_fn" in findings
+    assert rep["subtasks"][0]["unresolved"] == ["missing_fn"]
+
+
+def _narrow_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "nr"
+    (root / "pkg").mkdir(parents=True)
+    (root / "tests").mkdir()
+    (root / "pkg" / "svc.py").write_text("class Svc:\n    def start(self):\n        return 1\n", encoding="utf-8")
+    (root / "pkg" / "other.py").write_text("class Other:\n    def start(self):\n        return 2\n", encoding="utf-8")
+    (root / "tests" / "test_x.py").write_text("class Fake:\n    def start(self):\n        return 3\n", encoding="utf-8")
+    for i in range(8):
+        (root / "pkg" / f"m{i}.py").write_text(f"class C{i}:\n    def stop(self):\n        return {i}\n", encoding="utf-8")
+    return root
+
+
+def test_non_names_skipped(repo: Path, tmp_path: Path) -> None:
+    text = "Use `self`, `await`, `print`, `null`, `FOUNDRY_HELP_DESK`, `MAX_THING_X` and `missing_fn`."
+    rep = compile_subs(repo, tmp_path, [sub(text, ["app.py"])])
+    piece = rep["subtasks"][0]
+    assert [n["name"] for n in piece["names"]] == ["missing_fn"]
+    assert "settings or constants not checked: 2" in piece["findings"]
+    assert "not found (fine if this piece creates them): missing_fn" in piece["findings"]
+
+
+def test_test_fake_dropped_and_own_file_wins(tmp_path: Path) -> None:
+    root = _narrow_repo(tmp_path)
+    rep = compile_subs(root, tmp_path, [sub("Change `start`.", ["pkg/svc.py"])])
+    n = rep["subtasks"][0]["names"][0]
+    assert n["status"] == "resolved"
+    assert n["calls"] == ["pkg/svc.py::Svc.start"]
+    assert n["alsoDefined"] == 2
+    assert "(also defined in 2 other places)" in oc.format_report(rep)
+    rep = compile_subs(root, tmp_path, [sub("Change `start`.", ["pkg/x.py"])])
+    n = rep["subtasks"][0]["names"][0]
+    assert n["status"] == "ambiguous"
+    assert sorted(n["calls"]) == ["pkg/other.py::Other.start", "pkg/svc.py::Svc.start"]
+    rep = compile_subs(root, tmp_path, [sub("Change `start`.", ["pkg/x.py"], readFiles=["pkg/other.py"])])
+    assert rep["subtasks"][0]["names"][0]["calls"] == ["pkg/other.py::Other.start"]
+
+
+def test_tests_kept_when_piece_edits_tests(tmp_path: Path) -> None:
+    root = _narrow_repo(tmp_path)
+    rep = compile_subs(root, tmp_path, [sub("Change `start`.", ["tests/test_x.py"])])
+    assert rep["subtasks"][0]["names"][0]["calls"] == ["tests/test_x.py::Fake.start"]
+
+
+def test_ambiguous_cap(tmp_path: Path) -> None:
+    root = _narrow_repo(tmp_path)
+    rep = compile_subs(root, tmp_path, [sub("Change `stop`.", ["pkg/x.py"])])
+    n = rep["subtasks"][0]["names"][0]
+    assert len(n["calls"]) == oc.MAX_CANDIDATES
+    assert n["more"] == 3
+    assert "+3 more" in rep["subtasks"][0]["findings"][0]
 
 
 def test_fact_sheet_and_read_files(repo: Path, tmp_path: Path) -> None:
@@ -193,4 +246,4 @@ def test_cli(repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     assert out.exists()
     assert oc.main([str(src), "--repo", str(repo)]) == 0
     text = capsys.readouterr().out
-    assert "`nothing_here` not found; fine if this piece creates it" in text
+    assert "not found (fine if this piece creates them): nothing_here" in text
