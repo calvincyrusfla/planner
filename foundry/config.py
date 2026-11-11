@@ -129,6 +129,10 @@ Environment variable               Field (default)
                                    advisory pitfall notes and PR briefs
 ``FOUNDRY_TURN_LEDGER``            ``turn_ledger`` (``true``): record per-turn
                                    token use from Claude Code transcripts
+``FOUNDRY_PROMPT_ARCHIVE``         ``prompt_archive`` (``true``): archive every
+                                   Claude prompt and reply, compressed
+``FOUNDRY_PROMPT_ARCHIVE_DAYS``    ``prompt_archive_days`` (``30``, >= 1): days
+                                   archived calls are kept
 ``FOUNDRY_PR_TEMPLATE``            ``pr_template`` (``false``): PR descriptions
                                    use the fixed template sections
 ``FOUNDRY_GEMMA_NOTES_TIMEOUT_S``  ``gemma_notes_timeout_s`` (``90``, > 0):
@@ -661,6 +665,15 @@ class FoundryConfig(BaseModel):
         default=True,
         description="Whether Foundry records per-turn token use from Claude Code transcripts.",
     )
+    prompt_archive: bool = Field(
+        default=True,
+        description="Whether every Claude call's prompt and reply is archived (compressed) in the queue database.",
+    )
+    prompt_archive_days: int = Field(
+        default=30,
+        ge=1,
+        description="Days an archived prompt and reply are kept before they are pruned.",
+    )
     pr_template: bool = Field(
         default=False,
         description="Whether PR descriptions use the fixed template (summary, acceptance criteria, files changed, brief).",
@@ -868,6 +881,8 @@ class FoundryConfig(BaseModel):
             "AUTO_UPDATE": "auto_update",
             "AUTO_MERGE": "auto_merge",
             "GEMMA_NOTES": "gemma_notes",
+            "PROMPT_ARCHIVE": "prompt_archive",
+            "PROMPT_ARCHIVE_DAYS": "prompt_archive_days",
             "TURN_LEDGER": "turn_ledger",
             "PR_TEMPLATE": "pr_template",
             "GEMMA_NOTES_TIMEOUT_S": "gemma_notes_timeout_s",
