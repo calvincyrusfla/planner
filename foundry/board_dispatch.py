@@ -50,6 +50,7 @@ from typing import Any, Callable, Mapping
 
 from foundry.ledger import Ledger
 from foundry.metrics_report import build_metrics
+from foundry.order_consistency import consistency_note
 # Board limits from schema/order.json: error texts, and each question, context or option of a help request.
 from foundry.order_schema import LIMIT_ERROR, LIMIT_HELP
 
@@ -688,9 +689,26 @@ class BatchWatcher:
             args["results"] = changed
         if first and rec["tasks"] and batch.get("status") == "claimed":
             args["status"] = "running"
+        if first and can_submit and not rec.get("consistency"):
+            rec["consistency"] = True
+            config = getattr(self.service, "config", None)
+            if getattr(config, "gemma_notes", False):
+                note = ""
+                try:
+                    gemma = getattr(self.service, "gemma", None) or getattr(
+                        getattr(self.service, "factory", None), "gemma", None)
+                    repo = getattr(self.service, "repo", None)
+                    timeout = float(getattr(config, "gemma_notes_timeout_s", 90))
+                    note = await consistency_note(gemma, subtasks, Path(repo) if repo else None, timeout=timeout)
+                except Exception as exc:  # noqa: BLE001 - advisory only
+                    log.debug("board dispatch: %s consistency check failed: %s", bid, exc)
+                    note = ""
+                if note:
+                    args["note"] = note
         self._save(bid, rec)
         last = self._last_sent.get(bid)
-        write_due = bool(changed) or "status" in args or last is None or self._now() - last >= self.heartbeat_s
+        write_due = (bool(changed) or "status" in args or "note" in args or last is None
+                     or self._now() - last >= self.heartbeat_s)
         with_usage = self._usage_results(rec, board_view, changed) if write_due else {}
         if with_usage:
             args["results"] = {**changed, **with_usage}
