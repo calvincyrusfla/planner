@@ -1,4 +1,4 @@
-"""FOUNDRY_FOREMAN_ACTIONS: the Foreman's monitor can report its actions without carrying them out.
+"""FOUNDRY_FOREMAN_ACTIONS still parses, and the Foreman reports its actions without carrying them out.
 
 Real queue/manager wired by ``build_factory`` with the simulated Claude client
 and a dry board bridge; nothing calls Claude, Ollama or the board.
@@ -80,7 +80,10 @@ def test_env_bogus_is_refused() -> None:
 # --------------------------------------------------------------------------- floor manager
 
 
-def test_act_false_reports_without_quarantining(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("kwargs", [{}, {"act": True}, {"act": False}])
+def test_reports_without_quarantining_whatever_act_says(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, bool]
+) -> None:
     f = _factory(tmp_path)
     m, q = f.manager, f.queue
     posted: list[Any] = []
@@ -91,7 +94,7 @@ def test_act_false_reports_without_quarantining(tmp_path: Path, monkeypatch: pyt
         state = q.get_task(tid)["state"]
         alert = _quarantine_alert(tid)
 
-        out = await m.apply_escalation(alert, act=False)
+        out = await m.apply_escalation(alert, **kwargs)
         assert out.applied is False and out.detail == _LOGGED_ONLY
         assert out.action == "QUARANTINE_TASK"
         assert q.get_task(tid)["state"] == state and state != "quarantined"
@@ -113,25 +116,6 @@ def test_act_false_reports_without_quarantining(tmp_path: Path, monkeypatch: pyt
         assert again.applied is False and again.detail == _LOGGED_ONLY
         assert q.get_task(tid)["state"] == state
         assert posted == [alert]
-
-    asyncio.run(go())
-    f.close()
-
-
-def test_act_true_quarantines_as_today(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    f = _factory(tmp_path)
-    m, q = f.manager, f.queue
-    posted: list[Any] = []
-    monkeypatch.setattr(m.bridge, "escalation", posted.append)
-
-    async def go() -> None:
-        tid = await m.submit(_order())
-        alert = _quarantine_alert(tid)
-        out = await m.apply_escalation(alert, act=True)
-        assert out.applied is True and out.detail == f"{tid} quarantined"
-        assert q.get_task(tid)["state"] == "quarantined"
-        assert posted == [alert]
-        assert m.actions()[0]["undoable"] is True
 
     asyncio.run(go())
     f.close()
@@ -159,9 +143,9 @@ def _monitored(tmp_path: Path, mode: str | None) -> tuple[Service, list[dict[str
     return Service(config, repo=tmp_path, factory=factory), calls
 
 
-@pytest.mark.parametrize(("mode", "expected"), [(None, {}), ("act", {}), ("log", {"act": False})])
-def test_monitor_passes_act_only_in_log_mode(tmp_path: Path, mode: str | None, expected: dict[str, Any]) -> None:
+@pytest.mark.parametrize("mode", [None, "act", "log"])
+def test_monitor_does_not_branch_on_the_setting(tmp_path: Path, mode: str | None) -> None:
     svc, calls = _monitored(tmp_path, mode)
     assert asyncio.run(svc.monitor_once()) is not None
     assert svc.last_monitor_error is None
-    assert calls == [expected]
+    assert calls == [{}]

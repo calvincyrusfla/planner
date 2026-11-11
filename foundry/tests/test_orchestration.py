@@ -12,7 +12,7 @@ Claude, Ollama or the Agent Department board.
 4. gate short-circuit             -> test_broken_diff_never_reaches_the_reviewer
 5. retry limit                    -> (same test) third failure quarantines, no 4th build
 6. rate limiter under load        -> test_rate_limiter_*
-7. escalation validation/actions  -> test_escalation_* / test_floor_manager_executes_*
+7. escalation validation/actions  -> test_escalation_* / test_floor_manager_logs_*
 8. foreman_probe                  -> test_probe_*
 plus the ``python -m foundry.main --simulate`` demo.
 """
@@ -418,7 +418,7 @@ def test_floor_manager_rejects_invalid_escalation_dict(tmp_path: Path) -> None:
     f.close()
 
 
-def test_floor_manager_executes_each_action(tmp_path: Path) -> None:
+def test_floor_manager_logs_each_action_without_acting(tmp_path: Path) -> None:
     repo = write_demo_repo(tmp_path / "repo")
     claude = SimulatedClaudeClient()
     f = _factory(tmp_path, claude, repo=repo, teams=["alpha"])
@@ -429,22 +429,23 @@ def test_floor_manager_executes_each_action(tmp_path: Path) -> None:
         t2 = await m.submit(WorkOrder(title="resize me", description="d", files=["shop/strings.py", "shop/slug.py"]))
         t3 = await m.submit(WorkOrder(title="stall me", description="d", files=["shop/pricing.py"]))
         q = f.queue
+        builders = q.get_task(t2)["allocated_builders"]
 
         # QUARANTINE_TASK
-        out = await m.apply_escalation(_alert("QUARANTINE_TASK", task_id=t1, params={"reason": "2 gate failures"}))
-        assert out.applied and q.get_task(t1)["state"] == "quarantined"
+        await m.apply_escalation(_alert("QUARANTINE_TASK", task_id=t1, params={"reason": "2 gate failures"}))
+        assert q.get_task(t1)["state"] != "quarantined"
 
         # RESIZE_ALLOCATION
-        out = await m.apply_escalation(
+        await m.apply_escalation(
             _alert("RESIZE_ALLOCATION", category="CAPACITY_REBALANCE", task_id=t2, team_id="alpha", params={"builders": 4, "from": 2})
         )
-        assert out.applied and q.get_task(t2)["allocated_builders"] == 4
+        assert q.get_task(t2)["allocated_builders"] == builders != 4
 
         # THROTTLE_DISPATCH
-        out = await m.apply_escalation(
+        await m.apply_escalation(
             _alert("THROTTLE_DISPATCH", category="TOKEN_VELOCITY_SPIKE", team_id="alpha", params={"factor": 0.5, "seconds": 60})
         )
-        assert out.applied and f.limiter.is_throttled and f.limiter.throttle_factor == 0.5
+        assert not f.limiter.is_throttled
 
         # RESET_BUILDER_CONTEXT: a claimed ticket on slot 1 of t3 (t2's slot-1 ticket comes first; claim until we hit t3)
         pool = f.pools["alpha"]
@@ -453,54 +454,45 @@ def test_floor_manager_executes_each_action(tmp_path: Path) -> None:
             ticket = q.claim_ticket("alpha", 1)
             assert ticket is not None
         pool.builder(1).scratch["last_prompt"] = "old"
-        out = await m.apply_escalation(
+        await m.apply_escalation(
             _alert(
                 "RESET_BUILDER_CONTEXT", category="AGENT_STALLED", task_id=t3, team_id="alpha", agent_id="alpha-1",
                 params={"agent_id": "alpha-1", "ticket_id": ticket.ticket_id, "slot": 1},
             )
         )
-        assert out.applied and pool.builder(1).scratch == {}
-        reopened = q.get_ticket(ticket.ticket_id)
-        assert reopened.status == "open" and reopened.fix_hint is None
-        assert reopened.attempt == ticket.attempt  # a stall costs no retry (queue.release_ticket)
+        assert pool.builder(1).scratch == {"last_prompt": "old"}
+        assert q.get_ticket(ticket.ticket_id).status == "claimed"
 
-        # PROMOTE_PEER_REVIEWER (needs the pool running)
-        q.quarantine(t2, "test cleanup")
-        q.quarantine(t3, "test cleanup")
-        # not running -> the pool cannot promote: applied=False
-        out = await m.apply_escalation(
-            _alert("PROMOTE_PEER_REVIEWER", category="REVIEW_BOTTLENECK", team_id="alpha", params={"minutes": 1})
-        )
-        assert not out.applied and m.peer_reviewer_for("alpha") is None
+        # PROMOTE_PEER_REVIEWER, even with the pool running (nothing left for it to build)
+        for tid in (t1, t2, t3):
+            q.quarantine(tid, "test cleanup")
         async with f.running():
-            out = await m.apply_escalation(
+            await m.apply_escalation(
                 _alert("PROMOTE_PEER_REVIEWER", category="REVIEW_BOTTLENECK", team_id="alpha", params={"minutes": 1, "slot": 5})
             )
-            assert out.applied
-            assert "alpha-5" in pool.peer_reviewers
-            grant = m.peer_reviewer_for("alpha")
-            assert grant is not None and grant.agent_id == "alpha-5"
+            assert "alpha-5" not in pool.peer_reviewers
+            assert m.peer_reviewer_for("alpha") is None
 
         # NONE
         out = await m.apply_escalation(_alert("NONE", team_id="alpha"))
-        assert out.applied and out.detail == "no action"
+        assert out.detail == "logged only (FOUNDRY_FOREMAN_ACTIONS=log): NONE"
 
     _run(go())
     assert [a.action for a in m.outcomes] == [
         "QUARANTINE_TASK", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "RESET_BUILDER_CONTEXT",
-        "PROMOTE_PEER_REVIEWER", "PROMOTE_PEER_REVIEWER", "NONE",
+        "PROMOTE_PEER_REVIEWER", "NONE",
     ]
-    assert [a.applied for a in m.outcomes] == [True, True, True, True, False, True, True]
+    assert not any(a.applied for a in m.outcomes)
     # every escalation is stored and posted to the board in the agreed format
-    assert len(f.queue.escalations()) == 7
+    assert len(f.queue.escalations()) == 6
     posted = [op["args"]["message"] for op in f.bridge.ops if op["type"] == "reportProgress" and op["args"]["message"].startswith("[Foreman]")]
-    assert len(posted) == 7 and posted[0].startswith("[Foreman] HIGH LINE_JAM: Test alert.")
-    assert claude.total_calls == 0  # none of the actions called Claude
+    assert len(posted) == 6 and posted[0].startswith("[Foreman] HIGH LINE_JAM: Test alert.")
+    assert claude.total_calls == 0  # logging an escalation never calls Claude
     f.close()
 
 
-def test_real_foreman_line_jam_drives_quarantine(tmp_path: Path) -> None:
-    """The real ShopForeman detects LINE_JAM from telemetry; the manager quarantines."""
+def test_real_foreman_line_jam_is_logged_without_quarantining(tmp_path: Path) -> None:
+    """The real ShopForeman detects LINE_JAM from telemetry; the manager only logs it."""
     gemma = SimulatedGemmaClient(lambda req: "Task keeps failing its syntax gate. Quarantine it for a human.")
     f = _factory(tmp_path, SimulatedClaudeClient(), gemma=gemma, teams=["alpha"])
 
@@ -518,8 +510,7 @@ def test_real_foreman_line_jam_drives_quarantine(tmp_path: Path) -> None:
         assert alert.prescribed_action.value == "QUARANTINE_TASK"
         assert alert.diagnosis == "Task keeps failing its syntax gate. Quarantine it for a human."
         out = await f.manager.apply_escalation(alert)
-        assert out.applied and f.queue.get_task(tid)["state"] == "quarantined"
-        assert await f.foreman.evaluate_line_anomaly() is None  # terminal task: line healthy again
+        assert not out.applied and f.queue.get_task(tid)["state"] != "quarantined"
 
     _run(go())
     f.close()
@@ -577,7 +568,7 @@ def test_simulated_demo_runs_end_to_end_quickly(tmp_path: Path) -> None:
     calls = result["calls"]
     assert [calls.get(f"alpha-{n}", 0) for n in range(1, 6)] == [1, 0, 0, 0, 0]
     assert calls.get("bravo-1") == 2 and result["retries"] == 1  # forced gate failure + retry
-    assert result["alert"] is not None and result["action"]["applied"]
+    assert result["alert"] is not None and result["action"]["applied"] is False
     assert len(result["pr_summaries"]) == 3
     out = result["output"]
     for needle in ("Sizing", "Selective dispatch", "gate failed -> hint", "Review", "Floor Manager ->", "PR summaries"):
@@ -712,7 +703,7 @@ def test_apply_escalation_is_idempotent_per_alert_id(tmp_path: Path) -> None:
     # after a restart the stored outcome is still honoured
     f2 = _factory(tmp_path, SimulatedClaudeClient(), teams=["alpha"])
     out = _run(f2.manager.apply_escalation(_alert("NONE", alert_id="ALT-20261107-900", team_id="alpha")))
-    assert out.applied
+    assert not out.applied
     f2.manager.applied_alerts.clear()  # even with the manager's cache gone, the queue row wins
     again = _run(f2.manager.apply_escalation(_alert("QUARANTINE_TASK", alert_id="ALT-20261107-900", task_id="F-001")))
     assert again.action == "NONE" and f2.queue.get_task("F-001")["state"] != "quarantined"
@@ -724,9 +715,8 @@ def test_quarantine_is_reported_to_the_board_once(tmp_path: Path) -> None:
 
     async def go() -> None:
         tid = await f.manager.submit(WorkOrder(**S_ORDER))
-        await f.manager.apply_escalation(_alert("QUARANTINE_TASK", task_id=tid, params={"reason": "jam"}))
-        out = await f.manager.apply_escalation(_alert("QUARANTINE_TASK", task_id=tid, params={"reason": "jam"}))
-        assert not out.applied  # already quarantined
+        f.queue.quarantine(tid, "jam")
+        assert f.manager.report_quarantines() == [tid]
         assert f.manager.report_quarantines() == []
 
     _run(go())

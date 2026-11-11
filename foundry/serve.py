@@ -478,7 +478,7 @@ class Service:
     # ------------------------------------------------------------------ monitor
 
     async def monitor_once(self) -> dict[str, Any] | None:
-        """One line check: evaluate the line and let the Floor Manager act on an alert."""
+        """One line check: evaluate the line and let the Floor Manager log an alert."""
         f = self.factory
         self.monitor_runs += 1
         try:
@@ -487,10 +487,7 @@ class Service:
             if alert is None:
                 self.last_monitor_error = None
                 return None
-            if getattr(self.config, "foreman_actions", "act") == "log":
-                action = await f.manager.apply_escalation(alert, act=False)
-            else:
-                action = await f.manager.apply_escalation(alert)
+            action = await f.manager.apply_escalation(alert)
             if hasattr(alert, "model_dump"):
                 self.last_alert = alert.model_dump(mode="json")
             else:
