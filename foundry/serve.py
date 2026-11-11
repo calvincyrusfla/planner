@@ -256,6 +256,8 @@ class Service:
         self._metrics_finished: set[str] = set()
         #: Checks that the open Foundry PRs work together (:mod:`foundry.combined_check`).
         self.combined_checker: Any = None
+        #: Restacks child PRs after their parent merged (:mod:`foundry.stack_keeper`).
+        self.stack_keeper: Any = None
         #: Board update requests (:mod:`foundry.update_watcher`), started next to the batch watcher.
         self.update_watcher: Any = None
         #: Set by :meth:`request_restart`; ``run_service`` then returns 75.
@@ -381,6 +383,12 @@ class Service:
 
     def _start_combined_check(self) -> None:
         """Keep checking that the open Foundry PRs work together (needs automatic PRs)."""
+        try:
+            self._start_checker()
+        finally:
+            self._start_stack_keeper()
+
+    def _start_checker(self) -> None:
         if self.combined_checker is None:
             if not getattr(self.config, "auto_pr", False):
                 return
@@ -394,6 +402,20 @@ class Service:
                 log.warning("foundry serve: the combined PR check is off: %s", exc)
                 return
         self.combined_checker.start()
+
+    def _start_stack_keeper(self) -> None:
+        """Restack child PRs when their parent merges (needs automatic PRs)."""
+        if not getattr(self.config, "auto_pr", False):
+            return
+        try:
+            if self.stack_keeper is None:
+                from foundry.stack_keeper import StackKeeper
+
+                self.stack_keeper = StackKeeper(self)
+            self.stack_keeper.start()
+        except Exception as exc:  # optional: the service runs without it
+            log.warning("foundry serve: the stack keeper is off: %s", exc)
+            self.stack_keeper = None
 
     def _resume(self) -> None:
         """Open tickets of this repo are claimed by the pools; finish approved tasks without a patch."""
@@ -453,6 +475,8 @@ class Service:
             await self.batch_watcher.stop()
         if self.combined_checker is not None:
             await self.combined_checker.stop()
+        if self.stack_keeper is not None:
+            await self.stack_keeper.stop()
         if self._monitor_task is not None:
             self._monitor_task.cancel()
             try:
