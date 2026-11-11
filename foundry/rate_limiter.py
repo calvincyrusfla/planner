@@ -150,6 +150,7 @@ class RateLimiter:
         self._req_bucket = TokenBucket(float(rpm), rpm / WINDOW_SECONDS, float(rpm), now)
         self._tok_bucket = TokenBucket(float(tpm), tpm / WINDOW_SECONDS, float(tpm), now)
         self._in_flight = 0
+        self._wake_tasks: set[asyncio.Task[None]] = set()
         self._peak_in_flight = 0
         self._cond: asyncio.Condition | None = None
         self._gate: asyncio.Lock | None = None
@@ -391,6 +392,33 @@ class RateLimiter:
         self._tok_bucket.level = min(self._tok_bucket.level, self._tok_bucket.capacity * factor)
 
     # ------------------------------------------------------------ introspection
+    def set_max_concurrent(self, n: int) -> int:
+        """Change the concurrency cap; calls already in flight keep their slots.
+
+        A lower cap only delays new grants until enough calls finish; a higher one
+        wakes waiting callers. Returns the new cap.
+        """
+        n = int(n)
+        if n <= 0:
+            raise ValueError("max_concurrent must be positive")
+        raised = n > self.max_concurrent
+        self.max_concurrent = n
+        cond = self._cond
+        if raised and cond is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return n
+
+            async def _wake() -> None:
+                async with cond:
+                    cond.notify_all()
+
+            task = loop.create_task(_wake())
+            self._wake_tasks.add(task)
+            task.add_done_callback(self._wake_tasks.discard)
+        return n
+
     @property
     def in_flight(self) -> int:
         """Calls currently holding a slot."""
