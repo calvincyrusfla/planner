@@ -278,7 +278,20 @@ def subtask_state(manager: Any, queue: Any, tid: str) -> dict[str, Any]:
     out: dict[str, Any] = {"foundryTask": tid, "state": state}
     error = task.get("quarantine_reason") or (getattr(manager, "sizing_errors", {}) or {}).get(tid)
     if error and state != "complete":
-        out["error"] = _cap(error, LIMIT_ERROR)
+        text = _cap(error, LIMIT_ERROR)
+        if state == "quarantined" and text:
+            try:
+                events = queue.events(task_id=tid, kind="quarantine_report")
+                payload = (events[-1].get("payload") or {}) if events else {}
+                summary = str(payload.get("summary") or "").strip()
+                if summary:
+                    body = f"{error}\n\nReport: {summary}"
+                    path = str(payload.get("path") or "").strip()
+                    tail = f"\n\nFull report: {path} on the PC" if path else ""
+                    text = (body + tail) if len(body) + len(tail) <= LIMIT_ERROR else body[:LIMIT_ERROR]
+            except Exception:  # noqa: BLE001 - the plain reason still goes out
+                text = _cap(error, LIMIT_ERROR)
+        out["error"] = text
     pr_fn = getattr(manager, "pr_state", None)
     pr = pr_fn(tid) if callable(pr_fn) else None
     if pr:
