@@ -37,7 +37,7 @@ def test_diff_mode_keeps_the_read_flags() -> None:
 
 
 def test_edit_mode_flags() -> None:
-    cfg = FoundryConfig.from_env(environ=EDIT_ENV)
+    cfg = FoundryConfig.from_env(environ={**EDIT_ENV, "FOUNDRY_BUILDER_SESSIONS": "1"})
     before = list(cfg.claude_extra_args)
     args = builder_claude_args(cfg)
     assert _value_after(args, "--disallowedTools").split() == [
@@ -56,8 +56,16 @@ def test_edit_mode_flags() -> None:
 
 
 def test_edit_mode_uses_configured_max_turns() -> None:
-    cfg = FoundryConfig.from_env(environ={**EDIT_ENV, "FOUNDRY_BUILDER_EDIT_MAX_TURNS": "25"})
-    assert _value_after(builder_claude_args(cfg), "--max-turns") == "25"
+    cfg = FoundryConfig.from_env(
+        environ={**EDIT_ENV, "FOUNDRY_BUILDER_EDIT_MAX_TURNS": "45", "FOUNDRY_BUILDER_SESSIONS": "1"}
+    )
+    assert _value_after(builder_claude_args(cfg), "--max-turns") == "45"
+
+
+def test_edit_mode_with_sessions_uses_session_turns() -> None:
+    cfg = FoundryConfig.from_env(environ={**EDIT_ENV, "FOUNDRY_BUILDER_SESSION_TURNS": "12"})
+    assert cfg.builder_sessions == 3
+    assert _value_after(builder_claude_args(cfg), "--max-turns") == "12"
 
 
 def test_edit_mode_env_is_case_insensitive() -> None:

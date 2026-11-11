@@ -90,6 +90,16 @@ Environment variable               Field (default)
 ``FOUNDRY_BUILDER_EDIT_MAX_TURNS`` ``builder_edit_max_turns`` (``60``, 5..200):
                                    ``--max-turns`` for builder calls when
                                    ``builder_mode`` is ``edit``
+``FOUNDRY_BUILDER_SESSION_TURNS``  ``builder_session_turns`` (``25``, 5..200):
+                                   ``--max-turns`` of one builder session in
+                                   ``edit`` mode when ``builder_sessions`` > 1
+``FOUNDRY_BUILDER_SESSIONS``       ``builder_sessions`` (``3``, 1..10): builder
+                                   sessions per attempt; 1 = one session
+``FOUNDRY_BUILDER_LIBRARY``        ``builder_library`` (``false``): builders get
+                                   the code library server (``mcp__library``)
+``FOUNDRY_STRICT_MCP``             ``strict_mcp`` (``true``): builders and
+                                   reviewers load no MCP servers from the
+                                   user's own Claude Code
 ``FOUNDRY_BUILDER_TESTS``          ``builder_tests`` (``false``): with
                                    ``builder_mode`` ``edit``, builders may run
                                    the ``BUILDER_TEST_COMMANDS`` test commands
@@ -597,6 +607,26 @@ class FoundryConfig(BaseModel):
             "only applies when builder_mode is edit."
         ),
     )
+    builder_session_turns: int = Field(
+        default=25,
+        ge=5,
+        le=200,
+        description="--max-turns of one builder session in edit mode when builder_sessions > 1.",
+    )
+    builder_sessions: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Builder sessions per attempt in edit mode (1 = one session per attempt).",
+    )
+    builder_library: bool = Field(
+        default=False,
+        description="Whether builders get the code library server (mcp__library tools).",
+    )
+    strict_mcp: bool = Field(
+        default=True,
+        description="Whether builders and reviewers ignore the MCP servers of the user's Claude Code.",
+    )
     gate_error_chars: int = Field(
         default=0,
         ge=0,
@@ -869,6 +899,10 @@ class FoundryConfig(BaseModel):
             "BUILDER_MODE": "builder_mode",
             "BUILDER_EDIT_MAX_TURNS": "builder_edit_max_turns",
             "BUILDER_TESTS": "builder_tests",
+            "BUILDER_SESSION_TURNS": "builder_session_turns",
+            "BUILDER_SESSIONS": "builder_sessions",
+            "BUILDER_LIBRARY": "builder_library",
+            "STRICT_MCP": "strict_mcp",
             "GATE_ERROR_CHARS": "gate_error_chars",
             "BUILDER_MODEL": "builder_model",
             "BUILDER_RETRY_MODEL": "builder_retry_model",
