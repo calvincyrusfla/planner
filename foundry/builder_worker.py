@@ -43,6 +43,7 @@ import copy
 import logging
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -50,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from foundry import claude_client as _claude_client
+from foundry.base_snapshot import BaseSnapshots
 from foundry.gemma_excerpts import error_excerpt
 from foundry.file_map import build_index, file_map
 from foundry.gemma_notes import find_related, pitfall_notes
@@ -1480,6 +1482,7 @@ class BuilderWorker(_WorkerBase):
             if isinstance(opened, str):
                 return opened
             workspace = opened
+        stray: list[str] = []
         call_options: dict[str, Any] = {
             "ticket_id": _get(ticket, "ticket_id"), "attempt": assignment.attempt + 1,
         }
@@ -1493,9 +1496,11 @@ class BuilderWorker(_WorkerBase):
                 if workspace is None:
                     result = await self._call_claude(prompt, task_id=task_id, **call_options)
                 else:
+                    folder_before = await self._user_folder_status()
                     result = await self._run_builder_sessions(
                         prompt, task_id, call_options, workspace, assignment.attempt + 1
                     )
+                    stray = await self._stray_writes(folder_before, assignment)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1505,6 +1510,8 @@ class BuilderWorker(_WorkerBase):
                 return await self._infra_release(ticket, exc)
             self._tm("record_duration", task_id, "build", time.monotonic() - started)
             self.scratch["last_reply"] = result.text
+            if stray:
+                return self._send_back_stray_writes(ticket, stray)
             if is_infrastructure_error(result):
                 # timeout / non-zero exit without JSON / no reply at all
                 return await self._infra_release(
@@ -1690,8 +1697,6 @@ class BuilderWorker(_WorkerBase):
         self, prompt: str, task_id: str, call_options: dict[str, Any], workspace: Path, attempt: int
     ) -> ClaudeResult:
         """Edit mode: continue a session that hit its turn limit in a fresh one with a handoff note."""
-        import subprocess
-
         limit = max(1, int(getattr(getattr(self, "config", None), "builder_sessions", 1) or 1))
         ticket_id = call_options.get("ticket_id")
 
@@ -1783,10 +1788,59 @@ class BuilderWorker(_WorkerBase):
                 "The workspace already contains the changes above; continue from the note, do not start over."
             )
 
+    def _served_repo(self) -> Path | None:
+        """The user's folder: the context engine's repo, else the service's; None when unknown."""
+        root = getattr(self.context_engine, "repo_root", None) or self.repo_root
+        return Path(root) if root else None
+
+    def _pieces_root(self) -> Path:
+        """Where piece workspaces go: ``<work_root>/pieces``, next to the database without a work root."""
+        resolve = getattr(self.config, "resolved_work_root", None)
+        if callable(resolve):
+            return Path(resolve(self._served_repo())) / "pieces"
+        return Path(self.config.db_path).parent / "pieces"
+
+    async def _user_folder_status(self) -> set[str] | None:
+        """The paths ``git status`` lists in the user's folder; None when that is not known."""
+        repo = self._served_repo()
+        if repo is None:
+            return None
+        try:
+            return await asyncio.to_thread(_porcelain_paths, repo)
+        except Exception as exc:  # noqa: BLE001 - the guard must never fail the attempt
+            log.debug("%s: git status of the user's folder failed: %s", self.agent_id, exc)
+            return None
+
+    async def _stray_writes(self, before: set[str] | None, assignment: TaskAssignment) -> list[str]:
+        """Allowed files that appeared in ``git status`` of the user's folder during the sessions."""
+        if before is None:
+            return []
+        after = await self._user_folder_status()
+        if after is None:
+            return []
+        allowed = {_read_only_path(f) for f in assignment.allowed_files}
+        return sorted((after - before) & allowed)
+
+    def _send_back_stray_writes(self, ticket: Any, paths: list[str]) -> str:
+        """Report allowed files written into the user's folder; those files are left where they are."""
+        task_id = _get(ticket, "task_id")
+        ticket_id = _get(ticket, "ticket_id")
+        joined = ", ".join(paths)
+        self._event("stray_write", task_id, {"ticket_id": ticket_id, "builder_id": self.agent_id, "paths": paths})
+        log.warning("%s: ticket %s wrote %s into the user's folder", self.agent_id, ticket_id, joined)
+        self._reset_infra(ticket)  # a real reply (E1)
+        self._tm("record_gate_failure", task_id)
+        return self._send_back(
+            ticket,
+            f"Wrote {joined} into the user's folder instead of the workspace; "
+            "write only inside the current working directory.",
+            reason="stray_write",
+        )
+
     async def _open_piece_workspace(self, ticket: Any, assignment: TaskAssignment) -> Path | str:
         """A fresh piece workspace for this attempt, or the outcome of releasing the ticket."""
         assert self._base is not None
-        pieces = Path(self.config.db_path).parent / "pieces"
+        pieces = self._pieces_root()
         name = re.sub(r"[^A-Za-z0-9._-]", "_", str(_get(ticket, "ticket_id")))
         dest = pieces / f"{name}-a{assignment.attempt + 1}"
         try:
@@ -2150,6 +2204,29 @@ def _snapshot_files(workspace: Path, paths: Iterable[str]) -> dict[str, str | No
         except (OSError, UnicodeDecodeError):
             continue
     return snap
+
+
+def _porcelain_paths(repo: Path) -> set[str] | None:
+    """Every path ``git status`` lists in ``repo`` (a rename's new name); None when git failed."""
+    try:
+        done = subprocess.run(
+            ["git", "-c", "core.quotepath=off", "status", "--porcelain", "--untracked-files=all"],
+            cwd=str(repo), env=BaseSnapshots._env(), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60, check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    paths: set[str] = set()
+    for line in done.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        rel = line[3:]
+        if "R" in line[:2] or "C" in line[:2]:
+            rel = rel.split(" -> ")[-1]
+        paths.add(_read_only_path(rel.strip().strip('"')))
+    return paths
 
 
 def _restore_files(workspace: Path | None, snapshot: dict[str, str | None] | None) -> None:

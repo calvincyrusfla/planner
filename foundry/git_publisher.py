@@ -45,7 +45,8 @@ log = logging.getLogger(__name__)
 #: A full or abbreviated commit id (``publish(base_sha=)``); never an option or a ref expression.
 _SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 
-#: Where temporary worktrees live by default (inside foundry/data, git-ignored).
+#: Fallback for callers that pass no root (inside foundry/data, git-ignored);
+#: the service passes ``<work_root>/worktrees``, outside the repository.
 DEFAULT_WORKTREE_ROOT = Path(__file__).resolve().parent / "data" / "worktrees"
 
 #: Branch name prefix for every branch Foundry publishes.

@@ -152,6 +152,12 @@ Environment variable               Field (default)
                                    use the fixed template sections
 ``FOUNDRY_GEMMA_NOTES_TIMEOUT_S``  ``gemma_notes_timeout_s`` (``90``, > 0):
                                    timeout of a Gemma notes call
+``FOUNDRY_WORK_ROOT``              ``work_root`` (unset: ``%LOCALAPPDATA%\\foundry``
+                                   on Windows, else ``$XDG_DATA_HOME/foundry`` or
+                                   ``~/.local/share/foundry``; see
+                                   ``resolved_work_root()``): the folder for
+                                   Foundry's working trees; refused at start
+                                   when inside the served repository
 =================================  ==========================================
 
 Settings file: when ``from_env()`` reads the real environment (``environ`` is
@@ -175,6 +181,7 @@ import json
 import logging
 import os
 import shlex
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -207,6 +214,8 @@ __all__ = [
     "DEFAULT_SETTINGS_FILE",
     "ENV_PREFIX",
     "FoundryConfig",
+    "WorkRootError",
+    "default_work_root",
     "split_claude_args",
 ]
 
@@ -401,6 +410,20 @@ class AnomalyThresholds(BaseModel):
     stall_s: float = Field(default=900.0, gt=0)
     gate_fail_quarantine: int | None = Field(default=None, ge=1)
     tpm_spike_ratio: float = Field(default=0.9, gt=0, le=1)
+
+
+class WorkRootError(ValueError):
+    """The folder for Foundry's working trees is inside the repository being served."""
+
+
+def default_work_root(environ: Mapping[str, str] | None = None, platform: str | None = None) -> Path:
+    """The per-user folder for Foundry's working trees, outside any repository."""
+    env = os.environ if environ is None else environ
+    if (platform or sys.platform) == "win32":
+        local = env.get("LOCALAPPDATA", "").strip()
+        return (Path(local) if local else Path.home() / "AppData" / "Local") / "foundry"
+    xdg = env.get("XDG_DATA_HOME", "").strip()
+    return (Path(xdg) if xdg else Path.home() / ".local" / "share") / "foundry"
 
 
 class FoundryConfig(BaseModel):
@@ -729,6 +752,10 @@ class FoundryConfig(BaseModel):
         gt=0,
         description="Seconds a Gemma notes call may take.",
     )
+    work_root: str | None = Field(
+        default=None,
+        description="Folder for Foundry's working trees; None = see resolved_work_root().",
+    )
 
     @field_validator("gemma_base_url")
     @classmethod
@@ -758,10 +785,10 @@ class FoundryConfig(BaseModel):
         """Strip entries and drop blanks and exact duplicates, keeping the order."""
         return list(dict.fromkeys(r.strip() for r in value if r.strip()))
 
-    @field_validator("pr_base")
+    @field_validator("pr_base", "work_root")
     @classmethod
     def _blank_base_is_none(cls, value: str | None) -> str | None:
-        """Treat a blank PR base as "use the repo default"."""
+        """Treat a blank PR base or work root as unset (use the default)."""
         if value is None or not value.strip():
             return None
         return value.strip()
@@ -806,6 +833,33 @@ class FoundryConfig(BaseModel):
         if self.patches_dir is not None:
             return self.patches_dir
         return self.db_path.parent / "patches"
+
+    def resolved_work_root(self, repo: str | os.PathLike[str] | None = None) -> Path:
+        """Return the absolute folder for piece workspaces, snapshots and publish worktrees.
+
+        ``work_root`` when set.  Unset: :func:`default_work_root`, except that a
+        database moved out of ``foundry/data`` (and out of ``repo``, the
+        repository being served) takes its working trees along, as it does
+        its patches.
+        """
+        if self.work_root is not None:
+            return Path(self.work_root).expanduser().resolve()
+        data_dir = self.db_path.resolve().parent
+        moved = data_dir != DEFAULT_DATA_DIR.resolve()
+        if moved and (repo is None or not data_dir.is_relative_to(Path(repo).resolve())):
+            return data_dir
+        return default_work_root().expanduser().resolve()
+
+    def check_work_root(self, repo: str | os.PathLike[str]) -> Path:
+        """Return the resolved work root; raise :class:`WorkRootError` when it is inside ``repo``."""
+        root = self.resolved_work_root(repo)
+        served = Path(repo).resolve()
+        if root.is_relative_to(served):
+            raise WorkRootError(
+                f"Foundry's work folder {root} is inside the repository {served}: "
+                f"set {ENV_PREFIX}WORK_ROOT to a folder outside it."
+            )
+        return root
 
     def effective_gate_fail_quarantine(self) -> int:
         """Return the LINE_JAM gate-failure limit the Shop Foreman applies.
@@ -938,6 +992,7 @@ class FoundryConfig(BaseModel):
             "PR_DIGEST": "pr_digest",
             "REVIEW_BY_TIER": "review_by_tier",
             "GEMMA_NOTES_TIMEOUT_S": "gemma_notes_timeout_s",
+            "WORK_ROOT": "work_root",
         }
         for var, field in simple.items():
             value = get(var)
