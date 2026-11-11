@@ -26,6 +26,12 @@ def _pr(number: int, mergeable: str = "MERGEABLE", status: str = "CLEAN", head: 
             "mergeStateStatus": status}
 
 
+def _diff_for(path: str, added: int) -> str:
+    body = "".join(f"+line {i}\n" for i in range(added))
+    return (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,1 +1,{added + 1} @@\n"
+            f" context\n{body}")
+
+
 class FakeRunner:
     """Stands in for git and gh: records every command, each merge and each comment."""
 
@@ -33,6 +39,7 @@ class FakeRunner:
         self.prs = prs
         self.files = files or {}
         self.sha = SHA
+        self.added = 5
         self.fetch_rc = 0
         self.comment_rc = 0
         self.merge_rc: dict[int, int] = {}
@@ -56,6 +63,9 @@ class FakeRunner:
             assert args[4:] == ["--json", "files"]
             paths = self.files.get(int(args[3]), TESTS_ONLY)
             return 0, json.dumps({"files": [{"path": path} for path in paths]}), ""
+        if args[:3] == ["gh", "pr", "diff"]:
+            paths = self.files.get(int(args[3]), TESTS_ONLY)
+            return 0, "".join(_diff_for(path, self.added) for path in paths), ""
         if args[:3] == ["gh", "pr", "merge"]:
             self.merges.append(args)
             rc = self.merge_rc.get(int(args[3]), 0)
@@ -156,6 +166,66 @@ def test_tests_only_clean_and_green_merges_once(tmp_path: Path, monkeypatch: pyt
     body = dict(runner.comments[-2:])[1]
     assert body.splitlines() == [COMMENT_MARKER, MERGED_TEXT]
     assert set(_saved(checker)["merged"]) == {"1", "2"}
+
+
+def test_low_pr_merges_in_low_mode_with_tier_in_comment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], {1: ["foundry/x.py"]}, auto_merge="low")
+
+    _round(checker)
+
+    assert runner.merged() == [1]
+    assert any(n == 1 and "risk tier low" in body for n, body in runner.comments)
+
+
+def test_low_pr_is_not_merged_in_tests_docs_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], {1: ["foundry/x.py"]})
+
+    _round(checker)
+
+    assert runner.merges == []
+
+
+def test_tests_docs_pr_merges_in_low_mode_naming_tier(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], auto_merge="low")
+
+    _round(checker)
+
+    assert runner.merged() == [1]
+    assert any("risk tier tests_docs" in body for _, body in runner.comments)
+
+
+def test_normal_pr_is_never_merged_in_low_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], {1: ["foundry/x.py"]}, auto_merge="low")
+    runner.added = 200
+
+    _round(checker)
+
+    assert runner.merges == []
+
+
+def test_high_pr_is_never_merged_in_low_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], {1: ["netlify/functions/x.js"]}, auto_merge="low")
+
+    _round(checker)
+
+    assert runner.merges == []
+
+
+def test_claude_md_is_never_merged_in_low_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1), _pr(2)],
+                                  {1: ["CLAUDE.md"], 2: [".claude/agents/x.md"]}, auto_merge="low")
+
+    _round(checker)
+
+    assert runner.merges == []
+
+
+def test_unknown_mode_is_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, runner, _ = _checker(tmp_path, monkeypatch, [_pr(1)], auto_merge="everything")
+
+    _round(checker)
+
+    assert runner.merges == []
 
 
 def test_merge_is_pinned_to_the_judged_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
