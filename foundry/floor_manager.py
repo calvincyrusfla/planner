@@ -176,8 +176,10 @@ class FloorManager(ForemanActionsMixin):
         snapshots: Any = None,
         gemma_notes: bool = False,
         gemma_notes_timeout_s: float = 90.0,
+        pr_template: bool = False,
     ) -> None:
         self.queue = queue
+        self.pr_template = bool(pr_template)
         self.gemma_notes = bool(gemma_notes)
         self.gemma_notes_timeout_s = float(gemma_notes_timeout_s)
         #: task id -> Gemma's advisory PR brief (in memory only)
@@ -1268,6 +1270,28 @@ class FloorManager(ForemanActionsMixin):
             body = "\n".join(lines[1:])
         footer = f"Opened by Foundry (task {task_id})"
         brief = (self.pr_briefs.get(task_id) or "").strip()
+        if self.pr_template:
+            parts = [f"## Summary\n\n{body or (order.title if order else task_id)}"]
+            if order and order.acceptance_criteria:
+                crit = "\n".join(f"- {c}" for c in order.acceptance_criteria)
+                parts.append(f"## Acceptance criteria\n\n{crit}")
+            files: list[str] = []
+            try:
+                patch = self._pr_patch(task_id)
+                if patch is not None:
+                    text = patch.read_text(encoding="utf-8")
+                    files = sorted({
+                        m.group(1).strip() for m in re.finditer(r"^\+\+\+ b/(.+)$", text, re.MULTILINE)
+                        if m.group(1).strip() != "/dev/null"
+                    })
+            except (OSError, UnicodeDecodeError):
+                files = []
+            if files:
+                parts.append("## Files changed\n\n" + "\n".join(f"- `{f}`" for f in files))
+            if brief:
+                parts.append(f"## Brief (Gemma, advisory)\n\n{brief}")
+            parts.append(f"---\n{footer}")
+            return {"title": title, "body": "\n\n".join(parts) + "\n", "draft": self.pr_draft}
         if brief:
             section = f"## Brief (Gemma, advisory)\n\n{brief}"
             body = f"{body}\n\n{section}" if body else section
@@ -2017,6 +2041,7 @@ def build_factory(
         pr_draft=bool(getattr(config, "pr_draft", False)),
         snapshots=snapshots,
         gemma_notes=bool(getattr(config, "gemma_notes", False)),
+        pr_template=bool(getattr(config, "pr_template", False)),
         gemma_notes_timeout_s=float(getattr(config, "gemma_notes_timeout_s", 90.0)),
     )
     # the Foreman reads the action log so it never prescribes RETRY_TASK twice for one task
