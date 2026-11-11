@@ -1698,6 +1698,10 @@ class BuilderWorker(_WorkerBase):
         async def diff_stat() -> str:
             def run_git() -> str:
                 try:
+                    subprocess.run(
+                        ["git", "add", "--intent-to-add", "--all"], cwd=str(workspace),
+                        capture_output=True, text=True, timeout=60, check=False,
+                    )
                     done = subprocess.run(
                         ["git", "diff", "--stat"], cwd=str(workspace), capture_output=True, text=True,
                         timeout=60, check=False,
@@ -1732,16 +1736,28 @@ class BuilderWorker(_WorkerBase):
                     base: Any = call_options.get("client") or self.client
                     args = list(getattr(base, "extra_args", ()))
                     kept: list[str] = []
-                    skip = False
-                    for arg in args:
-                        if skip:
-                            skip = False
-                        elif arg in ("--max-turns", "--disallowedTools", "--resume"):
-                            skip = True
+                    blocked: list[str] = []
+                    idx = 0
+                    while idx < len(args):
+                        arg = args[idx]
+                        value = str(args[idx + 1]) if idx + 1 < len(args) else ""
+                        if arg in ("--max-turns", "--resume"):
+                            idx += 2
+                        elif arg == "--disallowedTools":
+                            blocked += [t for t in re.split(r"[\s,]+", value) if t]
+                            idx += 2
+                        elif arg == "--allowedTools":
+                            left = [t for t in re.split(r"[\s,]+", value)
+                                    if t and t not in ("Edit", "Write", "Bash")]
+                            if left:
+                                kept += [arg, " ".join(left)]
+                            idx += 2
                         else:
                             kept.append(arg)
+                            idx += 1
+                    merged = list(dict.fromkeys([*blocked, "Edit", "Write", "Bash"]))
                     kept += ["--resume", result.session_id, "--max-turns", "2",
-                             "--disallowedTools", "Edit Write Bash"]
+                             "--disallowedTools", " ".join(merged)]
                     resumer = type(base)(
                         getattr(base, "claude_bin", "claude"), kept, env=getattr(base, "env", None)
                     )
