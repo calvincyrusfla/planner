@@ -510,10 +510,9 @@ def test_validation_gates_async(tmp_path: Path) -> None:
     assert not outcome.passed and outcome.failed_check == "syntax"
 
 
-def test_reexports_cache_and_retry_policy() -> None:
+def test_reexports_retry_policy() -> None:
     from foundry import solution_cache
 
-    assert vg.SolutionCache is solution_cache.SolutionCache
     assert vg.RetryPolicy is solution_cache.RetryPolicy
 
 

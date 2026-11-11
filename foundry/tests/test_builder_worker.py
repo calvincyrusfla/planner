@@ -46,7 +46,6 @@ from foundry.schemas import (
     TaskSizingDirective,
     TaskState,
 )
-from foundry.solution_cache import SolutionCache
 from foundry.telemetry import Telemetry
 from foundry.validation_gates import ValidationGates
 
@@ -125,7 +124,7 @@ class Rig:
         self.telemetry = Telemetry(self.queue)
         self.limiter = RateLimiter(rpm=600, tpm=10_000_000, max_concurrent=max_concurrent,
                                    sleep=lambda _s: asyncio.sleep(0))
-        self.cache = SolutionCache(tmp_path / "foundry.db")
+        self.cache: Any = None  # the workers still accept a cache parameter, unused
         self.engine = ContextEngine(self.ws) if context else None
         self.foreman = FakeForeman(ContextEngine(self.ws))
         self.gates = ValidationGates(checks=("syntax", "linter")) if gates == "real" else gates
@@ -361,7 +360,6 @@ def test_small_task_only_slot_one_calls_claude(tmp_path: Path) -> None:
     assert rig.telemetry.queue_dwell("T-S") >= 0.0
     assert rig.telemetry.waiting_for_review() == {}  # reviewer picked it up
     assert rig.telemetry.idle_counts()[TEAM] == 5
-    assert rig.cache.stats()["entries"] == 1
     assert rig.limiter.current_rpm() == 2  # every Claude call went through the limiter
 
 
@@ -465,7 +463,6 @@ def test_revise_counts_toward_retry_cap(tmp_path: Path) -> None:
     states = asyncio.run(run_pool(rig, ["T-X"]))
     assert states == {"T-X": "quarantined"}
     assert rig.client.calls[f"{TEAM}-1"] == MAX_RETRIES + 1 and rig.client.calls[REVIEWER] == MAX_RETRIES + 1
-    assert rig.cache.stats()["entries"] == 0  # never cached without APPROVED
     assert (rig.ws / "pkg" / "mathx.py").read_text() == ORIGINAL
 
 
@@ -481,39 +478,6 @@ def test_rejected_quarantines_and_rolls_back(tmp_path: Path) -> None:
     assert "wrong module" in (rig.queue.get_task("T-J")["quarantine_reason"] or "")
 
 
-def _fake_gates(sub: BuilderSubmission, a: TaskAssignment) -> list[DeterministicGateResult]:
-    """Pass-through gates that leave the workspace untouched (so identical tasks stay identical)."""
-    return [DeterministicGateResult(task_id=a.task_id, subtask_id=a.subtask_id, passed=True, check_type="syntax")]
-
-
-def _two_tasks(rig: Rig, titles: tuple[str, str], **pool_kwargs: Any) -> None:
-    async def scenario() -> None:
-        pool = rig.pool(**pool_kwargs)
-        async with pool:
-            rig.submit("T-C1", "S", title=titles[0])
-            await pool.wait_for_tasks(["T-C1"], timeout=10)
-            rig.submit("T-C2", "S", title=titles[1])
-            await pool.wait_for_tasks(["T-C2"], timeout=10)
-
-    asyncio.run(scenario())
-
-
-def test_cache_hit_skips_builder_claude_but_still_reviewed_by_default(tmp_path: Path) -> None:
-    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=_fake_gates)
-    _two_tasks(rig, ("Add mul", "Add mul"))
-    assert rig.state("T-C1") == TaskState.COMPLETE and rig.state("T-C2") == TaskState.COMPLETE
-    assert rig.client.calls[f"{TEAM}-1"] == 1  # second task served from the cache
-    assert rig.client.calls[REVIEWER] == 2  # trust_cache defaults to False: still reviewed
-    assert rig.telemetry.tokens_saved_by_source()["cache"] > 0
-    assert rig.completed == ["T-C1", "T-C2"]
-
-
-def test_trusted_cache_hit_skips_reviewer_too(tmp_path: Path) -> None:
-    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=_fake_gates)
-    _two_tasks(rig, ("Add mul", "Add mul"), trust_cache=True)
-    assert rig.client.calls[f"{TEAM}-1"] == 1 and rig.client.calls[REVIEWER] == 1
-
-
 def test_trust_cache_comes_from_config(tmp_path: Path) -> None:
     from foundry.config import FoundryConfig
 
@@ -523,12 +487,6 @@ def test_trust_cache_comes_from_config(tmp_path: Path) -> None:
     pool = rig.pool(config=cfg)
     assert pool.trust_cache is True and pool.builder(1).trust_cache is True
     assert pool.builder(1).limit_cooldown_s == 77 and pool.reviewer.limit_cooldown_s == 77
-
-
-def test_different_work_order_title_misses_the_cache(tmp_path: Path) -> None:
-    rig = Rig(tmp_path, lambda p, agent: APPROVE if is_reviewer(agent) else fenced(GOOD_DIFF), gates=_fake_gates)
-    _two_tasks(rig, ("Add mul", "Add a multiply helper for invoices"))
-    assert rig.client.calls[f"{TEAM}-1"] == 2
 
 
 def test_rate_limited_call_is_retried_without_burning_an_attempt(tmp_path: Path) -> None:

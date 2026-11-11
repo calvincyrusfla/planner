@@ -7,7 +7,6 @@ Builder loop (one slot)::
 
     wait_for_ticket(team, slot)        # no Claude call while waiting
       -> TaskAssignment (pruned ContextSlice from the context engine)
-      -> SolutionCache.lookup          # exact hit: skip Claude, record tokens saved
       -> Claude (limiter.slot + call_with_backoff), reply must hold one ```diff block
       -> parse_builder_reply -> BuilderSubmission (bad reply -> blocked)
       -> deterministic gates (short-circuit on the first failure)
@@ -23,7 +22,7 @@ Reviewer loop::
 
     review inbox -> diff-only prompt (criteria + unified diff + gate results)
       -> Claude -> parse_reviewer_reply (strict JSON ReviewerVerdict)
-           APPROVED: cache.store, ticket done, task complete when all tickets are
+           APPROVED: ticket done, task complete when all tickets are
            REVISE:   reopen the ticket with the line directives (counts as a retry)
            REJECTED: quarantine the task
 
@@ -291,7 +290,7 @@ class ReviewItem:
     #: Pre-diff contents of the touched files (restored on REVISE/REJECTED).
     snapshot: dict[str, str | None] | None = None
     workspace: Path | None = None
-    #: Work-order title/description used in the solution-cache key (same for lookup and store).
+    #: Work-order title/description (the reviewer prompt uses the description).
     cache_meta: dict[str, str] = field(default_factory=dict)
     #: Gemma pre-review notes for the reviewer prompt (advisory; None = none).
     pre_review_notes: str | None = None
@@ -878,15 +877,12 @@ class BuilderWorker(_WorkerBase):
         telemetry: ``Telemetry`` (tokens, durations, gate failures, retries).
         context_engine: builds the pruned ``ContextSlice`` for a subtask.
         gates: gate runner (see :class:`GatesLike`); ``None`` passes everything.
-        cache: ``SolutionCache`` (``lookup``/``store``); ``None`` disables it.
+        cache: unused; kept for call compatibility.
         foreman: ``ShopForeman`` (``condense_error_trace``); ``None`` uses a
             deterministic local condenser.
         review_inbox: the team's review queue (``TeamPool`` shares one).
         poll: ticket polling interval passed to ``wait_for_ticket``.
-        trust_cache: when True an exact cache hit that passes the gates
-            completes the ticket without a reviewer call; when False (default,
-            ``FoundryConfig.trust_cache``) the cached diff skips the builder's
-            Claude call but still goes through the gates and the reviewer.
+        trust_cache: unused; kept for call compatibility.
         limit_cooldown_s: pause used for a usage limit with no parseable reset
             time (``FoundryConfig.limit_cooldown_s``).
         infra_backoff_s: first per-worker backoff after a non-limit
@@ -1528,8 +1524,7 @@ class BuilderWorker(_WorkerBase):
     async def _build_ticket(self, ticket: Any) -> str:
         """Process one claimed ticket end to end; returns the outcome label.
 
-        Labels: ``"review"`` (sent to the reviewer), ``"cached"`` (cache hit
-        completed without Claude), ``"retry"`` (reopened with a fix hint),
+        Labels: ``"review"`` (sent to the reviewer), ``"retry"`` (reopened with a fix hint),
         ``"awaiting_help"`` (parked until the Floor Manager answers),
         ``"quarantined"``, ``"skipped"`` (task already terminal).
 
@@ -1545,14 +1540,7 @@ class BuilderWorker(_WorkerBase):
 
         self._ticket_changed(task_id)  # the ticket was just claimed
 
-        # 1. exact-match solution cache: a hit never calls Claude.
         meta = self._work_order(task_id)
-        cached = _cache_call(self.cache, "lookup", assignment, meta) if self.cache is not None else None
-        if cached:
-            outcome = await self._try_cached(ticket, assignment, cached, started, meta)
-            if outcome is not None:
-                return outcome
-            # A stale cached diff no longer passes its gates: build normally, no retry burned.
 
         # 2. Claude (inside limiter.slot + call_with_backoff)
         edit_mode = (getattr(getattr(self, "config", None), "builder_mode", "diff") == "edit"
@@ -2003,54 +1991,6 @@ class BuilderWorker(_WorkerBase):
             payload["reason"] = reason
         self._event("pre_review", _get(ticket, "task_id"), payload)
 
-    async def _try_cached(
-        self, ticket: Any, assignment: TaskAssignment, cached: str, started: float, meta: dict[str, str]
-    ) -> str | None:
-        """Use an approved cached diff; returns the outcome, or None if it no longer passes."""
-        task_id = assignment.task_id
-        submission = BuilderSubmission(
-            task_id=task_id,
-            subtask_id=assignment.subtask_id,
-            builder_id=assignment.builder_id,
-            status="ready_for_review",
-            modified_files=extract_diff_paths(cached),
-            diff=cached,
-            self_check={"cache_hit": True},
-        )
-        self._set_state(task_id, TaskState.VALIDATING)
-        snapshot = self._snapshot(cached)
-        before = self._before_change(cached)
-        try:
-            gates = await self._run_gates(submission, assignment)
-        except Exception as exc:
-            _restore_files(self.workspace, snapshot)
-            if not _is_counted_infra(exc):
-                raise
-            return await self._infra_release(ticket, exc)
-        self._record_gate_results(gates.results)
-        if not gates.passed:
-            _restore_files(self.workspace, snapshot)
-            self._event("cache_stale", task_id, {"ticket_id": _get(ticket, "ticket_id")})
-            return None
-        submission = self._normalized(ticket, submission, before)
-        cached = submission.diff
-        prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
-                                      focus_files=self._focus_files(ticket, assignment))
-        self._tm("record_tokens_saved", task_id, "cache", _estimate_tokens(prompt) + _estimate_tokens(cached))
-        self._event("cache_hit", task_id, {"ticket_id": _get(ticket, "ticket_id"), "builder_id": self.agent_id})
-        self._tm("record_duration", task_id, "build", time.monotonic() - started)
-        if self.trust_cache:
-            record = getattr(self.queue, "record_approved_diff", None)
-            if callable(record):  # later stacked tickets build on it
-                try:
-                    record(_get(ticket, "ticket_id"), cached)
-                except KeyError:
-                    pass
-            await _complete_ticket(self, _get(ticket, "ticket_id"), task_id, self.on_task_complete)
-            return "cached"
-        await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta)
-        return "review"
-
     # -- diff normalisation --------------------------------------------------------
     def _before_root(self) -> Path | None:
         """Where the files stand before this ticket's change (stacked copy, workspace or base)."""
@@ -2100,7 +2040,7 @@ class BuilderWorker(_WorkerBase):
         return "released"
 
     def _work_order(self, task_id: str) -> dict[str, str]:
-        """The task's title and description (part of the solution-cache key, D5)."""
+        """The task's title and description."""
         task = None
         getter = getattr(self.queue, "get_task", None)
         if getter is not None:
@@ -2165,12 +2105,6 @@ def _is_counted_infra(exc: BaseException) -> bool:
     return any(c.__name__ == "InfrastructureError" for c in type(exc).__mro__) or isinstance(
         exc, _claude_client.ClaudeError
     )
-
-
-def _cache_call(cache: Any, method: str, assignment: TaskAssignment, meta: dict[str, str], *args: Any) -> Any:
-    """``cache.lookup/store(assignment, *args, title=, description=)``; older caches lack the keywords."""
-    fn = getattr(cache, method)
-    return fn(assignment, *args, **_supported_kwargs(fn, meta))
 
 
 async def _complete_ticket(
@@ -2431,8 +2365,6 @@ class ReviewerWorker(_WorkerBase):
                     record(item.ticket_id, item.submission.diff)
                 except KeyError:
                     pass
-            if self.cache is not None and item.submission.diff.strip() and not item.submission.self_check.get("cache_hit"):
-                _cache_call(self.cache, "store", item.assignment, item.cache_meta, item.submission.diff)
             if self.on_approved is not None:
                 await _maybe_await(self.on_approved(item, verdict))
             await _complete_ticket(self, item.ticket_id, task_id, self.on_task_complete)
