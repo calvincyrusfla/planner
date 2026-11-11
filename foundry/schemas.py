@@ -598,6 +598,7 @@ class ClaudeResult(FoundryModel):
     error: str | None = None
     session_id: str | None = None
     num_turns: int | None = None
+    subtype: str | None = None
 
     @property
     def total_tokens(self) -> int:

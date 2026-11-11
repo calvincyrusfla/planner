@@ -1490,7 +1490,12 @@ class BuilderWorker(_WorkerBase):
             call_options["client"] = retry_client
         try:
             try:
-                result = await self._call_claude(prompt, task_id=task_id, **call_options)
+                if workspace is None:
+                    result = await self._call_claude(prompt, task_id=task_id, **call_options)
+                else:
+                    result = await self._run_builder_sessions(
+                        prompt, task_id, call_options, workspace, assignment.attempt + 1
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1680,6 +1685,87 @@ class BuilderWorker(_WorkerBase):
             log.info("%s: ticket %s builds in diff mode although builder_mode is edit (%s)",
                      self.agent_id, key, why)
         return False
+
+    async def _run_builder_sessions(
+        self, prompt: str, task_id: str, call_options: dict[str, Any], workspace: Path, attempt: int
+    ) -> ClaudeResult:
+        """Edit mode: continue a session that hit its turn limit in a fresh one with a handoff note."""
+        import subprocess
+
+        limit = max(1, int(getattr(getattr(self, "config", None), "builder_sessions", 1) or 1))
+        ticket_id = call_options.get("ticket_id")
+
+        async def diff_stat() -> str:
+            def run_git() -> str:
+                try:
+                    done = subprocess.run(
+                        ["git", "diff", "--stat"], cwd=str(workspace), capture_output=True, text=True,
+                        timeout=60, check=False,
+                    )
+                    return done.stdout.strip() if done.returncode == 0 else ""
+                except (OSError, subprocess.SubprocessError):
+                    return ""
+
+            return await asyncio.to_thread(run_git)
+
+        session_prompt = prompt
+        number = 1
+        while True:
+            result = await self._call_claude(session_prompt, task_id=task_id, **call_options)
+            hit_limit = result.is_error and (
+                result.subtype == "error_max_turns" if result.subtype else "max_turns" in (result.error or "")
+            )
+            more = hit_limit and number < limit
+            stat = await diff_stat() if more else ""
+            if more and not stat and not (result.num_turns or 0):
+                more = False
+            self._event(
+                "builder_session", task_id,
+                {"ticket_id": ticket_id, "attempt": attempt, "session": number, "turns": result.num_turns,
+                 "reason": "max_turns" if hit_limit else ("error" if result.is_error else "finished")},
+            )
+            if not more:
+                return result
+            note = ""
+            if result.session_id:
+                try:
+                    base: Any = call_options.get("client") or self.client
+                    args = list(getattr(base, "extra_args", ()))
+                    kept: list[str] = []
+                    skip = False
+                    for arg in args:
+                        if skip:
+                            skip = False
+                        elif arg in ("--max-turns", "--disallowedTools", "--resume"):
+                            skip = True
+                        else:
+                            kept.append(arg)
+                    kept += ["--resume", result.session_id, "--max-turns", "2",
+                             "--disallowedTools", "Edit Write Bash"]
+                    resumer = type(base)(
+                        getattr(base, "claude_bin", "claude"), kept, env=getattr(base, "env", None)
+                    )
+                    resumed = await self._call_claude(
+                        "Stop working. Write a handoff note for the next session, under 300 words: what you "
+                        "learned (exact names, files, line numbers), what you changed, what is left, and "
+                        "anything that failed. Reply with the note only.",
+                        task_id=task_id, **{**call_options, "client": resumer},
+                    )
+                    if not resumed.is_error:
+                        note = resumed.text.strip()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug("%s: handoff resume failed", self.agent_id, exc_info=True)
+                    note = ""
+            if not note:
+                note = f"(Foundry fallback note)\nChanges so far:\n{stat or '(none)'}\n\nLast reply:\n{result.text[-1500:]}"
+            number += 1
+            session_prompt = (
+                f"{prompt}\n\n## Continuing an earlier session\n\n{note}\n\n"
+                f"Current `git diff --stat`:\n{stat or '(no changes yet)'}\n\n"
+                "The workspace already contains the changes above; continue from the note, do not start over."
+            )
 
     async def _open_piece_workspace(self, ticket: Any, assignment: TaskAssignment) -> Path | str:
         """A fresh piece workspace for this attempt, or the outcome of releasing the ticket."""
