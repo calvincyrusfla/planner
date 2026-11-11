@@ -124,6 +124,8 @@ Environment variable               Field (default)
                                    ``tests_docs`` merges small test/docs PRs
 ``FOUNDRY_GEMMA_NOTES``            ``gemma_notes`` (``false``): Gemma writes
                                    advisory pitfall notes and PR briefs
+``FOUNDRY_PR_TEMPLATE``            ``pr_template`` (``false``): PR descriptions
+                                   use the fixed template sections
 ``FOUNDRY_GEMMA_NOTES_TIMEOUT_S``  ``gemma_notes_timeout_s`` (``90``, > 0):
                                    timeout of a Gemma notes call
 =================================  ==========================================
@@ -650,6 +652,10 @@ class FoundryConfig(BaseModel):
         default=False,
         description="Whether Gemma writes advisory pitfall notes and PR briefs.",
     )
+    pr_template: bool = Field(
+        default=False,
+        description="Whether PR descriptions use the fixed template (summary, acceptance criteria, files changed, brief).",
+    )
     gemma_notes_timeout_s: float = Field(
         default=90,
         gt=0,
@@ -853,6 +859,7 @@ class FoundryConfig(BaseModel):
             "AUTO_UPDATE": "auto_update",
             "AUTO_MERGE": "auto_merge",
             "GEMMA_NOTES": "gemma_notes",
+            "PR_TEMPLATE": "pr_template",
             "GEMMA_NOTES_TIMEOUT_S": "gemma_notes_timeout_s",
         }
         for var, field in simple.items():
