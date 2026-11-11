@@ -1,4 +1,4 @@
-"""End-to-end checks for T-019 (Gemma group 3: automatic PRs, self-fixing line with undo).
+"""End-to-end checks for T-019 (Gemma group 3: automatic PRs, a line check that only logs).
 
 * **Automatic pull request.** ``foundry.serve`` runs on a free loopback port
   for a temporary git repository whose ``origin`` is a local bare repository,
@@ -12,12 +12,12 @@
 * **Failed PR, then Retry.** ``gh pr create`` fails once: the task row shows
   ``pr.state == failed`` / ``stage == pr_failed``; ``POST
   /api/tasks/<id>/pr/retry`` opens it.
-* **Stuck task -> REASSIGN_TEAM -> Undo over HTTP.** Dispatch is paused so
-  the task's tickets stay open on their team; the line check
-  (``service.monitor_once``) applies a REASSIGN_TEAM escalation (the Foreman's
-  detection itself is unit-tested in test_shop_foreman), the action appears in
-  ``GET /api/actions``, and ``POST /api/actions/<id>/undo`` moves the tickets
-  back; a second undo is a no-op.
+* **Stuck task -> REASSIGN_TEAM is only logged.** Dispatch is paused so the
+  task's tickets stay open on their team; the line check
+  (``service.monitor_once``) logs a REASSIGN_TEAM escalation (the Foreman's
+  detection itself is unit-tested in test_shop_foreman) without moving the
+  tickets, the entry appears in ``GET /api/actions``, and ``POST
+  /api/actions/<id>/undo`` is refused.
 
 Safety: simulated Claude and Gemma only, dry board bridge, DEPT_HUB=off plus a
 scratch DEPT_DATA, a fake ``gh`` and a local bare "origin" (no GitHub, no
@@ -357,10 +357,10 @@ def test_failed_pr_shows_failed_then_retry_over_http_opens_it(
     assert _git(bare, "for-each-ref", "--format=%(refname:short)", "refs/heads/foundry/").split() == [first_branch]
 
 
-# --------------------------------------------------------------------------- 2 stuck task -> reassign -> undo
+# --------------------------------------------------------------------------- 2 stuck task -> logged, undo refused
 
 
-def test_stuck_task_is_reassigned_and_undo_over_http_moves_it_back(
+def test_stuck_task_is_logged_and_undo_over_http_is_refused(
     tmp_path: Path, clean_foundry_env: pytest.MonkeyPatch
 ) -> None:
     from foundry.main import write_demo_repo
@@ -401,40 +401,35 @@ def test_stuck_task_is_reassigned_and_undo_over_http_moves_it_back(
             fired.append(alert.alert_id)
             return alert
 
-        f.foreman.evaluate_line_anomaly = evaluate  # the detector is unit-tested; drive the real apply path
+        f.foreman.evaluate_line_anomaly = evaluate  # the detector is unit-tested; drive the real log path
         result = _on_loop(service, service.monitor_once())
-        assert result is not None and result["action"].get("applied") is True, result
+        assert result is not None and result["action"].get("applied") is False, result
         assert result["action"].get("action") == "REASSIGN_TEAM", result
-        assert {t.team_id for t in f.queue.tickets(task_id=tid)} == {to_team}
-        assert f.queue.get_task(tid)["team_id"] == to_team
-        assert _row(base, tid).get("team") == to_team
+        assert {t.team_id for t in f.queue.tickets(task_id=tid)} == {from_team}
+        assert f.queue.get_task(tid)["team_id"] == from_team
+        assert _row(base, tid).get("team") == from_team
 
         actions = _http("GET", f"{base}/api/actions")
         assert actions["ok"] is True
         entry = actions["actions"][0]  # newest first
         assert entry["action"] == "REASSIGN_TEAM" and entry["task_id"] == tid, actions
         assert entry["alert_id"] == alert.alert_id
-        assert entry["undoable"] is True and not entry["undone_at"], entry
-        assert entry["params"].get("to_team") == to_team, entry
+        assert entry["applied"] is False and entry["undoable"] is False and not entry["undone_at"], entry
 
-        # The same alert is not applied twice.
+        # The same alert is not logged twice.
         assert _on_loop(service, service.monitor_once()) is None
 
-        undo = _http("POST", f"{base}/api/actions/{entry['action_id']}/undo", {})
-        assert undo["ok"] is True and undo["action_id"] == entry["action_id"], undo
-        assert {t.team_id for t in f.queue.tickets(task_id=tid)} == {from_team}
-        assert f.queue.get_task(tid)["team_id"] == from_team
+        gone = "undo is gone: the Foreman only logs and never acts"
+        undo = _http("POST", f"{base}/api/actions/{entry['action_id']}/undo", {}, expect=409)
+        assert undo["ok"] is False and undo["reason"] == gone and undo["action_id"] == entry["action_id"], undo
         assert sorted(t.ticket_id for t in f.queue.tickets(task_id=tid, status="open")) == ids
+        assert {t.team_id for t in f.queue.tickets(task_id=tid)} == {from_team}
 
         after = _http("GET", f"{base}/api/actions")["actions"][0]
-        assert after["action_id"] == entry["action_id"] and after["undone_at"] and after["undone_by"] == "user", after
-
-        again = _http("POST", f"{base}/api/actions/{entry['action_id']}/undo", {})
-        assert again["ok"] is True and again.get("already_undone") is True, again
-        assert {t.team_id for t in f.queue.tickets(task_id=tid)} == {from_team}
+        assert after["action_id"] == entry["action_id"] and not after["undone_at"], after
 
         missing = _http("POST", f"{base}/api/actions/A-9999/undo", {}, expect=409)
-        assert missing["ok"] is False and "A-9999" in missing["reason"], missing
+        assert missing["ok"] is False and missing["reason"] == gone, missing
 
 
 async def _call(fn: Any) -> Any:

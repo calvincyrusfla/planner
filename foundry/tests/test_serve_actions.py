@@ -18,6 +18,8 @@ import pytest
 from foundry.serve import Service
 from foundry.serve_api import FoundryAPI
 
+UNDO_GONE = "undo is gone: the Foreman only logs and never acts"
+
 
 class FakeService:
     def __init__(self) -> None:
@@ -44,9 +46,7 @@ class FakeService:
 
     async def undo_action(self, action_id, by="user"):
         self.undone.append((action_id, by))
-        if action_id == "A-2":
-            return {"ok": True, "action_id": "A-2", "message": "Moved F-012 back to Team Alpha"}
-        return {"ok": False, "reason": "not undoable"}
+        return {"ok": False, "reason": UNDO_GONE}
 
 
 @pytest.fixture()
@@ -89,15 +89,11 @@ def test_get_actions(api, svc):
     assert resp.status == 400 and out["code"] == "invalid"
 
 
-def test_undo_ok_and_refused(api, svc):
+def test_undo_is_refused(api, svc):
     resp, out = request(api, "POST", "/api/actions/A-2/undo", body={})
-    assert resp.status == 200
-    assert out["ok"] is True and out["action_id"] == "A-2"
-    assert svc.undone[-1] == ("A-2", "user")
-    resp, out = request(api, "POST", "/api/actions/A-1/undo")
     assert resp.status == 409
-    assert out == {"ok": False, "reason": "not undoable", "error": "not undoable", "action_id": "A-1",
-                   "code": "refused"}
+    assert out == {"ok": False, "reason": UNDO_GONE, "error": UNDO_GONE, "action_id": "A-2", "code": "refused"}
+    assert svc.undone[-1] == ("A-2", "user")
 
 
 def test_undo_routes_refuse_bad_ids_methods_and_foreign_callers(api, svc):
@@ -154,7 +150,7 @@ class FakeManager:
 
     def undo_action(self, action_id, by="user"):
         self.calls.append((action_id, by))
-        return {"ok": action_id == "A-1", "reason": None if action_id == "A-1" else "state moved on"}
+        return {"ok": False, "reason": UNDO_GONE}
 
 
 def _service(tmp_path, manager):
@@ -176,9 +172,9 @@ def test_service_actions_newest_first_jsonable_and_this_repo_only(tmp_path):
 def test_service_undo_action(tmp_path):
     m = FakeManager({})
     svc = _service(tmp_path, m)
-    assert asyncio.run(svc.undo_action("A-1")) == {"ok": True, "reason": None, "action_id": "A-1"}
+    assert asyncio.run(svc.undo_action("A-1")) == {"ok": False, "reason": UNDO_GONE, "action_id": "A-1"}
     out = asyncio.run(svc.undo_action("A-2", by="dashboard"))
-    assert out["ok"] is False and out["reason"] == "state moved on"
+    assert out["ok"] is False and out["reason"] == UNDO_GONE
     assert m.calls == [("A-1", "user"), ("A-2", "dashboard")]
 
 
@@ -208,7 +204,8 @@ def test_service_undo_refuses_another_repos_action(tmp_path):
     out = asyncio.run(svc.undo_action("A-9"))
     assert out == {"ok": False, "action_id": "A-9", "reason": "unknown action", "code": "not_found"}
     assert m.calls == []
-    assert asyncio.run(svc.undo_action("A-1"))["ok"] is True
+    assert asyncio.run(svc.undo_action("A-1"))["reason"] == UNDO_GONE
+    assert m.calls == [("A-1", "user")]
 
 
 def test_undo_not_found_and_not_running(api, svc):
