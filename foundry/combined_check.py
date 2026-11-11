@@ -18,12 +18,15 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from foundry.git_publisher import GitPublisher, default_runner, valid_ref
+from foundry.merge_train import EVENT_KIND as MERGE_TRAIN_EVENT
+from foundry.merge_train import merge_train_enabled, rebase_behind
 from foundry.suite_check import run_suite
 
 log = logging.getLogger("foundry.combined_check")
@@ -343,6 +346,9 @@ class CombinedChecker:
         self.runner = runner or default_runner
         self.gh = gh or shutil.which("gh") or "gh"
         self.git = git
+        self.train_poll_s = _env_seconds("FOUNDRY_TRAIN_POLL_S", 60.0, 15.0)
+        #: base -> (sha, open PR numbers) at the last train poll.
+        self._train_seen: dict[str, tuple[str, frozenset[int]]] = {}
         self.rounds = 0
         self.last_error: str | None = None
         self.last_result: CombinedResult | None = None
@@ -364,13 +370,72 @@ class CombinedChecker:
             await asyncio.gather(task, return_exceptions=True)
 
     async def _loop(self) -> None:
+        if not merge_train_enabled():
+            while True:
+                await asyncio.sleep(self.interval_s)
+                await self._safe_round()
+        due = time.monotonic() + self.interval_s
         while True:
-            await asyncio.sleep(self.interval_s)
+            await asyncio.sleep(max(0.0, min(self.train_poll_s, due - time.monotonic())))
+            if time.monotonic() >= due:
+                await self._safe_round()
+                due = time.monotonic() + self.interval_s
+                continue
             try:
-                await self.run_once()
-            except Exception as exc:  # noqa: BLE001 - the check must never take the service down
+                if await self.train_once():
+                    due = time.monotonic() + self.interval_s
+            except Exception as exc:  # noqa: BLE001 - the train must never take the service down
                 self.last_error = f"{type(exc).__name__}: {exc}"
-                log.warning("combined check: round failed: %s", self.last_error)
+                log.warning("combined check: merge train failed: %s", self.last_error)
+
+    async def _safe_round(self) -> None:
+        try:
+            await self.run_once()
+        except Exception as exc:  # noqa: BLE001 - the check must never take the service down
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            log.warning("combined check: round failed: %s", self.last_error)
+
+    async def train_once(self) -> bool:
+        """Poll the bases; rebase the PRs that fell behind a moved base, then run a round. True when it acted."""
+        if not self.service.running or not merge_train_enabled():
+            return False
+        prs = await open_foundry_prs(self.gh, Path(self.service.repo), self.runner)
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for pr in prs:
+            base = pr.get("baseRefName")
+            if isinstance(pr.get("number"), int) and isinstance(base, str) and valid_ref(base) \
+                    and not base.startswith("foundry/"):
+                groups.setdefault(base, []).append(pr)
+        acted = False
+        for base, group in sorted(groups.items()):
+            rc, out, _err = await self._run([self.git, "ls-remote", "origin", base], _GIT_TIMEOUT_S)
+            words = out.split() if rc == 0 else []
+            sha = words[0] if words else ""
+            if not sha:
+                continue
+            numbers = frozenset(pr["number"] for pr in group)
+            old_sha, old_numbers = self._train_seen.get(base, (None, None))
+            self._train_seen[base] = (sha, numbers)
+            if old_sha is None or (old_sha == sha and old_numbers == numbers):
+                continue
+            outcome = await rebase_behind(self.service, base, group, runner=self.runner)
+            acted = True
+            self._record_train(base, old_sha, sha, outcome)
+        if acted:
+            await self._safe_round()
+        return acted
+
+    def _record_train(self, base: str, old_sha: str, new_sha: str, outcome: dict[str, Any]) -> None:
+        record = self._kv("record_event")
+        payload = {"base": base, "old_sha": old_sha, "new_sha": new_sha, "rebased": outcome.get("rebased", []),
+                   "conflicts": {str(k): v for k, v in outcome.get("conflicts", {}).items()}}
+        log.info("combined check: merge train on %s: %s", base, payload)
+        if record is None:
+            return
+        try:
+            record(MERGE_TRAIN_EVENT, None, payload)
+        except Exception as exc:  # noqa: BLE001 - the event is only a record
+            log.warning("combined check: merge train event not saved: %s", exc)
 
     async def run_once(self) -> None:
         """One round: follow the bases, check each base with two or more open Foundry PRs that moved, then auto-merge."""
