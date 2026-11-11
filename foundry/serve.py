@@ -334,8 +334,28 @@ class Service:
         self._monitor_task = self.loop.create_task(self._monitor_loop())
         self._start_batches()
         self._start_combined_check()
+        self._start_helpers()
         log.info("foundry serve: running for %s (%d pool(s))", self.repo, len(self.factory.pools))
         return self
+
+    def _start_helpers(self) -> None:
+        """Start the notifier, help desk, capacity governor and quarantine reporter; one failing skips only it."""
+        import importlib
+
+        self.helpers: list[Any] = []
+        for module, name in (
+            ("foundry.notifier", "Notifier"),
+            ("foundry.help_desk", "HelpDesk"),
+            ("foundry.governor", "CapacityGovernor"),
+            ("foundry.quarantine_report", "QuarantineReporter"),
+        ):
+            try:
+                helper = getattr(importlib.import_module(module), name)(self)
+                helper.start()
+            except Exception as exc:  # helpers are optional: the service runs without them
+                log.warning("foundry serve: helper %s is off: %s", name, exc)
+                continue
+            self.helpers.append(helper)
 
     def _start_batches(self) -> None:
         """Watch the board for Foundry batches of this repo (see :mod:`foundry.board_dispatch`)."""
@@ -477,6 +497,12 @@ class Service:
             await self.combined_checker.stop()
         if self.stack_keeper is not None:
             await self.stack_keeper.stop()
+        for helper in list(getattr(self, "helpers", [])):
+            try:
+                await helper.stop()
+            except Exception as exc:  # shutdown must go on
+                log.warning("foundry serve: helper %s did not stop cleanly: %s", type(helper).__name__, exc)
+        self.helpers = []
         if self._monitor_task is not None:
             self._monitor_task.cancel()
             try:
@@ -705,6 +731,7 @@ class Service:
                 "calls": _count(stats.get("calls")),
             },
         }
+        out["helpers"] = [type(h).__name__ for h in getattr(self, "helpers", [])]
         if watcher is not None:
             out["batches"] = watcher.summary()
         out["combined_check"] = self.combined_checker.summary() if self.combined_checker is not None else None
