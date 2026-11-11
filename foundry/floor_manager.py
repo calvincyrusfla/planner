@@ -1271,6 +1271,10 @@ class FloorManager(ForemanActionsMixin):
         footer = f"Opened by Foundry (task {task_id})"
         brief = (self.pr_briefs.get(task_id) or "").strip()
         if self.pr_template:
+            body_lines = body.splitlines()
+            first = next((i for i, ln in enumerate(body_lines) if ln.strip()), None)
+            if first is not None and re.fullmatch(r"#+\s*summary\s*#*", body_lines[first].strip(), re.IGNORECASE):
+                body = "\n".join(body_lines[first + 1:]).strip()
             parts = [f"## Summary\n\n{body or (order.title if order else task_id)}"]
             if order and order.acceptance_criteria:
                 crit = "\n".join(f"- {c}" for c in order.acceptance_criteria)
