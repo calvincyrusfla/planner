@@ -13,8 +13,15 @@ slug, host and service id) and every ``interval`` seconds:
 3. claims it (``claimFoundryUpdate``; a refusal means someone else took it);
 4. runs ``apply(service.repo, settings)`` (default
    :func:`foundry.self_update.apply_update`);
-5. reports the result (``finishFoundryUpdate``) and, when the update is
-   ``done``, asks the service to restart (``service.request_restart()``).
+5. when a ``done`` update changed files under ``department/``, restarts the
+   local dashboard and says so in the result message;
+6. reports the result (``finishFoundryUpdate``; the board client usually goes
+   through that same dashboard, so after a restart the report is retried until
+   it is back) and, when the update is ``done``, asks the service to restart
+   (``service.request_restart()``).
+
+An update that ends ``refused`` or ``failed`` leaves an ``update_refused`` or
+``update_failed`` queue event and a warning (once per distinct message).
 
 Board errors are logged and retried on the next poll; one request is handled at a time.
 
@@ -22,19 +29,25 @@ With the ``auto_update`` setting on, a poll that finds nothing to carry out also
 compares this checkout with ``origin`` (at most every :data:`AUTO_UPDATE_CHECK_S`
 seconds) and, when the remote branch has a commit that HEAD does not contain,
 sends ``requestFoundryUpdate`` (``by: "auto"``) once for that remote commit. The
-steps above then carry it out.
+steps above then carry it out. After a refused pull no automatic request is sent
+until the remote branch moves or :data:`AUTO_UPDATE_REFUSED_BACKOFF_S` seconds pass.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Callable, Mapping
 
 log = logging.getLogger("foundry.update_watcher")
 
-__all__ = ["AUTO_UPDATE_CHECK_S", "DEFAULT_UPDATE_POLL_S", "MAX_MESSAGE", "UpdateWatcher"]
+__all__ = [
+    "AUTO_UPDATE_CHECK_S", "AUTO_UPDATE_REFUSED_BACKOFF_S", "DEFAULT_UPDATE_POLL_S", "MAX_MESSAGE", "UpdateWatcher",
+]
 
 DEFAULT_UPDATE_POLL_S = 15.0
 #: The result message sent to the board is cut to this many characters.
@@ -47,6 +60,17 @@ AUTO_UPDATE_CHECK_S = 60.0
 _AUTO_GIT_TIMEOUT = 30.0
 #: Request states that block a new request (the board's ``OPEN_UPDATE``).
 _OPEN_STATES = frozenset({"queued", "claimed"})
+#: After a refused pull, the same remote commit is not requested again for this long (seconds).
+AUTO_UPDATE_REFUSED_BACKOFF_S = 1800.0
+#: Time limit of the POST that restarts the local dashboard (seconds).
+_DASHBOARD_RESTART_TIMEOUT = 10.0
+_DASHBOARD_RESTARTED = "; dashboard restarted"
+_MAX_DASHBOARD_REASON = 200
+#: Characters of the result message kept in an update_refused / update_failed event.
+_MAX_EVENT_MESSAGE = 500
+#: After a dashboard restart the board client is down until it is back: tries and the pause between them.
+_FINISH_ATTEMPTS = 20
+_FINISH_RETRY_S = 3.0
 
 
 def _field(result: Any, *names: str) -> Any:
@@ -66,6 +90,24 @@ def _refused(exc: BaseException) -> bool:
     except ImportError:  # pragma: no cover - board_dispatch always ships with Foundry
         return False
     return isinstance(exc, BoardRefused)
+
+
+def _post_dashboard_restart() -> None:
+    """Ask the local dashboard to restart (blocking); raises when it does not accept."""
+    from foundry.board_dispatch import _LOCAL_OPENER, DEFAULT_DASHBOARD_URL
+
+    base = (os.environ.get("FOUNDRY_DASHBOARD_URL") or DEFAULT_DASHBOARD_URL).rstrip("/")
+    req = urllib.request.Request(
+        f"{base}/api/dashboard/restart", data=b"{}",
+        headers={"content-type": "application/json"}, method="POST",
+    )
+    with _LOCAL_OPENER.open(req, timeout=_DASHBOARD_RESTART_TIMEOUT) as resp:
+        resp.read()
+
+
+def _not_restarted(reason: object) -> str:
+    """The result message suffix of a dashboard that was not restarted."""
+    return "; dashboard not restarted: " + " ".join(str(reason).split())[:_MAX_DASHBOARD_REASON]
 
 
 class UpdateWatcher:
@@ -114,6 +156,13 @@ class UpdateWatcher:
         self._last_auto_check: float | None = None
         #: Remote commits an automatic request was already sent for.
         self._auto_requested: set[str] = set()
+        #: The remote commit the last auto-update check saw.
+        self._last_remote: str | None = None
+        #: When the last pull was refused (None: no back-off) and the remote commit it was refused for.
+        self._refused_at: float | None = None
+        self._refused_remote: str | None = None
+        #: (status, message) pairs already logged at warning.
+        self._warned: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -135,10 +184,13 @@ class UpdateWatcher:
     async def _loop(self) -> None:
         while True:
             await self.poll_once()
-            v = self._sleep(self.interval)
-            if asyncio.iscoroutine(v) or isinstance(v, asyncio.Future):
-                await v
+            await self._pause(self.interval)
             await asyncio.sleep(0)
+
+    async def _pause(self, seconds: float) -> None:
+        v = self._sleep(seconds)
+        if asyncio.iscoroutine(v) or isinstance(v, asyncio.Future):
+            await v
 
     def summary(self) -> dict[str, Any]:
         return {"repo": self.repo_slug, "service": self.service_id, "rounds": self.rounds,
@@ -233,23 +285,19 @@ class UpdateWatcher:
             return None
         result = await self._run_apply(request.get("settings"))
         status = str(_field(result, "status") or "failed")
-        message = str(_field(result, "message") or "")[:MAX_MESSAGE]
+        before = _field(result, "commit_before", "commitBefore")
+        after = _field(result, "commit_after", "commitAfter")
+        suffix = await self._restart_dashboard(before, after) if status == "done" else ""
+        # the suffix is kept whole: only the message of the update itself is cut
+        message = str(_field(result, "message") or "")[:MAX_MESSAGE - len(suffix)] + suffix
+        if status in ("refused", "failed"):
+            self._note_unsuccessful(rid, status, message, request)
         payload = {
             "id": rid, "service": self.service_id, "status": status,
-            "result": {
-                "commitBefore": _field(result, "commit_before", "commitBefore"),
-                "commitAfter": _field(result, "commit_after", "commitAfter"),
-                "message": message,
-            },
+            "result": {"commitBefore": before, "commitAfter": after, "message": message},
         }
         self.handled.append(rid)
-        try:
-            await asyncio.to_thread(self.board.op, "finishFoundryUpdate", payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # the update itself already happened
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            log.warning("foundry updates: could not report %s (%s): %s", rid, status, self.last_error)
+        await self._finish(rid, status, payload, _FINISH_ATTEMPTS if suffix == _DASHBOARD_RESTARTED else 1)
         log.info("foundry updates: %s %s: %s", rid, status, message)
         if status == "done":
             self.restarting = True
@@ -257,6 +305,78 @@ class UpdateWatcher:
             if callable(restart):
                 restart()
         return rid
+
+    async def _finish(self, rid: str, status: str, payload: Mapping[str, Any], attempts: int) -> None:
+        """Report the result, trying up to ``attempts`` times while the board cannot be reached.
+
+        A refusal is final. The update itself already happened, so a report that
+        cannot be delivered is logged and does not stop what follows.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.to_thread(self.board.op, "finishFoundryUpdate", payload)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt >= attempts or _refused(exc):
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    log.warning("foundry updates: could not report %s (%s): %s", rid, status, self.last_error)
+                    return
+                log.info("foundry updates: waiting for the dashboard to report %s (try %d of %d): %s",
+                         rid, attempt, attempts, exc)
+            await self._pause(_FINISH_RETRY_S)
+
+    async def _restart_dashboard(self, before: Any, after: Any) -> str:
+        """Restart the local dashboard when the pull changed ``department/``.
+
+        Returns the suffix for the result message ("" when nothing under
+        ``department/`` changed). Never raises except on cancellation.
+        """
+        if not (isinstance(before, str) and before and isinstance(after, str) and after) or before == after:
+            return ""
+        try:
+            rc, out, err = await self._git("diff", "--name-only", before, after, "--", "department")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return _not_restarted(f"could not compare the commits: {exc}")
+        if rc != 0:
+            return _not_restarted(f"could not compare the commits: {(err or out).strip()}")
+        if not out.strip():
+            return ""
+        try:
+            await asyncio.to_thread(_post_dashboard_restart)
+        except asyncio.CancelledError:
+            raise
+        except urllib.error.HTTPError as exc:
+            return _not_restarted(f"the dashboard answered {exc.code}")
+        except OSError as exc:  # also URLError: nothing listens, which is not an error
+            log.info("foundry updates: no dashboard to restart: %s", exc)
+            return _not_restarted("the dashboard is not running")
+        except Exception as exc:
+            return _not_restarted(f"{type(exc).__name__}: {exc}")
+        log.info("foundry updates: department/ changed, dashboard restart requested")
+        return _DASHBOARD_RESTARTED
+
+    def _note_unsuccessful(self, rid: str, status: str, message: str, request: Mapping[str, Any]) -> None:
+        """Leave the event and the warning of a refused or failed update, and start the back-off."""
+        queue: Any = getattr(getattr(self.service, "factory", None), "queue", None)
+        try:
+            queue.record_event(f"update_{status}", None,
+                               {"request_id": rid, "message": message[:_MAX_EVENT_MESSAGE]})
+        except Exception as exc:  # best effort: the board still gets the result
+            log.info("foundry updates: could not record the %s event of %s: %s", status, rid, exc)
+        if (status, message) not in self._warned:
+            self._warned.add((status, message))
+            log.warning("foundry updates: update %s: %s (%s)", status, message, rid)
+        # bad settings are refused before any pull, so they say nothing about the next one
+        if status == "refused" and not request.get("settings"):
+            self._refused_at = self._clock()
+            self._refused_remote = self._last_remote
+            if getattr(getattr(self.service, "config", None), "auto_update", False):
+                log.info("foundry updates: auto-update waits until the remote branch moves or %g minutes pass",
+                         AUTO_UPDATE_REFUSED_BACKOFF_S / 60)
 
     # ------------------------------------------------------------------ auto-update
 
@@ -293,8 +413,9 @@ class UpdateWatcher:
     async def _new_remote_sha(self) -> str | None:
         """The remote branch's commit when it should be pulled, else None.
 
-        None when the remote matches HEAD, was already requested, or is contained in HEAD:
-        pulling a commit HEAD already has changes nothing, yet would still restart Foundry.
+        None when the remote matches HEAD, was just refused, was already requested, or is
+        contained in HEAD: pulling a commit HEAD already has changes nothing, yet would
+        still restart Foundry.
         """
         head = await self._git_out("rev-parse", "HEAD")
         branch = await self._git_out("symbolic-ref", "--short", "HEAD")
@@ -305,11 +426,25 @@ class UpdateWatcher:
         if remote is None:
             log.info("foundry updates: %s is not on origin, no auto-update", branch)
             return None
-        if remote == head or remote in self._auto_requested:
+        self._last_remote = remote
+        if remote == head or self._waiting_after_refusal(remote) or remote in self._auto_requested:
             return None
         # exit 1: not an ancestor; 128: the commit is not fetched yet, so HEAD cannot contain it
         rc, _, _ = await self._git("merge-base", "--is-ancestor", remote, "HEAD")
         return None if rc == 0 else remote
+
+    def _waiting_after_refusal(self, remote: str) -> bool:
+        """True while ``remote`` is the commit of a recent refused pull; ends the back-off otherwise."""
+        if self._refused_at is None:
+            return False
+        if self._refused_remote is None:  # refused before any check saw the remote
+            self._refused_remote = remote
+        if remote == self._refused_remote:
+            if self._clock() - self._refused_at < AUTO_UPDATE_REFUSED_BACKOFF_S:
+                return True
+            self._auto_requested.discard(remote)  # time is up: this commit may be requested again
+        self._refused_at = self._refused_remote = None
+        return False
 
     async def _git(self, *args: str) -> tuple[int, str, str]:
         from foundry.self_update import _git  # non-interactive, without the git location variables
