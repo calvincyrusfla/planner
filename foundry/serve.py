@@ -288,12 +288,15 @@ class Service:
 
         kwargs: dict[str, Any] = {"repo_root": self.repo, "workspace": self.repo, "dispatch_repo": self.repo}
         kwargs.update(self._factory_kwargs)
+        resolve_root = getattr(self.config, "resolved_work_root", None)
+        work_root: Path | None = resolve_root(self.repo) if callable(resolve_root) else None
         if "publisher" not in kwargs and getattr(self.config, "auto_pr", False):
             from foundry.git_publisher import GitPublisher
 
             kwargs["publisher"] = GitPublisher(
                 self.repo, base=getattr(self.config, "pr_base", None),
                 draft=bool(getattr(self.config, "pr_draft", False)),
+                worktree_root=work_root / "worktrees" if work_root is not None else None,
             )
         if "snapshots" not in kwargs and getattr(self.config, "auto_pr", False):
             from foundry.git_publisher import GitPublisher
@@ -304,14 +307,26 @@ class Service:
                 # (your folder's branch and line endings no longer matter)
                 from foundry.base_snapshot import BaseSnapshots
 
-                # next to the publisher's worktrees (foundry/data/base by default; git-ignored)
-                kwargs["snapshots"] = BaseSnapshots(self.repo, remote=pub.remote,
-                                                    root=Path(pub.worktree_root).parent / "base")
+                # without a work root: next to the publisher's worktrees
+                root = work_root if work_root is not None else Path(pub.worktree_root).parent
+                kwargs["snapshots"] = BaseSnapshots(self.repo, remote=pub.remote, root=root / "base")
         return build_factory(
             self.config, claude=self.claude, builder_claude=self.builder_claude,
             builder_retry_claude=self.builder_retry_claude,
             reviewer_claude=self.reviewer_claude, gemma=self.gemma, **kwargs,
         )
+
+    def _check_work_root(self) -> None:
+        """Refuse a work root inside the repository; mention old work folders left in foundry/data."""
+        check = getattr(self.config, "check_work_root", None)
+        if not callable(check):
+            return
+        from foundry.config import DEFAULT_DATA_DIR
+
+        root = check(self.repo)
+        old = [DEFAULT_DATA_DIR / name for name in ("pieces", "base", "worktrees")]
+        if root != DEFAULT_DATA_DIR.resolve() and any(path.is_dir() for path in old):
+            log.info("foundry serve: old work folders under foundry/data can be deleted")
 
     async def start(self) -> Service:
         """Build the factory (if needed), start the pools, resume work, start the monitor."""
@@ -319,6 +334,7 @@ class Service:
             return self
         self.loop = asyncio.get_running_loop()
         if self.factory is None:
+            self._check_work_root()
             self.factory = self._build()
         forget = getattr(self.factory.queue, "kv_delete", None)
         if callable(forget):
@@ -1141,7 +1157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     enable_ctrl_c()
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    from foundry.config import FoundryConfig
+    from foundry.config import FoundryConfig, WorkRootError
     from foundry.main import builder_claude_args, builder_retry_claude_args, claude_args, reviewer_claude_args
 
     config = FoundryConfig.from_env(**({"board_bridge_mode": args.board} if args.board else {}))
@@ -1201,6 +1217,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(run_service(service, host=DEFAULT_HOST, port=args.port))
     except PortInUse as exc:  # another Foundry is probably running
         print(f"{exc} - is Foundry already running?", file=sys.stderr)
+        return 2
+    except WorkRootError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     except KeyboardInterrupt:  # Windows Ctrl+C; run_service's finally already shut down
         return 0

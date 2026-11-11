@@ -52,7 +52,8 @@ from .git_publisher import (
 
 log = logging.getLogger(__name__)
 
-#: Where snapshots live by default (inside foundry/data, git-ignored).
+#: Fallback for callers that pass no root (inside foundry/data, git-ignored);
+#: the service passes ``<work_root>/base``, outside the repository.
 DEFAULT_SNAPSHOT_ROOT = Path(__file__).resolve().parent / "data" / "base"
 
 #: Stages a :class:`SnapshotUnavailable` can carry.
