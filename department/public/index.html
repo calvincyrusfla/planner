@@ -367,6 +367,24 @@
   .sub-list .sub-err { flex-basis: 100%; font-size: 12px; color: var(--bad); overflow-wrap: anywhere; }
   .batch-goal.batch-err { color: var(--bad); }
   .batch-actions { display: flex; gap: 6px; margin-top: 8px; }
+  .inbox-btn { position: relative; min-height: 36px; }
+  .inbox-btn .badge { display: inline-block; min-width: 20px; margin-left: 6px; padding: 0 6px; border-radius: 10px; background: var(--bad); color: #fff; font-size: 12px; font-weight: 600; text-align: center; }
+  .inbox-btn .badge[hidden] { display: none; }
+  .wrap.show-inbox > :not(header):not(#inbox-view) { display: none; }
+  .wrap:not(.show-inbox) > #inbox-view { display: none; }
+  #inbox-view { max-width: 640px; margin: 0 auto; }
+  #inbox-view .ib-item { padding: 12px; margin-bottom: 10px; overflow-wrap: anywhere; }
+  #inbox-view .ib-kind { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  #inbox-view .ib-item.help { border-color: var(--warn); }
+  #inbox-view .ib-item.failed .ib-kind { color: var(--bad); }
+  #inbox-view .ib-title { font-weight: 600; margin: 2px 0; }
+  #inbox-view .ib-text { margin: 6px 0; white-space: pre-wrap; }
+  #inbox-view .ib-err { color: var(--bad); }
+  #inbox-view .ib-opts { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+  #inbox-view textarea { width: 100%; min-height: 72px; padding: 10px; font-size: 16px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; }
+  #inbox-view button, #inbox-view .ib-link { min-height: 44px; padding: 10px 14px; display: inline-flex; align-items: center; }
+  #inbox-view .ib-send { margin-top: 6px; width: 100%; justify-content: center; }
+  #inbox-view .ib-link { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -378,10 +396,16 @@
     <span class="foundry-chip" id="foundry-chip" role="status" title="Checking for Foundry…"><i></i><span class="fc-text"><b>Foundry</b> · checking…</span></span>
     <div class="spacer"></div>
     <div class="stats" id="stats"></div>
+    <button type="button" class="inbox-btn" id="inbox-btn" title="Help requests, failures and open PRs">Inbox<span class="badge" id="inbox-badge" hidden>0</span></button>
     <label class="switch" title="Free teams automatically pick up waiting tasks">
       <input type="checkbox" id="auto"> Auto-dispatch
     </label>
   </header>
+
+  <section id="inbox-view" aria-labelledby="inbox-h">
+    <h2 id="inbox-h">Inbox</h2>
+    <div id="inbox-list" aria-live="polite"></div>
+  </section>
 
   <form class="card new-task" id="new-task">
     <div class="fields">
@@ -1142,6 +1166,116 @@ function renderBatches() {
   tickHeartbeats();
 }
 
+// ---- Inbox (same logic as department/lib/inbox.mjs, which holds the tests) ----
+const INBOX_OPEN = ['queued', 'claimed', 'running'];
+function inboxItems(st, now = Date.now()) {
+  const ms = (iso) => Date.parse(iso || '') || 0;
+  const arr = (v) => (Array.isArray(v) ? v : []);
+  const items = [];
+  const since = now - 7 * 86400000;
+  for (const b of arr(st && st.foundryBatches)) {
+    if (!b || typeof b.id !== 'string') continue;
+    const open = INBOX_OPEN.includes(b.status);
+    const results = b.results && typeof b.results === 'object' ? b.results : {};
+    const prs = [];
+    for (const s of arr(b.subtasks)) {
+      const r = results[s.key] || {};
+      const at = r.updatedAt || b.updatedAt || b.createdAt || '';
+      const title = String(s.title || s.key);
+      if (r.pr && r.pr.url) prs.push({ key: s.key, title, url: String(r.pr.url), state: r.pr.state || '' });
+      if (r.state === 'needs_help' && open && r.help) {
+        items.push({ kind: 'help', id: `${b.id}/${s.key}`, batchId: b.id, key: s.key, title, at,
+          question: String(r.help.question || ''), context: String(r.help.context || ''), options: arr(r.help.options).map(String) });
+      } else if ((r.state === 'failed' || r.state === 'quarantined') && ms(at) >= since) {
+        items.push({ kind: 'failed', id: `${b.id}/${s.key}`, batchId: b.id, key: s.key, title, at,
+          state: r.state, error: String(r.error || (r.pr && r.pr.error) || '') });
+      }
+    }
+    if (open) items.push({ kind: 'batch', id: b.id, batchId: b.id, title: String(b.title || b.id), at: b.updatedAt || b.createdAt || '', status: b.status, prs, prCount: prs.length });
+  }
+  return items.sort((a, b) => ms(b.at) - ms(a.at) || String(b.id).localeCompare(String(a.id)));
+}
+function answerOperation(item, answer, by = 'user') {
+  const text = String(answer ?? '').trim();
+  if (!item || !item.batchId || !item.key || !text) return null;
+  return { type: 'answerHelp', args: { id: item.batchId, key: item.key, answer: text, by } };
+}
+const inboxDrafts = {};
+function ibEl(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function inboxCard(it) {
+  const card = ibEl('div', `card ib-item ${it.kind}`);
+  const when = fmtAgoShort(it.at);
+  card.append(ibEl('div', 'ib-kind', `${it.kind === 'help' ? 'Needs help' : it.kind === 'failed' ? it.state : 'Open batch'} · ${it.batchId}${when ? ` · ${when}` : ''}`));
+  card.append(ibEl('div', 'ib-title', it.title));
+  if (it.kind === 'help') {
+    card.append(ibEl('div', 'ib-text', it.question));
+    if (it.context) card.append(ibEl('div', 'ib-text', it.context));
+    const ta = ibEl('textarea');
+    ta.placeholder = 'Your answer';
+    ta.setAttribute('aria-label', `Answer for ${it.title}`);
+    ta.value = inboxDrafts[it.id] || '';
+    ta.addEventListener('input', () => { inboxDrafts[it.id] = ta.value; });
+    if (it.options.length) {
+      const opts = ibEl('div', 'ib-opts');
+      for (const o of it.options) {
+        const ob = ibEl('button', '', o);
+        ob.type = 'button';
+        ob.addEventListener('click', () => { ta.value = o; inboxDrafts[it.id] = o; });
+        opts.append(ob);
+      }
+      card.append(opts);
+    }
+    card.append(ta);
+    const send = ibEl('button', 'primary ib-send', 'Send answer');
+    send.type = 'button';
+    send.addEventListener('click', async () => {
+      const op = answerOperation(it, ta.value);
+      if (!op) { toast('Write an answer first'); return; }
+      send.disabled = true;
+      try {
+        await api('POST', '/api/op', op);
+        delete inboxDrafts[it.id];
+        toast(`Answered ${it.id}`);
+      } catch { send.disabled = false; }
+    });
+    card.append(send);
+  } else if (it.kind === 'failed') {
+    card.append(ibEl('div', 'ib-text ib-err', it.error || '(no error text)'));
+  } else {
+    card.append(ibEl('div', 'ib-text', `${it.status} · ${it.prCount} PR${it.prCount === 1 ? '' : 's'}`));
+    for (const p of it.prs) {
+      const href = safeHref(p.url);
+      if (!href) continue;
+      const a = ibEl('a', 'ib-link', `${p.key}: PR${p.state ? ` (${p.state})` : ''}`);
+      a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      card.append(a);
+    }
+  }
+  return card;
+}
+function renderInbox() {
+  const items = inboxItems(state);
+  const badge = $('#inbox-badge');
+  badge.textContent = String(items.length);
+  badge.hidden = !items.length;
+  if (!$('.wrap').classList.contains('show-inbox')) return;
+  const list = $('#inbox-list');
+  if (list.contains(document.activeElement) && document.activeElement.tagName === 'TEXTAREA') return; // don't eat typing
+  list.replaceChildren(...(items.length ? items.map(inboxCard) : [ibEl('div', 'empty-state', 'Nothing needs you.')]));
+}
+function syncInboxView() {
+  $('.wrap').classList.toggle('show-inbox', location.hash === '#inbox');
+  if (state) renderInbox();
+}
+window.addEventListener('hashchange', syncInboxView);
+$('#inbox-btn').addEventListener('click', () => { location.hash = location.hash === '#inbox' ? '' : '#inbox'; if (!location.hash) history.replaceState(null, '', location.pathname + location.search); syncInboxView(); });
+syncInboxView();
+
 let pending = false;
 function render() {
   if (!state) return;
@@ -1153,7 +1287,7 @@ function render() {
     return;
   }
   pending = false;
-  renderStats(); renderTeams(); renderTime(); renderTasks(); renderFoundryMetrics(); renderBatches(); renderLog();
+  renderStats(); renderTeams(); renderTime(); renderTasks(); renderFoundryMetrics(); renderBatches(); renderInbox(); renderLog();
 }
 document.addEventListener('focusout', () => setTimeout(() => pending && render(), 0));
 
