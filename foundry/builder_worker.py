@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from foundry import claude_client as _claude_client
+from foundry.file_map import build_index, file_map
 from foundry.gemma_notes import find_related, pitfall_notes
 from foundry.piece_workspace import WorkspaceError, collect_changes, make_workspace, remove_workspace
 from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
@@ -1560,7 +1561,8 @@ class BuilderWorker(_WorkerBase):
                                       order_description=meta.get("description"),
                                       floor_manager_note=self._help_answer(ticket).get("note"),
                                       contract=EDIT_CONTRACT if edit_mode else BUILDER_CONTRACT,
-                                      pitfall_notes=await self._pitfall_notes(ticket, assignment, meta))
+                                      pitfall_notes=await self._pitfall_notes(ticket, assignment, meta),
+                                      file_map=await self._file_map(ticket, assignment, meta))
         self.scratch["last_prompt"] = prompt
         _save_prompt(prompt, str(_get(ticket, "ticket_id")), assignment.attempt + 1)
         workspace: Path | None = None
@@ -1704,6 +1706,34 @@ class BuilderWorker(_WorkerBase):
             return list(notes)
         except Exception as exc:  # noqa: BLE001 - the notes are advisory
             log.debug("pitfall notes unavailable: %s", exc)
+            return []
+
+    async def _file_map(self, ticket: Any, assignment: TaskAssignment, meta: Mapping[str, Any]) -> list[str]:
+        """Where to look: symbols of the allowed files this order likely needs; ``[]`` on any failure."""
+        try:
+            config = getattr(self, "config", None)
+            if not getattr(config, "gemma_notes", False):
+                return []
+            engine = getattr(self, "context_engine", None)
+            gemma = getattr(engine, "gemma", None)
+            repo_root = getattr(engine, "repo_root", None)
+            if gemma is None or not repo_root:
+                return []
+            cache: dict[tuple[str, str], list[str]] | None = self.__dict__.get("_file_map_cache")
+            if cache is None:
+                cache = {}
+                self.__dict__["_file_map_cache"] = cache
+            key = (str(assignment.task_id), str(assignment.subtask_id))
+            if key in cache:
+                return list(cache[key])
+            text = str(meta.get("description") or assignment.context.objective or "")
+            index = await asyncio.to_thread(build_index, Path(repo_root), list(assignment.allowed_files))
+            entries = await file_map(gemma, text, index,
+                                     timeout=float(getattr(config, "gemma_notes_timeout_s", 90)))
+            cache[key] = list(entries)
+            return list(entries)
+        except Exception as exc:  # noqa: BLE001 - the map is advisory
+            log.debug("file map unavailable: %s", exc)
             return []
 
     # -- edit mode -----------------------------------------------------------------
