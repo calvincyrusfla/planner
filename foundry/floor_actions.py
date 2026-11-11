@@ -50,8 +50,6 @@ class ForemanActionsMixin:
 
         def _prune_later(self) -> None: ...
 
-        def _start_partial(self, task_id: str, reason: str) -> Any: ...
-
     # ------------------------------------------------------------ escalations
 
     async def apply_escalation(
@@ -123,7 +121,6 @@ class ForemanActionsMixin:
         self.record_outcome(task_id)
         self.bridge.quarantined(task_id, reason)
         self._prune_later()
-        self._start_partial(task_id, reason)
 
     def record_outcome(self, task_id: str) -> dict[str, Any] | None:
         """Record the task's sizing outcome in the queue (predicted vs actual effort).
