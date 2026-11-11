@@ -181,8 +181,10 @@ class FloorManager(ForemanActionsMixin):
         gemma_notes: bool = False,
         gemma_notes_timeout_s: float = 90.0,
         pr_template: bool = False,
+        pr_digest: bool = False,
     ) -> None:
         self.queue = queue
+        self.pr_digest = bool(pr_digest)
         self.pr_template = bool(pr_template)
         self.gemma_notes = bool(gemma_notes)
         self.gemma_notes_timeout_s = float(gemma_notes_timeout_s)
@@ -1223,6 +1225,17 @@ class FloorManager(ForemanActionsMixin):
         if pin:
             footer = f"Built on {pin['base']} @ {pin['sha'][:12]}\n{footer}"
         brief = (self.pr_briefs.get(task_id) or "").strip()
+        digest = ""
+        if self.pr_digest:
+            brief = ""
+            try:
+                dpatch = self._pr_patch(task_id)
+                if dpatch is not None:
+                    from foundry.pr_digest import build_digest
+
+                    digest = build_digest(self, task_id, dpatch.read_text(encoding="utf-8")).strip()
+            except Exception as exc:  # advisory only
+                log.debug("floor manager: PR digest failed: %s", exc)
         if self.pr_template:
             body_lines = body.splitlines()
             first = next((i for i, ln in enumerate(body_lines) if ln.strip()), None)
@@ -1247,10 +1260,15 @@ class FloorManager(ForemanActionsMixin):
                 parts.append("## Files changed\n\n" + "\n".join(f"- `{f}`" for f in files))
             if brief:
                 parts.append(f"## Brief (Gemma, advisory)\n\n{brief}")
+            if digest:
+                parts.append(f"## Digest\n\n{digest}")
             parts.append(f"---\n{footer}")
             return {"title": title, "body": "\n\n".join(parts) + "\n", "draft": self.pr_draft}
         if brief:
             section = f"## Brief (Gemma, advisory)\n\n{brief}"
+            body = f"{body}\n\n{section}" if body else section
+        if digest:
+            section = f"## Digest\n\n{digest}"
             body = f"{body}\n\n{section}" if body else section
         body = f"{body}\n\n---\n{footer}\n" if body else f"{footer}\n"
         return {"title": title, "body": body, "draft": self.pr_draft}
@@ -1259,7 +1277,7 @@ class FloorManager(ForemanActionsMixin):
         """Store Gemma's advisory PR brief for the task (never raises)."""
         gemma = getattr(self.foreman, "gemma", None)
         order = self.orders.get(task_id)
-        if not self.gemma_notes or gemma is None or order is None or self.pr_briefs.get(task_id):
+        if self.pr_digest or not self.gemma_notes or gemma is None or order is None or self.pr_briefs.get(task_id):
             return
         try:
             from foundry.gemma_notes import pr_brief
@@ -1905,6 +1923,7 @@ def build_factory(
         snapshots=snapshots,
         gemma_notes=bool(getattr(config, "gemma_notes", False)),
         pr_template=bool(getattr(config, "pr_template", False)),
+        pr_digest=bool(getattr(config, "pr_digest", False)),
         gemma_notes_timeout_s=float(getattr(config, "gemma_notes_timeout_s", 90.0)),
     )
     # the Foreman reads the action log so it never prescribes RETRY_TASK twice for one task

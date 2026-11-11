@@ -133,8 +133,13 @@ Environment variable               Field (default)
                                    reviewer calls
 ``FOUNDRY_AUTO_UPDATE``            ``auto_update`` (``false``): update Foundry
                                    when the base branch moves
-``FOUNDRY_AUTO_MERGE``             ``auto_merge`` (``off``; ``off|tests_docs``):
-                                   ``tests_docs`` merges small test/docs PRs
+``FOUNDRY_AUTO_MERGE``             ``auto_merge`` (``off``; ``off|tests_docs|low``):
+                                   ``tests_docs`` merges small test/docs PRs;
+                                   ``low`` also merges low-risk PRs
+``FOUNDRY_PR_DIGEST``              ``pr_digest`` (``true``): PR descriptions carry
+                                   a plain-code digest instead of the Gemma brief
+``FOUNDRY_REVIEW_BY_TIER``         ``review_by_tier`` (``false``): review effort
+                                   follows the risk tier of the change
 ``FOUNDRY_GEMMA_NOTES``            ``gemma_notes`` (``false``): Gemma writes
                                    advisory pitfall notes and PR briefs
 ``FOUNDRY_TURN_LEDGER``            ``turn_ledger`` (``true``): record per-turn
@@ -310,7 +315,7 @@ PreReviewMode = Literal["off", "advise", "gate"]
 BuilderToolsMode = Literal["off", "read"]
 BuilderMode = Literal["diff", "edit"]
 ReviewerToolsMode = Literal["off", "read"]
-AutoMergeMode = Literal["off", "tests_docs"]
+AutoMergeMode = Literal["off", "tests_docs", "low"]
 ForemanActionsMode = Literal["act", "log"]
 SizingMode = Literal["gemma", "heuristic"]
 
@@ -685,7 +690,18 @@ class FoundryConfig(BaseModel):
     )
     auto_merge: AutoMergeMode = Field(
         default="off",
-        description="off = never merge PRs; tests_docs = merge small test/docs-only PRs.",
+        description=(
+            "off = never merge PRs; tests_docs = merge small test/docs-only PRs; "
+            "low = also merge low-risk PRs."
+        ),
+    )
+    pr_digest: bool = Field(
+        default=True,
+        description="Whether PR descriptions carry a plain-code digest (and no Gemma brief).",
+    )
+    review_by_tier: bool = Field(
+        default=False,
+        description="Whether review effort follows the risk tier of the change.",
     )
     gemma_notes: bool = Field(
         default=False,
@@ -919,6 +935,8 @@ class FoundryConfig(BaseModel):
             "PROMPT_ARCHIVE_DAYS": "prompt_archive_days",
             "TURN_LEDGER": "turn_ledger",
             "PR_TEMPLATE": "pr_template",
+            "PR_DIGEST": "pr_digest",
+            "REVIEW_BY_TIER": "review_by_tier",
             "GEMMA_NOTES_TIMEOUT_S": "gemma_notes_timeout_s",
         }
         for var, field in simple.items():
