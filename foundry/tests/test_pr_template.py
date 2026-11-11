@@ -64,6 +64,21 @@ def test_summary_falls_back_to_title(tmp_path: Path) -> None:
     assert "## Summary\n\nAdd y" in m.pr_request(TID)["body"]
 
 
+def test_foreman_summary_heading_is_not_doubled(tmp_path: Path) -> None:
+    m = _manager(tmp_path, template=True)
+    for head in ("## Summary", "# summary"):
+        m.pr_summaries[TID] = {"pr_body": f"{head}\n\nAdds y.\n\n## Changes\n\n- y"}
+        body = m.pr_request(TID)["body"]
+        assert body.lower().count("summary") == 1
+        assert body.startswith("## Summary\n\nAdds y.\n\n## Changes\n\n- y")
+
+
+def test_body_without_summary_heading_unchanged(tmp_path: Path) -> None:
+    m = _manager(tmp_path, template=True)
+    m.pr_summaries[TID] = {"pr_body": "Adds y.\n\n## Summary\n\nlater"}
+    assert m.pr_request(TID)["body"].startswith("## Summary\n\nAdds y.\n\n## Summary\n\nlater")
+
+
 def test_build_factory_passes_the_setting(tmp_path: Path) -> None:
     from foundry.main import demo_claude, demo_gemma, write_demo_repo
 
