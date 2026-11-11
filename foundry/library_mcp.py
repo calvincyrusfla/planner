@@ -21,7 +21,7 @@ import logging
 import os
 import sys
 import tempfile
-from typing import Any, Protocol, TextIO
+from typing import Any, Callable, Protocol, TextIO
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +119,73 @@ TOOLS: list[dict[str, Any]] = [
         ),
     },
 ]
+
+
+def _edit_schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+    """Like :func:`_schema` for tools with several required arguments."""
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+_EDIT_NOTE = (
+    "This EDITS the workspace (paths are repo-relative, nothing is overwritten) and returns "
+    "what changed and what you still have to fix; afterwards fix the imports and callers it "
+    "reports and re-read the changed files."
+)
+_PATH_PROPERTY: dict[str, Any] = {"type": "string", "description": "A repo-relative posix path."}
+
+# Offered only when the server runs on a workspace (started without --db).
+EDIT_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "delete_file",
+        "description": f"Delete one file. {_EDIT_NOTE}",
+        "inputSchema": _edit_schema({"path": _PATH_PROPERTY}, ["path"]),
+    },
+    {
+        "name": "move_file",
+        "description": (
+            f"Move a file to a new path, creating folders; refuses to overwrite. {_EDIT_NOTE}"
+        ),
+        "inputSchema": _edit_schema(
+            {"src": _PATH_PROPERTY, "dst": _PATH_PROPERTY}, ["src", "dst"]
+        ),
+    },
+    {
+        "name": "delete_symbol",
+        "description": (
+            f"Delete a function or class by call number (Python: with its decorators and the "
+            f"blank lines after it) and list the callers that remain. {_CALL_NUMBER} {_EDIT_NOTE}"
+        ),
+        "inputSchema": _edit_schema({"call": _CALL_PROPERTY}, ["call"]),
+    },
+    {
+        "name": "move_symbol",
+        "description": (
+            f"Move a top-level Python function or class (decorators included) to another "
+            f"Python file, created if missing. Methods and JS/TS are not supported. With "
+            f"`reexport` the source module imports the name from the new place. It lists the "
+            f"names the moved code uses from the old module, so add those imports to the target. "
+            f"{_CALL_NUMBER} {_EDIT_NOTE}"
+        ),
+        "inputSchema": _edit_schema(
+            {
+                "call": _CALL_PROPERTY,
+                "to_path": {"type": "string", "description": "The repo-relative target .py file."},
+                "reexport": {
+                    "type": "boolean",
+                    "description": "Import the name from the target in the source module.",
+                },
+            },
+            ["call", "to_path"],
+        ),
+    },
+]
 _TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS}
+_EDIT_TOOLS_BY_NAME = {tool["name"]: tool for tool in EDIT_TOOLS}
 
 
 class Backend(Protocol):
@@ -139,6 +205,19 @@ class Backend(Protocol):
 
     def outline(self, path: str) -> list[dict[str, Any]]:
         """The file's sections."""
+
+
+class Workspace:
+    """The repo the edit tools work in, and the library over it, rebuilt after each edit."""
+
+    def __init__(self, root: str, backend: Backend, rebuild: Callable[[], Backend]) -> None:
+        self.root = root
+        self.backend = backend
+        self._rebuild = rebuild
+
+    def refresh(self) -> None:
+        """Rebuild the library so later lookups see the edit."""
+        self.backend = self._rebuild()
 
 
 class _RpcError(Exception):
@@ -180,6 +259,8 @@ def _argument_problem(tool: dict[str, Any], arguments: dict[str, Any]) -> str | 
             return f"Unknown argument `{key}` for `{tool['name']}`."
         if spec["type"] == "string" and not isinstance(value, str):
             return f"Argument `{key}` must be a string."
+        if spec["type"] == "boolean" and not isinstance(value, bool):
+            return f"Argument `{key}` must be a boolean."
         if spec["type"] == "integer":
             if isinstance(value, bool) or not isinstance(value, int):
                 return f"Argument `{key}` must be an integer."
@@ -222,10 +303,46 @@ def _run_tool(backend: Backend, name: str, arguments: dict[str, Any]) -> tuple[s
     return f"No {'callers' if name == 'callers' else 'tests'} found for {call}.", False
 
 
-def _call_tool(backend: Backend, params: dict[str, Any]) -> dict[str, Any]:
+def _run_edit(workspace: Workspace, name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
+    """Run one edit tool in the workspace and rebuild the library after a success."""
+    from foundry import codemod
+
+    root = workspace.root
+    try:
+        if name == "delete_file":
+            text = codemod.delete_file(root, arguments["path"])
+        elif name == "move_file":
+            text = codemod.move_file(root, arguments["src"], arguments["dst"])
+        elif name == "delete_symbol":
+            text = codemod.delete_symbol(root, workspace.backend, arguments["call"])
+        else:
+            text = codemod.move_symbol(
+                root,
+                workspace.backend,
+                arguments["call"],
+                arguments["to_path"],
+                bool(arguments.get("reexport", False)),
+            )
+    except codemod.CodemodError as exc:
+        return f"Nothing changed: {exc}", True
+    try:
+        workspace.refresh()
+    except Exception as exc:
+        log.exception("could not rebuild the library")
+        text += f"\nThe library could not be rebuilt ({exc}); lookups may show the old code."
+    return text, False
+
+
+def _call_tool(
+    backend: Backend, params: dict[str, Any], workspace: Workspace | None = None
+) -> dict[str, Any]:
     """Handle ``tools/call``; tool failures are results, never exceptions."""
     name = params.get("name")
     tool = _TOOLS_BY_NAME.get(name) if isinstance(name, str) else None
+    if tool is None and workspace is not None and isinstance(name, str):
+        tool = _EDIT_TOOLS_BY_NAME.get(name)
+    if workspace is not None:
+        backend = workspace.backend
     if tool is None or not isinstance(name, str):
         raise _RpcError(INVALID_PARAMS, f"Unknown tool: {name}")
     arguments = params.get("arguments")
@@ -237,14 +354,19 @@ def _call_tool(backend: Backend, params: dict[str, Any]) -> dict[str, Any]:
     if problem is not None:
         return _tool_result(problem, True)
     try:
-        text, is_error = _run_tool(backend, name, arguments)
+        if name in _EDIT_TOOLS_BY_NAME and workspace is not None:
+            text, is_error = _run_edit(workspace, name, arguments)
+        else:
+            text, is_error = _run_tool(backend, name, arguments)
     except Exception as exc:
         log.exception("library tool %s failed", name)
         return _tool_result(f"Library error: {exc}", True)
     return _tool_result(text, is_error)
 
 
-def _dispatch(backend: Backend, method: str, params: dict[str, Any]) -> dict[str, Any]:
+def _dispatch(
+    backend: Backend, method: str, params: dict[str, Any], workspace: Workspace | None = None
+) -> dict[str, Any]:
     """The result of one request."""
     if method == "initialize":
         version = params.get("protocolVersion")
@@ -256,13 +378,15 @@ def _dispatch(backend: Backend, method: str, params: dict[str, Any]) -> dict[str
     if method == "ping":
         return {}
     if method == "tools/list":
-        return {"tools": TOOLS}
+        return {"tools": TOOLS + EDIT_TOOLS if workspace is not None else TOOLS}
     if method == "tools/call":
-        return _call_tool(backend, params)
+        return _call_tool(backend, params, workspace)
     raise _RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")
 
 
-def _handle_line(backend: Backend, line: str) -> dict[str, Any] | None:
+def _handle_line(
+    backend: Backend, line: str, workspace: Workspace | None = None
+) -> dict[str, Any] | None:
     """The reply to one input line, None when it must go unanswered."""
     try:
         message = json.loads(line)
@@ -284,7 +408,7 @@ def _handle_line(backend: Backend, line: str) -> dict[str, Any] | None:
     if not isinstance(params, dict):
         return _error(request_id, INVALID_PARAMS, "Invalid params: expected an object")
     try:
-        return {"jsonrpc": "2.0", "id": request_id, "result": _dispatch(backend, method, params)}
+        return {"jsonrpc": "2.0", "id": request_id, "result": _dispatch(backend, method, params, workspace)}
     except _RpcError as exc:
         return _error(request_id, exc.code, exc.message)
     except Exception:
@@ -305,14 +429,20 @@ def _send(stdout: TextIO, reply: dict[str, Any]) -> bool:
     return True
 
 
-def serve(backend: Backend, stdin: TextIO, stdout: TextIO) -> None:
-    """Answer requests from ``stdin`` on ``stdout`` until end of input."""
+def serve(
+    backend: Backend, stdin: TextIO, stdout: TextIO, workspace: Workspace | None = None
+) -> None:
+    """Answer requests from ``stdin`` on ``stdout`` until end of input.
+
+    With a ``workspace`` the edit tools are offered too and lookups use the
+    workspace's library, which is rebuilt after each edit.
+    """
     # A stray print in a backend must not land between the protocol lines.
     with contextlib.redirect_stdout(sys.stderr):
         for line in stdin:
             if not line.strip():
                 continue
-            reply = _handle_line(backend, line)
+            reply = _handle_line(backend, line, workspace)
             if reply is not None and not _send(stdout, reply):
                 return
 
@@ -341,16 +471,26 @@ def main(argv: list[str] | None = None) -> int:
     _use_utf8(sys.stdin)
     _use_utf8(sys.stdout)
     tmp_dir: tempfile.TemporaryDirectory[str] | None = None
+    workspace: Workspace | None = None
     try:
-        from foundry.code_library import build_library, open_library
+        from foundry.code_library import open_library
 
         db_path = args.db
         if db_path is None:
+            from foundry.code_library import build_library
+
             repo = os.path.abspath(args.repo or os.getcwd())
             tmp_dir = tempfile.TemporaryDirectory(prefix="foundry-library-")
             db_path = os.path.join(tmp_dir.name, "library.db")
             info = build_library(repo, db_path)
             log.info("catalogued %s: %s entries", repo, info["entries"])
+            built_db = db_path
+
+            def rebuild() -> Backend:
+                build_library(repo, built_db)
+                return open_library(built_db)
+
+            workspace = Workspace(repo, open_library(db_path), rebuild)
         backend = open_library(db_path)
     except Exception:
         log.exception("could not open the code library")
@@ -358,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
             tmp_dir.cleanup()
         return 1
     try:
-        serve(backend, sys.stdin, sys.stdout)
+        serve(backend, sys.stdin, sys.stdout, workspace)
     finally:
         if tmp_dir is not None:
             tmp_dir.cleanup()
