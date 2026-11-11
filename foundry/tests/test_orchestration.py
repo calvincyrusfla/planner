@@ -132,7 +132,7 @@ def test_s_task_uses_exactly_one_builder(tmp_path: Path) -> None:
     f.close()
 
 
-def test_m_and_l_tasks_use_two_and_five_builders(tmp_path: Path) -> None:
+def test_m_and_l_tasks_still_use_one_builder(tmp_path: Path) -> None:
     repo = write_demo_repo(tmp_path / "repo")
     claude = demo_claude(repo, fail_first=None)
     f = _factory(tmp_path, claude, repo=repo)
@@ -140,10 +140,12 @@ def test_m_and_l_tasks_use_two_and_five_builders(tmp_path: Path) -> None:
     big = ["shop/inventory.py", "shop/pricing.py", "shop/orders.py", "shop/report.py", "shop/cli.py"]
     l_ = {"title": "Rewrite inventory end-to-end", "description": "five files", "files": big, "team_id": "charlie"}
     ids, states = _run(_submit_and_run(f, m, l_))
-    assert [f.manager.directives[t].allocated_builders for t in ids] == [2, 5]
+    assert [f.manager.directives[t].complexity for t in ids] == ["M", "L"]
+    assert [f.manager.directives[t].allocated_builders for t in ids] == [1, 1]
+    assert [len(f.manager.directives[t].subtasks) for t in ids] == [1, 1]
     assert set(states.values()) == {"complete"}
-    assert [claude.calls[f"bravo-{n}"] for n in range(1, 6)] == [1, 1, 0, 0, 0]
-    assert [claude.calls[f"charlie-{n}"] for n in range(1, 6)] == [1, 1, 1, 1, 1]
+    assert [claude.calls[f"bravo-{n}"] for n in range(1, 6)] == [1, 0, 0, 0, 0]
+    assert [claude.calls[f"charlie-{n}"] for n in range(1, 6)] == [1, 0, 0, 0, 0]
     f.close()
 
 
@@ -563,7 +565,7 @@ def test_simulated_demo_runs_end_to_end_quickly(tmp_path: Path) -> None:
     t0 = time.monotonic()
     result = _run(run_demo(workdir=tmp_path, quiet=True))
     assert time.monotonic() - t0 < 10
-    assert [d["allocated_builders"] for d in result["directives"].values()] == [1, 2, 5]
+    assert [d["allocated_builders"] for d in result["directives"].values()] == [1, 1, 1]
     assert set(result["states"].values()) == {"complete"}
     calls = result["calls"]
     assert [calls.get(f"alpha-{n}", 0) for n in range(1, 6)] == [1, 0, 0, 0, 0]

@@ -71,7 +71,8 @@ def test_heuristic_result_is_calibrated(queue: FoundryQueue) -> None:
     assert f.last_source["size_task_scope"] == "heuristic"
     assert directive.complexity == "L"
     assert "calibrated from 8 past tasks" in directive.rationale
-    assert directive.allocated_builders == 2  # still capped by the two files
+    assert directive.allocated_builders == 1 and len(directive.subtasks) == 1  # one builder per piece
+    assert directive.override_reason == "one builder per piece"
 
 
 def test_gemma_result_is_calibrated_and_sees_examples(queue: FoundryQueue) -> None:
@@ -220,7 +221,7 @@ FIVE = [f"pkg/f{k}.py" for k in range(5)]
 
 
 def _check(directive: Any, files: list[str]) -> None:
-    assert directive.allocated_builders == len(directive.subtasks)
+    assert directive.allocated_builders == len(directive.subtasks) == 1
     assigned = [f for s in directive.subtasks for f in s.allowed_files]
     assert sorted(assigned) == sorted(files)  # every file once, no overlap
     assert all(s.allowed_files and s.acceptance_criteria for s in directive.subtasks)  # no idle builder
@@ -233,8 +234,8 @@ def test_shift_up_with_gemma_subtasks_for_old_size(queue: FoundryQueue) -> None:
     ]}
     f = foreman(queue, history_m_was_l(), SimulatedGemmaClient(lambda req: reply))
     directive = run(f.size_task_scope(dict(M_TASK, files=FIVE)))
-    assert directive.complexity == "L" and directive.allocated_builders == 5
-    assert "split deterministically" in directive.rationale and "calibrated" in directive.rationale
+    assert directive.complexity == "L" and directive.allocated_builders == 1
+    assert directive.override_reason == "one builder per piece" and "calibrated" in directive.rationale
     _check(directive, FIVE)
 
 
@@ -245,7 +246,7 @@ def test_shift_down_with_gemma_subtasks_for_old_size(queue: FoundryQueue) -> Non
     rows = [outcome(f"P-{k}", "L", "M") for k in range(8)]
     f = foreman(queue, rows, SimulatedGemmaClient(lambda req: reply))
     directive = run(f.size_task_scope(dict(M_TASK, files=FIVE)))
-    assert directive.complexity == "M" and directive.allocated_builders == 2
+    assert directive.complexity == "M" and directive.allocated_builders == 1
     assert f.last_raw_complexity == "L"
     _check(directive, FIVE)
     assert {c for s in directive.subtasks for c in s.acceptance_criteria} >= {f"c{k}" for k in range(5)}
