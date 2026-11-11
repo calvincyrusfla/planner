@@ -16,6 +16,7 @@ from typing import Any
 __all__ = [
     "ACTION_LOG_MAX",
     "ActionOutcome",
+    "BaseUnavailable",
     "InfrastructureError",
     "PeerReviewerGrant",
 ]
@@ -28,6 +29,14 @@ class InfrastructureError(Exception):
     workspace cannot be made. Workers treat it as a *counted* infrastructure
     failure (D1/E1: release the ticket, no attempt spent; quarantine after the
     configured number of consecutive failures), never as a gate failure.
+    """
+
+
+class BaseUnavailable(InfrastructureError):
+    """A task's clean snapshot of its publish branch cannot be had right now.
+
+    With snapshots on, a task is never built, gated or reviewed from the
+    user's folder instead: the ticket goes back to the queue, no attempt spent.
     """
 
 

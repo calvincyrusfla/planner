@@ -44,6 +44,7 @@ from foundry.floor_actions import ForemanActionsMixin
 from foundry.floor_helpers import (
     ACTION_LOG_MAX,
     ActionOutcome,
+    BaseUnavailable,
     InfrastructureError,
     PeerReviewerGrant,
     _ACTIONS_KEY,
@@ -64,6 +65,7 @@ from foundry.validation_gates import copy_ignore
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "BaseUnavailable",
     "InfrastructureError",
     "WorkOrder",
     "ActionOutcome",
@@ -129,6 +131,8 @@ _KV_KEY = "floor_manager.state"
 #: draft when Gemma times out, so this is an upper bound, not a typical wait.
 DEFAULT_FINISH_TIMEOUT_S = 600.0
 _TASK_ID_RE = re.compile(r"^F-(\d+)$")
+#: ``SnapshotUnavailable`` stages of a folder with no publish branch at all: nothing to be stale against.
+_NO_PUBLISH_BRANCH = ("no_git", "not_a_repo", "no_remote")
 
 
 class FloorManager(ForemanActionsMixin):
@@ -191,6 +195,12 @@ class FloorManager(ForemanActionsMixin):
         self.task_bases: dict[str, dict[str, str]] = {}
         #: tasks already warned about building from the user's folder (one WARNING per task).
         self._snapshot_warned: set[str] = set()
+        #: task id -> why its last pin failed (reported when the task cannot be built).
+        self._pin_errors: dict[str, str] = {}
+        #: tasks whose pin was compared with the remote in this run (:meth:`_repin_if_moved`).
+        self._pin_rechecked: set[str] = set()
+        #: held while a pin is compared with the remote, so concurrent callers see one result
+        self._repin_lock = asyncio.Lock()
         #: held while a snapshot is created and recorded, and while snapshots are pruned
         self._snapshot_lock = asyncio.Lock()
         #: sha -> number of blocks using its snapshot right now (:meth:`base_lease`); never pruned.
@@ -638,9 +648,10 @@ class FloorManager(ForemanActionsMixin):
         """Pin the task to the current commit of its publish branch and create the snapshot.
 
         Idempotent: an already pinned task keeps its commit (a restart, a second
-        sizing). Returns ``{"base", "sha"}``, or None when snapshots are off or
-        unavailable (no git, no remote, fetch failed): the task is then built
-        from the user's folder as before, with one warning.
+        sizing). Returns ``{"base", "sha"}``, or None when snapshots are off (the
+        task is built from the user's folder) or unavailable (no git, no remote,
+        fetch failed: one warning, and :meth:`task_base` tries again and refuses
+        to build without a pin).
         """
         pin = self.task_bases.get(task_id)
         if pin is not None:
@@ -657,9 +668,16 @@ class FloorManager(ForemanActionsMixin):
                 self.task_bases[task_id] = pin
                 if path:
                     self._snapshot_paths[pin["sha"]] = Path(path)
-        except Exception as exc:  # SnapshotUnavailable, or anything else: fall back, never stop the line
-            self._warn_user_folder(task_id, f"no snapshot of the publish branch: {exc}")
+        except Exception as exc:  # SnapshotUnavailable, or anything else: no pin yet
+            self._pin_errors[task_id] = str(exc)
+            if getattr(exc, "stage", None) in _NO_PUBLISH_BRANCH:
+                self._warn_user_folder(task_id, f"no snapshot of the publish branch: {exc}")
+            elif task_id not in self._snapshot_warned:
+                self._snapshot_warned.add(task_id)
+                log.warning("floor manager: %s has no snapshot of its publish branch yet (%s); "
+                            "it is not built until one is available", task_id, exc)
             return None
+        self._pin_errors.pop(task_id, None)
         log.info("floor manager: %s builds on %s @ %s", task_id, base, str(sha)[:12])
         try:
             self.queue.record_event("base_pinned", task_id, dict(pin))
@@ -678,25 +696,84 @@ class FloorManager(ForemanActionsMixin):
         except Exception:  # pragma: no cover - defensive
             return False
 
+    async def _has_publish_branch(self, tid: str) -> bool:
+        """False only when the folder cannot have one (no git, not a repository, no remote)."""
+        try:
+            await _maybe_await(self.snapshots.resolve(self._publish_base(tid)))
+        except Exception as exc:
+            return getattr(exc, "stage", None) not in _NO_PUBLISH_BRANCH
+        return True
+
+    async def _repin_if_moved(self, tid: str) -> None:
+        """Move a pinned task none of whose work is approved to its branch's current commit.
+
+        Compared at most once per task per run, so retries keep a stable base.
+        When the remote cannot be asked the pin stands. Raises
+        :class:`BaseUnavailable` when the branch moved but the new commit has no
+        snapshot; the next call compares again.
+        """
+        if tid in self._pin_rechecked or tid not in self.task_bases or not self._can_pin_late(tid):
+            return
+        async with self._repin_lock:
+            old = self.task_bases.get(tid)
+            if tid in self._pin_rechecked or old is None:
+                return  # a concurrent caller compared it meanwhile
+            try:
+                base, sha = await _maybe_await(self.snapshots.resolve(self._publish_base(tid)))
+            except Exception as exc:
+                self._pin_rechecked.add(tid)
+                log.warning("floor manager: could not check whether the base of %s moved, keeping %s: %s",
+                            tid, old["sha"][:12], exc)
+                return
+            pin = {"base": str(base), "sha": str(sha)}
+            if pin["sha"] == old["sha"]:
+                self._pin_rechecked.add(tid)
+                return
+            try:
+                async with self._snapshot_lock:  # recorded under the lock: a concurrent prune keeps it
+                    path = await _maybe_await(self.snapshots.checkout(pin["sha"]))
+                    self.task_bases[tid] = pin
+                    if path:
+                        self._snapshot_paths[pin["sha"]] = Path(path)
+            except Exception as exc:
+                raise BaseUnavailable(f"the snapshot of {pin['sha'][:12]} is unavailable: {exc}") from exc
+            self._pin_rechecked.add(tid)
+        log.info("floor manager: %s re-pinned on %s: %s -> %s", tid, pin["base"], old["sha"][:12], pin["sha"][:12])
+        try:
+            self.queue.record_event("base_repinned", tid,
+                                    {"base": pin["base"], "old_sha": old["sha"], "new_sha": pin["sha"]})
+        except Exception as exc:  # pragma: no cover - bookkeeping is best effort
+            log.debug("floor manager: could not record the re-pinned base: %s", exc)
+        self.save()
+
     async def task_base(self, task_id: str) -> Path | None:
         """The snapshot directory the task is built from (may re-create it), or None.
 
-        None means "use the user's folder" (snapshots off/unavailable, or a task
-        pinned before snapshots existed). A task whose pin failed at sizing (e.g.
-        offline) is pinned again here as long as none of its work is approved yet.
-        A snapshot pruned meanwhile (a retry or undo after the task finished) is
-        checked out again at the pinned commit. A snapshot already verified clean
-        in this run is reused without asking git again.
+        None means "use the user's folder" and only happens with snapshots off,
+        or in a folder with no publish branch at all (not a git repository, no
+        remote). Otherwise :class:`BaseUnavailable` is raised when the task has
+        no pin and cannot be pinned now, or its snapshot cannot be checked out.
+        A task whose pin failed at sizing (e.g. offline) is pinned again here as
+        long as none of its work is approved yet; a pinned task in that state
+        follows its branch once per run (:meth:`_repin_if_moved`). A snapshot
+        pruned meanwhile (a retry or undo after the task finished) is checked
+        out again at the pinned commit. A snapshot already verified clean in
+        this run is reused without asking git again.
         """
         tid = str(task_id)
         if self.snapshots is None:
             return None
         if tid not in self.task_bases and self._can_pin_late(tid):
             await self.pin_base(tid)
+            if tid in self.task_bases:
+                self._pin_rechecked.add(tid)  # just resolved: nothing to compare
+        else:
+            await self._repin_if_moved(tid)
         pin = self.task_bases.get(tid)
         if pin is None:
-            if self.snapshots_enabled:
-                self._warn_user_folder(tid, "the task has no pinned base commit")
+            if self.snapshots_enabled and await self._has_publish_branch(tid):
+                why = self._pin_errors.get(tid) or "none of its work can move to a new base"
+                raise BaseUnavailable(f"{tid} has no pinned base commit: {why}")
             return None
         sha = pin["sha"]
         known = self._snapshot_paths.get(sha)
@@ -707,6 +784,8 @@ class FloorManager(ForemanActionsMixin):
                 path = Path(await _maybe_await(self.snapshots.checkout(sha)))
         except Exception as exc:
             self._snapshot_paths.pop(sha, None)
+            if self.snapshots_enabled:
+                raise BaseUnavailable(f"the snapshot of {sha[:12]} is unavailable: {exc}") from exc
             self._warn_user_folder(tid, f"the snapshot of {sha[:12]} is unavailable: {exc}")
             return None
         self._snapshot_paths[sha] = path  # verified clean by checkout(): trusted for this run
@@ -1140,6 +1219,9 @@ class FloorManager(ForemanActionsMixin):
         if not body and len(lines) > 1:
             body = "\n".join(lines[1:])
         footer = f"Opened by Foundry (task {task_id})"
+        pin = self.task_bases.get(task_id)
+        if pin:
+            footer = f"Built on {pin['base']} @ {pin['sha'][:12]}\n{footer}"
         brief = (self.pr_briefs.get(task_id) or "").strip()
         if self.pr_template:
             body_lines = body.splitlines()
@@ -1403,7 +1485,11 @@ class FloorManager(ForemanActionsMixin):
         text = _with_newline(diff) if diff else ""
         # checked against what the task was built on: its snapshot of the publish branch
         # (as stored, LF), else the user's folder
-        problem = await self._leased_root(task_id, _git_check, text) if text else None
+        try:
+            problem = await self._leased_root(task_id, _git_check, text) if text else None
+        except BaseUnavailable as exc:  # never judged on the user's folder: the next call retries
+            log.warning("floor manager: could not check the patch for %s: %s", task_id, exc)
+            return False
         md = f"{summary.get('commit_message', '').strip()}\n\n{summary.get('pr_body', '').strip()}\n"
         try:
             self.patches_dir.mkdir(parents=True, exist_ok=True)

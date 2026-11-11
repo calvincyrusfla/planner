@@ -4,8 +4,9 @@ The Floor Manager pins each accepted task to the commit of the branch its PR
 targets (persisted), the workers read that snapshot (context engine, Claude's
 cwd, gates' base copy, diff normalisation), the combined
 patch is stacked and ``git apply --check``-ed on it, and the publisher branches
-from exactly that commit. When snapshots are unavailable the user's folder is
-used as before, with one warning per task. No real Claude, Gemma or GitHub.
+from exactly that commit. When snapshots are unavailable the task is not built
+(one warning per task); the user's folder is used only with snapshots off. No
+real Claude, Gemma or GitHub.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from foundry.base_snapshot import BaseSnapshots, SnapshotUnavailable
 from foundry.board_bridge import BoardBridge
 from foundry.claude_client import ClaudeResult, SimulatedClaudeClient
 from foundry.config import FoundryConfig
-from foundry.floor_manager import WorkOrder, WorkspaceGates, build_factory
+from foundry.floor_manager import BaseUnavailable, WorkOrder, WorkspaceGates, build_factory
 from foundry.git_publisher import GitPublisher
 from foundry.main import append_diff, demo_gemma, write_demo_repo
 
@@ -207,19 +208,23 @@ class BrokenSnapshots:
         return []
 
 
-def test_fallback_to_the_users_folder_warns_once_per_task(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_no_snapshot_never_builds_from_the_users_folder_and_warns_once(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     repo = write_demo_repo(tmp_path / "repo")
     pub = FakePublisher()
     claude = _claude()
     f = _factory(tmp_path, repo, pub, BrokenSnapshots(), claude)
+    for builder in f.pools["alpha"].builders:
+        builder.infra_backoff_s = 0.01
     with caplog.at_level(logging.WARNING, logger="foundry.floor_manager"):
         tid = asyncio.run(_run(f))
     assert f.manager.task_bases == {}
-    warns = [r for r in caplog.records if "built from your working folder" in r.getMessage()]
+    warns = [r for r in caplog.records if "no snapshot of its publish branch" in r.getMessage()]
     assert len(warns) == 1 and tid in warns[0].getMessage() and "offline" in warns[0].getMessage()
-    assert {c.cwd for c in claude.history} == {str(repo.resolve())}
-    assert (tmp_path / "patches" / f"{tid}.patch").is_file()
-    assert pub.calls[0]["base_sha"] is None and pub.calls[0]["base"] is None
+    assert claude.history == []
+    assert f.queue.get_task(tid)["quarantine_reason"].startswith("infrastructure:")
+    assert f.queue.tickets_for_task(tid)[0].attempt == 0
+    assert not (tmp_path / "patches" / f"{tid}.patch").exists() and pub.calls == []
     f.close()
 
 
@@ -372,14 +377,17 @@ def test_a_failed_pin_is_retried_until_work_is_approved(tmp_path: Path) -> None:
     async def go() -> None:
         tid = m._prepare(WorkOrder(**ORDER))
         assert await m.pin_base(tid) is None
-        assert await m.task_base(tid) is None  # still offline
+        with pytest.raises(BaseUnavailable, match="offline"):  # still offline
+            await m.task_base(tid)
         snaps.online = True
         assert await m.task_base(tid) == tmp_path / "base" / ("a" * 12)
         assert m.task_bases[tid]["sha"] == "a" * 40
-        # once work is approved on the user's folder, it never switches base
+        # once work is approved without a pin, it never switches base and is not built further
         tid2 = m._prepare(WorkOrder(title="two", description="x", files=["shop/mathx.py"]))
         m.diffs[tid2] = {f"{tid2}.1": "--- a/x\n+++ b/x\n"}
-        assert await m.task_base(tid2) is None and tid2 not in m.task_bases
+        with pytest.raises(BaseUnavailable):
+            await m.task_base(tid2)
+        assert tid2 not in m.task_bases
 
     asyncio.run(go())
     f.close()
