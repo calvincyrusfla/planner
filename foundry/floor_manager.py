@@ -1991,7 +1991,6 @@ def build_factory(
     from foundry.orchestrator_queue import FoundryQueue
     from foundry.rate_limiter import RateLimiter
     from foundry.shop_foreman import ShopForeman
-    from foundry.solution_cache import SolutionCache
     from foundry.telemetry import Telemetry
     from foundry.validation_gates import ValidationGates
 
@@ -2008,7 +2007,6 @@ def build_factory(
     # sizing calibration: the Foreman reads past outcomes as
     # ``outcomes_provider(repo=None, limit=50) -> list[dict]`` (newest first)
     foreman.outcomes_provider = queue.sizing_outcomes
-    cache = SolutionCache(db)
     if gates is None:
         gates = WorkspaceGates(
             ValidationGates(
@@ -2068,7 +2066,7 @@ def build_factory(
             telemetry=telemetry,
             context_engine=context,
             gates=gates,
-            cache=cache,
+            cache=None,
             foreman=foreman,
             poll=poll,
             trust_cache=trust_cache,
@@ -2090,4 +2088,4 @@ def build_factory(
         attach = getattr(pool, "set_on_ticket_change", None)
         if callable(attach):
             attach(manager.report_task_progress)
-    return Factory(config, queue, telemetry, limiter, context, foreman, cache, gates, pools, manager, bridge, claude, gemma)
+    return Factory(config, queue, telemetry, limiter, context, foreman, None, gates, pools, manager, bridge, claude, gemma)

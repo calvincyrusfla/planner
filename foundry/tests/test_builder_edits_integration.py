@@ -39,7 +39,6 @@ from foundry.context_engine import ContextEngine
 from foundry.orchestrator_queue import FoundryQueue
 from foundry.rate_limiter import RateLimiter
 from foundry.schemas import ContextSlice, SubtaskAllocation, TaskAssignment, TaskSizingDirective
-from foundry.solution_cache import SolutionCache
 from foundry.telemetry import Telemetry
 from foundry.validation_gates import ValidationGates
 
@@ -99,7 +98,7 @@ class Rig:
         self.queue = FoundryQueue(tmp_path / "foundry.db")
         self.telemetry = Telemetry(self.queue)
         self.limiter = RateLimiter(rpm=600, tpm=10_000_000, max_concurrent=3, sleep=lambda _s: asyncio.sleep(0))
-        self.cache = SolutionCache(tmp_path / "foundry.db")
+        self.cache: Any = None  # the workers still accept a cache parameter, unused
         self.engine = ContextEngine(self.ws)
         self.gates = ValidationGates(checks=("syntax", "linter"))
         self.client = SimulatedClaudeClient(script)

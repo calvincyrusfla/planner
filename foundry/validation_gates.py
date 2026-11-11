@@ -31,8 +31,8 @@ The module also provides :func:`apply_diff`, a pure-Python unified-diff
 applier used to materialise a submission's diff into a workspace. It refuses
 paths outside ``allowed_files`` and paths that escape the workspace.
 
-``SolutionCache`` and ``RetryPolicy`` live in :mod:`foundry.solution_cache`
-and are re-exported here for convenience.
+``RetryPolicy`` lives in :mod:`foundry.solution_cache` and is re-exported
+here for convenience.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Literal
 
 from foundry.schemas import BuilderSubmission, DeterministicGateResult, GateCheck
-from foundry.solution_cache import RetryPolicy, SolutionCache
+from foundry.solution_cache import RetryPolicy
 
 __all__ = [
     "ALL_CHECKS",
@@ -66,7 +66,6 @@ __all__ = [
     "DiffApplyError",
     "GateOutcome",
     "RetryPolicy",
-    "SolutionCache",
     "TypecheckMode",
     "ValidationGates",
     "SCRATCH_SKIP_DIRS",
