@@ -2250,6 +2250,7 @@ class ReviewerWorker(_WorkerBase):
         self.on_approved = on_approved
         self.busy = False
         self.verdicts: list[ReviewerVerdict] = []
+        self._tier_clients: dict[str, ClaudeLike] = {}
 
     async def run(self, stop: asyncio.Event) -> None:
         """Review inbox items until ``stop`` is set (idle waiting makes no Claude call)."""
@@ -2325,9 +2326,25 @@ class ReviewerWorker(_WorkerBase):
         error: BaseException | None = None
         result: ClaudeResult | None = None
         try:
-            result = await self._call_claude(
-                prompt, task_id=task_id, ticket_id=item.ticket_id, attempt=item.assignment.attempt + 1
-            )
+            tier_client = self._tier_client(item, task_id)
+            result = None
+            if tier_client is not None:
+                try:
+                    result = await self._call_claude(
+                        prompt, task_id=task_id, ticket_id=item.ticket_id,
+                        attempt=item.assignment.attempt + 1, client=tier_client,
+                    )
+                    if result.is_error:
+                        result = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug("%s: tiered review failed, using the usual reviewer", self.agent_id, exc_info=True)
+                    result = None
+            if result is None:
+                result = await self._call_claude(
+                    prompt, task_id=task_id, ticket_id=item.ticket_id, attempt=item.assignment.attempt + 1
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2384,6 +2401,37 @@ class ReviewerWorker(_WorkerBase):
             self._quarantine(task_id, _one_line(reason, 300))
             self._event("rejected", task_id, {"ticket_id": item.ticket_id, "reviewer_id": self.agent_id})
         return verdict
+
+    def _tier_client(self, item: ReviewItem, task_id: str) -> ClaudeLike | None:
+        """With ``review_by_tier`` on: the light, strict or usual client for the item's risk tier.
+
+        ``None`` means the usual client (setting off, normal tier, or any problem).
+        """
+        config: Any = getattr(self, "config", None)
+        if not getattr(config, "review_by_tier", False):
+            return None
+        try:
+            from foundry.risk_tier import classify
+
+            tier = str(classify(list(item.submission.modified_files), item.submission.diff)["tier"])
+            self._event("review_tier", task_id, {"ticket_id": item.ticket_id, "reviewer_id": self.agent_id,
+                                                 "tier": tier})
+            if tier == "normal":
+                return None
+            kind = "strict" if tier == "high" else "light"
+            clients = self._tier_clients
+            if kind not in clients:
+                from foundry import main as _main
+
+                base: Any = self.client
+                args = _main.reviewer_strict_args(config) if kind == "strict" else _main.reviewer_light_args(config)
+                clients[kind] = type(base)(
+                    getattr(base, "claude_bin", "claude"), args, env=getattr(base, "env", None)
+                )
+            return clients[kind]
+        except Exception:
+            log.debug("%s: could not pick a tiered reviewer", self.agent_id, exc_info=True)
+            return None
 
     def _record_verdict(self, verdict: ReviewerVerdict, item: ReviewItem) -> None:
         fn = getattr(self.queue, "record_verdict", None)
