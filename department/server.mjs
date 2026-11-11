@@ -8,7 +8,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as core from './lib/core.mjs';
 import { load, save, DATA_FILE } from './lib/store.mjs';
@@ -57,7 +57,18 @@ const claudeLaunch = claudeLaunchSpec({
   which: claudeDryRun ? () => true : undefined,
 });
 const capabilities = (local) => ({ usageRefresh: !usageDirectOff && local, claudeLaunch: local && Boolean(claudeLaunch.spec) });
-const payload = (local = false) => ({ ...state, sync: { ...sync }, capabilities: capabilities(local) });
+// Which code this dashboard runs: the git commit of its folder, read once at start (null on any failure).
+function readCommit() {
+  try {
+    const r = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: path.dirname(here), timeout: 5000, encoding: 'utf8', windowsHide: true });
+    const out = r.status === 0 ? String(r.stdout || '').trim() : '';
+    return /^[0-9a-f]{7,64}$/i.test(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+const dashboard = { commit: readCommit(), startedAt: new Date().toISOString() };
+const payload = (local = false) => ({ ...state, sync: { ...sync }, capabilities: capabilities(local), dashboard: { ...dashboard } });
 
 const clients = new Map(); // SSE response -> whether its request came from this computer
 function broadcast() {
@@ -463,6 +474,18 @@ const server = http.createServer(async (req, res) => {
       if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use POST', code: 'method' });
       return answerWithClaude(req, res);
     }
+    if (url.pathname === '/api/health') {
+      if (req.method !== 'GET') return send(res, 405, { ok: false, error: 'Use GET', code: 'method' });
+      return send(res, 200, { ok: true, commit: dashboard.commit, startedAt: dashboard.startedAt, pid: process.pid });
+    }
+    if (url.pathname === '/api/dashboard/restart') {
+      if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use POST', code: 'method' });
+      if (!isLocalRequest(req)) return send(res, 403, { ok: false, error: 'Restart is only allowed from this computer', code: 'forbidden' });
+      if (restarting) return send(res, 409, { ok: false, error: 'Already restarting', code: 'busy' });
+      restarting = true;
+      res.on('finish', restartSelf);
+      return send(res, 200, { ok: true, restarting: true });
+    }
     const fm = url.pathname.match(/^\/api\/foundry\/([a-z]+|actions\/[^/]+\/undo|tasks\/[^/]+\/pr\/retry)$/);
     if (fm) return await foundryProxy(req, res, fm[1]);
     if (url.pathname.startsWith('/api/foundry')) return send(res, 404, { ok: false, error: 'Not found' });
@@ -491,6 +514,63 @@ const server = http.createServer(async (req, res) => {
     send(res, err.status || 500, { ok: false, error: err.message });
   }
 });
+
+// ---------- restart (POST /api/dashboard/restart) ----------
+let restarting = false;
+
+// Start a detached copy of this process (same node, script, args, env); log goes next to the state file.
+function spawnReplacement() {
+  const logFile = path.join(path.dirname(DATA_FILE), 'server.log');
+  let stdio = 'ignore';
+  let fd = null;
+  try {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    fd = fs.openSync(logFile, 'a');
+    fs.writeSync(fd, `\n--- ${new Date().toISOString()} server.mjs restarting (was pid ${process.pid})\n`);
+    stdio = ['ignore', fd, fd];
+  } catch {
+    stdio = 'ignore';
+  }
+  try {
+    return spawn(process.execPath, [process.argv[1], ...process.argv.slice(2)], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio,
+      detached: true,
+      windowsHide: true,
+    });
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+function restartSelf() {
+  const fail = (err) => {
+    console.warn(`Dashboard restart failed, keeping this process: ${err && err.message ? err.message : err}`);
+    restarting = false;
+    if (!server.listening) server.listen(PORT, HOST);
+  };
+  for (const res of clients.keys()) res.end();
+  clients.clear();
+  server.close(() => {
+    let child;
+    try {
+      child = restartSpawn();
+    } catch (err) {
+      return fail(err);
+    }
+    child.once('error', fail);
+    child.once('spawn', () => {
+      child.unref();
+      process.exit(0);
+    });
+  });
+  server.closeAllConnections?.();
+}
+// Indirection so tests can stub the respawn (DEPT_RESTART_FAIL=1 makes it fail).
+let restartSpawn = process.env.DEPT_RESTART_FAIL === '1'
+  ? () => spawn(path.join(here, 'no-such-program-xyz'), [], { stdio: 'ignore' })
+  : spawnReplacement;
 
 server.listen(PORT, HOST, () => {
   const link = `http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`;
