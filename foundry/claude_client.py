@@ -515,7 +515,9 @@ def _result_from_payload(payload: dict, wall_seconds: float) -> ClaudeResult:
         error = (text or str(payload.get("subtype") or "claude reported an error"))[:_ERROR_EXCERPT]
     session_id = payload.get("session_id")
     num_turns = payload.get("num_turns")
+    subtype = payload.get("subtype")
     return _make_result(
+        subtype=subtype if isinstance(subtype, str) and subtype else None,
         text=text,
         input_tokens=input_tokens,
         cache_read_tokens=cache_read_tokens,
