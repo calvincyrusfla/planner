@@ -20,6 +20,9 @@ from foundry.schemas import (
 )
 from foundry.worker_helpers import _fence_for, _one_line, _read_only_path
 
+PROMPT_LAYOUT_VERSION = 2
+"""Version of the builder prompt layout: stable sections first, per-attempt sections last."""
+
 EDITS_EXAMPLE = (
     '```edits\n'
     '{"edits": [{"op": "replace_symbol", "file": "pkg/mod.py", "symbol": "Shop.total",\n'
@@ -213,43 +216,20 @@ def build_builder_prompt(
     ``order_description``: the original work-order text, quoted (capped) under "## Order details".
     ``assignment.ticket_description``: the ticket's own description, quoted (capped) under "### This part".
 
-    Contains only: who/what (ids, attempt), the objective, acceptance criteria,
-    the order details, allowed files, the pruned ``ContextSlice`` snippets (edit targets in full,
-    the rest as outlines, plus a symbol inventory), the fix hint from the
-    previous attempt (if any) and the ```edits / ```diff output contract.  Never
-    whole files beyond the context engine's line budget.
+    Contains only: the ```edits / ```diff output contract, allowed files, read-only files,
+    the pruned ``ContextSlice`` snippets (edit targets in full, the rest as outlines, plus a
+    symbol inventory), the objective, acceptance criteria, the order details, the advisory
+    notes, and last the attempt-specific part (ids, attempt, Floor Manager note, fix hint
+    from the previous attempt).  Never whole files beyond the context engine's line budget.
+
+    Layout rule (``PROMPT_LAYOUT_VERSION``): the prompt cache matches from the start, so
+    everything that stays the same for a piece comes first and everything that changes per
+    attempt comes last, under "## This attempt" and after it.  Never put ids, attempt
+    numbers, timestamps or random values above that section.
     """
     ctx = assignment.context
     criteria = assignment.acceptance_criteria or ctx.acceptance_criteria
-    parts: list[str] = [
-        f"You are builder {assignment.builder_id} on team {assignment.team_id}. "
-        f"Task {assignment.task_id}, subtask {assignment.subtask_id}, "
-        f"attempt {assignment.attempt + 1} of {max_retries + 1}.",
-        "",
-        "## Objective",
-        ctx.objective.strip(),
-        "",
-        "## Acceptance criteria",
-    ]
-    parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
-    parts += _order_details_section(order_description, assignment.ticket_description)
-    if pitfall_notes:
-        parts += [
-            "",
-            "## Watch out (advisory)",
-            "Found by a search of the repo's tests. Check each against the code; ignore any that do not apply.",
-        ]
-        parts += [f"- {note}" for note in pitfall_notes]
-    if file_map:
-        parts += [
-            "",
-            "## Where to look (advisory)",
-            "Functions and classes this piece likely needs, with line ranges in the base. "
-            "Read these first; your tools reach the rest.",
-        ]
-        parts += [f"- {entry}" for entry in file_map]
-    if floor_manager_note and floor_manager_note.strip():
-        parts += ["", "## Floor Manager note (follow it)", floor_manager_note.strip()]
+    parts: list[str] = ["## Output contract", contract]
     allowed = list(assignment.allowed_files)
     read_files = list(getattr(assignment, "read_files", ()))
     protected = set(read_files)
@@ -271,6 +251,23 @@ def build_builder_prompt(
         parts += [f"- {f}" for f in allowed] or [
             "- (no restriction given)" if not assignment.allowed_files else "- (none: every listed file is read-only)"
         ]
+    if read_files:
+        parts += [
+            "",
+            "## Read-only files",
+            "For reference only. Do not change these files: a reply that edits any of them is refused. "
+            "To see more of one, reply `BLOCKED:` naming the symbol in backticks.",
+        ]
+        parts += [f"- {f}" for f in read_files]
+        for excerpt in getattr(assignment, "read_only_excerpts", ()):
+            text = str(excerpt["text"])
+            fence = _fence_for(text)
+            parts += [
+                f"### {excerpt['path']} (lines {excerpt['start_line']}-{excerpt['end_line']})",
+                f"{fence}text",
+                text.rstrip("\n"),
+                fence,
+            ]
     if ctx.snippets:
         parts += [
             "",
@@ -290,30 +287,39 @@ def build_builder_prompt(
                 snip.text.rstrip("\n"),
                 fence,
             ]
+    parts += ["", "## Objective", ctx.objective.strip(), "", "## Acceptance criteria"]
+    parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
+    parts += _order_details_section(order_description, assignment.ticket_description)
+    if pitfall_notes:
+        parts += [
+            "",
+            "## Watch out (advisory)",
+            "Found by a search of the repo's tests. Check each against the code; ignore any that do not apply.",
+        ]
+        parts += [f"- {note}" for note in pitfall_notes]
+    if file_map:
+        parts += [
+            "",
+            "## Where to look (advisory)",
+            "Functions and classes this piece likely needs, with line ranges in the base. "
+            "Read these first; your tools reach the rest.",
+        ]
+        parts += [f"- {entry}" for entry in file_map]
+    parts += [
+        "",
+        "## This attempt",
+        f"You are builder {assignment.builder_id} on team {assignment.team_id}. "
+        f"Task {assignment.task_id}, subtask {assignment.subtask_id}, "
+        f"attempt {assignment.attempt + 1} of {max_retries + 1}.",
+    ]
+    if floor_manager_note and floor_manager_note.strip():
+        parts += ["", "## Floor Manager note (follow it)", floor_manager_note.strip()]
     if assignment.fix_hint:
         parts += [
             "",
             "## Fix required (your previous attempt was sent back)",
             assignment.fix_hint.strip(),
         ]
-    if read_files:
-        parts += [
-            "",
-            "## Read-only files",
-            "For reference only. Do not change these files: a reply that edits any of them is refused. "
-            "To see more of one, reply `BLOCKED:` naming the symbol in backticks.",
-        ]
-        parts += [f"- {f}" for f in read_files]
-        for excerpt in getattr(assignment, "read_only_excerpts", ()):
-            text = str(excerpt["text"])
-            fence = _fence_for(text)
-            parts += [
-                f"### {excerpt['path']} (lines {excerpt['start_line']}-{excerpt['end_line']})",
-                f"{fence}text",
-                text.rstrip("\n"),
-                fence,
-            ]
-    parts += ["", "## Output contract", contract]
     return "\n".join(parts) + "\n"
 
 
