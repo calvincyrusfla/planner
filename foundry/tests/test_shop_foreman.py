@@ -220,23 +220,24 @@ def test_size_task_scope_heuristic_without_gemma(
     directive = run(foreman.size_task_scope(task))
     assert isinstance(directive, TaskSizingDirective)
     assert directive.complexity == complexity
-    assert directive.allocated_builders == builders == len(directive.subtasks)
-    assert directive.override_reason is None
-    assigned = [f for s in directive.subtasks for f in s.allowed_files]
-    assert sorted(assigned) == sorted(files)  # every file once, no overlap
-    assert all(s.acceptance_criteria for s in directive.subtasks)
-    assert [s.subtask_id for s in directive.subtasks] == [f"F-001.{k}" for k in range(1, builders + 1)]
+    assert directive.allocated_builders == 1 == len(directive.subtasks)
+    assert directive.override_reason == ("one builder per piece" if builders != 1 else None)
+    (sub,) = directive.subtasks
+    assert sub.allowed_files == files
+    assert sub.acceptance_criteria == ["it works", "tests pass"]
+    assert sub.title == "Work" and sub.part_note == "Covers the whole order"
+    assert sub.subtask_id == "F-001.1"
     assert foreman.last_source["size_task_scope"] == "heuristic"
 
 
-def test_size_caps_builders_at_file_count_with_override(line: dict[str, Any]) -> None:
+def test_size_gives_one_subtask_with_override(line: dict[str, Any]) -> None:
     foreman = make_foreman(line)
     task = {"task_id": "F-002", "team_id": "alpha", "title": "Rewrite the parser",
             "description": "x", "files": ["parser.py", "lexer.py"]}
     directive = run(foreman.size_task_scope(task))
     assert directive.complexity == "L"
-    assert directive.allocated_builders == 2
-    assert directive.override_reason and "2 file(s)" in directive.override_reason
+    assert directive.allocated_builders == 1 and len(directive.subtasks) == 1
+    assert directive.override_reason == "one builder per piece"
 
 
 def test_size_requires_ids(line: dict[str, Any]) -> None:
@@ -260,13 +261,13 @@ def test_size_task_scope_uses_valid_gemma_json(line: dict[str, Any]) -> None:
             "description": "Build a tokenizer.", "files": ["parser.py", "lexer.py", "README.md"]}
     directive = run(foreman.size_task_scope(task))
     assert foreman.last_source["size_task_scope"] == "gemma"
-    assert directive.complexity == "M" and directive.allocated_builders == 2
+    assert directive.complexity == "M" and directive.allocated_builders == 1
+    assert directive.override_reason == "one builder per piece"
     assert directive.rationale == "Two independent modules."
-    first, second = directive.subtasks
-    # evil.py is not in the task's files; the surplus "Docs" subtask merges into the first
-    assert first.allowed_files == ["parser.py", "README.md"]
-    assert "documented" in first.acceptance_criteria
-    assert second.allowed_files == ["lexer.py"]  # no file in two subtasks
+    (first,) = directive.subtasks
+    # evil.py is not in the task's files; every other proposal merges into the one subtask
+    assert first.allowed_files == ["parser.py", "lexer.py", "README.md"]
+    assert {"parses", "lexes", "documented"} <= set(first.acceptance_criteria)
     assert gemma.requests[0].json_schema is not None
     saved = line["telemetry"].tokens_saved_by_source()
     assert saved["triage"] > 0
@@ -297,12 +298,11 @@ def test_size_task_scope_falls_back_when_gemma_unreachable(line: dict[str, Any])
     assert foreman.last_source["size_task_scope"] == "heuristic"
 
 
-def test_gemma_with_too_few_subtasks_is_split_deterministically(line: dict[str, Any]) -> None:
-    reply = {"complexity": "L", "rationale": "Big.", "subtasks": [
-        {"title": "All", "acceptance_criteria": ["a"], "allowed_files": []}]}
+def test_gemma_without_subtasks_gets_the_deterministic_one(line: dict[str, Any]) -> None:
+    reply = {"complexity": "L", "rationale": "Big.", "subtasks": []}
     foreman = make_foreman(line, SimulatedGemmaClient(lambda req: reply))
     directive = run(foreman.size_task_scope({"task_id": "F-006", "team_id": "alpha", "title": "Big job"}))
-    assert directive.complexity == "L" and len(directive.subtasks) == 5
+    assert directive.complexity == "L" and len(directive.subtasks) == 1
     assert "split deterministically" in directive.rationale
 
 

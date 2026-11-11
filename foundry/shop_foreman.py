@@ -126,7 +126,6 @@ from foundry.foreman_helpers import (
 )
 from foundry.schemas import (
     BUILDERS_FOR,
-    MAX_BUILDERS,
     ContextSlice,
     SubtaskAllocation,
     TaskSizingDirective,
@@ -1415,14 +1414,8 @@ class ShopForeman(AnomalyMixin):
         proposals: list[dict[str, Any]] | None,
     ) -> TaskSizingDirective:
         """Normalise subtasks to one per builder, merge tiny ones and validate the directive."""
-        n = BUILDERS_FOR[complexity]
-        override: str | None = None
-        if files and len(files) < n:
-            override = f"only {len(files)} file(s) to split; capped from {n} to {len(files)} builder(s)"
-            n = len(files)
-        n = max(1, min(n, MAX_BUILDERS, self.config.builders_per_team))
-        if override is None and n != BUILDERS_FOR[complexity]:
-            override = f"team has {self.config.builders_per_team} builder(s)"
+        n = 1  # one builder and one subtask per piece, whatever the complexity label says
+        override: str | None = "one builder per piece" if BUILDERS_FOR[complexity] != 1 else None
 
         subtasks: list[dict[str, Any]]
         if proposals and all(p["title"] for p in proposals) and len(proposals) >= n:
