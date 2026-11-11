@@ -207,8 +207,14 @@ class FloorManager:
         auto_pr: bool | None = None,
         pr_draft: bool = False,
         snapshots: Any = None,
+        gemma_notes: bool = False,
+        gemma_notes_timeout_s: float = 90.0,
     ) -> None:
         self.queue = queue
+        self.gemma_notes = bool(gemma_notes)
+        self.gemma_notes_timeout_s = float(gemma_notes_timeout_s)
+        #: task id -> Gemma's advisory PR brief (in memory only)
+        self.pr_briefs: dict[str, str] = {}
         #: :class:`~foundry.base_snapshot.BaseSnapshots` (or a fake): clean checkouts of the
         #: publish branch that every task is built, gated, stacked and checked on.
         self.snapshots = snapshots
@@ -1937,8 +1943,35 @@ class FloorManager:
         if not body and len(lines) > 1:
             body = "\n".join(lines[1:])
         footer = f"Opened by Foundry (task {task_id})"
+        brief = (self.pr_briefs.get(task_id) or "").strip()
+        if brief:
+            section = f"## Brief (Gemma, advisory)\n\n{brief}"
+            body = f"{body}\n\n{section}" if body else section
         body = f"{body}\n\n---\n{footer}\n" if body else f"{footer}\n"
         return {"title": title, "body": body, "draft": self.pr_draft}
+
+    async def _make_brief(self, task_id: str, patch: Path) -> None:
+        """Store Gemma's advisory PR brief for the task (never raises)."""
+        gemma = getattr(self.foreman, "gemma", None)
+        order = self.orders.get(task_id)
+        if not self.gemma_notes or gemma is None or order is None or self.pr_briefs.get(task_id):
+            return
+        try:
+            from foundry.gemma_notes import pr_brief
+
+            patch_text = patch.read_text(encoding="utf-8")
+            changed = sorted({
+                m.group(1).strip() for m in re.finditer(r"^\+\+\+ b/(.+)$", patch_text, re.MULTILINE)
+                if m.group(1).strip() != "/dev/null"
+            })
+            brief = await pr_brief(
+                gemma, order.title + "\n\n" + order.description, order.acceptance_criteria,
+                changed, patch_text, timeout=self.gemma_notes_timeout_s,
+            )
+            if brief and brief.strip():
+                self.pr_briefs[task_id] = brief
+        except Exception as exc:  # advisory only
+            log.debug("floor manager: PR brief failed: %s", exc)
 
     async def _publish(self, task_id: str) -> dict[str, Any]:
         st = dict(self.pr_states.get(task_id) or {})
@@ -1962,6 +1995,8 @@ class FloorManager:
             if held is not None:
                 return held
         order = self.orders.get(task_id)
+        if self.gemma_notes and patch is not None:
+            await self._make_brief(task_id, patch)
         req = self.pr_request(task_id)
         try:
             publish = self.publisher.publish
@@ -2679,6 +2714,8 @@ def build_factory(
         auto_pr=bool(getattr(config, "auto_pr", True)) and publisher is not None,
         pr_draft=bool(getattr(config, "pr_draft", False)),
         snapshots=snapshots,
+        gemma_notes=bool(getattr(config, "gemma_notes", False)),
+        gemma_notes_timeout_s=float(getattr(config, "gemma_notes_timeout_s", 90.0)),
     )
     # the Foreman reads the action log so it never prescribes RETRY_TASK twice for one task
     foreman.actions_provider = manager.actions
