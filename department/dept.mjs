@@ -96,7 +96,7 @@ const HELP = `Agent Department CLI
                                                        totals and per-task rows
   node department/dept.mjs foundry watch [<S-id> ...] [--interval <s>] [--timeout <s>] [--json]
                                                        Wait until a batch needs attention: prints
-                                                       HELP/DONE/FAIL/BATCH/STALE lines and exits.
+                                                       HELP/DONE/FAIL/NOTE/BATCH/STALE lines and exits.
                                                        Without ids: every open batch and new ones
                                                        (--interval default 30, min 5; --timeout 6900)
   node department/dept.mjs json                        Dump the full state

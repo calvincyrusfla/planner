@@ -45,7 +45,7 @@ function heartbeatAge(b, nowMs) {
 // `before` is the snapshot taken at the start of the watch and must hold every
 // batch that existed then, closed ones too: a batch missing from it counts as
 // dispatched during the watch. `after` is the latest poll, already narrowed to
-// the watched batches. Returns [{kind: HELP|DONE|FAIL|BATCH|STALE, batch, line,
+// the watched batches. Returns [{kind: HELP|DONE|FAIL|NOTE|BATCH|STALE, batch, line,
 // ...details}]; `line` is the text to print. Queue progress (queued, sizing,
 // building, reviewing, answered) produces nothing.
 export function watchEvents(before, after, nowMs) {
@@ -55,6 +55,9 @@ export function watchEvents(before, after, nowMs) {
     const prev = known.get(b.id);
     for (const st of b.subtasks || []) {
       events.push(...subtaskEvents(b, st, b.results?.[st.key] || {}, prev?.results?.[st.key] || {}));
+    }
+    if (typeof b.note === 'string' && b.note && b.note !== (typeof prev?.note === 'string' ? prev.note : '')) {
+      events.push({ kind: 'NOTE', batch: b.id, note: b.note, line: `NOTE  ${b.id} ${b.note}` });
     }
     if ((!prev || OPEN_BATCH.has(prev.status)) && !OPEN_BATCH.has(b.status)) {
       events.push({ kind: 'BATCH', batch: b.id, status: b.status, line: `BATCH ${b.id} ${b.status}` });
