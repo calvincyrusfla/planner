@@ -112,7 +112,7 @@ def test_read_only_excerpts_query_carries_the_ticket_text() -> None:
         return [{"path": paths[0]}]
 
     worker = _stub(
-        _stack_engine=lambda: _stub(read_only_excerpts=build),
+        _base_engine=lambda: _stub(read_only_excerpts=build),
         _work_order=lambda _task: {"description": "order text"},
         _requested_symbols=lambda _ticket: ["asked_for"],
     )
@@ -125,7 +125,7 @@ def test_read_only_excerpts_query_carries_the_ticket_text() -> None:
 
 
 def test_read_only_excerpts_empty_when_engine_cannot_build_them() -> None:
-    worker = _stub(_stack_engine=lambda: _stub())
+    worker = _stub(_base_engine=lambda: _stub())
     assert BuilderWorker._read_only_excerpts(worker, _stub(), {}) == []
 
 

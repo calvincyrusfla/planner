@@ -101,7 +101,6 @@ def test_builder_saves_the_prompt_it_sends(prompt_dir: Path) -> None:
         _task_state=lambda _task_id: "building",
         _ticket_changed=lambda _task_id: None,
         _work_order=lambda _task_id: {"title": "t", "description": ""},
-        _already_done=list,
         _focus_files=lambda _ticket, _assignment: [],
         _tm=lambda *_args: None,
         _help_answer=lambda _ticket: {},
