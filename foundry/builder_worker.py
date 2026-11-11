@@ -58,6 +58,7 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from foundry import claude_client as _claude_client
+from foundry.gemma_notes import find_related, pitfall_notes
 from foundry.order_schema import LIMIT_BUILDER_ORDER
 from foundry.piece_workspace import WorkspaceError, collect_changes, make_workspace, remove_workspace
 from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
@@ -563,10 +564,13 @@ def build_builder_prompt(
     floor_manager_note: str | None = None,
     order_description: str | None = None,
     contract: str = BUILDER_CONTRACT,
+    pitfall_notes: Sequence[str] | None = None,
 ) -> str:
     """Return the exact prompt a builder sends to Claude for ``assignment``.
 
     ``contract``: the text of the '## Output contract' section (``EDIT_CONTRACT`` in edit mode).
+    ``pitfall_notes``: advisory notes from a search of the repo's tests, listed under
+    "## Watch out (advisory)" after the order details; none = no section.
 
     ``already_done`` (stacked tickets): the task's earlier approved tickets,
     listed under "## Already done on this piece" (title, files, symbols).
@@ -598,6 +602,13 @@ def build_builder_prompt(
     ]
     parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
     parts += _order_details_section(order_description, assignment.ticket_description)
+    if pitfall_notes:
+        parts += [
+            "",
+            "## Watch out (advisory)",
+            "Found by a search of the repo's tests. Check each against the code; ignore any that do not apply.",
+        ]
+        parts += [f"- {note}" for note in pitfall_notes]
     if floor_manager_note and floor_manager_note.strip():
         parts += ["", "## Floor Manager note (follow it)", floor_manager_note.strip()]
     allowed = list(assignment.allowed_files)
@@ -2493,7 +2504,8 @@ class BuilderWorker(_WorkerBase):
                                       focus_files=self._focus_files(ticket, assignment),
                                       order_description=meta.get("description"),
                                       floor_manager_note=self._help_answer(ticket).get("note"),
-                                      contract=EDIT_CONTRACT if edit_mode else BUILDER_CONTRACT)
+                                      contract=EDIT_CONTRACT if edit_mode else BUILDER_CONTRACT,
+                                      pitfall_notes=await self._pitfall_notes(ticket, assignment, meta))
         self.scratch["last_prompt"] = prompt
         _save_prompt(prompt, str(_get(ticket, "ticket_id")), assignment.attempt + 1)
         workspace: Path | None = None
@@ -2605,6 +2617,39 @@ class BuilderWorker(_WorkerBase):
 
         await self._enqueue_review(ticket, assignment, submission, gates.results, snapshot, meta, notes)
         return "review"
+
+    async def _pitfall_notes(self, ticket: Any, assignment: TaskAssignment, meta: Mapping[str, Any]) -> list[str]:
+        """Advisory notes on the repo's tests this order could break (Gemma); ``[]`` on any failure."""
+        try:
+            config = getattr(self, "config", None)
+            if not getattr(config, "gemma_notes", False):
+                return []
+            engine = getattr(self, "context_engine", None)
+            gemma = getattr(engine, "gemma", None)
+            repo_root = getattr(engine, "repo_root", None)
+            if gemma is None or not repo_root:
+                return []
+            cache: dict[tuple[str, str], list[str]] | None = self.__dict__.get("_pitfall_cache")
+            if cache is None:
+                cache = {}
+                self.__dict__["_pitfall_cache"] = cache
+            key = (str(assignment.task_id), str(assignment.subtask_id))
+            if key in cache:
+                return list(cache[key])
+            notes: list[str] = []
+            text = str(meta.get("description") or assignment.context.objective or "")
+            names = list(dict.fromkeys(re.findall(r"`([A-Za-z_][A-Za-z0-9_.]{3,})`", text)))
+            hits = await asyncio.to_thread(find_related, Path(repo_root), list(assignment.allowed_files), names)
+            if hits:
+                notes = await pitfall_notes(gemma, text, hits, timeout=float(getattr(config, "gemma_notes_timeout_s", 90)))
+            cache[key] = list(notes)
+            if notes:
+                log.info("builder %s: %d advisory pitfall notes for %s", self.agent_id, len(notes),
+                         _get(ticket, "ticket_id"))
+            return list(notes)
+        except Exception as exc:  # noqa: BLE001 - the notes are advisory
+            log.debug("pitfall notes unavailable: %s", exc)
+            return []
 
     # -- edit mode -----------------------------------------------------------------
     def _edit_mode_applies(self, ticket: Any) -> bool:
