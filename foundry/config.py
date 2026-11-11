@@ -127,6 +127,8 @@ Environment variable               Field (default)
                                    ``tests_docs`` merges small test/docs PRs
 ``FOUNDRY_GEMMA_NOTES``            ``gemma_notes`` (``false``): Gemma writes
                                    advisory pitfall notes and PR briefs
+``FOUNDRY_TURN_LEDGER``            ``turn_ledger`` (``true``): record per-turn
+                                   token use from Claude Code transcripts
 ``FOUNDRY_PR_TEMPLATE``            ``pr_template`` (``false``): PR descriptions
                                    use the fixed template sections
 ``FOUNDRY_GEMMA_NOTES_TIMEOUT_S``  ``gemma_notes_timeout_s`` (``90``, > 0):
@@ -655,6 +657,10 @@ class FoundryConfig(BaseModel):
         default=False,
         description="Whether Gemma writes advisory pitfall notes and PR briefs.",
     )
+    turn_ledger: bool = Field(
+        default=True,
+        description="Whether Foundry records per-turn token use from Claude Code transcripts.",
+    )
     pr_template: bool = Field(
         default=False,
         description="Whether PR descriptions use the fixed template (summary, acceptance criteria, files changed, brief).",
@@ -862,6 +868,7 @@ class FoundryConfig(BaseModel):
             "AUTO_UPDATE": "auto_update",
             "AUTO_MERGE": "auto_merge",
             "GEMMA_NOTES": "gemma_notes",
+            "TURN_LEDGER": "turn_ledger",
             "PR_TEMPLATE": "pr_template",
             "GEMMA_NOTES_TIMEOUT_S": "gemma_notes_timeout_s",
         }

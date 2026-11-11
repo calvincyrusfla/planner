@@ -513,6 +513,8 @@ def _result_from_payload(payload: dict, wall_seconds: float) -> ClaudeResult:
     error: str | None = None
     if is_error:
         error = (text or str(payload.get("subtype") or "claude reported an error"))[:_ERROR_EXCERPT]
+    session_id = payload.get("session_id")
+    num_turns = payload.get("num_turns")
     return _make_result(
         text=text,
         input_tokens=input_tokens,
@@ -522,6 +524,8 @@ def _result_from_payload(payload: dict, wall_seconds: float) -> ClaudeResult:
         cost_usd=cost_usd,
         is_error=is_error,
         error=error,
+        session_id=session_id if isinstance(session_id, str) and session_id else None,
+        num_turns=num_turns if isinstance(num_turns, int) and not isinstance(num_turns, bool) else None,
     )
 
 
