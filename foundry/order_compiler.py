@@ -9,9 +9,11 @@ code is 0 unless the batch cannot be read.
 from __future__ import annotations
 
 import argparse
+import builtins
 import copy
 import datetime
 import json
+import keyword
 import re
 import sys
 import tempfile
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from foundry.code_library import Library, build_library
+from foundry.code_library import _is_test_path as _is_test_path
 
 __all__ = ["compile_batch", "extract_names", "main"]
 
@@ -37,6 +40,16 @@ _FILE_EXT = {
 }
 _CHANGE_RE = re.compile(r"rename|remov|delet|signature|move", re.IGNORECASE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n")
+
+MAX_CANDIDATES = 5
+
+_SKIP_WORDS = (
+    set(keyword.kwlist)
+    | set(keyword.softkwlist)
+    | set(dir(builtins))
+    | {"self", "cls", "true", "false", "null", "undefined"}
+)
+_SETTING_RE = re.compile(r"^(?:FOUNDRY_[A-Z0-9_]+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)$")
 
 Entry = dict[str, Any]
 
@@ -69,6 +82,18 @@ def _resolve(lib: Library, name: str) -> list[Entry]:
         if (q == name) if dotted else (q.rsplit(".", 1)[-1] == name):
             out.append(e)
     return out
+
+
+def _narrow(hits: list[Entry], files: list[str], read_files: list[str]) -> list[Entry]:
+    """Drop test-file candidates (unless the piece edits tests), then prefer its own files."""
+    if not any(_is_test_path(f) for f in files):
+        kept = [h for h in hits if not _is_test_path(str(h["path"]))]
+        hits = kept or hits
+    for group in (files, read_files):
+        own = [h for h in hits if h["path"] in group]
+        if own:
+            return own
+    return hits
 
 
 def _as_list(value: Any) -> list[str]:
@@ -147,18 +172,37 @@ def compile_batch(batch: dict[str, Any], lib: Library) -> dict[str, Any]:
         names: list[dict[str, Any]] = []
         resolved: list[Entry] = []
         findings: list[str] = []
+        unresolved: list[str] = []
+        settings = 0
         for name in extract_names(text):
+            if name in _SKIP_WORDS:
+                continue
             hits = _resolve(lib, name)
+            if not hits and _SETTING_RE.match(name):
+                settings += 1
+                continue
+            total = len(hits)
+            if total > 1:
+                hits = _narrow(hits, files, read_files)
             if len(hits) == 1:
-                names.append({"name": name, "status": "resolved", "calls": [hits[0]["call"]]})
+                item: dict[str, Any] = {"name": name, "status": "resolved", "calls": [hits[0]["call"]]}
+                if total > 1:
+                    item["alsoDefined"] = total - 1
+                names.append(item)
                 resolved.append(hits[0])
             elif hits:
                 calls = [h["call"] for h in hits]
-                names.append({"name": name, "status": "ambiguous", "calls": calls})
-                findings.append(f"`{name}` is ambiguous: {', '.join(calls)}")
+                more = max(0, len(calls) - MAX_CANDIDATES)
+                names.append({"name": name, "status": "ambiguous", "calls": calls[:MAX_CANDIDATES], "more": more})
+                tail = f" +{more} more" if more else ""
+                findings.append(f"`{name}` is ambiguous: {', '.join(calls[:MAX_CANDIDATES])}{tail}")
             else:
                 names.append({"name": name, "status": "unresolved", "calls": []})
-                findings.append(f"`{name}` not found; fine if this piece creates it")
+                unresolved.append(name)
+        if unresolved:
+            findings.append(f"not found (fine if this piece creates them): {', '.join(unresolved)}")
+        if settings:
+            findings.append(f"settings or constants not checked: {settings}")
         known = set(files) | set(read_files)
         suggested: list[str] = []
         for e in resolved:
@@ -171,6 +215,8 @@ def compile_batch(batch: dict[str, Any], lib: Library) -> dict[str, Any]:
                 "key": keys[i],
                 "title": str(sub.get("title") or ""),
                 "names": names,
+                "unresolved": unresolved,
+                "settingsSkipped": settings,
                 "findings": findings,
                 "facts": _fact_sheet(lib, resolved, set(files)),
                 "suggestedReadFiles": suggested,
@@ -255,7 +301,8 @@ def format_report(report: dict[str, Any]) -> str:
         lines.append(f"#{piece['key']} {piece['title']}".rstrip())
         for n in piece["names"]:
             if n["status"] == "resolved":
-                lines.append(f"  resolved: `{n['name']}` -> {n['calls'][0]}")
+                extra = f" (also defined in {n['alsoDefined']} other places)" if n.get("alsoDefined") else ""
+                lines.append(f"  resolved: `{n['name']}` -> {n['calls'][0]}{extra}")
         for f in piece["findings"]:
             lines.append(f"  {f}")
         for p in piece["suggestedReadFiles"]:
