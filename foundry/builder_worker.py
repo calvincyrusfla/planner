@@ -682,6 +682,24 @@ class _WorkerBase:
             "record_tokens", task_id, self.agent_id, self.role, result.input_tokens, result.output_tokens,
             cache_read_tokens=int(getattr(result, "cache_read_tokens", 0) or 0),
         )
+        session_id = getattr(result, "session_id", None)
+        if session_id and getattr(getattr(self, "config", None), "turn_ledger", False):
+            try:
+                from foundry import turn_ledger
+
+                async def record_turns() -> None:
+                    try:
+                        await asyncio.to_thread(
+                            turn_ledger.record_session, self.queue, task_id, self.agent_id, self.role, session_id
+                        )
+                    except Exception:
+                        log.debug("%s: turn ledger failed for %s", self.agent_id, session_id, exc_info=True)
+
+                recording = asyncio.create_task(record_turns())
+                turn_ledger.BACKGROUND_TASKS.add(recording)
+                recording.add_done_callback(turn_ledger.BACKGROUND_TASKS.discard)
+            except Exception:  # the ledger must never fail a build
+                log.debug("%s: could not start the turn ledger", self.agent_id, exc_info=True)
         return result
 
     # -- infrastructure failures (D1/E1) --------------------------------------

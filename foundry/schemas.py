@@ -596,6 +596,8 @@ class ClaudeResult(FoundryModel):
     cost_usd: float | None = None
     is_error: bool = False
     error: str | None = None
+    session_id: str | None = None
+    num_turns: int | None = None
 
     @property
     def total_tokens(self) -> int:
