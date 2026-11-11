@@ -31,7 +31,6 @@ OTHER = "pkg/other.py"
 APP_SRC = b"A = 1\nB = 2\n"
 APP_NEW = b"A = 1\nB = 3\n"
 APP_DIFF = "--- a/pkg/app.py\n+++ b/pkg/app.py\n@@ -1,2 +1,2 @@\n A = 1\n-B = 2\n+B = 3\n"
-NEW_FILE_DIFF = "--- /dev/null\n+++ b/pkg/new.py\n@@ -0,0 +1 @@\n+X = 1\n"
 
 
 def _env() -> dict[str, str]:
@@ -71,7 +70,7 @@ class Rig:
     """A seeded git repo, a snapshot worktree of it, a real queue and one builder."""
 
     def __init__(self, tmp_path: Path, act: Callable[[Path | None], str], *, mode: str = "edit",
-                 base: Path | None = None, stacked: list[tuple[str, str]] | None = None) -> None:
+                 base: Path | None = None) -> None:
         self.tmp = tmp_path
         repo = tmp_path / "repo"
         git(tmp_path, "init", "-q", "-b", "main", str(repo))
@@ -92,17 +91,12 @@ class Rig:
         ))
         self.client = FakeClient(act)
         chosen: Path = self.snapshot if base is None else base
-        items: list[tuple[str, str]] = list(stacked or [])
 
         def base_for(_task_id: str) -> Path:
             return chosen
 
-        def approved(_ticket_id: str) -> list[tuple[str, str]]:
-            return items
-
         self.worker = BuilderWorker(TEAM, 1, self.queue, self.client, None, None, None, None, None, _Foreman(),
-                                    poll=0.01, base_for=base_for,
-                                    approved_diffs_before=approved if items else None)
+                                    poll=0.01, base_for=base_for)
         self.worker.config = SimpleNamespace(builder_mode=mode, db_path=tmp_path / "foundry.db")
 
     def run(self) -> str:
@@ -226,13 +220,3 @@ def test_diff_mode_is_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert not (tmp_path / "pieces").exists()
     item = rig.worker.review_inbox.get_nowait()
     assert "+B = 3" in item.submission.diff
-
-
-def test_stacked_ticket_uses_diff_mode(tmp_path: Path) -> None:
-    rig = Rig(tmp_path, blocked_reply, stacked=[(f"{TASK}.0", NEW_FILE_DIFF)])
-    assert rig.run() == "retry"
-    prompt = rig.client.prompts[0]
-    assert BUILDER_CONTRACT in prompt
-    assert EDIT_CONTRACT not in prompt
-    assert rig.only_cwd() == rig.snapshot
-    assert not (tmp_path / "pieces").exists()

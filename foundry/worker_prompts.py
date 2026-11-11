@@ -6,8 +6,7 @@ Split out of ``foundry/builder_worker.py``, which imports these names back.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Sequence
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
@@ -19,8 +18,7 @@ from foundry.schemas import (
     DeterministicGateResult,
     TaskAssignment,
 )
-from foundry.worker_helpers import _fence_for, _normalize_path, _one_line, _read_only_path
-from foundry.worker_replies import extract_diff_paths
+from foundry.worker_helpers import _fence_for, _one_line, _read_only_path
 
 EDITS_EXAMPLE = (
     '```edits\n'
@@ -77,68 +75,7 @@ REVIEWER_CONTRACT = (
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class StackedWork:
-    """One earlier approved ticket of the same task (the "Already done on this piece" list)."""
-
-    subtask_id: str
-    title: str
-    files: tuple[str, ...]
-    symbols: tuple[str, ...]
-    #: ``((path, (symbol, ...)), ...)``: where each added/changed symbol lives.
-    by_file: tuple[tuple[str, tuple[str, ...]], ...] = field(default=(), compare=False)
-
-
 _DEF_KW = r"(?:async\s+def|def|class|(?:export\s+)?(?:async\s+)?function)"
-#: A definition on an added line: ``def x``, ``class X``, ``function x``.
-_ADDED_DEF_RE = re.compile(r"^\+\s*" + _DEF_KW + r"\s+([A-Za-z_$][\w$]*)")
-#: The enclosing symbol git names in a hunk header (``@@ -1,2 +1,3 @@ def total(self):``).
-_HUNK_CTX_RE = re.compile(r"^@@[^@]*@@\s*" + _DEF_KW + r"\s+([A-Za-z_$][\w$]*)")
-#: A module-level constant assignment on an added line (``+MAX_X = 3``).
-_ADDED_CONST_RE = re.compile(r"^\+([A-Z][A-Z0-9_]*)\s*(?::[^=]+)?=")
-
-
-def summarize_diff(diff: str) -> tuple[list[str], list[str]]:
-    """``(files, symbols)`` a diff adds or changes (symbols in first-seen order, deduplicated)."""
-    files = extract_diff_paths(diff)
-    symbols: dict[str, None] = {}
-    for line in diff.splitlines():
-        if line.startswith("+++"):
-            continue
-        m = _ADDED_DEF_RE.match(line) or _HUNK_CTX_RE.match(line) or _ADDED_CONST_RE.match(line)
-        if m:
-            symbols.setdefault(m.group(1), None)
-    return files, list(symbols)
-
-
-def symbols_by_file(diff: str) -> dict[str, list[str]]:
-    """Added/changed symbols of a diff grouped by the file they are in (deleted files skipped)."""
-    out: dict[str, list[str]] = {}
-    current: str | None = None
-    for line in diff.splitlines():
-        if line.startswith("+++ "):
-            target = line[4:].split("\t", 1)[0].strip()
-            current = None if target == "/dev/null" else _normalize_path(target[2:] if target.startswith("b/") else target)
-            continue
-        if line.startswith("--- ") or current is None:
-            continue
-        m = _ADDED_DEF_RE.match(line) or _HUNK_CTX_RE.match(line) or _ADDED_CONST_RE.match(line)
-        if m and m.group(1) not in out.setdefault(current, []):
-            out[current].append(m.group(1))
-    return out
-
-
-def stacked_work(items: Iterable[tuple[str, str]], titles: Mapping[str, str] | None = None) -> list[StackedWork]:
-    """:class:`StackedWork` per ``(subtask_id, diff)`` (titles by subtask id; default the id)."""
-    out: list[StackedWork] = []
-    for subtask_id, diff in items:
-        files, symbols = summarize_diff(diff or "")
-        by_file = tuple((p, tuple(names)) for p, names in symbols_by_file(diff or "").items() if names)
-        sid = str(subtask_id)
-        out.append(StackedWork(sid, str((titles or {}).get(sid) or sid), tuple(files), tuple(symbols), by_file))
-    return out
-
-
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 
 
@@ -156,31 +93,6 @@ def _defines_any(path: Path, names: set[str]) -> bool:
         if (m.group(1) or m.group(2)) in names:
             return True
     return False
-
-
-#: At most this many symbols are listed per earlier ticket.
-_MAX_STACK_SYMBOLS = 25
-
-
-def _already_done_section(done: Sequence[StackedWork]) -> list[str]:
-    parts = [
-        "",
-        "## Already done on this piece",
-        "These earlier subtasks of this task are approved and already applied to the code "
-        "shown under Context (their new functions and files are real). Build on these; "
-        "don't redo them. Write your change relative to that code.",
-    ]
-    for w in done:
-        title = _one_line(w.title, 160)
-        parts.append(f"- {w.subtask_id}: {title}" if title != w.subtask_id else f"- {w.subtask_id}")
-        if w.files:
-            parts.append(f"  - files: {', '.join(w.files)}")
-        if w.symbols:
-            shown = list(w.symbols[:_MAX_STACK_SYMBOLS])
-            more = len(w.symbols) - len(shown)
-            parts.append(f"  - added/changed: {', '.join(f'`{s}`' for s in shown)}"
-                         + (f" (+{more} more)" if more > 0 else ""))
-    return parts
 
 
 class _ReadOnlyAssignment(TaskAssignment):
@@ -280,7 +192,6 @@ def build_builder_prompt(
     assignment: TaskAssignment,
     *,
     max_retries: int = MAX_RETRIES,
-    already_done: Sequence[StackedWork] | None = None,
     focus_files: Sequence[str] | None = None,
     floor_manager_note: str | None = None,
     order_description: str | None = None,
@@ -294,8 +205,6 @@ def build_builder_prompt(
     ``pitfall_notes``: advisory notes from a search of the repo's tests, listed under
     "## Watch out (advisory)" after the order details; none = no section.
 
-    ``already_done`` (stacked tickets): the task's earlier approved tickets,
-    listed under "## Already done on this piece" (title, files, symbols).
     ``floor_manager_note``: the Floor Manager's answer to this ticket's help request,
     shown right after the order details.
     ``focus_files``: this subtask's own files; when they are a strict subset
@@ -362,8 +271,6 @@ def build_builder_prompt(
         parts += [f"- {f}" for f in allowed] or [
             "- (no restriction given)" if not assignment.allowed_files else "- (none: every listed file is read-only)"
         ]
-    if already_done:
-        parts += _already_done_section(already_done)
     if ctx.snippets:
         parts += [
             "",

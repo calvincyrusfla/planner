@@ -2,7 +2,7 @@
 
 The Floor Manager pins each accepted task to the commit of the branch its PR
 targets (persisted), the workers read that snapshot (context engine, Claude's
-cwd, gates' base copy, stacked workspace, diff normalisation), the combined
+cwd, gates' base copy, diff normalisation), the combined
 patch is stacked and ``git apply --check``-ed on it, and the publisher branches
 from exactly that commit. When snapshots are unavailable the user's folder is
 used as before, with one warning per task. No real Claude, Gemma or GitHub.
@@ -33,7 +33,7 @@ POSIX = sys.platform != "win32"
 needs_git = pytest.mark.skipif(not HAS_GIT, reason="needs git")
 needs_sh = pytest.mark.skipif(not (HAS_GIT and POSIX), reason="needs git and a POSIX shell for the fake gh")
 
-ORDER = {"title": "Add mathx helper", "description": "Add a helper to mathx.", "files": ["shop/mathx.py"]}
+ORDER: dict[str, Any] = {"title": "Add mathx helper", "description": "Add a helper to mathx.", "files": ["shop/mathx.py"]}
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -407,7 +407,6 @@ def test_checkout_runs_once_per_commit_per_run(tmp_path: Path) -> None:
 
 def test_scratch_copies_skip_foundry_data(tmp_path: Path) -> None:
     from foundry.floor_manager import _copy_workspace
-    from foundry.validation_gates import prepare_stacked_workspace
 
     src = tmp_path / "src"
     (src / "foundry/data/base/x").mkdir(parents=True)
@@ -415,11 +414,10 @@ def test_scratch_copies_skip_foundry_data(tmp_path: Path) -> None:
     (src / "foundry/core.py").write_text("y = 1\n", encoding="utf-8")
     (src / "data").mkdir()
     (src / "data/keep.txt").write_text("k\n", encoding="utf-8")
-    _copy_workspace(src, tmp_path / "a")
-    out = prepare_stacked_workspace(src, tmp_path / "b", [])
-    for d in (tmp_path / "a", Path(out)):
-        assert (d / "foundry/core.py").is_file() and (d / "data/keep.txt").is_file()
-        assert not (d / "foundry/data").exists()
+    copy = tmp_path / "a"
+    _copy_workspace(src, copy)
+    assert (copy / "foundry/core.py").is_file() and (copy / "data/keep.txt").is_file()
+    assert not (copy / "foundry/data").exists()
 
 
 def test_old_publisher_without_base_sha_still_publishes(tmp_path: Path) -> None:
@@ -509,6 +507,6 @@ def test_publish_branches_from_the_pinned_commit_even_when_the_base_moved(tmp_pa
     assert _git(origin, "show", f"{res.branch}:hello.txt") == "hello\nworld"
     # an unknown commit fails clearly; an option-like one is refused before git runs
     bad = asyncio.run(pub.publish("F-002", "x", patch, {}, base_sha="0" * 40))
-    assert not bad.ok and bad.stage == "fetch_failed" and "000000000000" in bad.error
+    assert not bad.ok and bad.stage == "fetch_failed" and "000000000000" in (bad.error or "")
     worse = asyncio.run(pub.publish("F-003", "x", patch, {}, base_sha="--upload-pack=evil"))
     assert not worse.ok and worse.stage == "bad_ref"

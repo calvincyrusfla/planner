@@ -43,8 +43,6 @@ import copy
 import logging
 import os
 import re
-import shutil
-import tempfile
 import time
 from pathlib import Path
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -56,7 +54,7 @@ from foundry.gemma_excerpts import error_excerpt
 from foundry.file_map import build_index, file_map
 from foundry.gemma_notes import find_related, pitfall_notes
 from foundry.piece_workspace import WorkspaceError, collect_changes, make_workspace, remove_workspace
-from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
+from foundry.validation_gates import DiffApplyError, normalize_diff
 from foundry.schemas import (
     MAX_RETRIES,
     MAX_RETRIES_LIMIT,
@@ -94,17 +92,11 @@ from foundry.worker_prompts import (
     EDITS_EXAMPLE as EDITS_EXAMPLE,
     MAX_ORDER_DETAILS_CHARS as MAX_ORDER_DETAILS_CHARS,
     REVIEWER_CONTRACT,
-    StackedWork,
-    _ADDED_CONST_RE as _ADDED_CONST_RE,
-    _ADDED_DEF_RE as _ADDED_DEF_RE,
     _DEF_KW as _DEF_KW,
-    _HUNK_CTX_RE as _HUNK_CTX_RE,
     _IDENT_RE,
-    _MAX_STACK_SYMBOLS as _MAX_STACK_SYMBOLS,
     _PLAN_ITEM_RE as _PLAN_ITEM_RE,
     _PLAN_STOP_WORDS as _PLAN_STOP_WORDS,
     _ReadOnlyAssignment,
-    _already_done_section as _already_done_section,
     _capped_order_text as _capped_order_text,
     _defines_any,
     _order_details_section as _order_details_section,
@@ -113,9 +105,6 @@ from foundry.worker_prompts import (
     build_builder_prompt,
     build_reviewer_prompt,
     plan_checklist as plan_checklist,
-    stacked_work,
-    summarize_diff as summarize_diff,
-    symbols_by_file as symbols_by_file,
 )
 from foundry.worker_replies import (
     DEFAULT_HELP_AFTER,
@@ -922,7 +911,6 @@ class BuilderWorker(_WorkerBase):
         pre_review: str = "gate",
         pre_review_min_confidence: float = 0.7,
         pre_review_breaker: PreReviewBreaker | None = None,
-        approved_diffs_before: Callable[[str], Any] | None = None,
         base_for: Callable[[str], Any] | None = None,
         base_lease: Callable[[str], Any] | None = None,
     ) -> None:
@@ -977,11 +965,6 @@ class BuilderWorker(_WorkerBase):
         self.current_ticket: Any = None
         #: Per-worker scratch (last prompt, last reply ...); cleared by reset_context().
         self.scratch: dict[str, Any] = {}
-        #: ``approved_diffs_before(ticket_id) -> [(subtask_id, diff), ...]`` (task order): the
-        #: earlier approved work a ticket is stacked on; default ``queue.approved_diffs_before``.
-        self.approved_diffs_before = approved_diffs_before
-        #: The stacked workspace of the ticket being processed (see :meth:`_prepare_stack`).
-        self._stack: _Stack | None = None
         #: The base snapshot of the ticket being processed (None: the user's folder).
         self._base: Path | None = None
         #: ``base_lease(task_id)`` -> async context manager yielding the task's snapshot and keeping
@@ -1126,7 +1109,7 @@ class BuilderWorker(_WorkerBase):
 
     def _read_only_excerpts(self, ticket: Any, info: dict[str, Any]) -> list[dict[str, Any]]:
         """The lines of the ticket's read-only files that its text names (see the context engine)."""
-        build = getattr(self._stack_engine(), "read_only_excerpts", None)
+        build = getattr(self._base_engine(), "read_only_excerpts", None)
         if build is None:
             return []
         texts = [
@@ -1182,7 +1165,7 @@ class BuilderWorker(_WorkerBase):
         returning a ``ContextSlice`` (or a dict).  No engine -> a bare slice.
         """
         objective = _one_line(str(info["title"]).rstrip(".") + ".", 300)
-        engine = self._stack_engine()
+        engine = self._base_engine()
         if engine is None:
             return ContextSlice(objective=objective, acceptance_criteria=info["acceptance_criteria"]), 0
         subtask = SubtaskAllocation(
@@ -1196,7 +1179,7 @@ class BuilderWorker(_WorkerBase):
             "allowed_files": info["allowed_files"],
         }
         # Focus first: the ticket's own files are edit targets; the task's other files
-        # only when named (in the subtask text or by an earlier ticket's work), else outlines.
+        # only when named in the subtask text, else outlines.
         focus = list(info.get("focus_files") or info["allowed_files"])
         others = [f for f in info["allowed_files"] if f not in focus]
         # The task's level is the floor and retries widen past it (attempt 1 -> level 1,
@@ -1212,21 +1195,16 @@ class BuilderWorker(_WorkerBase):
         if description:
             widen["description"] = description
         extra = self._requested_symbols(ticket)
-        stacked = self._stacked_symbols()
         if others:
             root = getattr(engine, "repo_root", None)
             text = " ".join([str(info["title"]), *map(str, info["acceptance_criteria"]), description,
                              *(str(e) for e in extra)])
             names = set(_IDENT_RE.findall(text))
-            by_earlier = {path for path, _name in stacked}
-            named = [f for f in others if f in by_earlier
-                     or (root is not None and _defines_any(Path(root) / f, names))]
+            named = [f for f in others if root is not None and _defines_any(Path(root) / f, names)]
             kwargs["allowed_files"] = focus + named
             rest = [f for f in others if f not in named]
             if rest:
                 widen["extra_files"] = rest
-        visible = set(kwargs["allowed_files"])
-        extra = list(extra) + [f"{p}::{n}" for p, n in stacked if p in visible]
         if extra:
             widen["extra_symbols"] = extra
         afn = getattr(engine, "abuild_slice", None)
@@ -1303,31 +1281,9 @@ class BuilderWorker(_WorkerBase):
                 fn = gates
             if fn is None:
                 raise TypeError("gates must provide validate_async/validate/run or be callable")
-            stack = self._stack
-            extra: dict[str, Any] = {}
-            if stack is not None and stack.tmp is not None and stack.root is not None:
-                # gate the diff on top of the earlier approved diffs, in the stacked copy
-                # itself (WorkspaceGates(workspace=)): one repo copy per attempt
-                extra = _supported_kwargs(fn, {"workspace": stack.root})
-            elif self._base is not None:
-                # the gates copy the task's snapshot, not the user's folder (WorkspaceGates(base=))
-                based = _supported_kwargs(fn, {"base": self._base})
-                if based:
-                    outcome = await _maybe_await(fn(submission, assignment, **based))
-                    return self._gate_summary(outcome)
-            if extra:
-                assert stack is not None and stack.root is not None
-                before = _snapshot_files(stack.root, extract_diff_paths(submission.diff))
-                try:
-                    outcome = await _maybe_await(fn(submission, assignment, **extra))
-                except BaseException:
-                    _restore_files(stack.root, before)
-                    raise
-                if not bool(getattr(outcome, "passed", True)):
-                    # e.g. a stale cached diff: the build that follows starts from the clean stack
-                    _restore_files(stack.root, before)
-            else:
-                outcome = await _maybe_await(fn(submission, assignment))
+            # the gates copy the task's snapshot, not the user's folder (WorkspaceGates(base=))
+            based = _supported_kwargs(fn, {"base": self._base}) if self._base is not None else {}
+            outcome = await _maybe_await(fn(submission, assignment, **based))
         return self._gate_summary(outcome)
 
     @staticmethod
@@ -1368,17 +1324,12 @@ class BuilderWorker(_WorkerBase):
     async def process_ticket(self, ticket: Any) -> str:
         """Process one claimed ticket end to end; returns the outcome label.
 
-        A ticket of a task whose earlier tickets are approved is *stacked*:
-        it is built, gated and its edits resolved in a scratch workspace =
-        repo + those approved diffs (in task order), its context slice comes
-        from that workspace and its prompt lists them under "Already done on
-        this piece".  The submitted diff is relative to that workspace.  See
-        :meth:`_process_ticket` for the labels.
+        See :meth:`_process_ticket` for the labels.
         """
         if self._task_state(_get(ticket, "task_id")) in _TERMINAL_STATES:
             return "skipped"
         # everything for this ticket reads the task's snapshot of the publish branch
-        # (context, gates' base, stacked copy, normalisation), never the user's folder
+        # (context, gates' base, normalisation), never the user's folder
         task_id = _get(ticket, "task_id")
         if self.base_lease is not None and task_id:
             # held for the whole ticket: the snapshot is never pruned under this worker
@@ -1394,93 +1345,14 @@ class BuilderWorker(_WorkerBase):
         """:meth:`process_ticket` with the task's base snapshot (None: the user's folder) resolved."""
         self._base = base
         try:
-            self._stack = await self._prepare_stack(ticket)
-        except asyncio.CancelledError:
-            raise
-        except (DiffApplyError, OSError, shutil.Error) as exc:
-            # not this builder's fault: no attempt spent, counted toward the infra cap
-            self._base = None
-            self._event("stack_failed", _get(ticket, "task_id"),
-                        {"ticket_id": _get(ticket, "ticket_id"), "error": _one_line(str(exc), 300)})
-            return await self._infra_release(ticket, _StackError(str(exc)))
-        except BaseException:
-            self._base = None
-            raise
-        try:
             return await self._process_ticket(ticket)
         finally:
             self._base = None
-            stack, self._stack = self._stack, None
-            if stack is not None and stack.tmp is not None:
-                await asyncio.to_thread(shutil.rmtree, stack.tmp, True)
 
-    # -- stacking -----------------------------------------------------------------
-    def _stack_items(self, ticket: Any) -> list[tuple[str, str]]:
-        """The task's earlier approved ``(subtask_id, diff)`` pairs, in order (empty diffs dropped)."""
-        fn = self.approved_diffs_before or getattr(self.queue, "approved_diffs_before", None)
-        if fn is None or not callable(fn):
-            return []
-        try:
-            got = fn(str(_get(ticket, "ticket_id")))
-        except KeyError:
-            return []
-        out: list[tuple[str, str]] = []
-        for item in got or []:
-            sid, diff = (_get(item, "subtask_id"), _get(item, "diff")) if not isinstance(item, (tuple, list)) else item
-            if str(diff or "").strip():
-                out.append((str(sid), str(diff)))
-        return out
-
-    def _stack_titles(self, task_id: str) -> dict[str, str]:
-        fn = getattr(self.queue, "tickets_for_task", None)
-        if fn is None:
-            return {}
-        try:
-            return {str(_get(t, "subtask_id")): str(_get(t, "title", "") or "") for t in fn(task_id) or []}
-        except Exception:  # pragma: no cover - defensive
-            return {}
-
-    def _stack_base(self) -> Path | None:
-        """The directory a stacked workspace copies: the task's snapshot, else the gates' base
-        workspace, else the engine's repo."""
-        if self._base is not None:
-            return self._base
-        base = getattr(self.gates, "base_workspace", None) or getattr(self.context_engine, "repo_root", None)
-        return Path(base) if base is not None else None
-
-    async def _prepare_stack(self, ticket: Any) -> _Stack | None:
-        """Build the stacked workspace for ``ticket``; None when nothing earlier is approved.
-
-        With an in-place ``ValidationGates`` workspace (``workspace=``) the
-        approved diffs already stay applied there, so that workspace is used
-        as is (no copy).  Otherwise the gates' base workspace (or the context
-        engine's repo) is copied to a temp dir and the diffs are applied in
-        order.  Raises ``DiffApplyError`` when an approved diff does not stack.
-        """
-        items = self._stack_items(ticket)
-        if not items:
-            return None
-        work = stacked_work(items, self._stack_titles(str(_get(ticket, "task_id"))))
-        if self.workspace is not None:
-            return _Stack(self.workspace, None, work)
-        base = self._stack_base()
-        if base is None:
-            return _Stack(None, None, work)
-        tmp = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="foundry-stack-"))
-        try:
-            root = await asyncio.to_thread(prepare_stacked_workspace, base, tmp / "ws", items)
-        except BaseException:
-            await asyncio.to_thread(shutil.rmtree, tmp, True)
-            raise
-        self._event("stacked", str(_get(ticket, "task_id")),
-                    {"ticket_id": _get(ticket, "ticket_id"), "on": [w.subtask_id for w in work]})
-        return _Stack(root, tmp, work)
-
-    def _stack_engine(self) -> Any:
-        """The context engine, re-rooted at the stacked workspace (else the task's snapshot) when there is one."""
+    def _base_engine(self) -> Any:
+        """The context engine, re-rooted at the task's snapshot when there is one."""
         engine = self.context_engine
-        stack = self._stack
-        target = stack.root if stack is not None and stack.root is not None else self._base
+        target = self._base
         if engine is None or target is None or not hasattr(engine, "repo_root"):
             return engine
         try:
@@ -1492,25 +1364,12 @@ class BuilderWorker(_WorkerBase):
                 clone.last_stats = None
             return clone
         except Exception:  # pragma: no cover - an engine that cannot be re-rooted
-            log.exception("%s: could not re-root the context engine at the stacked workspace", self.agent_id)
+            log.exception("%s: could not re-root the context engine at the task's snapshot", self.agent_id)
             return engine
-
-    def _stacked_symbols(self, limit: int = 12) -> list[tuple[str, str]]:
-        """``(path, symbol)`` the earlier tickets added/changed (newest work first), at most ``limit``."""
-        out: list[tuple[str, str]] = []
-        for w in reversed(self._already_done()):
-            for path, names in w.by_file:
-                for n in names:
-                    if (path, n) not in out:
-                        out.append((path, n))
-        return out[:limit]
 
     @staticmethod
     def _focus_files(ticket: Any, assignment: TaskAssignment) -> list[str]:
         return [f for f in (_get(ticket, "focus_files") or []) if f in assignment.allowed_files]
-
-    def _already_done(self) -> list[StackedWork]:
-        return list(self._stack.work) if self._stack is not None else []
 
     async def _process_ticket(self, ticket: Any) -> str:
         """Report this slot's activity around :meth:`_build_ticket`; the last report is always idle."""
@@ -1528,9 +1387,9 @@ class BuilderWorker(_WorkerBase):
         ``"awaiting_help"`` (parked until the Floor Manager answers),
         ``"quarantined"``, ``"skipped"`` (task already terminal).
 
-        In edit mode (``config.builder_mode`` ``edit``, a base snapshot and no
-        earlier approved work) Claude edits a private piece workspace and the
-        workspace's changes become the submission; the workspace is always removed.
+        In edit mode (``config.builder_mode`` ``edit`` and a base snapshot) Claude
+        edits a private piece workspace and the workspace's changes become the
+        submission; the workspace is always removed.
         """
         task_id = _get(ticket, "task_id")
         if self._task_state(task_id) in _TERMINAL_STATES:
@@ -1545,7 +1404,7 @@ class BuilderWorker(_WorkerBase):
         # 2. Claude (inside limiter.slot + call_with_backoff)
         edit_mode = (getattr(getattr(self, "config", None), "builder_mode", "diff") == "edit"
                      and self._edit_mode_applies(ticket))
-        prompt = build_builder_prompt(assignment, max_retries=self.max_retries, already_done=self._already_done(),
+        prompt = build_builder_prompt(assignment, max_retries=self.max_retries,
                                       focus_files=self._focus_files(ticket, assignment),
                                       order_description=meta.get("description"),
                                       floor_manager_note=self._help_answer(ticket).get("note"),
@@ -1742,16 +1601,14 @@ class BuilderWorker(_WorkerBase):
     def _edit_mode_applies(self, ticket: Any) -> bool:
         """``builder_mode`` is edit: True when the ticket can be built in a piece workspace.
 
-        Needs the task's base snapshot, a ``db_path`` for the pieces directory and no
-        earlier approved work; otherwise the ticket builds in diff mode (logged once).
+        Needs the task's base snapshot and a ``db_path`` for the pieces directory;
+        otherwise the ticket builds in diff mode (logged once).
         """
         why: str | None = None
         if not isinstance(self._base, Path):
             why = "no base snapshot"
         elif getattr(self.config, "db_path", None) is None:
             why = "no db_path for the pieces directory"
-        elif self._stack_items(ticket):
-            why = "stacked on earlier approved work"
         if why is None:
             return True
         key = str(_get(ticket, "ticket_id"))
@@ -1813,13 +1670,7 @@ class BuilderWorker(_WorkerBase):
 
     # -- edits / requested symbols ----------------------------------------------
     def _edits_root(self) -> Path | None:
-        """Where ```edits replies are resolved: the gate workspace, else the engine's repo.
-
-        A stacked ticket resolves against its stacked workspace, so the diff it
-        submits is relative to the earlier approved work.
-        """
-        if self._stack is not None and self._stack.root is not None:
-            return self._stack.root
+        """Where ```edits replies are resolved: the gate workspace, else the engine's repo."""
         if self.workspace is not None:
             return self.workspace
         if self._base is not None:
@@ -1993,12 +1844,14 @@ class BuilderWorker(_WorkerBase):
 
     # -- diff normalisation --------------------------------------------------------
     def _before_root(self) -> Path | None:
-        """Where the files stand before this ticket's change (stacked copy, workspace or base)."""
-        if self._stack is not None and self._stack.root is not None:
-            return self._stack.root
+        """Where the files stand before this ticket's change: the workspace, the task's snapshot,
+        the gates' base workspace or the engine's repo."""
         if self.workspace is not None:
             return self.workspace
-        return self._stack_base()
+        if self._base is not None:
+            return self._base
+        base = getattr(self.gates, "base_workspace", None) or getattr(self.context_engine, "repo_root", None)
+        return Path(base) if base is not None else None
 
     def _before_change(self, diff: str) -> dict[str, str | None] | None:
         """Contents of the files ``diff`` touches before the gates apply it (None: unknown)."""
@@ -2012,9 +1865,9 @@ class BuilderWorker(_WorkerBase):
         """``submission`` with its diff re-derived exactly (see ``validation_gates.normalize_diff``).
 
         Claude's raw diff passed the gates' lenient applier (offsets, loose
-        context); the normalised diff has exact context, so it stacks
-        strictly (``git apply``) under later tickets and in the combined
-        patch.  The raw diff is kept when normalising fails or yields nothing.
+        context); the normalised diff has exact context, so it applies
+        strictly (``git apply``) in the combined patch.  The raw diff is kept
+        when normalising fails or yields nothing.
         """
         raw = submission.diff
         if before is None or not raw.strip():
@@ -2085,19 +1938,6 @@ def _hunk_lines(diff: str) -> list[str]:
         if line[:1] in ("@", "+", "-", " ", "\\"):
             out.append(line)
     return out
-
-
-@dataclass
-class _Stack:
-    """A stacked ticket's workspace: ``root`` (None = nothing to read), ``tmp`` (ours to delete)."""
-
-    root: Path | None
-    tmp: Path | None
-    work: list[StackedWork]
-
-
-class _StackError(RuntimeError):
-    """The task's earlier approved diffs could not be stacked (an infrastructure failure)."""
 
 
 def _is_counted_infra(exc: BaseException) -> bool:
@@ -2357,8 +2197,8 @@ class ReviewerWorker(_WorkerBase):
         self._record_verdict(verdict, item)
 
         if verdict.verdict == "APPROVED":
-            # stacked tickets: later tickets of the task build on this diff
-            # (queue.approved_diffs_before); recorded before the ticket is done
+            # the Floor Manager rebuilds the task's patch from this after a restart;
+            # recorded before the ticket is done
             record = getattr(self.queue, "record_approved_diff", None)
             if callable(record):
                 try:
@@ -2452,7 +2292,7 @@ class TeamPool:
         pre_review: str | None = None,
         pre_review_min_confidence: float | None = None,
         pre_review_breaker: PreReviewBreaker | None = None,
-        approved_diffs_before: Callable[[str], Any] | None = None,
+        approved_diffs_before: Callable[[str], Any] | None = None,  # accepted and ignored: callers and fakes still pass it
         base_for: Callable[[str], Any] | None = None,
         base_lease: Callable[[str], Any] | None = None,
     ) -> None:
@@ -2498,8 +2338,6 @@ class TeamPool:
         self.on_ticket_change: Callable[..., Any] | None = None
         self._cwd = cwd
         self.on_approved = on_approved
-        #: Earlier approved work per ticket (stacked tickets); None -> queue.approved_diffs_before.
-        self.approved_diffs_before = approved_diffs_before
         #: ``base_for(task_id)``: the task's base snapshot (``FloorManager.task_base``); None = user's folder.
         self.base_for = base_for
         self.builders: list[BuilderWorker] = [
@@ -2530,7 +2368,6 @@ class TeamPool:
                 pre_review=pre_review,
                 pre_review_min_confidence=pre_review_min_confidence,
                 pre_review_breaker=self.pre_review_breaker,
-                approved_diffs_before=approved_diffs_before,
                 base_for=base_for,
                 base_lease=base_lease,
             )
