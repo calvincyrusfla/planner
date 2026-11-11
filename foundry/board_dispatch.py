@@ -3,7 +3,10 @@
 The Floor Manager (often a cloud Claude session that can reach only the shared
 board) puts a **Foundry batch** on the board with ``dispatchBatch``. The
 Foundry service on the user's PC runs one :class:`BatchWatcher`, which every
-``FOUNDRY_BATCH_POLL_S`` seconds (default 15):
+``FOUNDRY_BATCH_POLL_S`` seconds (default 15), every
+``FOUNDRY_BATCH_ACTIVE_POLL_S`` seconds (default 5, never slower than the idle
+interval) while a batch is open, and at once (at most one round a second) when
+the Foundry queue records an event:
 
 1. reads the board state (``GET /api/state`` on the local dashboard, which
    forwards to the shared board when one is configured);
@@ -53,16 +56,20 @@ from foundry.metrics_report import build_metrics
 from foundry.order_consistency import consistency_note
 # Board limits from schema/order.json: error texts, and each question, context or option of a help request.
 from foundry.order_schema import LIMIT_ERROR, LIMIT_HELP
+from foundry.wakeup import Wakeup
 
 log = logging.getLogger("foundry.board_dispatch")
 
 __all__ = [
     "HEARTBEAT_S", "BatchWatcher", "BoardRefused", "BoardUnavailable", "DashboardBoard",
-    "DEFAULT_BATCH_POLL_S", "STALE_HEARTBEAT_S", "batch_poll_interval", "batches_enabled",
-    "order_text", "repo_slug_for", "subtask_state",
+    "DEFAULT_BATCH_ACTIVE_POLL_S", "DEFAULT_BATCH_POLL_S", "STALE_HEARTBEAT_S", "batch_active_poll_interval",
+    "batch_poll_interval", "batches_enabled", "order_text", "repo_slug_for", "subtask_state",
 ]
 
 DEFAULT_BATCH_POLL_S = 15.0
+DEFAULT_BATCH_ACTIVE_POLL_S = 5.0
+#: A wake never starts a round sooner than this after the last one ended.
+MIN_ROUND_GAP_S = 1.0
 #: Without result changes, updateBatch (a hub write) is sent at most this often as a heartbeat.
 HEARTBEAT_S = 120.0
 #: A claim whose heartbeat is older than this may be taken over (the board enforces it too).
@@ -124,6 +131,18 @@ def batch_poll_interval(env: Mapping[str, str] | None = None) -> float:
     except ValueError:
         log.warning("board dispatch: FOUNDRY_BATCH_POLL_S=%r is not a number; using %gs", raw, DEFAULT_BATCH_POLL_S)
         value = DEFAULT_BATCH_POLL_S
+    return max(1.0, value)
+
+
+def batch_active_poll_interval(env: Mapping[str, str] | None = None) -> float:
+    """``FOUNDRY_BATCH_ACTIVE_POLL_S`` (default 5 s, at least 1 s): the interval while a batch is open."""
+    raw = (env if env is not None else os.environ).get("FOUNDRY_BATCH_ACTIVE_POLL_S", "")
+    try:
+        value = float(raw) if raw.strip() else DEFAULT_BATCH_ACTIVE_POLL_S
+    except ValueError:
+        log.warning("board dispatch: FOUNDRY_BATCH_ACTIVE_POLL_S=%r is not a number; using %gs",
+                    raw, DEFAULT_BATCH_ACTIVE_POLL_S)
+        value = DEFAULT_BATCH_ACTIVE_POLL_S
     return max(1.0, value)
 
 
@@ -281,10 +300,11 @@ class BatchWatcher:
             (blocking; called in a thread). Default: :class:`DashboardBoard`.
         repo_slug: ``owner/name`` this Foundry works for (default :func:`repo_slug_for`).
         host: this PC's name (default ``socket.gethostname()``).
-        interval: seconds between rounds (default :func:`batch_poll_interval`).
+        interval: seconds between rounds while idle (default :func:`batch_poll_interval`).
         enabled: default :func:`batches_enabled`.
         sleep: async sleep used by the loop (tests).
         now: wall clock in epoch seconds (tests).
+        wakeup: starts the next round early when notified; without one the loop only sleeps.
     """
 
     def __init__(
@@ -298,6 +318,7 @@ class BatchWatcher:
         enabled: bool | None = None,
         sleep: Callable[[float], Any] | None = None,
         now: Callable[[], float] | None = None,
+        wakeup: Wakeup | None = None,
     ) -> None:
         import time
 
@@ -306,6 +327,12 @@ class BatchWatcher:
         self.repo_slug = repo_slug if repo_slug is not None else repo_slug_for(service.repo)
         self.host = host or socket.gethostname() or "pc"
         self.interval = float(interval) if interval else batch_poll_interval()
+        #: Seconds between rounds while a batch is open; never slower than the idle interval.
+        self.active_interval = min(batch_active_poll_interval(), self.interval)
+        self.wakeup = wakeup
+        #: The last round saw an open batch of ours or one queued for this repo.
+        self._batch_open = False
+        self._active_mode = False
         self.enabled = batches_enabled() if enabled is None else bool(enabled)
         self._sleep = sleep or asyncio.sleep
         self._now = now or time.time
@@ -357,8 +384,31 @@ class BatchWatcher:
     async def _loop(self) -> None:
         while True:
             await self.poll_once()
-            await self._maybe_await(self._sleep(self.interval))
+            await self._wait_for_next_round()
             await asyncio.sleep(0)
+
+    async def _wait_for_next_round(self) -> None:
+        """Wait out the interval, or less when woken: then one round covers every wake so far."""
+        interval = self._next_interval()
+        if self.wakeup is None:
+            await self._maybe_await(self._sleep(interval))
+            return
+        finished = self._now()
+        if await self.wakeup.wait(interval) is None:
+            return
+        rest = MIN_ROUND_GAP_S - (self._now() - finished)
+        if rest > 0:
+            await self._maybe_await(self._sleep(min(rest, MIN_ROUND_GAP_S)))
+        await self.wakeup.wait(0)  # wakes during that pause are covered by the coming round
+
+    def _next_interval(self) -> float:
+        """The active or idle interval, as the last round left things; logs a switch once."""
+        if self._batch_open != self._active_mode:
+            self._active_mode = self._batch_open
+            log.info("board dispatch: %s, polling every %gs",
+                     "batch open" if self._active_mode else "no batch open",
+                     self.active_interval if self._active_mode else self.interval)
+        return self.active_interval if self._active_mode else self.interval
 
     @staticmethod
     async def _maybe_await(v: Any) -> Any:
@@ -401,9 +451,12 @@ class BatchWatcher:
         self._warned_down = False
         self.last_error = None
         self._pr_lines = None
-        batches = state.get("foundryBatches") if isinstance(state, dict) else None
+        listed = state.get("foundryBatches") if isinstance(state, dict) else None
+        batches: list[Any] = listed if isinstance(listed, list) else []
+        self._batch_open = any(isinstance(batch, dict) and batch.get("status") == "queued"
+                               and self._matches_repo(batch) for batch in batches)
         handled: list[str] = []
-        for batch in batches if isinstance(batches, list) else []:
+        for batch in batches:
             if not isinstance(batch, dict) or not batch.get("id"):
                 continue
             if not self._ready():
@@ -411,11 +464,13 @@ class BatchWatcher:
             bid = str(batch["id"])
             if self._is_ours(batch):
                 if not self._record(bid, batch.get("createdAt")).get("closed"):
+                    self._batch_open = self._batch_open or batch.get("status") in _OPEN_BATCH
                     await self._advance(batch)
                     handled.append(bid)
             elif self._claimable(batch):
                 claimed = await self._claim(batch)
                 if claimed is not None:
+                    self._batch_open = True
                     await self._advance(claimed)
                     handled.append(bid)
         # after the batches, so an answer already on the board wins over the timeout

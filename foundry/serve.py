@@ -345,12 +345,19 @@ class Service:
             if self._batch_board is None and not (self._own_factory and live):
                 return
             from foundry.board_dispatch import BatchWatcher
+            from foundry.wakeup import Wakeup
+            from foundry.worker_helpers import _supported_kwargs
 
             try:
-                self.batch_watcher = BatchWatcher(self, self._batch_board)
+                self.batch_watcher = BatchWatcher(
+                    self, self._batch_board, **_supported_kwargs(BatchWatcher, {"wakeup": Wakeup()}))
             except Exception as exc:  # batches are optional: the service runs without them
                 log.warning("foundry serve: board batches are off: %s", exc)
                 return
+        # outside the block above: a restarted service keeps its watcher but has a new queue
+        wakeup = getattr(self.batch_watcher, "wakeup", None)
+        if wakeup is not None and hasattr(self.factory.queue, "on_event"):
+            self.factory.queue.on_event = wakeup.notify
         if self.batch_watcher.start() is None:
             return
         self._start_updates()
