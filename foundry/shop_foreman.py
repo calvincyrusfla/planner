@@ -75,35 +75,62 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
-import contextvars
-import inspect
 import math
 import re
 import time
-from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from foundry.config import FoundryConfig
+from foundry.foreman_anomalies import (
+    MAX_DIAGNOSIS_CHARS as MAX_DIAGNOSIS_CHARS,
+    _ACTIONS_KV_KEY as _ACTIONS_KV_KEY,
+    _CHOICE_DIAGNOSIS as _CHOICE_DIAGNOSIS,
+    _DECISION_SCHEMA as _DECISION_SCHEMA,
+    _MAX_DECISIONS_PER_EVAL as _MAX_DECISIONS_PER_EVAL,
+    _REAL_FAILURE_MARKERS as _REAL_FAILURE_MARKERS,
+    _RETRY_MAX_AGE_S as _RETRY_MAX_AGE_S,
+    _RETRY_MIN_WAIT_S as _RETRY_MIN_WAIT_S,
+    _TRANSIENT_MARKERS as _TRANSIENT_MARKERS,
+    _UNDO_SUPPRESS_S as _UNDO_SUPPRESS_S,
+    _UNDO_SUPPRESSED as _UNDO_SUPPRESSED,
+    _VISIBILITY_FAILURE_RE as _VISIBILITY_FAILURE_RE,
+    _WIDEN_AFTER_FAILURES as _WIDEN_AFTER_FAILURES,
+    Anomaly,
+    AnomalyMixin,
+    classify_quarantine,
+)
+from foundry.foreman_helpers import (
+    _ACTIVE_TICKET,
+    _ASKED,
+    _LARGE_WORDS as _LARGE_WORDS,
+    _TERMINAL,
+    _UNKNOWN_TASK,
+    GemmaStats,
+    _SourceLog,
+    _accepts_timeout,
+    _clip,
+    _decode_json,
+    _estimate_tokens,
+    _field,
+    _first_sentences as _first_sentences,
+    _jsonable,
+    _parse_ts,
+    _reply_tokens,
+    _str_list,
+    heuristic_complexity,
+)
 from foundry.schemas import (
     BUILDERS_FOR,
     MAX_BUILDERS,
-    MAX_DIAGNOSIS_SENTENCES,
     ContextSlice,
-    EscalationCategory,
-    ForemanEscalation,
-    PrescribedAction,
-    Severity,
     SubtaskAllocation,
     TaskSizingDirective,
     TaskState,
-    count_sentences,
-    new_alert_id,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -142,10 +169,6 @@ MAX_TOOL_ROUNDS: int = 4
 #: so the fallback answer always arrives before the API gives up on the chunk.
 ASK_BUDGET_CAP_S: float = 100.0
 
-#: Hooks that called Gemma in the current asyncio task since their last
-#: ``last_source`` write (immutable, so concurrent tasks never share it).
-_ASKED: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar("foreman_gemma_asked", default=frozenset())
-
 #: Upper bound (seconds) on one pre-review Gemma call, whatever
 #: ``gemma_timeout_s`` says: a slow Gemma must not hold good work for long.
 PRE_REVIEW_TIMEOUT_CAP_S: float = 60.0
@@ -158,9 +181,6 @@ _PRE_REVIEW_NOTE_CHARS = 240
 #: Maximum length of a condensed error hint.
 MAX_HINT_CHARS: int = 160
 
-#: Maximum length of a Gemma-written escalation diagnosis.
-MAX_DIAGNOSIS_CHARS: int = 300
-
 #: Conventional Commit types accepted for ``commit_message``.
 CONVENTIONAL_TYPES: tuple[str, ...] = (
     "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert",
@@ -170,67 +190,9 @@ _CONVENTIONAL_RE = re.compile(
     r"^(?:" + "|".join(CONVENTIONAL_TYPES) + r")(?:\([A-Za-z0-9_./-]+\))?!?: \S.*$"
 )
 _LOCATION_RE = re.compile(r"[\w./\\-]+\.\w+:\d+")
-_TERMINAL = {TaskState.COMPLETE.value, TaskState.QUARANTINED.value, TaskState.FAILED.value}
-_ACTIVE_TICKET = ("open", "claimed")
-_LARGE_WORDS = ("rewrite", "overhaul", "migrate", "migration", "end-to-end", "end to end", "redesign")
 _DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
 _QA_TASK_ID = "foreman-qa"
 
-#: A quarantined task is considered for RETRY_TASK only after this many seconds
-#: (give the infrastructure a moment) and only within ``_RETRY_MAX_AGE_S``.
-_RETRY_MIN_WAIT_S = 60.0
-_RETRY_MAX_AGE_S = 6 * 3600.0
-#: After the user undoes one of these actions, the Foreman does not prescribe it
-#: again for the same task for this long (seconds).
-_UNDO_SUPPRESS_S = 2 * 3600.0
-_UNDO_SUPPRESSED = frozenset({
-    "REASSIGN_TEAM", "RESIZE_ALLOCATION", "THROTTLE_DISPATCH", "PROMOTE_PEER_REVIEWER", "WIDEN_CONTEXT",
-})
-#: kv key the Floor Manager stores its action log under (read only here).
-_ACTIONS_KV_KEY = "floor_manager.actions"
-#: Gemma decisions (REASSIGN/RETRY choices) asked per ``evaluate_line_anomaly`` call.
-_MAX_DECISIONS_PER_EVAL = 3
-#: Quarantine reasons that are real build/review failures: never retried.
-_REAL_FAILURE_MARKERS = (
-    "retry limit", "failed its gates", "gate fail", "reviewer rejected", "rejected", "duplicate of",
-    "could not be recovered",
-)
-#: Quarantine reasons that look transient (infrastructure, network, limits).
-_TRANSIENT_MARKERS = (
-    "infrastructure", "timed out", "timeout", "connection", "network", "rate limit", "rate-limit",
-    "429", "502", "503", "504", "overloaded", "unavailable", "temporar", "econnreset", "broken pipe",
-)
-_DECISION_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "prescribed_action": {"type": "string"},
-        "diagnosis": {"type": "string"},
-    },
-    "required": ["prescribed_action", "diagnosis"],
-}
-
-
-def classify_quarantine(reason: str | None) -> str:
-    """``"real"``, ``"transient"`` or ``"unclear"`` for a quarantine reason.
-
-    Real build failures win over transient words (``"retry limit reached
-    (timeout)"`` is real: the builder used up its attempts).
-    """
-    text = " ".join(str(reason or "").lower().split())
-    if not text:
-        return "unclear"
-    if any(m in text for m in _REAL_FAILURE_MARKERS):
-        return "real"
-    if any(m in text for m in _TRANSIENT_MARKERS):
-        return "transient"
-    return "unclear"
-_UNKNOWN_TASK = "unknown"
-#: Failed gate output showing the builder could not see code it needed.
-_VISIBILITY_FAILURE_RE = re.compile(
-    r"\bNameError\b|\bBLOCKED\b|\bF821\b|[Uu]ndefined name\b|\bis not defined\b|cannot import name"
-)
-#: Visibility failures on one task (at its current level) before its context is widened.
-_WIDEN_AFTER_FAILURES = 2
 #: Similar past tasks that must have needed a level before new tasks start at it.
 _LEARN_LEVEL_MIN_OUTCOMES = 2
 
@@ -354,207 +316,6 @@ _PR_SCHEMA: dict[str, Any] = {
     },
     "required": ["commit_message", "pr_body"],
 }
-
-
-# --------------------------------------------------------------------------- helpers
-
-
-class GemmaStats:
-    """Small rolling record of Gemma calls and hook fallbacks.
-
-    * ``calls`` -- Gemma requests attempted (successful or not).
-    * ``errors`` / ``timeouts`` -- requests that failed (timeouts included in errors).
-    * ``fallbacks`` -- hook results produced by the deterministic fallback
-      after Gemma was asked (it failed, timed out or gave an unusable reply).
-      Hook runs that never asked Gemma (no client, or a hook such as
-      ``prune_context_slice`` whose Gemma use lives elsewhere) are not counted,
-      so ``fallbacks`` never exceeds ``calls``.
-    * ``avg_ms`` / ``last_ms`` -- duration of the last :attr:`window` requests
-      (failed ones included: a timeout is time the user waited).
-    """
-
-    def __init__(self, window: int = 20) -> None:
-        self.window = int(window)
-        self._total = self._new()
-        self._hooks: dict[str, dict[str, Any]] = {}
-        self.last_error: str | None = None
-
-    def _new(self) -> dict[str, Any]:
-        return {"calls": 0, "errors": 0, "timeouts": 0, "fallbacks": 0, "gemma": 0,
-                "last_ms": None, "durations": deque(maxlen=self.window)}
-
-    def _targets(self, hook: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        return self._total, self._hooks.setdefault(hook, self._new())
-
-    def record_call(self, hook: str, ms: float, *, error: str | None = None, timed_out: bool = False) -> None:
-        """Record one Gemma request that took ``ms`` milliseconds."""
-        ms = round(float(ms), 1)
-        for rec in self._targets(hook):
-            rec["calls"] += 1
-            rec["last_ms"] = ms
-            rec["durations"].append(ms)
-            if error is not None:
-                rec["errors"] += 1
-                if timed_out:
-                    rec["timeouts"] += 1
-        if error is not None:
-            self.last_error = error
-
-    def record_source(self, hook: str, source: str) -> None:
-        """Record which path served a hook result (``"gemma"`` or ``"heuristic"``)."""
-        key = "gemma" if source == "gemma" else "fallbacks"
-        for rec in self._targets(hook):
-            rec[key] += 1
-
-    @staticmethod
-    def _view(rec: dict[str, Any]) -> dict[str, Any]:
-        durations = rec["durations"]
-        return {
-            "calls": rec["calls"],
-            "errors": rec["errors"],
-            "timeouts": rec["timeouts"],
-            "fallbacks": rec["fallbacks"],
-            "served_by_gemma": rec["gemma"],
-            "avg_ms": round(sum(durations) / len(durations), 1) if durations else None,
-            "last_ms": rec["last_ms"],
-        }
-
-    def snapshot(self) -> dict[str, Any]:
-        """JSON-ready ``{calls, errors, timeouts, fallbacks, served_by_gemma, avg_ms, last_ms, last_error, by_hook}``."""
-        out = self._view(self._total)
-        out["last_error"] = self.last_error
-        out["by_hook"] = {hook: self._view(rec) for hook, rec in sorted(self._hooks.items())}
-        return out
-
-
-class _SourceLog(dict):
-    """``last_source`` mapping that also feeds :class:`GemmaStats`.
-
-    A write is counted only when the hook asked Gemma (via ``ShopForeman._chat``)
-    in the current asyncio task since its previous write.
-    """
-
-    def __init__(self, stats: GemmaStats) -> None:
-        super().__init__()
-        self._stats = stats
-
-    def __setitem__(self, hook: str, source: str) -> None:
-        super().__setitem__(hook, source)
-        asked = _ASKED.get()
-        if hook in asked:
-            _ASKED.set(asked - {hook})
-            self._stats.record_source(hook, source)
-
-
-def _accepts_timeout(chat: Any) -> bool:
-    """True when a client's ``chat`` takes a ``timeout`` keyword."""
-    try:
-        params = inspect.signature(chat).parameters
-    except (TypeError, ValueError):
-        return False
-    return "timeout" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-
-def _jsonable(value: Any) -> Any:
-    """Convert enums, models and datetimes so ``json.dumps`` accepts the value."""
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, Mapping):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_jsonable(v) for v in value]
-    return value
-
-
-def _field(task: Any, name: str, default: Any = None) -> Any:
-    """Read ``name`` from a mapping or an object."""
-    if isinstance(task, Mapping):
-        return task.get(name, default)
-    return getattr(task, name, default)
-
-
-def _str_list(value: Any) -> list[str]:
-    """Coerce a value to a list of non-blank strings."""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        value = [value]
-    return [str(v).strip() for v in value if str(v).strip()]
-
-
-def _parse_ts(value: str | None) -> datetime | None:
-    """Parse an ISO timestamp (naive values are taken to be UTC)."""
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def _clip(text: str, limit: int) -> str:
-    """Shorten ``text`` to ``limit`` characters with an ellipsis."""
-    text = text.strip()
-    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
-
-
-def _estimate_tokens(text: str) -> int:
-    """``ceil(len(text) / 4)``, the factory-wide token estimate."""
-    return math.ceil(len(text) / 4) if text else 0
-
-
-def _reply_tokens(reply: Any, messages: Sequence[Mapping[str, Any]]) -> int:
-    """Tokens a Gemma call handled (reported usage, else an estimate)."""
-    usage = getattr(reply, "usage", None)
-    total = int(getattr(usage, "prompt_tokens", 0) or 0) + int(getattr(usage, "completion_tokens", 0) or 0)
-    if total > 0:
-        return total
-    prompt = "".join(str(m.get("content") or "") for m in messages)
-    return _estimate_tokens(prompt) + _estimate_tokens(str(getattr(reply, "text", "") or ""))
-
-
-def _decode_json(text: str) -> Any:
-    """Decode JSON from model text, tolerating a Markdown code fence."""
-    stripped = (text or "").strip()
-    fence = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", stripped, re.DOTALL)
-    if fence:
-        stripped = fence.group(1).strip()
-    return json.loads(stripped)
-
-
-def heuristic_complexity(
-    title: str, description: str, files: Sequence[str], criteria: Sequence[str]
-) -> tuple[str, str]:
-    """Deterministic complexity guess from text length, file and criteria counts.
-
-    Returns ``(complexity, rationale)``. The rules, in order:
-
-    * XL: 8+ files, or 2500+ characters of description;
-    * L: 4+ files, 1000+ characters, 6+ criteria, or a large-work keyword
-      (rewrite, overhaul, migrate, redesign, end-to-end);
-    * M: 2+ files, 300+ characters or 3+ criteria;
-    * S: anything smaller.
-    """
-    text = f"{title}\n{description}".strip()
-    n_chars, n_files, n_crit = len(text), len(files), len(criteria)
-    lowered = text.lower()
-    keyword = next((w for w in _LARGE_WORDS if w in lowered), None)
-    facts = f"{n_files} file(s), {n_chars} chars of description, {n_crit} criteria"
-    if n_files >= 8 or n_chars >= 2500:
-        return "XL", f"Heuristic: {facts}; very broad scope."
-    if n_files >= 4 or n_chars >= 1000 or n_crit >= 6 or keyword:
-        extra = f"; keyword '{keyword}'" if keyword else ""
-        return "L", f"Heuristic: {facts}{extra}; needs the full team."
-    if n_files >= 2 or n_chars >= 300 or n_crit >= 3:
-        return "M", f"Heuristic: {facts}; two builders."
-    return "S", f"Heuristic: {facts}; one builder."
 
 
 # --------------------------------------------------------------------------- sizing calibration
@@ -786,33 +547,6 @@ def _is_test_path(path: str) -> bool:
     return "/tests/" in f"/{path}" or name.startswith("test_") or name.endswith(("_test.py", ".test.js", ".spec.js", ".test.ts", ".spec.ts"))
 
 
-@dataclass
-class Anomaly:
-    """A deterministically detected line anomaly, before it becomes an escalation."""
-
-    category: EscalationCategory
-    severity: Severity
-    action: PrescribedAction
-    team_id: str | None = None
-    task_id: str | None = None
-    agent_id: str | None = None
-    dwell_seconds: float = 0.0
-    gate_failure_count: int = 0
-    action_parameters: dict[str, Any] = field(default_factory=dict)
-    extra_metrics: dict[str, Any] = field(default_factory=dict)
-    fallback_diagnosis: str = ""
-    #: Actions Gemma may choose between (``action`` is the deterministic pick and
-    #: is always among them); empty means Gemma only writes the diagnosis.
-    choices: tuple[PrescribedAction, ...] = ()
-
-    @property
-    def key(self) -> str:
-        """Identity used for the re-alert cooldown."""
-        base = f"{self.category.value}|{self.team_id}|{self.task_id}|{self.agent_id}"
-        # A widen shares LINE_JAM with quarantine: its cooldown must not hold a quarantine back.
-        return f"{base}|widen" if self.action == PrescribedAction.WIDEN_CONTEXT else base
-
-
 # --------------------------------------------------------------------------- the foreman
 
 
@@ -983,7 +717,7 @@ def merge_tiny_subtasks(
     return kept, merges
 
 
-class ShopForeman:
+class ShopForeman(AnomalyMixin):
     """The Gemma-backed Shop Foreman (every hook has a deterministic fallback).
 
     Args:
@@ -2159,623 +1893,3 @@ class ShopForeman:
             self._save(_QA_TASK_ID, "triage", tokens)
         for chunk in self._chunks(answer):
             yield chunk
-
-    # ---------------------------------------------------------------- anomalies
-    def _gate_fail_limit(self) -> int:
-        """The effective LINE_JAM limit (explicit threshold, else ``max_retries + 1``)."""
-        effective = getattr(self.config, "effective_gate_fail_quarantine", None)
-        if callable(effective):
-            return int(effective())
-        explicit = getattr(self.config.thresholds, "gate_fail_quarantine", None)
-        if explicit is not None:
-            return int(explicit)
-        return int(getattr(self.config, "max_retries", 3)) + 1
-
-    def detect_anomalies(self) -> list[Anomaly]:
-        """Deterministically detect every current anomaly, most urgent first.
-
-        Order: LINE_JAM, WIDEN_CONTEXT, TOKEN_VELOCITY_SPIKE, AGENT_STALLED,
-        REVIEW_BOTTLENECK, CAPACITY_REBALANCE. Thresholds come from
-        ``config.thresholds``.
-        """
-        th = self.config.thresholds
-        now = self._now()
-        found: list[Anomaly] = []
-        tasks = {t["task_id"]: t for t in self.queue.all_tasks() if _jsonable(t["state"]) not in _TERMINAL}
-
-        # LINE_JAM: one ticket failed its gates repeatedly (per ticket, like the retry policy) -> quarantine.
-        # Default limit is max_retries + 1, so a ticket with attempts left is never quarantined here.
-        jam_limit = self._gate_fail_limit()
-        for tid, task in tasks.items():
-            per_ticket = self._ticket_gate_failures(tid)
-            if not per_ticket:
-                continue
-            subtask_id, n = max(per_ticket.items(), key=lambda kv: (kv[1], kv[0]))
-            if n < jam_limit:
-                continue
-            ticket = next((t for t in self.queue.tickets_for_task(tid) if t.subtask_id == subtask_id), None)
-            ticket_id = ticket.ticket_id if ticket is not None else f"{tid}:{subtask_id}"
-            found.append(
-                Anomaly(
-                    EscalationCategory.LINE_JAM,
-                    Severity.CRITICAL if n > jam_limit else Severity.HIGH,
-                    PrescribedAction.QUARANTINE_TASK,
-                    team_id=task["team_id"],
-                    task_id=tid,
-                    agent_id=ticket.claimed_by if ticket is not None else None,
-                    gate_failure_count=n,
-                    action_parameters={"reason": f"ticket {ticket_id} failed its gates {n} times "
-                                                 f"(limit {jam_limit})",
-                                       "gate_failure_count": n, "ticket_id": ticket_id},
-                    extra_metrics={"threshold": jam_limit, "ticket_id": ticket_id},
-                    fallback_diagnosis=f"Ticket {ticket_id} failed its deterministic gates {n} times and is on its "
-                                       "last attempt. Quarantine the task before more builder calls are spent.",
-                )
-            )
-
-        found.extend(self._widen_anomalies(tasks))
-
-        # TOKEN_VELOCITY_SPIKE: burn above the configured share of the TPM cap.
-        if self.telemetry is not None:
-            current = float(self.telemetry.current_tpm())
-            cap = float(self.config.tpm)
-            limit = cap * th.tpm_spike_ratio
-            if current > limit:
-                agent = self._top_agent_last_minute()
-                factor = round(min(0.9, max(0.1, (limit * 0.8) / current)), 2)
-                found.append(
-                    Anomaly(
-                        EscalationCategory.TOKEN_VELOCITY_SPIKE,
-                        Severity.CRITICAL if current >= cap else Severity.HIGH,
-                        PrescribedAction.THROTTLE_DISPATCH,
-                        team_id=agent.rsplit("-", 1)[0] if agent and "-" in agent else "floor",
-                        agent_id=agent,
-                        action_parameters={"factor": factor, "seconds": self.throttle_seconds},
-                        extra_metrics={"tpm_cap": cap, "spike_threshold_tpm": limit},
-                        fallback_diagnosis=f"Claude burn is {current:.0f} tokens/min, above {th.tpm_spike_ratio:.0%} "
-                                           f"of the {cap:.0f} cap. Throttle dispatch to stay under the subscription limit.",
-                    )
-                )
-
-        # AGENT_STALLED: a claimed ticket with no activity for too long.
-        for ticket, secs in self._claimed_ages(None, now):
-            if secs > th.stall_s and ticket.task_id in tasks:
-                agent = ticket.claimed_by or f"{ticket.team_id}-{ticket.slot}"
-                found.append(
-                    Anomaly(
-                        EscalationCategory.AGENT_STALLED,
-                        Severity.HIGH if secs > 2 * th.stall_s else Severity.MEDIUM,
-                        PrescribedAction.RESET_BUILDER_CONTEXT,
-                        team_id=ticket.team_id,
-                        task_id=ticket.task_id,
-                        agent_id=agent,
-                        dwell_seconds=secs,
-                        gate_failure_count=self._ticket_gate_failures(ticket.task_id).get(ticket.subtask_id, 0),
-                        action_parameters={"agent_id": agent, "ticket_id": ticket.ticket_id, "slot": ticket.slot},
-                        extra_metrics={"threshold_s": th.stall_s},
-                        fallback_diagnosis=f"Builder {agent} has shown no activity on {ticket.ticket_id} for {secs:.0f}s. "
-                                           "Reset its context and reopen the ticket with a fresh prompt.",
-                    )
-                )
-
-        # REVIEW_BOTTLENECK: a submission waiting too long for its reviewer (per-submission dwell).
-        waits = self._review_wait_items()
-        for tid, info in sorted(waits.items(), key=lambda kv: -kv[1]["dwell_seconds"]):
-            secs = float(info["dwell_seconds"])
-            if secs > th.review_dwell_s and tid in tasks:
-                team = tasks[tid]["team_id"]
-                free = self._free_slots(team)
-                params: dict[str, Any] = {"minutes": self.peer_review_minutes}
-                if free:
-                    params["slot"] = free[-1]
-                if info.get("ticket_id"):
-                    params["ticket_id"] = info["ticket_id"]
-                found.append(
-                    Anomaly(
-                        EscalationCategory.REVIEW_BOTTLENECK,
-                        Severity.HIGH if secs > 2 * th.review_dwell_s else Severity.MEDIUM,
-                        PrescribedAction.PROMOTE_PEER_REVIEWER,
-                        team_id=team,
-                        task_id=tid,
-                        dwell_seconds=secs,
-                        gate_failure_count=max(self._ticket_gate_failures(tid).values(), default=0),
-                        action_parameters=params,
-                        extra_metrics={"threshold_s": th.review_dwell_s},
-                        fallback_diagnosis=f"A submission of {tid} has waited {secs:.0f}s for review on team {team}. "
-                                           "Promote an idle builder to peer reviewer for a while.",
-                    )
-                )
-
-        # CAPACITY_REBALANCE: idle builders while tickets queue up behind busy slots.
-        idle = self.telemetry.idle_counts() if self.telemetry is not None else {}
-        for tid, task in tasks.items():
-            team = task["team_id"]
-            tickets = self.queue.tickets_for_task(tid)
-            active = [t for t in tickets if t.status in _ACTIVE_TICKET]
-            stacked = len(active) - len({t.slot for t in active})
-            alloc = int(task.get("allocated_builders") or 0)
-            free = len(self._free_slots(team))
-            idle_n = int(idle.get(team, free))
-            if stacked <= 0 or idle_n <= 0 or alloc >= self.config.builders_per_team:
-                continue
-            new_n = min(self.config.builders_per_team, alloc + min(stacked, idle_n))
-            if new_n <= alloc:
-                continue
-            found.append(
-                Anomaly(
-                    EscalationCategory.CAPACITY_REBALANCE,
-                    Severity.LOW,
-                    PrescribedAction.RESIZE_ALLOCATION,
-                    team_id=team,
-                    task_id=tid,
-                    action_parameters={"builders": new_n, "from": alloc},
-                    extra_metrics={"idle_builders": idle_n, "stacked_tickets": stacked},
-                    fallback_diagnosis=f"Team {team} has {idle_n} idle builder(s) while {stacked} ticket(s) of {tid} "
-                                       f"wait behind busy slots. Resize the allocation from {alloc} to {new_n}.",
-                )
-            )
-
-        found.extend(self._reassign_anomalies(tasks, now, idle))
-        found.extend(self._retry_anomalies(now))
-        return found
-
-    def _idle_teams(self, exclude: str, idle: Mapping[str, int]) -> list[str]:
-        """Teams with no open or claimed ticket (and not reported as 0 idle), most idle first."""
-        out = []
-        for team in self.config.teams:
-            if team == exclude:
-                continue
-            if any(t.status in _ACTIVE_TICKET for t in self.queue.tickets(team_id=team)):
-                continue
-            if team in idle and int(idle[team]) <= 0:
-                continue
-            out.append(team)
-        order = {t: k for k, t in enumerate(self.config.teams)}
-        return sorted(out, key=lambda t: (-int(idle.get(t, self.config.builders_per_team)), order[t]))
-
-    def _reassign_anomalies(self, tasks: Mapping[str, Any], now: datetime,
-                            idle: Mapping[str, int]) -> list[Anomaly]:
-        """REASSIGN_TEAM: open tickets stuck behind busy slots of a full team while another team idles."""
-        th = self.config.thresholds
-        found: list[Anomaly] = []
-        claimed_to: set[str] = set()
-        for tid, task in tasks.items():
-            team = task["team_id"]
-            if self._free_slots(team):
-                continue  # the team has room: RESIZE_ALLOCATION / normal dispatch handles it
-            team_tickets = self.queue.tickets(team_id=team)
-            busy_slots = {t.slot for t in team_tickets if t.status == "claimed"}
-            stuck = []
-            for t in team_tickets:
-                if t.task_id != tid or t.status != "open" or t.slot not in busy_slots:
-                    continue
-                since = _parse_ts(t.updated_at) or _parse_ts(t.created_at)
-                if since is not None and (now - since).total_seconds() > th.stall_s:
-                    stuck.append((t, (now - since).total_seconds()))
-            if not stuck:
-                continue
-            targets = [x for x in self._idle_teams(team, idle) if x not in claimed_to]
-            if not targets:
-                continue
-            to_team = targets[0]
-            claimed_to.add(to_team)  # one task per idle team per pass
-            waited = max(s for _, s in stuck)
-            ids = [t.ticket_id for t, _ in sorted(stuck, key=lambda x: x[0].ticket_id)]
-            found.append(
-                Anomaly(
-                    EscalationCategory.CAPACITY_REBALANCE,
-                    Severity.HIGH if waited > 2 * th.stall_s else Severity.MEDIUM,
-                    PrescribedAction.REASSIGN_TEAM,
-                    team_id=team,
-                    task_id=tid,
-                    dwell_seconds=waited,
-                    action_parameters={"from_team": team, "to_team": to_team, "ticket_ids": ids,
-                                       "waited_s": round(waited, 1)},
-                    extra_metrics={"threshold_s": th.stall_s, "stuck_tickets": len(ids), "to_team": to_team},
-                    fallback_diagnosis=f"{len(ids)} ticket(s) of {tid} have waited {waited / 60:.0f} min behind busy "
-                                       f"builders on team {team} while team {to_team} is idle. "
-                                       f"Move them to team {to_team}.",
-                    choices=(PrescribedAction.REASSIGN_TEAM, PrescribedAction.NONE),
-                )
-            )
-        return found
-
-    def _action_log(self) -> list[Mapping[str, Any]]:
-        """The Floor Manager's action log: ``actions_provider``, ``queue.actions`` and the stored kv copy."""
-        rows: list[Mapping[str, Any]] = []
-        for source in (self.actions_provider, getattr(self.queue, "actions", None)):
-            if not callable(source):
-                continue
-            try:
-                try:
-                    got = source(limit=1000)
-                except TypeError:
-                    got = source()
-            except Exception as exc:  # noqa: BLE001
-                log.debug("reading the action log failed: %s", exc)
-                continue
-            rows.extend(r for r in got or [] if isinstance(r, Mapping))
-        kv_get = getattr(self.queue, "kv_get", None)
-        if callable(kv_get):
-            try:
-                raw = kv_get(_ACTIONS_KV_KEY)
-                if isinstance(raw, (str, bytes)):
-                    raw = json.loads(raw)
-                if isinstance(raw, Mapping):
-                    rows.extend(r for r in raw.get("actions") or [] if isinstance(r, Mapping))
-            except Exception as exc:  # noqa: BLE001
-                log.debug("reading the stored action log failed: %s", exc)
-        return rows
-
-    def _undone_recently(self, anomaly: Anomaly, now: datetime) -> bool:
-        """True when the user undid the same action for the same target within ``_UNDO_SUPPRESS_S``.
-
-        Applies to REASSIGN_TEAM, RESIZE_ALLOCATION, THROTTLE_DISPATCH, WIDEN_CONTEXT and
-        PROMOTE_PEER_REVIEWER (a task-less THROTTLE matches any undone throttle).
-        QUARANTINE_TASK needs new gate evidence instead (see ``_ticket_gate_failures``).
-        """
-        if anomaly.action.value not in _UNDO_SUPPRESSED:
-            return False
-        for row in self._action_log():
-            if str(row.get("action")) != anomaly.action.value or not row.get("undone_at"):
-                continue
-            if anomaly.task_id and row.get("task_id") != anomaly.task_id:
-                continue
-            undone = _parse_ts(row.get("undone_at"))
-            if undone is None or (now - undone).total_seconds() < _UNDO_SUPPRESS_S:
-                return True  # a clock mismatch (undo "in the future") also counts as recent
-        return False
-
-    def _retried_tasks(self) -> set[str]:
-        """Tasks a RETRY_TASK was already prescribed or applied for (memory, escalations, action log)."""
-        done = set(self._retry_prescribed)
-        try:
-            for e in self.queue.escalations():
-                if str(e.get("prescribed_action")) == PrescribedAction.RETRY_TASK.value:
-                    tid = (e.get("target_entity") or {}).get("task_id")
-                    if tid:
-                        done.add(str(tid))
-        except Exception as exc:  # noqa: BLE001
-            log.debug("reading escalations failed: %s", exc)
-        for row in self._action_log():
-            if str(row.get("action")) == PrescribedAction.RETRY_TASK.value and row.get("task_id"):
-                done.add(str(row["task_id"]))
-        return done
-
-    def _visibility_failures(self, task_id: str) -> int:
-        """Failed gate results of a task showing missing code, since its context level last changed.
-
-        Reads the output stored in ``gate_results``; tickets already done are
-        left out, and so are failures from before the last widen or undo.
-        """
-        key = f"{self.queue.CONTEXT_LEVEL_KV_PREFIX}{task_id}"
-        changed = self._sql("SELECT updated_at FROM kv WHERE key=?", (key,))
-        sql = "SELECT subtask_id, stdout, stderr FROM gate_results WHERE task_id=? AND passed=0"
-        params: list[Any] = [task_id]
-        if changed:
-            sql += " AND ts>?"
-            params.append(changed[0][0])
-        done = {t.subtask_id for t in self.queue.tickets_for_task(task_id) if t.status == "done"}
-        return sum(
-            1 for sub, out, err in self._sql(sql, params)
-            if sub not in done and _VISIBILITY_FAILURE_RE.search(f"{out or ''}\n{err or ''}")
-        )
-
-    def _widen_anomalies(self, tasks: Mapping[str, Any]) -> list[Anomaly]:
-        """WIDEN_CONTEXT: tasks whose builders repeatedly could not see the code they needed."""
-        found: list[Anomaly] = []
-        for tid, task in tasks.items():
-            level = self.queue.task_context_level(tid)
-            if level >= self.queue.MAX_CONTEXT_LEVEL:
-                continue
-            n = self._visibility_failures(tid)
-            if n < _WIDEN_AFTER_FAILURES:
-                continue
-            found.append(
-                Anomaly(
-                    EscalationCategory.LINE_JAM,
-                    Severity.MEDIUM,
-                    PrescribedAction.WIDEN_CONTEXT,
-                    team_id=task["team_id"],
-                    task_id=tid,
-                    gate_failure_count=n,
-                    action_parameters={"level": level + 1, "from": level},
-                    extra_metrics={"threshold": _WIDEN_AFTER_FAILURES, "context_level": level},
-                    fallback_diagnosis=f"{tid} failed {n} times because its builder could not see code it needed. "
-                                       f"Widen its context from level {level} to {level + 1}.",
-                )
-            )
-        return found
-
-    def _retry_anomalies(self, now: datetime) -> list[Anomaly]:
-        """RETRY_TASK: recently quarantined tasks whose reason is transient (or unclear, for Gemma)."""
-        try:
-            quarantined = self.queue.tasks_in_state(TaskState.QUARANTINED)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("reading quarantined tasks failed: %s", exc)
-            return []
-        if not quarantined:
-            return []
-        retried = self._retried_tasks()
-        found: list[Anomaly] = []
-        for task in quarantined:
-            tid = str(task["task_id"])
-            if tid in retried or tid in self._retry_declined:
-                continue
-            since = _parse_ts(task.get("state_changed_at")) or _parse_ts(task.get("updated_at"))
-            if since is None:
-                continue
-            age = (now - since).total_seconds()
-            if age < _RETRY_MIN_WAIT_S or age > _RETRY_MAX_AGE_S:
-                continue
-            if not any(t.status == "blocked" for t in self.queue.tickets_for_task(tid)):
-                continue  # nothing to re-open (e.g. sizing failed: sizing re-runs on restart)
-            reason = str(task.get("quarantine_reason") or "")
-            kind = classify_quarantine(reason)
-            if kind == "real" or (kind == "unclear" and self.gemma is None):
-                continue
-            transient = kind == "transient"
-            short = _clip(" ".join(reason.split()) or "no reason recorded", 120)
-            found.append(
-                Anomaly(
-                    EscalationCategory.LINE_JAM,
-                    Severity.MEDIUM,
-                    PrescribedAction.RETRY_TASK if transient else PrescribedAction.NONE,
-                    team_id=task.get("team_id"),
-                    task_id=tid,
-                    dwell_seconds=age,
-                    action_parameters={"reason": reason[:300], "transient": True,
-                                       "quarantined_s": round(age, 1), "source": "heuristic"},
-                    extra_metrics={"quarantine_kind": kind},
-                    fallback_diagnosis=f"{tid} was quarantined for a transient reason ({short}). "
-                                       "Retry it once with fresh attempts.",
-                    choices=(PrescribedAction.RETRY_TASK, PrescribedAction.NONE),
-                )
-            )
-        return found
-
-    def _next_alert_id(self, now: datetime) -> str:
-        """Issue the next per-day ``ALT-YYYYMMDD-NNN`` id and reserve it in the queue db (D12).
-
-        The sequence is seeded from every id already reserved or recorded, and
-        each candidate is persisted with ``queue.reserve_alert_id`` when it is
-        issued; a taken id (another Foreman, a restart) moves on to the next
-        number, so ids are never reused even if the alert is never applied.
-        """
-        day = now.strftime("%Y%m%d")
-        prefix = f"ALT-{day}-"
-        if self._alert_day != day:
-            self._alert_day, self._alert_seq = day, 0
-            stored: list[str] = []
-            try:
-                lister = getattr(self.queue, "alert_ids", None)
-                if callable(lister):
-                    stored = [str(a) for a in lister(prefix)]
-                else:
-                    stored = [str(e.get("alert_id", "")) for e in self.queue.escalations()]
-            except Exception as exc:  # noqa: BLE001
-                log.debug("reading stored alert ids failed: %s", exc)
-            for aid in stored:
-                if aid.startswith(prefix) and aid[len(prefix):].isdigit():
-                    self._alert_seq = max(self._alert_seq, int(aid[len(prefix):]))
-        reserve = getattr(self.queue, "reserve_alert_id", None)
-        while True:
-            self._alert_seq += 1
-            if self._alert_seq > 999:
-                raise RuntimeError("more than 999 escalations today")
-            alert_id = new_alert_id(self._alert_seq, now)
-            if not callable(reserve) or reserve(alert_id):
-                return alert_id
-
-    def _valid_diagnosis(self, text: str) -> str | None:
-        candidate = " ".join((text or "").split()).strip().strip('"')
-        if not candidate or len(candidate) > MAX_DIAGNOSIS_CHARS:
-            return None
-        if count_sentences(candidate) > MAX_DIAGNOSIS_SENTENCES:
-            return None
-        return candidate
-
-    async def evaluate_line_anomaly(self) -> ForemanEscalation | None:
-        """Detect the most urgent anomaly and return it as a validated escalation.
-
-        Detection is deterministic (:meth:`detect_anomalies`); anomalies
-        raised within ``cooldown_s`` for the same target are skipped. For most
-        anomalies Gemma only writes the ``diagnosis`` (<= 2 sentences,
-        validated); otherwise a fixed diagnosis is used. For REASSIGN_TEAM and
-        RETRY_TASK candidates (``Anomaly.choices``) Gemma also picks the action
-        from those choices (``NONE`` = leave it: the candidate is skipped and
-        the next one is tried); an invalid or missing choice keeps the
-        deterministic one. RETRY_TASK is never prescribed twice for a task.
-        Returns ``None`` when the line is healthy.
-        """
-        now = self._now()
-        decisions = 0
-        for anomaly in self.detect_anomalies():
-            last = self._raised.get(anomaly.key)
-            if last is not None and (now - last).total_seconds() < self.cooldown_s:
-                continue
-            if self._undone_recently(anomaly, now):
-                continue  # the user undid this very action: respect that for a while
-            if anomaly.choices and self.gemma is not None:
-                if decisions >= _MAX_DECISIONS_PER_EVAL:
-                    if anomaly.action == PrescribedAction.NONE:
-                        continue  # needs Gemma's decision; ask on a later pass
-                    alert = await self._escalate(anomaly, now, ask_gemma=False)
-                else:
-                    decisions += 1
-                    alert = await self._escalate(anomaly, now, ask_gemma=True)
-            elif anomaly.action == PrescribedAction.NONE:
-                continue  # an undecided candidate without Gemma: nothing to do
-            else:
-                alert = await self._escalate(anomaly, now, ask_gemma=self.gemma is not None)
-            if alert is not None:
-                return alert
-        return None
-
-    def _metrics_and_target(self, anomaly: Anomaly) -> tuple[dict[str, Any], dict[str, Any]]:
-        try:
-            queue_depth = int(self.queue.summary().get("queue_depth", 0))
-        except Exception:  # noqa: BLE001
-            queue_depth = 0
-        current_tpm = float(self.telemetry.current_tpm()) if self.telemetry is not None else 0.0
-        metrics = {
-            "queue_depth": queue_depth,
-            "dwell_seconds": round(float(anomaly.dwell_seconds), 1),
-            "gate_failure_count": int(anomaly.gate_failure_count),
-            "current_tpm": round(current_tpm, 1),
-            **anomaly.extra_metrics,
-        }
-        target = {k: v for k, v in (("team_id", anomaly.team_id), ("task_id", anomaly.task_id),
-                                     ("agent_id", anomaly.agent_id)) if v}
-        return metrics, target
-
-    async def _gemma_decision(
-        self, anomaly: Anomaly, target: dict[str, Any], metrics: dict[str, Any]
-    ) -> tuple[PrescribedAction | None, str | None, int]:
-        """Ask Gemma to pick one of ``anomaly.choices`` and write the diagnosis.
-
-        Returns ``(action or None when unusable, diagnosis or None, tokens)``.
-        A plain-text reply (no JSON) counts as a diagnosis only.
-        """
-        options = [c.value for c in anomaly.choices]
-        guide = {
-            PrescribedAction.REASSIGN_TEAM.value: "move the task's waiting tickets to the idle team",
-            PrescribedAction.RETRY_TASK.value: "re-open the quarantined task once with fresh attempts; only when "
-                                               "the quarantine was caused by infrastructure or a transient "
-                                               "problem (timeouts, network, rate limits), never for repeated "
-                                               "real build or review failures",
-            PrescribedAction.NONE.value: "leave it as it is",
-        }
-        messages = [
-            {
-                "role": "system",
-                "content": "You are the Shop Foreman of a software factory. Decide what to do about this "
-                           "production-line alert. Reply with JSON only: "
-                           '{"prescribed_action": one of ' + json.dumps(options) + ', "diagnosis": "at most '
-                           'two short sentences (max 300 characters)"}. Meaning of the actions: '
-                           + "; ".join(f"{o} = {guide.get(o, o)}" for o in options) + ".",
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"category": anomaly.category.value, "severity": anomaly.severity.value,
-                     "target": target, "metrics": metrics, "action_parameters": anomaly.action_parameters,
-                     "suggested_action": anomaly.action.value, "facts": anomaly.fallback_diagnosis},
-                    default=str,
-                ),
-            },
-        ]
-        schema = {
-            **_DECISION_SCHEMA,
-            "properties": {**_DECISION_SCHEMA["properties"], "prescribed_action": {"type": "string", "enum": options}},
-        }
-        reply = await self._chat(messages, hook="evaluate_line_anomaly", json_schema=schema, temperature=0.0)
-        if reply is None:
-            return None, None, 0
-        tokens = _reply_tokens(reply, messages)
-        try:
-            data = _decode_json(reply.text)
-        except (ValueError, TypeError):
-            data = None
-        if not isinstance(data, Mapping):
-            return None, self._valid_diagnosis(reply.text or ""), tokens
-        raw = str(data.get("prescribed_action") or "").strip().upper().replace("-", "_").replace(" ", "_")
-        action = next((c for c in anomaly.choices if c.value == raw), None)
-        return action, self._valid_diagnosis(str(data.get("diagnosis") or "")), tokens
-
-    async def _escalate(self, anomaly: Anomaly, now: datetime, *, ask_gemma: bool) -> ForemanEscalation | None:
-        """Turn one anomaly into a validated escalation (``None`` when the action ends up NONE)."""
-        metrics, target = self._metrics_and_target(anomaly)
-        action = anomaly.action
-        params = dict(anomaly.action_parameters)
-        diagnosis = anomaly.fallback_diagnosis
-        source = "heuristic"
-        gemma_said_none = False
-        if ask_gemma and anomaly.choices:
-            chosen, written, tokens = await self._gemma_decision(anomaly, target, metrics)
-            if chosen is not None:
-                if chosen == PrescribedAction.RETRY_TASK and anomaly.action != PrescribedAction.RETRY_TASK:
-                    params["source"] = "gemma"  # Gemma judged an unclear quarantine transient
-                gemma_said_none = chosen == PrescribedAction.NONE
-                if written is not None:
-                    diagnosis = written
-                elif chosen != anomaly.action:
-                    diagnosis = _CHOICE_DIAGNOSIS.get(chosen, anomaly.fallback_diagnosis).format(
-                        task=anomaly.task_id or "the task")
-                action, source = chosen, "gemma"
-            elif written is not None and action != PrescribedAction.NONE:
-                diagnosis, source = written, "gemma"  # plain-text reply: a diagnosis only
-            if source == "gemma":
-                self._save(anomaly.task_id or _UNKNOWN_TASK, "triage", tokens)
-        elif ask_gemma:
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are the Shop Foreman. Write a diagnosis of at most two short sentences "
-                               "(max 300 characters) for this production-line alert. Plain text only.",
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"category": anomaly.category.value, "severity": anomaly.severity.value,
-                         "target": target, "metrics": metrics,
-                         "prescribed_action": anomaly.action.value, "facts": anomaly.fallback_diagnosis},
-                        default=str,
-                    ),
-                },
-            ]
-            reply = await self._chat(messages, hook="evaluate_line_anomaly", temperature=0.1)
-            if reply is not None:
-                written = self._valid_diagnosis(reply.text)
-                if written is not None:
-                    diagnosis, source = written, "gemma"
-                    self._save(anomaly.task_id or _UNKNOWN_TASK, "triage", _reply_tokens(reply, messages))
-
-        if action == PrescribedAction.NONE:
-            # Gemma (or the missing decision) says leave it: no alert, and don't ask again soon.
-            self._raised[anomaly.key] = now
-            if gemma_said_none and PrescribedAction.RETRY_TASK in anomaly.choices and anomaly.task_id:
-                self._retry_declined.add(anomaly.task_id)  # Gemma looked at it: don't ask again
-            self.last_source["evaluate_line_anomaly"] = source
-            return None
-        if action == PrescribedAction.RETRY_TASK and anomaly.task_id:
-            if anomaly.task_id in self._retried_tasks():
-                return None  # never twice (another pass or a restart got there first)
-
-        payload = {
-            "alert_id": self._next_alert_id(now),
-            "timestamp": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "severity": anomaly.severity,
-            "category": anomaly.category,
-            "target_entity": target,
-            "metrics_snapshot": metrics,
-            "diagnosis": diagnosis,
-            "prescribed_action": action,
-            "action_parameters": params,
-        }
-        try:
-            alert = ForemanEscalation.model_validate(payload)
-        except ValidationError:
-            payload["diagnosis"] = _first_sentences(anomaly.fallback_diagnosis, MAX_DIAGNOSIS_SENTENCES)
-            source = "heuristic"
-            alert = ForemanEscalation.model_validate(payload)
-        self._raised[anomaly.key] = now
-        if action == PrescribedAction.RETRY_TASK and anomaly.task_id:
-            self._retry_prescribed.add(anomaly.task_id)
-        self.last_source["evaluate_line_anomaly"] = source
-        return alert
-
-
-#: Diagnosis used when Gemma picked a different action without a usable diagnosis.
-_CHOICE_DIAGNOSIS: dict[PrescribedAction, str] = {
-    PrescribedAction.RETRY_TASK: "{task} was quarantined for what looks like a transient problem. "
-                                 "Retry it once with fresh attempts.",
-    PrescribedAction.REASSIGN_TEAM: "{task} is stuck behind busy builders. Move its waiting tickets to an idle team.",
-}
-
-
-def _first_sentences(text: str, n: int = 2) -> str:
-    """Keep the first ``n`` sentences of ``text`` (never empty)."""
-    parts = re.split(r"(?<=[.!?])\s+", " ".join((text or "").split()))
-    kept = " ".join(parts[:n]).strip()
-    return kept or "Complete the subtask."
