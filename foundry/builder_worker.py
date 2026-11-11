@@ -621,7 +621,9 @@ class _WorkerBase:
             got = await _maybe_await(self.base_for(str(task_id)))
         except asyncio.CancelledError:
             raise
-        except Exception:  # never stop the line over a snapshot: fall back to the user's folder
+        except Exception as exc:
+            if _is_counted_infra(exc):  # BaseUnavailable: snapshots are on, never use the user's folder
+                raise
             log.exception("%s: could not get the base snapshot of %s", self.agent_id, task_id)
             got = None
         if not got:
@@ -1349,15 +1351,24 @@ class BuilderWorker(_WorkerBase):
         # everything for this ticket reads the task's snapshot of the publish branch
         # (context, gates' base, normalisation), never the user's folder
         task_id = _get(ticket, "task_id")
-        if self.base_lease is not None and task_id:
-            # held for the whole ticket: the snapshot is never pruned under this worker
-            async with self.base_lease(str(task_id)) as base:
-                if base:
-                    self._bases[str(task_id)] = Path(base)
-                else:
-                    self._bases.pop(str(task_id), None)
-                return await self._process_on_base(ticket, Path(base) if base else None)
-        return await self._process_on_base(ticket, await self._resolve_base(task_id))
+        resolved = False
+        try:
+            if self.base_lease is not None and task_id:
+                # held for the whole ticket: the snapshot is never pruned under this worker
+                async with self.base_lease(str(task_id)) as base:
+                    resolved = True
+                    if base:
+                        self._bases[str(task_id)] = Path(base)
+                    else:
+                        self._bases.pop(str(task_id), None)
+                    return await self._process_on_base(ticket, Path(base) if base else None)
+            snapshot = await self._resolve_base(task_id)
+            resolved = True
+            return await self._process_on_base(ticket, snapshot)
+        except Exception as exc:
+            if resolved or not _is_counted_infra(exc):
+                raise
+            return await self._infra_release(ticket, exc)  # no base (BaseUnavailable): no attempt spent
 
     async def _process_on_base(self, ticket: Any, base: Path | None) -> str:
         """:meth:`process_ticket` with the task's base snapshot (None: the user's folder) resolved."""
