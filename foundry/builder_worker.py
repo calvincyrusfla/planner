@@ -300,6 +300,8 @@ class _WorkerBase:
 
     agent_id: str
     role: str
+    #: When the prompt archive was last pruned (epoch seconds; once per day, shared by all workers).
+    _last_archive_prune: float = 0.0
 
     def __init__(
         self,
@@ -644,7 +646,8 @@ class _WorkerBase:
 
     # -- Claude ---------------------------------------------------------------
     async def _call_claude(
-        self, prompt: str, *, task_id: str, cwd: str | None = None, client: ClaudeLike | None = None
+        self, prompt: str, *, task_id: str, cwd: str | None = None, client: ClaudeLike | None = None,
+        ticket_id: Any = None, attempt: int | None = None,
     ) -> ClaudeResult:
         """One Claude call inside ``limiter.slot`` wrapped by ``call_with_backoff``.
 
@@ -702,6 +705,35 @@ class _WorkerBase:
                 recording.add_done_callback(turn_ledger.BACKGROUND_TASKS.discard)
             except Exception:  # the ledger must never fail a build
                 log.debug("%s: could not start the turn ledger", self.agent_id, exc_info=True)
+        config = getattr(self, "config", None)
+        if getattr(config, "prompt_archive", False):
+            try:
+                import threading
+
+                from foundry import prompt_archive
+
+                base = self._bases.get(str(task_id))
+                base_sha = base.name if base is not None and re.fullmatch(r"[0-9a-f]{7,64}", base.name) else None
+                days = int(getattr(config, "prompt_archive_days", 30) or 30)
+                due = time.time() - _WorkerBase._last_archive_prune >= 86400
+                if due:
+                    _WorkerBase._last_archive_prune = time.time()
+                role, agent_id, queue = self.role, self.agent_id, self.queue
+
+                def archive() -> None:
+                    prompt_archive.archive_call(
+                        queue, task_id=task_id, ticket_id=ticket_id, attempt=attempt, role=role,
+                        agent_id=agent_id, prompt=prompt, result=result, base_sha=base_sha,
+                    )
+                    if due:
+                        try:
+                            prompt_archive.prune(queue, days)
+                        except Exception:
+                            log.debug("prompt archive prune failed", exc_info=True)
+
+                threading.Thread(target=archive, name="prompt-archive", daemon=True).start()
+            except Exception:  # the archive must never fail a build
+                log.debug("%s: could not start the prompt archive", self.agent_id, exc_info=True)
         return result
 
     # -- infrastructure failures (D1/E1) --------------------------------------
@@ -1448,7 +1480,9 @@ class BuilderWorker(_WorkerBase):
             if isinstance(opened, str):
                 return opened
             workspace = opened
-        call_options: dict[str, Any] = {}
+        call_options: dict[str, Any] = {
+            "ticket_id": _get(ticket, "ticket_id"), "attempt": assignment.attempt + 1,
+        }
         if workspace is not None:
             call_options["cwd"] = str(workspace)
         retry_client = getattr(self, "retry_client", None)
@@ -2189,7 +2223,9 @@ class ReviewerWorker(_WorkerBase):
         error: BaseException | None = None
         result: ClaudeResult | None = None
         try:
-            result = await self._call_claude(prompt, task_id=task_id)
+            result = await self._call_claude(
+                prompt, task_id=task_id, ticket_id=item.ticket_id, attempt=item.assignment.attempt + 1
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
