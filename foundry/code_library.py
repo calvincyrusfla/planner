@@ -1,4 +1,4 @@
-"""The code library: a catalogue of every function and class with a call number.
+"""The code library: a catalogue of every function, class and module constant with a call number.
 
 :func:`build_library` walks a repo in plain code and writes a SQLite file. A
 *call number* is ``<repo-relative posix path>::<qualified name>``, for example
@@ -30,13 +30,25 @@ _SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "build", "dist", "
 _PY_SUFFIXES = (".py",)
 _JS_SUFFIXES = (".js", ".mjs", ".cjs", ".ts")
 _MAX_TEXT = 200
+_MAX_CONSTANT_SIGNATURE = 160
+_JS_VALUE_LINES = 20  # how far a constant's initializer is read to tell a multi-line arrow function
 
 _NAME = r"[A-Za-z_$][\w$]*"
+_UPPER = r"[0-9_]*[A-Z][A-Z0-9_]*"
+_UPPER_NAME = re.compile(_UPPER)
 _JS_FN = re.compile(rf"^([ \t]*)(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*({_NAME})")
 _JS_CLASS = re.compile(rf"^([ \t]*)(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+({_NAME})")
 _JS_EXPORT_CONST = re.compile(rf"^([ \t]*)export\s+const\s+({_NAME})\s*[=:]")
 _JS_ARROW = re.compile(rf"^([ \t]*)const\s+({_NAME})\s*=\s*(?:async\s+)?(?:\([^)]*\)|{_NAME})\s*=>")
 _JS_CALL = re.compile(rf"(?<![\w$])({_NAME})\(")
+# The lookahead leaves the ``=`` or type annotation in place for _JS_INITIALIZER.
+_JS_CONST = re.compile(rf"^(?:export\s+)?const\s+({_UPPER})\s*(?=[=:])")
+# Up to and including the assignment ``=``, stepping over any ``=>`` in a type annotation.
+_JS_INITIALIZER = re.compile(r"(?:[^=]|=>)*=(?!>)")
+_JS_CALLABLE_VALUE = re.compile(
+    rf"\s*(?:async\b\s*)?(?:function\b|class\b|{_NAME}\s*=>"
+    r"|(?:<[^>]*>\s*)?\((?:[^()]|\([^()]*\))*\)\s*(?::[^=]*)?=>)"
+)
 
 _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -113,6 +125,13 @@ def _py_scan(source: str) -> tuple[list[_Entry], dict[str, set[int]]]:
                     add(sub, f"{node.name}.{sub.name}", "method")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             add(node, node.name, "function")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets: list[ast.expr] = node.targets if isinstance(node, ast.Assign) else [node.target]
+            target = targets[0]
+            if len(targets) == 1 and isinstance(target, ast.Name) and _UPPER_NAME.fullmatch(target.id):
+                signature = lines[node.lineno - 1].strip()[:_MAX_CONSTANT_SIGNATURE]
+                end = int(node.end_lineno or node.lineno)
+                entries.append(("constant", target.id, target.id, node.lineno, end, signature))
 
     refs: dict[str, set[int]] = {}
     try:
@@ -128,10 +147,53 @@ def _py_scan(source: str) -> tuple[list[_Entry], dict[str, set[int]]]:
     return entries, refs
 
 
+def _js_constant_name(lines: list[str], index: int) -> str | None:
+    """The UPPER_CASE name declared at ``index``, unless its value is a function or class."""
+    m = _JS_CONST.match(lines[index])
+    if m is None:
+        return None
+    tail = "\n".join([lines[index][m.end() :], *lines[index + 1 : index + _JS_VALUE_LINES]])
+    assignment = _JS_INITIALIZER.match(tail)
+    if assignment is not None and _JS_CALLABLE_VALUE.match(tail, assignment.end()):
+        return None
+    return m.group(1)
+
+
+def _js_statement_end(lines: list[str], start: int, limit: int) -> int:
+    """Index of the line closing the statement at ``start``, at most ``limit``."""
+    depth = 0
+    quote = ""
+    for index in range(start, limit + 1):
+        escaped = False
+        for ch in lines[index]:
+            if escaped:
+                escaped = False
+            elif quote:
+                if ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = ""
+            elif ch in "'\"`":
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+        if quote != "`":  # only template strings span lines
+            quote = ""
+        if depth <= 0 and not quote and not lines[index].rstrip().endswith(("=", "+")):
+            return index
+    return limit
+
+
 def _js_scan(source: str) -> tuple[list[_Entry], dict[str, set[int]]]:
     lines = source.splitlines()
     found: list[tuple[int, int, str, str]] = []  # line index, indent, kind, name
     for i, line in enumerate(lines):
+        constant = _js_constant_name(lines, i)
+        if constant is not None:
+            found.append((i, 0, "constant", constant))
+            continue
         for rx, kind in ((_JS_FN, "function"), (_JS_CLASS, "class"), (_JS_EXPORT_CONST, "function"), (_JS_ARROW, "function")):
             m = rx.match(line)
             if m:
@@ -146,6 +208,8 @@ def _js_scan(source: str) -> tuple[list[_Entry], dict[str, set[int]]]:
                 break
         while end_idx > i and not lines[end_idx].strip():
             end_idx -= 1
+        if kind == "constant":
+            end_idx = _js_statement_end(lines, i, end_idx)
         sig = _clip(lines[i]).rstrip("{ \t")
         entries.append((kind, name, name, i + 1, end_idx + 1, sig))
     refs: dict[str, set[int]] = {}
