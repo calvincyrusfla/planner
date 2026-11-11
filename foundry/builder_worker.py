@@ -41,8 +41,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import inspect
-import json
 import logging
 import os
 import re
@@ -52,14 +50,10 @@ import time
 from pathlib import Path
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from fnmatch import fnmatchcase
 from typing import Any, Protocol
-
-from pydantic import ValidationError
 
 from foundry import claude_client as _claude_client
 from foundry.gemma_notes import find_related, pitfall_notes
-from foundry.order_schema import LIMIT_BUILDER_ORDER
 from foundry.piece_workspace import WorkspaceError, collect_changes, make_workspace, remove_workspace
 from foundry.validation_gates import DiffApplyError, normalize_diff, prepare_stacked_workspace
 from foundry.schemas import (
@@ -70,11 +64,91 @@ from foundry.schemas import (
     ClaudeResult,
     ContextSlice,
     DeterministicGateResult,
-    LineDirective,
     ReviewerVerdict,
     TaskAssignment,
     TaskState,
     utc_now_iso,
+)
+from foundry.worker_helpers import (
+    MAX_FIX_HINT_CHARS,
+    _KW_CACHE as _KW_CACHE,
+    _ONE_LINE_CHARS as _ONE_LINE_CHARS,
+    _accepts_kw,
+    _estimate_tokens,
+    _fallback_condense,
+    _fence_for as _fence_for,
+    _get,
+    _maybe_await,
+    _normalize_path as _normalize_path,
+    _one_line,
+    _read_only_path,
+    _read_only_touched as _read_only_touched,
+    _state_value,
+    _supported_kwargs,
+)
+from foundry.worker_prompts import (
+    BUILDER_CONTRACT,
+    DIFF_CONTRACT,
+    EDIT_CONTRACT,
+    EDITS_EXAMPLE as EDITS_EXAMPLE,
+    MAX_ORDER_DETAILS_CHARS as MAX_ORDER_DETAILS_CHARS,
+    REVIEWER_CONTRACT,
+    StackedWork,
+    _ADDED_CONST_RE as _ADDED_CONST_RE,
+    _ADDED_DEF_RE as _ADDED_DEF_RE,
+    _DEF_KW as _DEF_KW,
+    _HUNK_CTX_RE as _HUNK_CTX_RE,
+    _IDENT_RE,
+    _MAX_STACK_SYMBOLS as _MAX_STACK_SYMBOLS,
+    _PLAN_ITEM_RE as _PLAN_ITEM_RE,
+    _PLAN_STOP_WORDS as _PLAN_STOP_WORDS,
+    _ReadOnlyAssignment,
+    _already_done_section as _already_done_section,
+    _capped_order_text as _capped_order_text,
+    _defines_any,
+    _order_details_section as _order_details_section,
+    _path_covered,
+    _plan_checklist_section as _plan_checklist_section,
+    build_builder_prompt,
+    build_reviewer_prompt,
+    plan_checklist as plan_checklist,
+    stacked_work,
+    summarize_diff as summarize_diff,
+    symbols_by_file as symbols_by_file,
+)
+from foundry.worker_replies import (
+    DEFAULT_HELP_AFTER,
+    HELP_ANSWER_KV_PREFIX,
+    HELP_PAUSED_KV_PREFIX,
+    LAST_HINT_KV_PREFIX,
+    MAX_EXTRA_SYMBOLS,
+    MAX_HELP_AFTER,
+    MAX_HELP_TEXT_CHARS,
+    MISSING_INFO_KV_PREFIX,
+    PreReviewBreaker,
+    _BACKTICK_SYMBOL_RE as _BACKTICK_SYMBOL_RE,
+    _BLOCKED_RE,
+    _BODY_OF_RE as _BODY_OF_RE,
+    _DIFF_BLOCK_RE as _DIFF_BLOCK_RE,
+    _DIFF_OPEN_RE as _DIFF_OPEN_RE,
+    _EDITS_BLOCK_RE as _EDITS_BLOCK_RE,
+    _EDITS_OPEN_RE as _EDITS_OPEN_RE,
+    _FILE_SUFFIXES as _FILE_SUFFIXES,
+    _INFRA_ERROR_RE as _INFRA_ERROR_RE,
+    _JSON_FENCE_RE as _JSON_FENCE_RE,
+    _MISSING_INFO_PHRASES as _MISSING_INFO_PHRASES,
+    _NOT_SYMBOLS as _NOT_SYMBOLS,
+    _PRE_REVIEW_CHEAP_FALLBACKS,
+    _WORK_JUDGEMENT_REASONS as _WORK_JUDGEMENT_REASONS,
+    _is_missing_information,
+    _parse_edits_reply as _parse_edits_reply,
+    directives_to_hint,
+    extract_diff_paths,
+    extract_requested_symbols,
+    format_pre_review_notes,
+    is_infrastructure_error,
+    parse_builder_reply,
+    parse_reviewer_reply,
 )
 
 __all__ = [
@@ -107,9 +181,6 @@ log = logging.getLogger(__name__)
 #: (``BoardBridge.agent_status`` fits; workers never import the bridge).
 ActivityHook = Callable[..., Any]
 
-#: Longest fix hint stored on a reopened ticket (REVISE directives can be long).
-MAX_FIX_HINT_CHARS = 1200
-
 #: Gemma pre-review modes (``FoundryConfig.pre_review`` / ``FOUNDRY_PRE_REVIEW``).
 PRE_REVIEW_MODES: tuple[str, ...] = ("off", "advise", "gate")
 #: A ticket is sent back by the pre-review at most this many times; later submissions go to Claude.
@@ -122,58 +193,6 @@ EXTRA_SYMBOLS_KV_PREFIX = "extra_symbols:"
 CONTEXT_LEVEL_USED_KV_PREFIX = "context_level_used:"
 #: Widest context level (``ContextEngine.build_slice(level=...)``); retries step up to it.
 MAX_CONTEXT_LEVEL = 3
-
-#: Longest one-line hint produced by the local fallback condenser.
-_ONE_LINE_CHARS = 160
-
-EDITS_EXAMPLE = (
-    '```edits\n'
-    '{"edits": [{"op": "replace_symbol", "file": "pkg/mod.py", "symbol": "Shop.total",\n'
-    '  "code": "    def total(self):\\n        return sum(self.items)\\n"}]}\n'
-    '```'
-)
-"""A tiny ```edits example quoted in the builder contract."""
-
-BUILDER_CONTRACT = (
-    "Reply with exactly one fenced code block: either ```edits (preferred for changes to "
-    "existing code) or ```diff. Only touch the files listed under 'Files you may modify'. "
-    "Put no other code blocks in the reply and do not paste whole files.\n"
-    "- ```edits holds JSON {\"edits\": [...]}; Foundry applies the edits and builds the diff "
-    "itself, so you need no surrounding lines. Ops (each names its \"file\"): "
-    "`replace_symbol` {file, symbol, code} replaces a whole top-level function/class or "
-    "`Class.method` (code must define exactly that symbol, decorators included); "
-    "`insert_after_symbol` / `insert_before_symbol` {file, symbol, code}; `append` {file, code}; "
-    "`search_replace` {file, old, new} (`old` must occur exactly once, whitespace-exact); "
-    "`create_file` {file, code} (new files only); `delete_symbol` {file, symbol}. Never "
-    "re-define a symbol that already exists (see the inventory): use `replace_symbol`. "
-    "Example:\n" + EDITS_EXAMPLE + "\n"
-    "- ```diff holds a unified diff (`--- a/<path>` / `+++ b/<path>` headers and `@@` hunks "
-    "with exact context lines; `--- /dev/null` for a new file).\n"
-    "If a body you must change is hidden (outline only), or you cannot do the work, reply with "
-    "a single line starting with `BLOCKED:` naming the symbols you need in backticks "
-    "(e.g. BLOCKED: need the body of `evaluate_line_anomaly`), and no code block."
-)
-DIFF_CONTRACT = BUILDER_CONTRACT  # backwards-compatible name
-"""The builder output contract quoted verbatim in every builder prompt."""
-
-EDIT_CONTRACT = (
-    "Make the change by editing the files in your working directory with the Edit and Write tools; "
-    "Foundry collects your edits itself, so do not paste a diff or code block. Only change the files "
-    "listed under 'Files you may modify'. When you are done, reply with a short plain summary of what "
-    "you changed. If you cannot do the work, make no edits and reply with a single line starting with "
-    "`BLOCKED:` naming what you need in backticks."
-)
-"""The output contract of an edit-mode builder (``builder_mode`` ``edit``)."""
-
-REVIEWER_CONTRACT = (
-    "Reply with a single JSON object and nothing else (no prose, no code fence): "
-    '{"verdict": "APPROVED" | "REVISE" | "REJECTED", "directives": [{"path": "<file>", '
-    '"line": <int, 0 = whole file>, "instruction": "<what to change>"}]}. Use APPROVED when '
-    "every acceptance criterion is met, REVISE with at least one directive when the diff "
-    "can be fixed, REJECTED when the approach is wrong and the task should be quarantined. "
-    "Approve only when the acceptance criteria and every plan-checklist item this part is responsible for are met."
-)
-"""The reviewer output contract quoted verbatim in every reviewer prompt."""
 
 _TERMINAL_STATES = {TaskState.COMPLETE.value, TaskState.QUARANTINED.value, TaskState.FAILED.value}
 
@@ -214,15 +233,6 @@ class GatesLike(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _get(obj: Any, name: str, default: Any = None) -> Any:
-    """Read ``name`` from a mapping or an object."""
-    if obj is None:
-        return default
-    if isinstance(obj, Mapping):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
 #: Where builder prompts are saved unless ``FOUNDRY_PROMPT_DIR`` says otherwise.
 _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent / "data" / "prompts"
 #: Only this many saved prompts are kept; the oldest are deleted first.
@@ -250,961 +260,6 @@ def _save_prompt(prompt: str, ticket_id: str, attempt: int) -> None:
             old.unlink(missing_ok=True)
     except Exception as exc:
         log.warning("could not save the prompt of ticket %s: %s", ticket_id, exc)
-
-
-_KW_CACHE: dict[tuple[Any, str], bool] = {}
-
-
-def _accepts_kw(fn: Callable[..., Any], name: str) -> bool:
-    """Whether ``fn`` accepts keyword ``name`` (inspected once per function, then cached)."""
-    key = (getattr(fn, "__func__", fn), name)
-    cached = _KW_CACHE.get(key)
-    if cached is None:
-        try:
-            params = inspect.signature(fn).parameters
-        except (TypeError, ValueError):  # builtins without a signature
-            cached = False
-        else:
-            cached = name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
-        _KW_CACHE[key] = cached
-    return cached
-
-
-def _supported_kwargs(fn: Callable[..., Any], kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """The subset of ``kwargs`` that ``fn`` accepts (older collaborators lack newer keywords)."""
-    return {k: v for k, v in kwargs.items() if _accepts_kw(fn, k)}
-
-
-async def _maybe_await(value: Any) -> Any:
-    """Await ``value`` when it is awaitable, else return it."""
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
-def _estimate_tokens(text: str) -> int:
-    """``ceil(len(text) / 4)``, the shared token estimate."""
-    return -(-len(text) // 4)
-
-
-def _state_value(state: Any) -> str:
-    """Normalize a TaskState / string / None to its string value."""
-    if state is None:
-        return ""
-    return str(getattr(state, "value", state))
-
-
-def _one_line(text: str, limit: int = _ONE_LINE_CHARS) -> str:
-    """Collapse ``text`` to one line of at most ``limit`` characters."""
-    line = " ".join(text.split())
-    return line if len(line) <= limit else line[: limit - 3].rstrip() + "..."
-
-
-def _fallback_condense(trace: str) -> str:
-    """Deterministic 1-line condensation used when no foreman is configured.
-
-    Picks the last ``File "x", line N`` frame (or ``path:N:`` location) and the
-    last line that looks like an exception/error.
-    """
-    lines = [ln.strip() for ln in trace.splitlines() if ln.strip()]
-    if not lines:
-        return "gate failed with no output"
-    location = ""
-    for ln in reversed(lines):
-        m = re.search(r'File "([^"]+)", line (\d+)', ln)
-        if m:
-            location = f"{m.group(1)}:{m.group(2)}"
-            break
-        m = re.match(r"([\w./\\-]+\.\w+):(\d+)", ln)
-        if m:
-            location = f"{m.group(1)}:{m.group(2)}"
-            break
-    error = next(
-        (ln for ln in reversed(lines) if re.search(r"(Error|Exception|FAILED|failed|assert)", ln)),
-        lines[-1],
-    )
-    return _one_line(f"{location} {error}" if location and location not in error else error)
-
-
-def _fence_for(text: str) -> str:
-    """A backtick fence longer than any backtick run inside ``text``."""
-    longest = max((len(m.group(0)) for m in re.finditer(r"`+", text)), default=0)
-    return "`" * max(3, longest + 1)
-
-
-def _normalize_path(path: str) -> str:
-    """Repo-relative, forward-slash path without a leading ``./``."""
-    p = path.strip().replace("\\", "/")
-    while p.startswith("./"):
-        p = p[2:]
-    return p
-
-
-# ---------------------------------------------------------------------------
-# Prompts (pure)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class StackedWork:
-    """One earlier approved ticket of the same task (the "Already done on this piece" list)."""
-
-    subtask_id: str
-    title: str
-    files: tuple[str, ...]
-    symbols: tuple[str, ...]
-    #: ``((path, (symbol, ...)), ...)``: where each added/changed symbol lives.
-    by_file: tuple[tuple[str, tuple[str, ...]], ...] = field(default=(), compare=False)
-
-
-_DEF_KW = r"(?:async\s+def|def|class|(?:export\s+)?(?:async\s+)?function)"
-#: A definition on an added line: ``def x``, ``class X``, ``function x``.
-_ADDED_DEF_RE = re.compile(r"^\+\s*" + _DEF_KW + r"\s+([A-Za-z_$][\w$]*)")
-#: The enclosing symbol git names in a hunk header (``@@ -1,2 +1,3 @@ def total(self):``).
-_HUNK_CTX_RE = re.compile(r"^@@[^@]*@@\s*" + _DEF_KW + r"\s+([A-Za-z_$][\w$]*)")
-#: A module-level constant assignment on an added line (``+MAX_X = 3``).
-_ADDED_CONST_RE = re.compile(r"^\+([A-Z][A-Z0-9_]*)\s*(?::[^=]+)?=")
-
-
-def summarize_diff(diff: str) -> tuple[list[str], list[str]]:
-    """``(files, symbols)`` a diff adds or changes (symbols in first-seen order, deduplicated)."""
-    files = extract_diff_paths(diff)
-    symbols: dict[str, None] = {}
-    for line in diff.splitlines():
-        if line.startswith("+++"):
-            continue
-        m = _ADDED_DEF_RE.match(line) or _HUNK_CTX_RE.match(line) or _ADDED_CONST_RE.match(line)
-        if m:
-            symbols.setdefault(m.group(1), None)
-    return files, list(symbols)
-
-
-def symbols_by_file(diff: str) -> dict[str, list[str]]:
-    """Added/changed symbols of a diff grouped by the file they are in (deleted files skipped)."""
-    out: dict[str, list[str]] = {}
-    current: str | None = None
-    for line in diff.splitlines():
-        if line.startswith("+++ "):
-            target = line[4:].split("\t", 1)[0].strip()
-            current = None if target == "/dev/null" else _normalize_path(target[2:] if target.startswith("b/") else target)
-            continue
-        if line.startswith("--- ") or current is None:
-            continue
-        m = _ADDED_DEF_RE.match(line) or _HUNK_CTX_RE.match(line) or _ADDED_CONST_RE.match(line)
-        if m and m.group(1) not in out.setdefault(current, []):
-            out[current].append(m.group(1))
-    return out
-
-
-def stacked_work(items: Iterable[tuple[str, str]], titles: Mapping[str, str] | None = None) -> list[StackedWork]:
-    """:class:`StackedWork` per ``(subtask_id, diff)`` (titles by subtask id; default the id)."""
-    out: list[StackedWork] = []
-    for subtask_id, diff in items:
-        files, symbols = summarize_diff(diff or "")
-        by_file = tuple((p, tuple(names)) for p, names in symbols_by_file(diff or "").items() if names)
-        sid = str(subtask_id)
-        out.append(StackedWork(sid, str((titles or {}).get(sid) or sid), tuple(files), tuple(symbols), by_file))
-    return out
-
-
-_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
-
-
-def _defines_any(path: Path, names: set[str]) -> bool:
-    """True when the file defines (def/class/function/CONST =) one of ``names``."""
-    if not names:
-        return False
-    try:
-        if not path.is_file() or path.stat().st_size > 2_000_000:
-            return False
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    for m in re.finditer(r"^[ \t]*" + _DEF_KW + r"\s+([A-Za-z_$][\w$]*)|^([A-Za-z_][\w]*)\s*(?::[^=\n]+)?=", text, re.M):
-        if (m.group(1) or m.group(2)) in names:
-            return True
-    return False
-
-
-#: At most this many symbols are listed per earlier ticket.
-_MAX_STACK_SYMBOLS = 25
-
-
-def _already_done_section(done: Sequence[StackedWork]) -> list[str]:
-    parts = [
-        "",
-        "## Already done on this piece",
-        "These earlier subtasks of this task are approved and already applied to the code "
-        "shown under Context (their new functions and files are real). Build on these; "
-        "don't redo them. Write your change relative to that code.",
-    ]
-    for w in done:
-        title = _one_line(w.title, 160)
-        parts.append(f"- {w.subtask_id}: {title}" if title != w.subtask_id else f"- {w.subtask_id}")
-        if w.files:
-            parts.append(f"  - files: {', '.join(w.files)}")
-        if w.symbols:
-            shown = list(w.symbols[:_MAX_STACK_SYMBOLS])
-            more = len(w.symbols) - len(shown)
-            parts.append(f"  - added/changed: {', '.join(f'`{s}`' for s in shown)}"
-                         + (f" (+{more} more)" if more > 0 else ""))
-    return parts
-
-
-class _ReadOnlyAssignment(TaskAssignment):
-    """An assignment with files the builder may read but never change."""
-
-    read_files: list[str] = []
-    read_only_excerpts: list[dict[str, Any]] = []
-
-
-def _read_only_path(path: Any) -> str:
-    """A repo-relative path in the form diffs use (forward slashes), so paths compare reliably."""
-    return _normalize_path(str(path).strip().replace("\\", "/"))
-
-
-def _path_covered(path: str, patterns: Iterable[str]) -> bool:
-    """True when ``path`` is one of ``patterns``, exactly or through a glob."""
-    return any(path == p or fnmatchcase(path, p) for p in map(_read_only_path, patterns))
-
-
-def _read_only_touched(files: Iterable[str], assignment: TaskAssignment) -> list[str]:
-    """The ``files`` the assignment marks read-only, whatever ``allowed_files`` says."""
-    protected = {_read_only_path(f) for f in getattr(assignment, "read_files", ())}
-    return [f for f in files if _read_only_path(f) in protected]
-
-
-#: Cap on the work-order text quoted in builder and reviewer prompts (limits.builderOrder in schema/order.json).
-MAX_ORDER_DETAILS_CHARS = LIMIT_BUILDER_ORDER
-
-
-def _capped_order_text(text: str, label: str) -> str:
-    """``text`` cut to the order-details cap, saying how much of the ``label`` was left out."""
-    if len(text) <= MAX_ORDER_DETAILS_CHARS:
-        return text
-    more = len(text) - MAX_ORDER_DETAILS_CHARS
-    return f"{text[:MAX_ORDER_DETAILS_CHARS].rstrip()}\n[... {label} truncated: {more} more characters]"
-
-
-def _order_details_section(description: str | None, part_description: str | None = None) -> list[str]:
-    """Prompt lines quoting the original work order and the ticket's own part; empty when there is neither.
-
-    The part is left out when it only repeats the order (a single-ticket task).
-    """
-    text = (description or "").strip()
-    part = (part_description or "").strip()
-    if part == text:
-        part = ""
-    lines: list[str] = []
-    if text:
-        lines += [
-            "The original work order this subtask is part of, for background; the acceptance criteria above set what "
-            "this subtask must do.",
-            _capped_order_text(text, "order description"),
-        ]
-    if part:
-        lines += ["", "### This part", _capped_order_text(part, "ticket description")]
-    return ["", "## Order details", *lines] if lines else []
-
-
-#: A backticked span (group 1), or a quoted token that looks like a name, state or path (group 3).
-_PLAN_ITEM_RE = re.compile(r"`([^`\n]+)`|(?<!\w)(['\"])([A-Za-z_][\w.:/-]{1,80})\2(?!\w)")
-#: Common words an order may quote without naming anything (compared in lower case).
-_PLAN_STOP_WORDS = frozenset({"a", "an", "and", "or", "not", "the", "true", "false", "none", "null"})
-
-
-def plan_checklist(order_description: str | None, limit: int = 25) -> list[str]:
-    """The distinct items ``order_description`` names exactly, in order of first appearance, at most ``limit``.
-
-    An item is a backticked span (without the backticks) or a single- or
-    double-quoted token that looks like an identifier, op name, state or file
-    path. Very common words are skipped.
-    """
-    items: list[str] = []
-    if not order_description or limit <= 0:
-        return items
-    for match in _PLAN_ITEM_RE.finditer(order_description):
-        item = (match.group(1) or match.group(3)).strip()
-        if not item or item.lower() in _PLAN_STOP_WORDS or item in items:
-            continue
-        items.append(item)
-        if len(items) >= limit:
-            break
-    return items
-
-
-def _plan_checklist_section(order_description: str | None, *, last_part: bool = False) -> list[str]:
-    """Prompt lines listing the order's named items for the reviewer; empty when it names none."""
-    items = plan_checklist(order_description)
-    if not items:
-        return []
-    lines = [
-        "",
-        "## Plan checklist",
-        "The order names these exactly. For each one this part is responsible for, check the diff "
-        "(or the already-done parts) implements it with exactly this name and shape. If any of this "
-        "part's items is missing, renamed or shaped differently from the order, reply REVISE with a "
-        "directive naming it.",
-    ]
-    lines += [f"- {item}" for item in items]
-    if last_part:
-        lines.append(
-            "This is the last part of the task: every item above must now be covered by this diff "
-            "or the parts already done."
-        )
-    return lines
-
-
-def build_builder_prompt(
-    assignment: TaskAssignment,
-    *,
-    max_retries: int = MAX_RETRIES,
-    already_done: Sequence[StackedWork] | None = None,
-    focus_files: Sequence[str] | None = None,
-    floor_manager_note: str | None = None,
-    order_description: str | None = None,
-    contract: str = BUILDER_CONTRACT,
-    pitfall_notes: Sequence[str] | None = None,
-) -> str:
-    """Return the exact prompt a builder sends to Claude for ``assignment``.
-
-    ``contract``: the text of the '## Output contract' section (``EDIT_CONTRACT`` in edit mode).
-    ``pitfall_notes``: advisory notes from a search of the repo's tests, listed under
-    "## Watch out (advisory)" after the order details; none = no section.
-
-    ``already_done`` (stacked tickets): the task's earlier approved tickets,
-    listed under "## Already done on this piece" (title, files, symbols).
-    ``floor_manager_note``: the Floor Manager's answer to this ticket's help request,
-    shown right after the order details.
-    ``focus_files``: this subtask's own files; when they are a strict subset
-    of the allowed files the prompt lists "## Your files" and, separately,
-    "## You may also touch" (the rest of the task's files).
-    ``order_description``: the original work-order text, quoted (capped) under "## Order details".
-    ``assignment.ticket_description``: the ticket's own description, quoted (capped) under "### This part".
-
-    Contains only: who/what (ids, attempt), the objective, acceptance criteria,
-    the order details, allowed files, the pruned ``ContextSlice`` snippets (edit targets in full,
-    the rest as outlines, plus a symbol inventory), the fix hint from the
-    previous attempt (if any) and the ```edits / ```diff output contract.  Never
-    whole files beyond the context engine's line budget.
-    """
-    ctx = assignment.context
-    criteria = assignment.acceptance_criteria or ctx.acceptance_criteria
-    parts: list[str] = [
-        f"You are builder {assignment.builder_id} on team {assignment.team_id}. "
-        f"Task {assignment.task_id}, subtask {assignment.subtask_id}, "
-        f"attempt {assignment.attempt + 1} of {max_retries + 1}.",
-        "",
-        "## Objective",
-        ctx.objective.strip(),
-        "",
-        "## Acceptance criteria",
-    ]
-    parts += [f"- {c.strip()}" for c in criteria] or ["- (none given)"]
-    parts += _order_details_section(order_description, assignment.ticket_description)
-    if pitfall_notes:
-        parts += [
-            "",
-            "## Watch out (advisory)",
-            "Found by a search of the repo's tests. Check each against the code; ignore any that do not apply.",
-        ]
-        parts += [f"- {note}" for note in pitfall_notes]
-    if floor_manager_note and floor_manager_note.strip():
-        parts += ["", "## Floor Manager note (follow it)", floor_manager_note.strip()]
-    allowed = list(assignment.allowed_files)
-    read_files = list(getattr(assignment, "read_files", ()))
-    protected = set(read_files)
-    allowed = [f for f in allowed if _read_only_path(f) not in protected]
-    focus = [f for f in (focus_files or ()) if f in allowed]
-    also = [f for f in allowed if f not in focus]
-    if focus and also:
-        parts += ["", "## Your files"]
-        parts += [f"- {f}" for f in focus]
-        parts += [
-            "",
-            "## You may also touch",
-            "Other files of this task (teammates' subtasks). Change one only when your subtask "
-            "needs it; together with 'Your files' these are the files you may modify.",
-        ]
-        parts += [f"- {f}" for f in also]
-    else:
-        parts += ["", "## Files you may modify"]
-        parts += [f"- {f}" for f in allowed] or [
-            "- (no restriction given)" if not assignment.allowed_files else "- (none: every listed file is read-only)"
-        ]
-    if already_done:
-        parts += _already_done_section(already_done)
-    if ctx.snippets:
-        parts += [
-            "",
-            "## Context",
-            "Three kinds of excerpt: (1) a per-file **inventory** of the symbols that already "
-            "exist (name and line range): never define any of them again; (2) **full targets** "
-            "with numbered lines (`N| code`): these are the symbols to edit; (3) **outlines** "
-            "ending with `# outline only — body hidden; do not redefine, ask for it`: do not "
-            "rewrite them; if you need one, reply `BLOCKED:` naming it in backticks and it is "
-            "shown in full next attempt.",
-        ]
-        for snip in ctx.snippets:
-            fence = _fence_for(snip.text)
-            parts += [
-                f"### {snip.path} (lines {snip.start_line}-{snip.end_line})",
-                f"{fence}text",
-                snip.text.rstrip("\n"),
-                fence,
-            ]
-    if assignment.fix_hint:
-        parts += [
-            "",
-            "## Fix required (your previous attempt was sent back)",
-            assignment.fix_hint.strip(),
-        ]
-    if read_files:
-        parts += [
-            "",
-            "## Read-only files",
-            "For reference only. Do not change these files: a reply that edits any of them is refused. "
-            "To see more of one, reply `BLOCKED:` naming the symbol in backticks.",
-        ]
-        parts += [f"- {f}" for f in read_files]
-        for excerpt in getattr(assignment, "read_only_excerpts", ()):
-            text = str(excerpt["text"])
-            fence = _fence_for(text)
-            parts += [
-                f"### {excerpt['path']} (lines {excerpt['start_line']}-{excerpt['end_line']})",
-                f"{fence}text",
-                text.rstrip("\n"),
-                fence,
-            ]
-    parts += ["", "## Output contract", contract]
-    return "\n".join(parts) + "\n"
-
-
-def build_reviewer_prompt(
-    submission: BuilderSubmission,
-    acceptance_criteria: Sequence[str],
-    gate_results: Sequence[DeterministicGateResult],
-    *,
-    reviewer_id: str | None = None,
-    retry_count: int = 0,
-    pre_review_notes: str | None = None,
-    max_retries: int = MAX_RETRIES,
-    order_description: str | None = None,
-    part_description: str | None = None,
-    last_part: bool = False,
-) -> str:
-    """Return the exact, diff-only prompt a reviewer sends to Claude.
-
-    The payload is the acceptance criteria, the unified diff and a one-line
-    summary per deterministic gate result.  Full files, context snippets and
-    gate stdout are deliberately left out.  ``pre_review_notes`` (Gemma's
-    pre-review findings, if any) are added as advisory text the reviewer
-    is told may be wrong.
-    ``order_description`` (the original work order, capped) is quoted under "## Order details";
-    the items it names exactly (:func:`plan_checklist`) are listed under "## Plan checklist".
-    ``part_description`` (the ticket's own description, capped) is quoted under "### This part".
-    ``last_part``: this is the task's last ticket, so every checklist item must now be covered.
-    """
-    who = f"You are reviewer {reviewer_id}. " if reviewer_id else "You are the reviewer. "
-    parts: list[str] = [
-        who
-        + f"Review task {submission.task_id}, subtask {submission.subtask_id}, built by "
-        f"{submission.builder_id} (review round {retry_count + 1} of {max_retries + 1}).",
-        "",
-        "## Acceptance criteria",
-    ]
-    parts += [f"- {c.strip()}" for c in acceptance_criteria] or ["- (none given)"]
-    parts += _order_details_section(order_description, part_description)
-    parts += _plan_checklist_section(order_description, last_part=last_part)
-    parts += ["", "## Deterministic gates (already run)"]
-    if gate_results:
-        for g in gate_results:
-            line = f"- {g.check_type}: {'PASS' if g.passed else 'FAIL'} ({g.duration_seconds:.2f}s)"
-            if g.note:
-                line += f" - {_one_line(g.note, 120)}"
-            parts.append(line)
-    else:
-        parts.append("- (no gates configured)")
-    if pre_review_notes and pre_review_notes.strip():
-        parts += ["", "## Gemma pre-review", f"Gemma pre-review notes (may be wrong): {pre_review_notes.strip()}"]
-    fence = _fence_for(submission.diff)
-    parts += [
-        "",
-        "## Unified diff",
-        f"{fence}diff",
-        submission.diff.rstrip("\n"),
-        fence,
-        "",
-        "## Output contract",
-        REVIEWER_CONTRACT,
-    ]
-    return "\n".join(parts) + "\n"
-
-
-# ---------------------------------------------------------------------------
-# Reply parsers (pure)
-# ---------------------------------------------------------------------------
-
-_DIFF_OPEN_RE = re.compile(r"^[ \t]*```diff[^\n`]*$", re.M)
-_DIFF_BLOCK_RE = re.compile(r"^[ \t]*```diff[^\n`]*\n(.*?)^[ \t]*```[ \t]*$", re.M | re.S)
-_BLOCKED_RE = re.compile(r"^\s*BLOCKED:\s*(.+)$", re.M)
-_EDITS_OPEN_RE = re.compile(r"^[ \t]*```edits[^\n`]*$", re.M)
-_EDITS_BLOCK_RE = re.compile(r"^[ \t]*```edits[^\n`]*\n(.*?)^[ \t]*```[ \t]*$", re.M | re.S)
-
-
-def extract_diff_paths(diff: str) -> list[str]:
-    """Return the files a unified diff touches, in order, without ``a/``/``b/`` prefixes.
-
-    New and modified files come from ``+++`` headers; deleted files (``+++ /dev/null``)
-    from the matching ``---`` header.
-    """
-    paths: list[str] = []
-    previous_minus: str | None = None
-    for line in diff.splitlines():
-        if line.startswith("--- "):
-            previous_minus = line[4:].split("\t", 1)[0].strip()
-        elif line.startswith("+++ "):
-            plus = line[4:].split("\t", 1)[0].strip()
-            target = plus if plus != "/dev/null" else (previous_minus or "")
-            if target.startswith(("a/", "b/")):
-                target = target[2:]
-            target = _normalize_path(target)
-            if target and target != "/dev/null" and target not in paths:
-                paths.append(target)
-            previous_minus = None
-    return paths
-
-
-def parse_builder_reply(
-    text: str,
-    assignment: TaskAssignment,
-    *,
-    workspace: str | Path | None = None,
-) -> BuilderSubmission:
-    """Turn a builder's Claude reply into a :class:`BuilderSubmission`.
-
-    ``ready_for_review`` only when the reply has exactly one closed ```diff block
-    holding a non-empty unified diff whose files are all in
-    ``assignment.allowed_files`` (no restriction when that list is empty), or
-    exactly one ```edits block (JSON ``{"edits": [...]}``) that
-    :func:`foundry.edits.apply_edits` applies cleanly to ``workspace`` (the
-    workspace is not modified; the generated unified diff becomes
-    ``submission.diff``, so gates, review and publishing are unchanged).
-    Anything else (no block, several blocks, unterminated block, no headers or
-    hunks, files outside the allowance, invalid edits, an explicit
-    ``BLOCKED:``) gives a ``blocked`` submission with ``blocker_notes`` saying
-    why, so it never reaches the reviewer.
-    """
-    base = {
-        "task_id": assignment.task_id,
-        "subtask_id": assignment.subtask_id,
-        "builder_id": assignment.builder_id,
-    }
-
-    def blocked(note: str, *, diff: str = "", files: list[str] | None = None, checks: dict[str, bool]) -> BuilderSubmission:
-        return BuilderSubmission(
-            **base,
-            status="blocked",
-            modified_files=files or [],
-            diff=diff,
-            self_check=checks,
-            blocker_notes=note,
-        )
-
-    openers = len(_DIFF_OPEN_RE.findall(text))
-    edit_openers = len(_EDITS_OPEN_RE.findall(text))
-    if openers and edit_openers:
-        return blocked(
-            "reply contained both an ```edits and a ```diff block; send exactly one",
-            checks={"single_diff_block": False},
-        )
-    if edit_openers:
-        return _parse_edits_reply(text, edit_openers, assignment, workspace, blocked, base)
-    blocks = _DIFF_BLOCK_RE.findall(text)
-    if openers == 0:
-        m = _BLOCKED_RE.search(text)
-        note = f"builder reported BLOCKED: {m.group(1).strip()}" if m else "reply contained no ```edits or ```diff block"
-        return blocked(note, checks={"single_diff_block": False})
-    if openers > 1 or len(blocks) > 1:
-        return blocked(
-            f"reply contained {max(openers, len(blocks))} ```diff blocks; exactly one is required",
-            checks={"single_diff_block": False},
-        )
-    if not blocks:
-        return blocked("the ```diff block was not closed", checks={"single_diff_block": False})
-
-    diff = blocks[0]
-    if diff and not diff.endswith("\n"):
-        diff += "\n"
-    checks: dict[str, bool] = {"single_diff_block": True}
-    has_headers = bool(re.search(r"^--- ", diff, re.M)) and bool(re.search(r"^\+\+\+ ", diff, re.M))
-    has_hunks = bool(re.search(r"^@@ ", diff, re.M))
-    checks["unified_diff"] = has_headers and has_hunks
-    files = extract_diff_paths(diff)
-    if not diff.strip():
-        return blocked("the ```diff block was empty", checks={**checks, "unified_diff": False})
-    if not checks["unified_diff"] or not files:
-        return blocked(
-            "the ```diff block is not a unified diff (needs ---/+++ headers and @@ hunks)",
-            diff=diff,
-            files=files,
-            checks={**checks, "unified_diff": False},
-        )
-    allowed = {_normalize_path(f) for f in assignment.allowed_files}
-    touched = _read_only_touched(files, assignment)
-    if touched:
-        return blocked(
-            "diff touches read-only files: " + ", ".join(touched),
-            diff=diff,
-            files=files,
-            checks={**checks, "read_only_untouched": False},
-        )
-    outside = [f for f in files if allowed and f not in allowed]
-    checks["files_allowed"] = not outside
-    if outside:
-        return blocked(
-            "diff touches files outside the allowance: " + ", ".join(outside),
-            diff=diff,
-            files=files,
-            checks=checks,
-        )
-    return BuilderSubmission(
-        **base,
-        status="ready_for_review",
-        modified_files=files,
-        diff=diff,
-        self_check=checks,
-        blocker_notes=None,
-    )
-
-
-def _parse_edits_reply(
-    text: str,
-    openers: int,
-    assignment: TaskAssignment,
-    workspace: str | Path | None,
-    blocked: Callable[..., BuilderSubmission],
-    base: dict[str, Any],
-) -> BuilderSubmission:
-    """The ```edits half of :func:`parse_builder_reply`."""
-    blocks = _EDITS_BLOCK_RE.findall(text)
-    if openers > 1 or len(blocks) > 1:
-        return blocked(
-            f"reply contained {max(openers, len(blocks))} ```edits blocks; exactly one is required",
-            checks={"single_edits_block": False},
-        )
-    if not blocks:
-        return blocked("the ```edits block was not closed", checks={"single_edits_block": False})
-    checks: dict[str, bool] = {"single_edits_block": True}
-    raw = blocks[0].strip()
-    if not raw:
-        return blocked("the ```edits block was empty", checks={**checks, "edits_json": False})
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return blocked(
-            f"the ```edits block is not valid JSON ({exc.msg} at line {exc.lineno} col {exc.colno})",
-            checks={**checks, "edits_json": False},
-        )
-    edits = data.get("edits") if isinstance(data, dict) else data
-    if not isinstance(edits, list) or not edits:
-        return blocked(
-            'the ```edits block must be {"edits": [ ... ]} with at least one edit',
-            checks={**checks, "edits_json": False},
-        )
-    checks["edits_json"] = True
-    if workspace is None:
-        return blocked(
-            "```edits replies cannot be applied here (no workspace); send a ```diff block",
-            checks={**checks, "edits_applied": False},
-        )
-    from foundry.edits import apply_edits  # local: keeps the pure parsers importable alone
-
-    allowed = [_normalize_path(f) for f in assignment.allowed_files]
-    try:
-        diff, errors = apply_edits(Path(workspace), edits, allowed or None)
-    except Exception as exc:  # a malformed edit must never crash the worker
-        diff, errors = "", [f"{type(exc).__name__}: {exc}"]
-    if errors:
-        shown = "; ".join(_one_line(str(e), 200) for e in list(errors)[:3])
-        more = f" (+{len(errors) - 3} more)" if len(errors) > 3 else ""
-        return blocked(f"edits rejected: {shown}{more}", checks={**checks, "edits_applied": False})
-    if not diff or not diff.strip():
-        return blocked("the edits changed nothing", checks={**checks, "edits_applied": False})
-    if not diff.endswith("\n"):
-        diff += "\n"
-    files = extract_diff_paths(diff)
-    allowed_set = set(allowed)
-    touched = _read_only_touched(files, assignment)
-    if touched:
-        return blocked("edits touch read-only files: " + ", ".join(touched), diff=diff, files=files,
-                       checks={**checks, "edits_applied": True, "read_only_untouched": False})
-    outside = [f for f in files if allowed_set and f not in allowed_set]
-    checks["edits_applied"] = True
-    checks["files_allowed"] = not outside
-    if outside:
-        return blocked("edits touch files outside the allowance: " + ", ".join(outside),
-                       diff=diff, files=files, checks=checks)
-    return BuilderSubmission(
-        **base,
-        status="ready_for_review",
-        modified_files=files,
-        diff=diff,
-        self_check=checks,
-        blocker_notes=None,
-    )
-
-
-#: Backticked identifiers (``foo``, ``Class.method``) in a BLOCKED note.
-_BACKTICK_SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\(\))?`")
-#: "body of X" / "bodies of X" / "definition of X" in a BLOCKED note.
-_BODY_OF_RE = re.compile(
-    r"\b(?:body|bodies|definition|implementation|source)\s+of\s+`?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)",
-    re.I,
-)
-_FILE_SUFFIXES = (".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md",
-                  ".toml", ".yaml", ".yml", ".txt", ".cfg", ".ini", ".html", ".css")
-_NOT_SYMBOLS = {"git", "apply", "diff", "edits", "blocked", "none", "true", "false", "self", "cls",
-                "replace_symbol", "insert_after_symbol", "insert_before_symbol", "append",
-                "search_replace", "create_file", "delete_symbol"}
-#: Most symbols carried from a BLOCKED note into the next attempt's slice.
-MAX_EXTRA_SYMBOLS = 12
-
-
-def extract_requested_symbols(note: str | None) -> list[str]:
-    """Symbols a builder asked for in a BLOCKED / blocker note, in order, de-duplicated.
-
-    Picks backticked identifiers (``foo``, ``Class.method``, ``foo()``) and
-    names after "body of" / "definition of".  File names, ops and short
-    words are skipped.
-    """
-    if not note:
-        return []
-    found: list[str] = []
-    candidates = [m.group(1) for m in _BACKTICK_SYMBOL_RE.finditer(note)]
-    candidates += [m.group(1) for m in _BODY_OF_RE.finditer(note)]
-    for name in candidates:
-        name = name.strip(".")
-        if (
-            len(name) < 2
-            or name.lower() in _NOT_SYMBOLS
-            or name.lower().endswith(_FILE_SUFFIXES)
-            or name in found
-        ):
-            continue
-        found.append(name)
-        if len(found) >= MAX_EXTRA_SYMBOLS:
-            break
-    return found
-
-
-_JSON_FENCE_RE = re.compile(r"^```(?:json)?[ \t]*\n(.*?)\n?```$", re.S)
-
-
-def parse_reviewer_reply(
-    text: str,
-    *,
-    task_id: str,
-    reviewer_id: str,
-    retry_count: int = 0,
-    default_path: str = "(review)",
-) -> ReviewerVerdict:
-    """Parse a reviewer's strict-JSON reply into a :class:`ReviewerVerdict`.
-
-    The reply must be one JSON object (a single surrounding ```json fence is
-    tolerated) with ``verdict`` and optional ``directives``.  ``task_id``,
-    ``reviewer_id`` and ``retry_count`` always come from the caller, never from
-    the model.  Unknown extra keys are ignored; malformed directives are not.
-    Anything invalid yields ``REVISE`` with one directive explaining that the
-    review must be redone, so a bad reply can never approve work.
-    """
-    retry = max(0, min(int(retry_count), MAX_RETRIES_LIMIT))
-
-    def invalid(why: str) -> ReviewerVerdict:
-        return ReviewerVerdict(
-            task_id=task_id,
-            reviewer_id=reviewer_id,
-            verdict="REVISE",
-            directives=[
-                LineDirective(
-                    path=default_path or "(review)",
-                    line=0,
-                    instruction=_one_line(
-                        f"Reviewer reply was not a valid verdict ({why}); re-check the "
-                        "acceptance criteria and resubmit the diff.",
-                        300,
-                    ),
-                )
-            ],
-            retry_count=retry,
-        )
-
-    raw = text.strip()
-    fenced = _JSON_FENCE_RE.match(raw)
-    if fenced:
-        raw = fenced.group(1).strip()
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
-        return invalid(f"not JSON: {exc.msg if hasattr(exc, 'msg') else exc}")
-    if not isinstance(data, dict):
-        return invalid("top level is not an object")
-    verdict = data.get("verdict")
-    if isinstance(verdict, str):
-        verdict = verdict.strip().upper()
-    directives = data.get("directives", [])
-    if directives is None:
-        directives = []
-    if not isinstance(directives, list):
-        return invalid("directives is not a list")
-    known = set(LineDirective.model_fields)
-    directives = [
-        {k: v for k, v in d.items() if k in known} if isinstance(d, dict) else d for d in directives
-    ]
-    try:
-        return ReviewerVerdict(
-            task_id=task_id,
-            reviewer_id=reviewer_id,
-            verdict=verdict,
-            directives=directives,
-            retry_count=retry,
-        )
-    except ValidationError as exc:
-        first = exc.errors()[0]
-        where = ".".join(str(p) for p in first.get("loc", ()))
-        return invalid(f"{where}: {first.get('msg', 'invalid')}")
-
-
-_INFRA_ERROR_RE = re.compile(
-    r"^timeout after\b|without JSON output|^empty output\b|no JSON object", re.I
-)
-
-
-def is_infrastructure_error(result: ClaudeResult) -> bool:
-    """True when an ``is_error`` result means Claude never produced a reply (D1).
-
-    Matches the real ``ClaudeCodeClient`` shapes: ``"timeout after Ns"``,
-    ``"claude exited N without JSON output: ..."`` (non-zero exit / non-JSON
-    output), plus any error result with no reply text and no output tokens.
-    Such failures release the ticket without using an attempt.  An error
-    result that carries a model reply (e.g. ``error_max_turns`` with text or
-    output tokens) is a real build outcome and does use an attempt.
-    """
-    if not result.is_error:
-        return False
-    if _INFRA_ERROR_RE.search(result.error or ""):
-        return True
-    return not (result.text or "").strip() and result.output_tokens == 0
-
-
-#: Fallback reasons that cost no Gemma time (do not trip the breaker).
-_PRE_REVIEW_CHEAP_FALLBACKS = frozenset({"gemma off", "unusable reply"})
-
-
-class PreReviewBreaker:
-    """Circuit breaker for the Gemma pre-review, shared by a team's builders.
-
-    After ``threshold`` consecutive fallbacks caused by Gemma timeouts/errors,
-    the pre-review is skipped for ``cooldown_s`` seconds (``clock`` is
-    monotonic and injectable).  A usable Gemma reply resets the count.
-    """
-
-    def __init__(self, threshold: int = 3, cooldown_s: float = 600.0,
-                 clock: Callable[[], float] = time.monotonic) -> None:
-        self.threshold = int(threshold)
-        self.cooldown_s = float(cooldown_s)
-        self.clock = clock
-        self.failures = 0
-        self.open_until = 0.0
-
-    def is_open(self) -> bool:
-        return self.clock() < self.open_until
-
-    def record_failure(self) -> None:
-        self.failures += 1
-        if self.failures >= self.threshold:
-            self.open_until = self.clock() + self.cooldown_s
-            self.failures = 0
-            log.warning("Gemma pre-review: %d consecutive failures; skipping it for %.0f s",
-                        self.threshold, self.cooldown_s)
-
-    def record_success(self) -> None:
-        self.failures = 0
-
-
-def format_pre_review_notes(issues: Iterable[Any], limit: int = 600) -> str | None:
-    """``"blocking: x; minor: y"`` from pre-review issues (dicts or objects); None when empty."""
-    parts: list[str] = []
-    for issue in issues:
-        note = _one_line(str(_get(issue, "note", "") or ""), 200)
-        if not note:
-            continue
-        severity = str(_get(issue, "severity", "") or "minor")
-        parts.append(f"{severity}: {note}")
-    if not parts:
-        return None
-    text = "; ".join(parts)
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
-def directives_to_hint(directives: Iterable[LineDirective], limit: int = MAX_FIX_HINT_CHARS) -> str:
-    """Render reviewer directives as the fix hint stored on a reopened ticket."""
-    items = [
-        f"{d.path}:{d.line} {_one_line(d.instruction, 300)}" if d.line else f"{d.path}: {_one_line(d.instruction, 300)}"
-        for d in directives
-    ]
-    hint = "Reviewer asked for changes: " + ("; ".join(items) if items else "revise the diff to meet every criterion")
-    return hint if len(hint) <= limit else hint[: limit - 3] + "..."
-
-
-# When a builder pauses for help (see _WorkerBase._help_request): a send-back parks the
-# ticket through ``queue.pause_for_help`` instead of reopening it when ALL of these hold:
-#   - the queue has ``pause_for_help`` and ``help_after`` (FOUNDRY_HELP_AFTER) is above 0;
-#   - this failure is a missing-information one: its reason or hint contains ``BLOCKED`` or,
-#     in any case, one of _MISSING_INFO_PHRASES;
-#   - at least ``help_after`` such failures came in a row (any other failure resets the count);
-#   - the ticket still has an attempt left (attempt + 1 <= max_retries);
-#   - the ticket has never been paused before, so it pauses at most once.
-# If the queue refuses the pause, the normal send-back runs. The outcome of a pause is
-# ``awaiting_help``, which is handled like a retry, not like a quarantine.
-#
-# How the answer reaches the builder: once ``queue.answer_help`` has stored a note, the next
-# prompt for that ticket shows it in a ``## Floor Manager note (follow it)`` section right
-# after ``## Order details``, and the answer's read_files join the ticket's read-only files.
-
-#: Queue kv keys of the pause-for-help bookkeeping (each followed by the ticket id).
-MISSING_INFO_KV_PREFIX = "missing_info:"
-LAST_HINT_KV_PREFIX = "last_hint:"
-HELP_PAUSED_KV_PREFIX = "help_paused:"
-HELP_ANSWER_KV_PREFIX = "help_answer:"
-#: Missing-information failures in a row before a ticket waits for the Floor Manager.
-DEFAULT_HELP_AFTER = 2
-MAX_HELP_AFTER = 3
-MAX_HELP_TEXT_CHARS = 2000
-#: Send-back reasons that judge the work; these never mean the builder lacked information
-#: (nor does any ``gate_*`` reason).
-_WORK_JUDGEMENT_REASONS = frozenset({"pre_review", "revise", "review_error", "worker_error"})
-#: Looked for in the hint only, and only for reasons that are not judgements of the work.
-_MISSING_INFO_PHRASES = (
-    "can't see", "cannot see", "not shown", "isn't shown", "not supplied", "not provided",
-    "need the body", "need the exact", "no context",
-)
-
-
-def _is_missing_information(reason: str, hint: str) -> bool:
-    """True when a failure says the builder lacked information rather than got the code wrong.
-
-    Send-backs that judge the work (pre-review, reviewer, worker errors, any ``gate_*``)
-    never count, whatever their text says.  A ``blocked`` send-back counts when its hint
-    holds the builder's ``BLOCKED`` reply; anything else counts only when the hint (not
-    the reason) contains one of ``_MISSING_INFO_PHRASES``.
-    """
-    if reason in _WORK_JUDGEMENT_REASONS or reason.startswith("gate_"):
-        return False
-    if reason == "blocked" and "BLOCKED" in hint:
-        return True
-    lowered = hint.lower()
-    return any(phrase in lowered for phrase in _MISSING_INFO_PHRASES)
 
 
 # ---------------------------------------------------------------------------
