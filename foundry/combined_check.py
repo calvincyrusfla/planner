@@ -471,11 +471,13 @@ class CombinedChecker:
         state["status"] = {number: line for number, line in state["status"].items() if number in numbers}
         state["green"] = {number: mark for number, mark in state["green"].items() if number in numbers}
         self._save_state()
-        if getattr(getattr(self.service, "config", None), "auto_merge", "off") == "tests_docs":
-            await self._auto_merge(groups, checked)
+        mode = getattr(getattr(self.service, "config", None), "auto_merge", "off")
+        if mode in ("tests_docs", "low"):
+            await self._auto_merge(groups, checked, mode)
             self._save_state()
 
-    async def _auto_merge(self, groups: dict[str, list[dict[str, Any]]], checked: dict[str, str]) -> None:
+    async def _auto_merge(self, groups: dict[str, list[dict[str, Any]]], checked: dict[str, str],
+                          mode: str = "tests_docs") -> None:
         """Merge the green, mergeable PRs that only touch tests or docs: one attempt per PR and round."""
         merged = self._load_state()["merged"]
         for base, group in sorted(groups.items()):
@@ -489,7 +491,7 @@ class CombinedChecker:
                 if str(number) in merged or not self._merge_ready(pr, len(group) == 1, checked.get(base, "")):
                     continue
                 try:
-                    await self._merge_if_tests_docs(number, str(pr["headRefOid"]))
+                    await self._merge_if_tests_docs(number, str(pr["headRefOid"]), mode)
                 except Exception as exc:  # noqa: BLE001 - one bad PR must not stop the round
                     log.warning("combined check: could not auto-merge #%d: %s: %s", number, type(exc).__name__, exc)
 
@@ -500,14 +502,24 @@ class CombinedChecker:
             return False
         return alone or (bool(current) and self._load_state()["green"].get(str(pr["number"])) == current)
 
-    async def _merge_if_tests_docs(self, number: int, head: str) -> None:
-        """Squash-merge the PR when every file is a test or a doc; ``head`` pins the commit that was judged."""
+    async def _merge_if_tests_docs(self, number: int, head: str, mode: str = "tests_docs") -> None:
+        """Squash-merge the PR when every file is a test or a doc (or, in ``low`` mode, the tier is at most low).
+
+        ``head`` pins the commit that was judged.
+        """
         rc, out, err = await self._run([self.gh, "pr", "view", str(number), "--json", "files"], _GH_TIMEOUT_S)
         if rc != 0:
             log.warning("combined check: could not read the files of #%d: %s", number,
                         (err or out or f"exit {rc}").strip()[-300:])
             return
-        if not _only_tests_or_docs(json.loads(out or "{}").get("files")):
+        files = json.loads(out or "{}").get("files")
+        comment = _AUTO_MERGE_COMMENT
+        if mode == "low":
+            tier = await self._low_tier(number, files)
+            if tier is None:
+                return
+            comment = f"Merged automatically: risk tier {tier}, green and mergeable."
+        elif not _only_tests_or_docs(files):
             return
         rc, out, err = await self._run([self.gh, "pr", "merge", str(number), "--squash", "--match-head-commit", head],
                                        _GH_TIMEOUT_S)
@@ -517,8 +529,30 @@ class CombinedChecker:
             return
         self._load_state()["merged"][str(number)] = head
         self._save_state()  # a restart must never merge or comment on it again
-        await self._comment(number, f"{COMMENT_MARKER}\n{_AUTO_MERGE_COMMENT}\n")
+        await self._comment(number, f"{COMMENT_MARKER}\n{comment}\n")
         log.info("combined check: merged #%d automatically", number)
+
+    async def _low_tier(self, number: int, files: Any) -> str | None:
+        """The tier (``tests_docs`` or ``low``) of a PR that may merge in low mode; None when it must not."""
+        from foundry.risk_tier import classify  # imported late: risk_tier imports this module
+
+        if not isinstance(files, list) or not files:
+            return None
+        paths = [row.get("path") if isinstance(row, dict) else None for row in files]
+        names = [path for path in paths if isinstance(path, str)]
+        if len(names) != len(paths):
+            return None
+        for path in names:
+            *folders, name = path.split("/")
+            if name.lower() == "claude.md" or ".claude" in folders:
+                return None
+        rc, diff, err = await self._run([self.gh, "pr", "diff", str(number)], _GH_TIMEOUT_S)
+        if rc != 0:
+            log.warning("combined check: could not read the diff of #%d: %s", number,
+                        (err or diff or f"exit {rc}").strip()[-300:])
+            return None
+        tier = str(classify(names, diff).get("tier"))
+        return tier if tier in ("tests_docs", "low") else None
 
     async def _follow_base(self, prs: list[dict[str, Any]]) -> None:
         """Update the PRs that are behind their base and flag the ones that conflict with it.
