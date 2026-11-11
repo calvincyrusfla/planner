@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -43,14 +45,15 @@ def done(text: str = "```edits\n[]\n```") -> ClaudeResult:
     return ClaudeResult(text=text, session_id="sid-2", num_turns=5, subtype="success")
 
 
-def run_sessions(tmp_path: Path, script: list[ClaudeResult | Exception], sessions: int | None) -> tuple[
+def run_sessions(tmp_path: Path, script: list[ClaudeResult | Exception], sessions: int | None,
+                 client_args: Sequence[str] = ("--max-turns", "60", "--disallowedTools", "Foo")) -> tuple[
         ClaudeResult, list[Call], list[tuple[str, str, dict[str, Any]]]]:
     FakeClient.calls = []
     FakeClient.script = list(script)
     events: list[tuple[str, str, dict[str, Any]]] = []
     worker = BuilderWorker.__new__(BuilderWorker)
     w: Any = worker
-    w.client = FakeClient("claude", ["--max-turns", "60", "--disallowedTools", "Foo"])
+    w.client = FakeClient("claude", list(client_args))
     w.limiter = None
     w.claude_calls = 0
     w.agent_id = "alpha-1"
@@ -116,6 +119,34 @@ def test_other_errors_end_the_loop(tmp_path: Path) -> None:
     err = ClaudeResult(is_error=True, error="boom", subtype="error_during_execution", num_turns=3)
     result, calls, _ = run_sessions(tmp_path, [err], sessions=3)
     assert result is err and len(calls) == 1
+
+
+def test_new_file_shows_in_summary(tmp_path: Path) -> None:
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       cwd=str(tmp_path), check=True, capture_output=True)
+
+    git("init")
+    (tmp_path / "old.txt").write_text("x\n")
+    git("add", "--all")
+    git("commit", "-m", "init")
+    (tmp_path / "brand_new_file.py").write_text("print(1)\n")
+    _, calls, _ = run_sessions(tmp_path, [maxed(), done("NOTE"), done("final")], sessions=2)
+    assert "brand_new_file.py" in calls[2][1]
+
+
+def test_resume_merges_disallowed_and_trims_allowed(tmp_path: Path) -> None:
+    args = ("--max-turns", "60", "--disallowedTools", "Foo Bar Edit", "--allowedTools", "Read Edit Grep Bash",
+            "--other", "v")
+    _, calls, _ = run_sessions(tmp_path, [maxed(), done("NOTE"), done("final")], sessions=2, client_args=args)
+    resume_args = calls[1][0]
+    assert resume_args.count("--disallowedTools") == 1
+    value = resume_args[resume_args.index("--disallowedTools") + 1]
+    assert value.split() == ["Foo", "Bar", "Edit", "Write", "Bash"]
+    allowed = resume_args[resume_args.index("--allowedTools") + 1].split()
+    assert allowed == ["Read", "Grep"]
+    assert resume_args.count("--max-turns") == 1 and resume_args.count("--resume") == 1
+    assert "--other" in resume_args
 
 
 def test_subtype_parsed() -> None:
